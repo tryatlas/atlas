@@ -67,6 +67,12 @@
 .atlas-composer .ProseMirror ::selection {
   background: var(--selection-background);
 }
+/* A locked composer (`composer-input-card.tsx`): the text and its placeholder
+   step down the ladder to the disabled rung, which clears 4.5:1. */
+[data-composer-locked] .atlas-chat-composer,
+[data-composer-locked] .atlas-chat-composer .atlas-composer-placeholder {
+  color: var(--text-disabled);
+}
 .atlas-composer-placeholder {
   position: absolute;
   pointer-events: none;
@@ -1472,6 +1478,10 @@
     animation: none;
     background-image: none;
     -webkit-text-fill-color: var(--secondary-foreground);
+  }
+  /* The loop stops at full strength: its trough (0.45) is not readable text. */
+  .atlas-marker-running {
+    animation: none;
   }
 }
 

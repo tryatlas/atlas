@@ -52,12 +52,15 @@ export function ComposerInputCard({
           // /20 accent ring read far too loud on the nested surface.
           "focus-within:border-[color-mix(in_srgb,var(--border-strong)_50%,var(--border))]",
           "focus-within:ring-1 focus-within:ring-primary/10",
-          // The disabled dim, scoped to the field the lock actually
-          // applies to (see the shell above). No red tint — the send
-          // button is already disabled and submit()/Cmd+Enter are gated
-          // on `disabled`.
-          disabled && "opacity-60",
         )}
+        // The disabled dim, scoped to the field the lock actually applies to
+        // (see the shell above): its text steps down to `--text-disabled`
+        // (globals.css). Not an opacity: over the card's black that took the
+        // placeholder to 2.95:1, and the lock's notice above says why it is
+        // locked, so the text must stay readable. No red tint — the send
+        // button is already disabled and submit()/Cmd+Enter are gated on
+        // `disabled`.
+        data-composer-locked={disabled || undefined}
       >
         {/* Only the text area is pointer-blocked while `disabled`:
               `pointer-events-none` stops click-to-focus/typing AND the focus
