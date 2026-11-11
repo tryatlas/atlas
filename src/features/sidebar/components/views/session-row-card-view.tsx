@@ -274,8 +274,8 @@ export function SessionRowCardView(props: SessionRowCardViewProps) {
             <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-xs text-secondary-foreground">
               {session.branch ? (
                 <>
-                  <GitBranch aria-hidden className="size-3 shrink-0 text-muted-foreground/60" />
-                  <span className="min-w-0 flex-1 truncate text-muted-foreground/60">
+                  <GitBranch aria-hidden className="size-3 shrink-0 text-muted-foreground" />
+                  <span className="min-w-0 flex-1 truncate text-muted-foreground">
                     {session.branch}
                   </span>
                 </>

@@ -73,7 +73,6 @@ export const stopThen = (run: () => void) => (event: MouseEvent) => {
 export function rowSurfaceClassName(props: {
   isActive: boolean;
   shouldRecede: boolean;
-  status: SessionRowStatus;
   isDragging: boolean;
 }): string {
   return cn(
@@ -83,10 +82,7 @@ export function rowSurfaceClassName(props: {
       : props.shouldRecede
         ? "text-muted-foreground hover:bg-element-hover hover:text-foreground"
         : "bg-transparent text-foreground hover:bg-element-hover",
-    props.shouldRecede &&
-      props.status === "working" &&
-      "opacity-70 transition-opacity hover:opacity-100 focus-within:opacity-100 motion-reduce:transition-none",
-    props.isDragging && "bg-element-selected text-foreground opacity-100 shadow-lg",
+    props.isDragging && "bg-element-selected text-foreground shadow-lg",
   );
 }
 
