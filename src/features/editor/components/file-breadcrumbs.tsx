@@ -116,7 +116,7 @@ function FolderCrumb(props: {
         onClick={() => props.onNavigate(props.crumb.path)}
         className={cn(
           "block max-w-40 cursor-pointer truncate rounded-sm px-0.5 text-left outline-none transition-colors duration-fast hover:bg-element-hover hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-          props.descendant ? "text-muted-foreground/70" : "text-muted-foreground",
+          props.descendant ? "text-disabled" : "text-muted-foreground",
         )}
       >
         {props.crumb.label}
