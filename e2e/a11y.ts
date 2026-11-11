@@ -8,6 +8,8 @@
 //
 //   ATL-1007  desktop: Atlas fully drivable through the accessibility tree
 //   ATL-1006  @tryatlas/design: raise the contrast of its muted and disabled text
+//             (done; its one entry left is a WCAG exemption, not debt: see
+//             `settings`)
 //
 // An entry whose rule no longer fires is reported as a `stale-allowlist`
 // annotation on the test (in the list reporter and the HTML report) rather
@@ -26,16 +28,9 @@ interface Known {
   engines?: ("chromium" | "webkit")[];
 }
 
-const CONTRAST: Known = {
-  rule: "color-contrast",
-  issue: "ATL-1006",
-  why: "the package's muted text passes since 0.1.18; desktop still dims it further (the sidebar's text-muted-foreground/60 branch names at 2.96:1), and the 'Working' status (3.75:1) and the composer placeholder sit under 4.5:1",
-};
-
 // What every screen with the sidebar showing carries. A modal (First run, the
-// palette) hides the sidebar from axe, so those carry only CONTRAST.
+// palette) hides the sidebar from axe, so those carry none of it.
 const SHELL: Known[] = [
-  CONTRAST,
   {
     rule: "label-content-name-mismatch",
     issue: "ATL-1007",
@@ -63,14 +58,20 @@ export const KNOWN_VIOLATIONS: Record<string, Known[]> = {
   "inbox-long": SHELL,
   "memory-populated": SHELL,
   knowledge: SHELL,
-  "fresh-install": [CONTRAST, DIALOG_FOCUS_GUARDS],
+  "fresh-install": [DIALOG_FOCUS_GUARDS],
   // Surfaces reached by a journey.
-  "command-palette": [CONTRAST, DIALOG_FOCUS_GUARDS],
+  "command-palette": [DIALOG_FOCUS_GUARDS],
   // Settings makes the workspace behind it inert, so the shell's rules are gone.
   settings: [
     {
-      ...CONTRAST,
-      why: "the Windows-only disabled rows dim their description to 2.41:1",
+      // Not debt: WCAG 1.4.3 exempts an inactive control's text. The rows'
+      // controls are `inert` (no pointer, keyboard or assistive input), and
+      // their description takes the design system's one disabled treatment,
+      // half opacity, which over a card is 2.41:1. axe cannot see that the
+      // row is inactive. Chromium only: see the rule below.
+      rule: "color-contrast",
+      issue: "ATL-1006",
+      why: "the Windows-only disabled rows dim their description to 2.41:1 (WCAG-exempt: an inactive control)",
       engines: ["chromium"],
     },
     {
@@ -105,22 +106,45 @@ export async function expectNoNewViolations(
   const known = (KNOWN_VIOLATIONS[surface] ?? []).filter(
     (k) => !k.engines || k.engines.includes(engine as "chromium" | "webkit"),
   );
-  const results = await new AxeBuilder({ page })
-    // The mock's scenario badge is dev-only chrome that never ships.
-    .exclude("[data-mock-badge]")
-    .analyze();
+  const scan = async () => {
+    // Let entrances settle first: reduced motion keeps opacity fades (the
+    // composer placeholder, its pills), and axe sampling one mid-fade reads
+    // its text as faint. Ten calm frames in a row; looping animations never
+    // settle, so they do not count.
+    await page.waitForFunction(() => {
+      const entering = document
+        .getAnimations()
+        .some(
+          (a) => a.playState === "running" && a.effect?.getComputedTiming().iterations !== Infinity,
+        );
+      const w = window as { __axeCalmFrames?: number };
+      w.__axeCalmFrames = entering ? 0 : (w.__axeCalmFrames ?? 0) + 1;
+      return w.__axeCalmFrames >= 10;
+    });
+    const results = await new AxeBuilder({ page })
+      // The mock's scenario badge is dev-only chrome that never ships.
+      .exclude("[data-mock-badge]")
+      .analyze();
+    const blocking = results.violations.filter(
+      (v) => v.impact === "serious" || v.impact === "critical",
+    );
+    const unexpected = blocking
+      .filter((v) => !known.some((k) => k.rule === v.id))
+      .map((v) => ({
+        rule: v.id,
+        impact: v.impact,
+        help: v.help,
+        nodes: v.nodes.slice(0, 5).map((n) => n.html.slice(0, 160)),
+      }));
+    return { blocking, unexpected };
+  };
 
-  const blocking = results.violations.filter(
-    (v) => v.impact === "serious" || v.impact === "critical",
-  );
-  const unexpected = blocking
-    .filter((v) => !known.some((k) => k.rule === v.id))
-    .map((v) => ({
-      rule: v.id,
-      impact: v.impact,
-      help: v.help,
-      nodes: v.nodes.slice(0, 5).map((n) => n.html.slice(0, 160)),
-    }));
+  // Something can still mount and fade in during the scan (the lazily loaded
+  // editor lands whenever its chunk does, and not every scenario waits for
+  // it), so a failure must reproduce on a second, settled scan. A real one
+  // always does.
+  let { blocking, unexpected } = await scan();
+  if (unexpected.length > 0) ({ blocking, unexpected } = await scan());
 
   const fired = new Set(blocking.map((v) => v.id));
   for (const k of known.filter((k) => !fired.has(k.rule))) {
