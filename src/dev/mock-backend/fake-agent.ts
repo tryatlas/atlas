@@ -125,14 +125,24 @@ function latest(sessionId?: string): FakeSession | undefined {
 
 const at = (s: FakeSession) => ({ agent_id: s.key.agent_id, session_id: s.key.session_id });
 
-export function sendDelta(delta: AgentDelta): Promise<void> {
-  return emit("atlas:agents", delta);
+/** A delta as a helper builds it, before `sendDelta` stamps its `seq`. */
+type Unsequenced<D> = D extends unknown ? Omit<D, "seq"> : never;
+type DeltaBody = Unsequenced<AgentDelta>;
+
+/** The last `seq` each session's stream carried. */
+const streamSeq = new Map<string, number>();
+
+export function sendDelta(delta: DeltaBody): Promise<void> {
+  // Dense and monotonic per session from 1, as the host's projector stamps it.
+  const next = (streamSeq.get(delta.session_id) ?? 0) + 1;
+  streamSeq.set(delta.session_id, next);
+  return emit("atlas:agents", { ...delta, seq: next });
 }
 
 /** Send a delta to the most recent session, built from its ids, for deltas no
  *  helper here covers (`plan_updated`, `context_usage`, `rate_limits`, …). */
 export async function emitForLatest(
-  make: (ids: ReturnType<typeof at>) => AgentDelta,
+  make: (ids: ReturnType<typeof at>) => DeltaBody,
 ): Promise<void> {
   const s = latest();
   if (!s) {
@@ -213,7 +223,15 @@ function snapshot(s: FakeSession, withMessages: boolean): SessionSnapshot {
     // children are re-seeded from here (`hydrateSessionSnapshot`), so the
     // metadata-only read omits them exactly as it omits messages.
     subagents: withMessages ? s.subagents : undefined,
-    usage: { input_tokens: 0, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0 },
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation_tokens: 0,
+      cache_read_tokens: 0,
+      reasoning_tokens: 0,
+      cost: 0,
+      currency: null,
+    },
     created_at: now,
     updated_at: now,
   };
@@ -425,7 +443,7 @@ export function setStatus(
 ): Promise<void> {
   const s = latest(sessionId);
   if (!s) return Promise.resolve();
-  return sendDelta({ kind: "status", ...at(s), status });
+  return sendDelta({ kind: "status", ...at(s), status, turn_seq: 0 });
 }
 
 /** End the turn the way the real projector does — a `turn_finished` terminal,
@@ -879,6 +897,7 @@ export function requestElicitationForm(): Promise<void> {
   return raiseElicitation({
     mode: "form",
     message: "I need a few details before I open the release branch.",
+    url: null,
     requested_schema: {
       type: "object",
       required: ["branch"],
@@ -913,6 +932,7 @@ export function requestElicitationUrl(): Promise<void> {
     mode: "url",
     message: "Approve the deploy in the dashboard, then come back here.",
     url: "https://example.invalid/deploys/approve",
+    requested_schema: null,
   });
 }
 
@@ -923,6 +943,7 @@ export function requestElicitationQuestion(): Promise<void> {
   return raiseElicitation({
     mode: "form",
     message: "Where should the socket client live?",
+    url: null,
     requested_schema: {
       type: "object",
       properties: {

@@ -74,6 +74,15 @@ import { fileURLToPath } from "node:url";
  *    the cohort's spellings and the commands' argument names. A renamed
  *    `seen` would arrive as `undefined` and every tip would show again.
  *
+ * The session-delta wire's own shapes (`crates/atlas-agent-wire`) are not
+ * pinned here: their TypeScript is generated from the Rust types into
+ * `src/bindings/agent-wire/` and checked by `tsc`, and the crate's
+ * `tests/bindings.rs` fails when the committed copy is stale. What #8–#10
+ * and the Universal RC groundwork block keep for that wire is what `tsc`
+ * cannot see: that the store's reducer, whose switch has a default arm,
+ * still handles a kind, and that a mapper still copies an optional field
+ * across.
+ *
  * Unlike `tests/state-payload-contract.test.ts` (which is specifically the
  * `save_app_state` / `bootstrap_app_state` payload and generalises over many
  * struct pairs), these four are one-off, unrelated commands — plain regression
@@ -420,78 +429,26 @@ describe("chat Message ↔ ChatMessage, and who wrote it (#6)", () => {
   });
 });
 
-describe("subagents: Rust Subagent ↔ the renderer's Subagent (#8)", () => {
-  // ACP has no subagent concept, so a subagent is read out of an ordinary
-  // tool call (`atlas_acp_thread::subagent`) and projected onto the delta
-  // wire. Two shapes have to agree, and they disagree in different cases:
-  //
-  //  - `Subagent` is `rename_all = "camelCase"`, so its Rust field names
-  //    reach the renderer camelCased.
-  //  - the wire `ToolCall` has NO rename, so its new `parent_tool_call_id`
-  //    arrives snake_cased and the renderer's own camelCase `ToolCall` only
-  //    gets it because `toChatToolCall` maps it across.
-  //
-  // Both are the silent-undefined failure this file exists for: the renderer
-  // would group every child under "no parent" and show nothing.
-  const types = read("crates", "atlas-agent-wire", "src", "types.rs");
-  const delta = read("crates", "atlas-agent-wire", "src", "delta.rs");
-  const wireTs = read("src", "types", "agents.ts");
+describe("subagents: a tool call's parent link reaches the renderer (#8)", () => {
+  // The wire `ToolCall` has NO rename, so its `parent_tool_call_id` arrives
+  // snake_cased and the renderer's own camelCase `ToolCallDisplay` only gets
+  // it because `toChatToolCall` maps it across. The field is optional on the
+  // renderer's side, so a mapper that stopped copying it still type-checks,
+  // and the renderer would group every child under "no parent".
   const agentTs = read("src", "types", "agent.ts");
   const store = read("src", "features", "chat", "stores", "chat-store.ts");
 
-  it("every Rust Subagent field is on the renderer's Subagent, camelCased", () => {
-    const rustFields = rustStructFields(rustItem(types, "struct", "Subagent").body);
-    expect(rustFields).toContain("tool_call_id");
-    expect(rustFields).toContain("status");
-    const ts = tsInterfaceProps(agentTs, "Subagent");
-    const missing = rustFields
-      .map((field) => field.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase()))
-      .filter((field) => !ts.includes(field));
-    expect(missing).toEqual([]);
-  });
-
-  it("every Rust SubagentStatus is a renderer SubagentStatus", () => {
-    const variants = rustEnumVariants(rustItem(types, "enum", "SubagentStatus").body).map(
-      pascalToSnake,
-    );
-    expect(variants).toEqual(["running", "completed", "failed", "interrupted"]);
-    const ts = tsUnionLiterals(agentTs, "SubagentStatus");
-    expect(variants.filter((v) => !ts.includes(v))).toEqual([]);
-  });
-
-  it("the subagent_upserted delta exists on both sides", () => {
-    expect(delta).toMatch(/SubagentUpserted\s*\{\s*subagent: Subagent,/);
-    expect(wireTs).toMatch(/kind: "subagent_upserted";/);
-  });
-
-  it("a tool call's parent link survives the wire's snake_case", () => {
-    expect(rustStructFields(rustItem(types, "struct", "ToolCall").body)).toContain(
-      "parent_tool_call_id",
-    );
-    // The wire-shaped TS declares what Rust actually sends …
-    expect(tsInterfaceProps(wireTs, "ToolCall")).toContain("parent_tool_call_id");
-    // … and the mapper is what turns it into the renderer's camelCase field.
+  it("the store maps parent_tool_call_id onto the renderer's camelCase field", () => {
     expect(tsInterfaceProps(agentTs, "ToolCallDisplay")).toContain("parentToolCallId");
     expect(store).toMatch(/parentToolCallId:\s*tc\.parent_tool_call_id/);
   });
 });
 
-describe("slept_mid_turn: Rust SleptMidTurn ↔ the renderer's delta (#9)", () => {
-  // The host names a turn the computer slept through (`sleep_watch.rs`). Both
-  // fields are read by the chat store — `turn_seq` is its stale guard — so a
-  // rename on either side compiles and the notice silently attaches to
-  // nothing (or to a superseded turn).
-  const delta = read("crates", "atlas-agent-wire", "src", "delta.rs");
-  const wireTs = read("src", "types", "agents.ts");
+describe("slept_mid_turn: the store applies it (#9)", () => {
+  // The host names a turn the computer slept through (`sleep_watch.rs`). The
+  // reducer's switch has a default arm, so a kind it stopped handling would
+  // be dropped without a type error; `turn_seq` is its stale guard.
   const store = read("src", "features", "chat", "stores", "chat-store.ts");
-
-  it("the variant carries the same fields on both sides", () => {
-    expect(delta).toMatch(/SleptMidTurn\s*\{\s*turn_seq: u64,\s*slept_secs: u64,\s*\}/);
-    const ts = /kind: "slept_mid_turn";([\s\S]*?)\}/.exec(wireTs);
-    expect(ts, "the slept_mid_turn member of AgentDelta").not.toBeNull();
-    expect(ts![1]).toMatch(/\bturn_seq: number;/);
-    expect(ts![1]).toMatch(/\bslept_secs: number;/);
-  });
 
   it("the chat store applies it", () => {
     expect(store).toMatch(/case "slept_mid_turn":/);
@@ -499,64 +456,41 @@ describe("slept_mid_turn: Rust SleptMidTurn ↔ the renderer's delta (#9)", () =
   });
 });
 
-describe("timing: tool-call and turn times ↔ the renderer (#10)", () => {
+describe("timing: tool-call and turn times reach the renderer (#10)", () => {
   // A call's start/end and a turn's wall time travel from Rust so "Worked for",
-  // "Stopped after" and each step's duration survive a reload. Every name here
-  // is a string to `tsc`: a rename on either side compiles, and the durations
-  // silently vanish from every reloaded session.
-  const types = read("crates", "atlas-agent-wire", "src", "types.rs");
-  const delta = read("crates", "atlas-agent-wire", "src", "delta.rs");
-  const wireTs = read("src", "types", "agents.ts");
+  // "Stopped after" and each step's duration survive a reload. The wire
+  // fields are optional, so a mapper or reducer that stopped copying one
+  // still type-checks, and the durations silently vanish from every reloaded
+  // session.
   const store = read("src", "features", "chat", "stores", "chat-store.ts");
   const snapshot = read("src", "features", "chat", "lib", "snapshot-message.ts");
 
-  it("a tool call's times are declared on both sides and mapped by the store", () => {
-    const rust = rustStructFields(rustItem(types, "struct", "ToolCall").body);
-    const ts = tsInterfaceProps(wireTs, "ToolCall");
+  it("a tool call's times are mapped by the store and the snapshot mapper", () => {
     for (const field of ["started_at_ms", "ended_at_ms"]) {
-      expect(rust).toContain(field);
-      expect(ts).toContain(field);
       expect(store).toContain(`tc.${field}`);
       expect(snapshot).toContain(`tc.${field}`);
     }
   });
 
-  it("a snapshot message carries its turn's timing on both sides", () => {
-    const rust = rustStructFields(rustItem(types, "struct", "Message").body);
-    const ts = tsInterfaceProps(wireTs, "SessionMessage");
+  it("a snapshot message's turn timing is mapped", () => {
     for (const field of ["worked_ms", "stop_reason"]) {
-      expect(rust).toContain(field);
-      expect(ts).toContain(field);
       expect(snapshot).toContain(`m.${field}`);
     }
   });
 
-  it("a message says when its time is only a replay's, on both sides", () => {
+  it("a message says when its time is only a replay's", () => {
     // An agent's `session/load` replay carries no per-message time, so Rust
-    // flags those messages. A rename on either side compiles, and every
-    // replayed message goes back to showing the replay time as its own.
-    const rust = rustStructFields(rustItem(types, "struct", "Message").body);
-    const ts = tsInterfaceProps(wireTs, "SessionMessage");
-    expect(rust).toContain("timestamp_approximate");
-    expect(ts).toContain("timestamp_approximate");
-    // Both paths that turn a wire message into a ChatMessage carry it: the
-    // snapshot mapper and the live `message_appended` arm.
+    // flags those messages. Both paths that turn a wire message into a
+    // ChatMessage carry it: the snapshot mapper and the live
+    // `message_appended` arm.
     expect(snapshot).toContain("m.timestamp_approximate");
     expect(store).toContain("m.timestamp_approximate");
   });
 
-  it("turn_finished carries the turn's start and end on both sides", () => {
-    const rust = /TurnFinished\s*\{([\s\S]*?)\n\s{4}\},/.exec(delta);
-    expect(rust, "the TurnFinished variant").not.toBeNull();
-    const ts = /kind: "turn_finished";([\s\S]*?)\}/.exec(wireTs);
-    expect(ts, "the turn_finished member of AgentDelta").not.toBeNull();
+  it("turn_finished's start and run time reach the store", () => {
     for (const field of ["started_at_ms", "worked_ms"]) {
-      expect(rust![1]).toMatch(new RegExp(`\\b${field}: Option<(i64|u64)>,`));
-      expect(ts![1]).toMatch(new RegExp(`\\b${field}\\?: number;`));
       expect(store).toContain(`env.${field}`);
     }
-    expect(rust![1]).toMatch(/\bended_at_ms: Option<i64>,/);
-    expect(ts![1]).toMatch(/\bended_at_ms\?: number;/);
   });
 });
 
@@ -925,17 +859,15 @@ describe("Universal RC: the room as the window sees it (#10)", () => {
   });
 });
 
-describe("Universal RC groundwork: user prompts, the queue, holds and seq (#9)", () => {
+describe("Universal RC groundwork: user prompts, the queue, holds and the snapshot (#9)", () => {
   // The session-delta wire grew additively for remote control: a prompt is a
   // `user_message` delta (with who sent it and the window's client id), the
-  // turn queue lives in Rust and travels as `queue_changed`, a hold that keeps
-  // a session past its tab is `hold_changed`, and every envelope carries a
-  // per-session `seq` that a snapshot's `as_of_seq` refers to. Each of these
-  // is a field name on one side read as a string on the other; a rename on
-  // either side arrives as `undefined` and nothing else notices. Rust's own
-  // half is pinned by `crates/atlas-agent-wire/tests/contract.rs`.
-  const delta = read("crates", "atlas-agent-wire", "src", "delta.rs");
-  const types = read("crates", "atlas-agent-wire", "src", "types.rs");
+  // turn queue lives in Rust and travels as `queue_changed`, and a hold that
+  // keeps a session past its tab is `hold_changed`. Those shapes are generated
+  // (`src/bindings/agent-wire/`), so `tsc` compares them; what stays here is
+  // what it cannot see: that the reducer, whose switch has a default arm,
+  // handles each kind, and the snapshot and command surfaces `src-tauri`
+  // declares by hand.
   const host = read("src-tauri", "src", "commands", "agent_host.rs");
   const steering = read("src-tauri", "src", "commands", "agent_host", "steering.rs");
   const wireTs = read("src", "types", "agents.ts");
@@ -943,42 +875,15 @@ describe("Universal RC groundwork: user prompts, the queue, holds and seq (#9)",
   const api = read("src", "features", "chat", "lib", "agents-api.ts");
   const agentsRs = read("src-tauri", "src", "commands", "agents.rs");
 
-  it("the envelope carries seq on both sides", () => {
-    expect(rustStructFields(rustItem(delta, "struct", "SessionDeltaEnvelope").body)).toContain(
-      "seq",
-    );
-    expect(wireTs).toMatch(/export type AgentDelta = AgentDeltaBody & \{ seq\?: number \};/);
-  });
-
-  it("the three new kinds exist on both sides, and the store reduces each", () => {
-    for (const [variant, kind] of [
-      ["UserMessage", "user_message"],
-      ["QueueChanged", "queue_changed"],
-      ["HoldChanged", "hold_changed"],
-    ]) {
-      expect(delta).toMatch(new RegExp(`\\n\\s+${variant} \\{`));
-      expect(wireTs).toContain(`kind: "${kind}";`);
+  it("the store reduces each of the three kinds", () => {
+    for (const kind of ["user_message", "queue_changed", "hold_changed"]) {
       expect(store).toContain(`case "${kind}":`);
     }
   });
 
-  it("user_message's fields reach the reducer by the names Rust sends", () => {
-    expect(delta).toMatch(
-      /UserMessage \{\s*message: Message,\s*origin: Origin,[\s\S]*?client_message_id: Option<String>,/,
-    );
+  it("the reducer reads user_message's client id and origin", () => {
     expect(store).toMatch(/env\.client_message_id/);
     expect(store).toMatch(/env\.origin/);
-  });
-
-  it("Origin and QueuedPrompt read the same on both sides", () => {
-    const origin = rustItem(types, "enum", "Origin");
-    expect(origin.attrs).toMatch(/tag\s*=\s*"kind",\s*rename_all\s*=\s*"snake_case"/);
-    expect(wireTs).toMatch(
-      /export type Origin = \{ kind: "local" \} \| \{ kind: "remote"; id: string; name\?: string \};/,
-    );
-    const rustFields = rustStructFields(rustItem(types, "struct", "QueuedPrompt").body);
-    expect(rustFields).toEqual(["id", "text", "origin"]);
-    expect(tsInterfaceProps(wireTs, "QueuedPrompt").sort()).toEqual([...rustFields].sort());
   });
 
   it("the snapshot's live fields are on the frontend's SessionSnapshot", () => {
@@ -997,30 +902,6 @@ describe("Universal RC groundwork: user prompts, the queue, holds and seq (#9)",
   it("agents_send takes the client message id the window mints", () => {
     expect(agentsRs).toMatch(/pub async fn agents_send\([\s\S]*?client_message_id: Option<String>/);
     expect(api).toMatch(/invoke<void>\("agents_send",\s*\{[^}]*clientMessageId/);
-  });
-
-  it("a setting change names who made it, optionally, on both sides", () => {
-    // `origin` on the three setting deltas is additive: the steering entry
-    // stamps it, the agent's own echo omits it, and a frontend that does not
-    // read it sees the same payload as before. Serde must skip `None` (the TS
-    // side declares `origin?`, never `origin: null`), and the TS union must
-    // declare it on exactly these three kinds.
-    for (const [variant, field, kind] of [
-      ["ModeChanged", "mode_id", "mode_changed"],
-      ["ModelChanged", "model_id", "model_changed"],
-      ["ConfigOptionsUpdated", "config_options", "config_options_updated"],
-    ]) {
-      expect(delta).toMatch(
-        new RegExp(
-          `${variant} \\{\\s*${field}: [^,]+,\\s*#\\[serde\\(default, skip_serializing_if = "Option::is_none"\\)\\]\\s*origin: Option<Origin>,`,
-        ),
-      );
-      expect(wireTs).toMatch(
-        new RegExp(
-          `kind: "${kind}";[\\s\\S]*?${field}: [^;]+;\\s*(?:/\\*\\*[\\s\\S]*?\\*/\\s*)?origin\\?: Origin;`,
-        ),
-      );
-    }
   });
 });
 

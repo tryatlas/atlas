@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use serde::Serialize;
+use ts_rs::TS;
 
 use atlas_bus::EventBus;
 use tokio::sync::broadcast;
@@ -22,7 +23,7 @@ use crate::types::{
 use crate::AgentId;
 
 /// One change to one session. Tagged on the wire by `kind`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum SessionDelta {
     Status {
@@ -92,6 +93,7 @@ pub enum SessionDelta {
     ModeChanged {
         mode_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         origin: Option<Origin>,
     },
     /// A transient model-call failure is being retried after a backoff
@@ -107,9 +109,11 @@ pub enum SessionDelta {
     ModelChanged {
         model_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         origin: Option<Origin>,
     },
     AvailableCommands {
+        #[ts(type = "Array<unknown>")]
         commands: Vec<serde_json::Value>,
     },
     UsageUpdated {
@@ -121,6 +125,7 @@ pub enum SessionDelta {
         request_id: uuid::Uuid,
         mode: String,
         message: String,
+        #[ts(type = "unknown")]
         requested_schema: Option<serde_json::Value>,
         url: Option<String>,
     },
@@ -143,8 +148,10 @@ pub enum SessionDelta {
     /// of a `set_config_option` through the host; absent when the agent
     /// changed it on its own (see [`SessionDelta::ModeChanged`]).
     ConfigOptionsUpdated {
+        #[ts(type = "Array<unknown>")]
         config_options: Vec<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         origin: Option<Origin>,
     },
     /// Cumulative context-window usage from an ACP `usage_update` notification:
@@ -180,7 +187,9 @@ pub enum SessionDelta {
     /// owns this — `respond_permission` resolves it back through atlas-acp.
     PermissionRequest {
         request_id: Uuid,
+        #[ts(type = "unknown")]
         tool_call: serde_json::Value,
+        #[ts(type = "unknown")]
         options: serde_json::Value,
     },
     /// Permission was resolved (by the user or by cancellation).
@@ -197,15 +206,18 @@ pub enum SessionDelta {
         /// never saw it open (a stop announced with no turn running).
         /// Additive: old frontends ignore it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         started_at_ms: Option<i64>,
         /// When the turn stopped, as epoch milliseconds.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         ended_at_ms: Option<i64>,
         /// How long the turn ran, in ms, on the monotonic clock — not
         /// `ended_at_ms - started_at_ms`, which a stepped wall clock or a
         /// sleep stretches. The figure a snapshot carries as
         /// `Message::worked_ms`. Absent with `started_at_ms`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         worked_ms: Option<u64>,
     },
     TurnFailed {
@@ -216,6 +228,7 @@ pub enum SessionDelta {
         /// "transient"/"fatal"/"process_dead"/"unknown" are informational).
         /// Additive: absent on old payloads.
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         error_kind: Option<String>,
     },
     /// The computer slept (lid closed, system sleep) while this session's turn
@@ -248,6 +261,7 @@ pub enum SessionDelta {
         message: Message,
         origin: Origin,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         client_message_id: Option<String>,
     },
     /// The session's turn queue changed (a prompt parked, removed, started or
@@ -265,7 +279,7 @@ pub enum SessionDelta {
 }
 
 /// Envelope shipped through the Tauri event channel — keys for routing.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 pub struct SessionDeltaEnvelope {
     pub agent_id: AgentId,
     pub session_id: String,

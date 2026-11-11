@@ -125,6 +125,12 @@ export const EXTRA_INPUTS = [
     testOnly: true,
     why: "tests/contract.rs reads the prose contract when it exists",
   },
+  {
+    path: "src/bindings/agent-wire/",
+    packages: ["atlas-agent-wire"],
+    testOnly: true,
+    why: "tests/bindings.rs compares the committed TypeScript with what the types generate",
+  },
   // tests/spawn_audit.rs walks every Rust source in the workspace.
   ...["src-tauri/src/", "crates/", "vendor/atlas-engine/"].map((p) => ({
     path: p,

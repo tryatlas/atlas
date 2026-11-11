@@ -1,8 +1,8 @@
 //! The session-delta wire: additive-only. See [`types`] for the rules.
 //!
-//! `tests/contract.rs` (Rust) and `tests/wire-shape-contract.test.ts` (TS) are
-//! the authority on these shapes. Nothing here names a protocol version, which
-//! is the whole point — see [`types`] for the reason.
+//! `tests/contract.rs` is the authority on these shapes; the frontend's
+//! TypeScript is generated from them (`tests/bindings.rs`). Nothing here names
+//! a protocol version, which is the whole point — see [`types`] for the reason.
 
 pub mod delta;
 pub mod error;
@@ -24,7 +24,7 @@ use uuid::Uuid;
 /// Defined here rather than in either stack's crate because it is a routing key
 /// on [`SessionDeltaEnvelope`], so both stacks have to name it. `atlas-acp`
 /// re-exports it, which keeps it a single type across the whole app.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ts_rs::TS)]
 pub struct AgentId(pub Uuid);
 
 impl AgentId {
