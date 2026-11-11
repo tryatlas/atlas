@@ -185,7 +185,7 @@ const MarkdownBlock = memo(function MarkdownBlock({
         )}
       >
         {source}
-        <span className="atlas-stream-caret" aria-hidden />
+        <span className="stream-caret" aria-hidden />
       </pre>
     );
   }
@@ -329,7 +329,7 @@ export function StreamingMarkdown({
       ))}
       {/* Terminal-style caret after the last block while streaming — unless the
           trailing block is an open fence, which draws its own caret. */}
-      {streaming && !trailingIsFence && <span className="atlas-stream-caret" aria-hidden />}
+      {streaming && !trailingIsFence && <span className="stream-caret" aria-hidden />}
     </div>
   );
 }

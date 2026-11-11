@@ -17,14 +17,14 @@ license = "Apache-2.0"
 "secondary" = "#1a0d00"
 "secondary-foreground" = "#cc8800"
 "muted" = "#291600"
-"muted-foreground" = "#7e5300"
+"muted-foreground" = "#be8100"
 "accent" = "#291600"
 "accent-foreground" = "#ffb000"
 "destructive" = "#f44747"
 "destructive-foreground" = "#170900"
 "border" = "#3d2200"
 "input" = "#3d2200"
-"ring" = "#ff9500"
+"ring" = "#c27100"
 "chart-1" = "#ff9500"
 "chart-2" = "#98c379"
 "chart-3" = "#d19a66"
@@ -37,7 +37,7 @@ license = "Apache-2.0"
 "sidebar-accent" = "#1a0d00"
 "sidebar-accent-foreground" = "#ffb000"
 "sidebar-border" = "#1f1200"
-"sidebar-ring" = "#ff9500"
+"sidebar-ring" = "#c27100"
 "radius" = "8px"
 "tracking-normal" = "0em"
 "spacing" = "0.25rem"
@@ -60,6 +60,13 @@ purple = "#c678dd"
 pink = "#e06c75"
 
 [dark.keys]
+# Pinned: derived (`muted-foreground` 20% toward the background) this lands
+# below 4.5:1 on the popover, and it sets real text (menu shortcuts,
+# timestamps, empty states). The floor of the text ladder: 4.65:1 there.
+"text.disabled" = "#b27900"
+# Pinned to its value before `muted-foreground` rose for contrast: a terminal's
+# bright black is dim by convention (shell autosuggestions use it).
+"terminal.ansi.bright_black" = "#7e5300"
 "border.subtle" = "#1f1200"
 "border.strong" = "#5c3300"
 "panel.background" = "#120900"
@@ -149,6 +156,10 @@ purple = "#8250b5"
 pink = "#b8404a"
 
 [light.keys]
+# Pinned: derived (`muted-foreground` 20% toward the background) this lands
+# below 4.5:1 on the popover, and it sets real text (menu shortcuts,
+# timestamps, empty states). The floor of the text ladder: 4.60:1 there.
+"text.disabled" = "#855f2f"
 "border.strong" = "#d9b877"
 "panel.input.background" = "#fffdf5"
 "editor.gutter.background" = "#fdf3de"

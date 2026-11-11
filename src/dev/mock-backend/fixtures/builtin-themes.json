@@ -23,13 +23,13 @@
         "foreground": "#ffffff",
         "input": "#1e1e1e",
         "muted": "#171717",
-        "muted-foreground": "#585858",
+        "muted-foreground": "#939393",
         "popover": "#1c1c1c",
         "popover-foreground": "#ffffff",
         "primary": "#ffffff",
         "primary-foreground": "#000000",
         "radius": "8px",
-        "ring": "#ffffff",
+        "ring": "#808080",
         "secondary": "#0f0f0f",
         "secondary-foreground": "#aaaaaa",
         "shadow-2xl": "0 16px 48px rgba(0, 0, 0, 0.9)",
@@ -46,7 +46,7 @@
         "sidebar-foreground": "#ffffff",
         "sidebar-primary": "#ffffff",
         "sidebar-primary-foreground": "#000000",
-        "sidebar-ring": "#ffffff",
+        "sidebar-ring": "#808080",
         "spacing": "0.25rem",
         "tracking-normal": "0em"
       },
@@ -94,7 +94,9 @@
         "syntax.tag": "#ff855e",
         "syntax.type": "#d568ea",
         "syntax.variable": "#a3a3a3",
-        "terminal.ansi.black": "#1f1f1f"
+        "terminal.ansi.black": "#1f1f1f",
+        "terminal.ansi.bright_black": "#585858",
+        "text.disabled": "#858585"
       }
     },
     "light": {
@@ -121,7 +123,7 @@
         "primary": "#000000",
         "primary-foreground": "#ffffff",
         "radius": "8px",
-        "ring": "#000000",
+        "ring": "#757575",
         "secondary": "#f7f7f7",
         "secondary-foreground": "#4f4f4f",
         "shadow-2xl": "0 16px 48px rgba(0, 0, 0, 0.22)",
@@ -138,7 +140,7 @@
         "sidebar-foreground": "#000000",
         "sidebar-primary": "#000000",
         "sidebar-primary-foreground": "#ffffff",
-        "sidebar-ring": "#000000",
+        "sidebar-ring": "#757575",
         "spacing": "0.25rem",
         "tracking-normal": "0em"
       },
@@ -177,7 +179,8 @@
         "syntax.string": "#199f43",
         "syntax.tag": "#d5512f",
         "syntax.type": "#a631be",
-        "syntax.variable": "#636363"
+        "syntax.variable": "#636363",
+        "text.disabled": "#6c6c6c"
       }
     }
   },
@@ -205,15 +208,15 @@
         "foreground": "#d0d0d0",
         "input": "#2a2a2a",
         "muted": "#1a1a1a",
-        "muted-foreground": "#8a8a8a",
+        "muted-foreground": "#a4a4a4",
         "popover": "#2d2d2d",
         "popover-foreground": "#d0d0d0",
         "primary": "#ffff00",
         "primary-foreground": "#000000",
         "radius": "8px",
-        "ring": "#ffff00",
+        "ring": "#8f8f00",
         "secondary": "#1a1a1a",
-        "secondary-foreground": "#8a8a8a",
+        "secondary-foreground": "#a4a4a4",
         "shadow-2xl": "0 16px 48px rgba(0, 0, 0, 0.9)",
         "shadow-2xs": "0 1px 2px rgba(0, 0, 0, 0.35)",
         "shadow-lg": "0 8px 24px rgba(0, 0, 0, 0.75)",
@@ -228,7 +231,7 @@
         "sidebar-foreground": "#d0d0d0",
         "sidebar-primary": "#ffff00",
         "sidebar-primary-foreground": "#000000",
-        "sidebar-ring": "#ffff00",
+        "sidebar-ring": "#8f8f00",
         "spacing": "0.25rem",
         "tracking-normal": "0em"
       },
@@ -274,7 +277,9 @@
         "syntax.string": "#b0b0b0",
         "syntax.tag": "#d4d4d4",
         "syntax.type": "#d4d4d4",
-        "syntax.variable": "#ffffff"
+        "syntax.variable": "#ffffff",
+        "terminal.ansi.bright_black": "#8a8a8a",
+        "text.disabled": "#969696"
       }
     },
     "light": {
@@ -295,7 +300,7 @@
         "foreground": "#2e2e2e",
         "input": "#dcdcdc",
         "muted": "#f4f4f4",
-        "muted-foreground": "#6b6b6b",
+        "muted-foreground": "#5d5d5d",
         "popover": "#ebebeb",
         "popover-foreground": "#2e2e2e",
         "primary": "#8a7500",
@@ -303,7 +308,7 @@
         "radius": "8px",
         "ring": "#8a7500",
         "secondary": "#f4f4f4",
-        "secondary-foreground": "#6b6b6b",
+        "secondary-foreground": "#5d5d5d",
         "shadow-2xl": "0 16px 48px rgba(46, 46, 46, 0.23)",
         "shadow-2xs": "0 1px 2px rgba(46, 46, 46, 0.05)",
         "shadow-lg": "0 8px 24px rgba(46, 46, 46, 0.15)",
@@ -347,7 +352,9 @@
         "syntax.property": "#373737",
         "syntax.tag": "#2b2b2b",
         "syntax.type": "#2b2b2b",
-        "syntax.variable": "#000000"
+        "syntax.variable": "#000000",
+        "terminal.ansi.bright_black": "#6b6b6b",
+        "text.disabled": "#696969"
       }
     }
   },
@@ -375,13 +382,13 @@
         "foreground": "#ece5d5",
         "input": "#2a2114",
         "muted": "#1d1610",
-        "muted-foreground": "#645c47",
+        "muted-foreground": "#9a927f",
         "popover": "#211a10",
         "popover-foreground": "#ece5d5",
         "primary": "#c9a35a",
         "primary-foreground": "#140f06",
         "radius": "8px",
-        "ring": "#c9a35a",
+        "ring": "#9f8047",
         "secondary": "#171109",
         "secondary-foreground": "#a99f8c",
         "shadow-2xl": "0 16px 48px rgba(0, 0, 0, 0.9)",
@@ -398,7 +405,7 @@
         "sidebar-foreground": "#ece5d5",
         "sidebar-primary": "#c9a35a",
         "sidebar-primary-foreground": "#140f06",
-        "sidebar-ring": "#c9a35a",
+        "sidebar-ring": "#9f8047",
         "spacing": "0.25rem",
         "tracking-normal": "0em"
       },
@@ -444,7 +451,9 @@
         "syntax.string": "#98c379",
         "syntax.tag": "#f44747",
         "syntax.type": "#56b6c2",
-        "syntax.variable": "#ece5d5"
+        "syntax.variable": "#ece5d5",
+        "terminal.ansi.bright_black": "#645c47",
+        "text.disabled": "#8b8473"
       }
     },
     "light": {
@@ -514,7 +523,8 @@
         "syntax.comment": "#7d735a",
         "syntax.definition": "#8a6a1f",
         "syntax.function": "#8a6a1f",
-        "syntax.property": "#5c5240"
+        "syntax.property": "#5c5240",
+        "text.disabled": "#6c634e"
       }
     }
   },
@@ -1239,13 +1249,13 @@
         "foreground": "#ffb000",
         "input": "#3d2200",
         "muted": "#291600",
-        "muted-foreground": "#7e5300",
+        "muted-foreground": "#be8100",
         "popover": "#241300",
         "popover-foreground": "#ffb000",
         "primary": "#ff9500",
         "primary-foreground": "#170900",
         "radius": "8px",
-        "ring": "#ff9500",
+        "ring": "#c27100",
         "secondary": "#1a0d00",
         "secondary-foreground": "#cc8800",
         "shadow-2xl": "0 16px 48px rgba(0, 0, 0, 0.9)",
@@ -1262,7 +1272,7 @@
         "sidebar-foreground": "#ffb000",
         "sidebar-primary": "#ff9500",
         "sidebar-primary-foreground": "#170900",
-        "sidebar-ring": "#ff9500",
+        "sidebar-ring": "#c27100",
         "spacing": "0.25rem",
         "tracking-normal": "0em"
       },
@@ -1308,7 +1318,9 @@
         "syntax.string": "#98c379",
         "syntax.tag": "#f44747",
         "syntax.type": "#56b6c2",
-        "syntax.variable": "#ffb000"
+        "syntax.variable": "#ffb000",
+        "terminal.ansi.bright_black": "#7e5300",
+        "text.disabled": "#b27900"
       }
     },
     "light": {
@@ -1378,7 +1390,8 @@
         "syntax.comment": "#8f6a2e",
         "syntax.definition": "#a85f00",
         "syntax.function": "#a85f00",
-        "syntax.property": "#6b4200"
+        "syntax.property": "#6b4200",
+        "text.disabled": "#855f2f"
       }
     }
   },

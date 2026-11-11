@@ -17,14 +17,17 @@ license = "Apache-2.0"
 "secondary" = "#0f0f0f"
 "secondary-foreground" = "#aaaaaa"
 "muted" = "#171717"
-"muted-foreground" = "#585858"
+"muted-foreground" = "#939393"
 "accent" = "#171717"
 "accent-foreground" = "#ffffff"
 "destructive" = "#f44747"
 "destructive-foreground" = "#000000"
 "border" = "#1e1e1e"
 "input" = "#1e1e1e"
-"ring" = "#ffffff"
+# The keyboard focus ring: a mid grey, not the ink. It clears 3:1 on every
+# surface (5.3:1 on the background, 3.4:1 on a popover row that is pressed)
+# without reading as a second, brighter control.
+"ring" = "#808080"
 # The first series is the theme's ink, not a hue: Atlas is monochrome-first,
 # and on a black ground the busiest series reads best as plain white. The other
 # four stay muted so they separate from it rather than compete.
@@ -40,7 +43,7 @@ license = "Apache-2.0"
 "sidebar-accent" = "#0f0f0f"
 "sidebar-accent-foreground" = "#ffffff"
 "sidebar-border" = "#141414"
-"sidebar-ring" = "#ffffff"
+"sidebar-ring" = "#808080"
 "radius" = "8px"
 "tracking-normal" = "0em"
 "spacing" = "0.25rem"
@@ -63,6 +66,13 @@ purple = "#c9a2f5"
 pink = "#f0a0c8"
 
 [dark.keys]
+# Pinned: derived (`muted-foreground` 20% toward the background) this lands
+# below 4.5:1 on the popover, and it sets real text (menu shortcuts,
+# timestamps, empty states). The floor of the text ladder: 4.62:1 there.
+"text.disabled" = "#858585"
+# Pinned to its value before `muted-foreground` rose for contrast: a terminal's
+# bright black is dim by convention (shell autosuggestions use it).
+"terminal.ansi.bright_black" = "#585858"
 "border.subtle" = "#141414"
 "border.strong" = "#3d3d3d"
 "panel.background" = "#0a0a0a"
@@ -127,7 +137,9 @@ pink = "#f0a0c8"
 "destructive-foreground" = "#ffffff"
 "border" = "#e0e0e0"
 "input" = "#e0e0e0"
-"ring" = "#000000"
+# Mirrors the dark variant: 4.6:1 on the background, 3.4:1 on a pressed
+# popover row.
+"ring" = "#757575"
 # Mirrors the dark variant: the ink colour of this appearance.
 "chart-1" = "#000000"
 "chart-2" = "#3f7f2f"
@@ -141,7 +153,7 @@ pink = "#f0a0c8"
 "sidebar-accent" = "#f2f2f2"
 "sidebar-accent-foreground" = "#000000"
 "sidebar-border" = "#ededed"
-"sidebar-ring" = "#000000"
+"sidebar-ring" = "#757575"
 "radius" = "8px"
 "tracking-normal" = "0em"
 "spacing" = "0.25rem"
@@ -164,6 +176,10 @@ purple = "#7b3fb5"
 pink = "#b03a6a"
 
 [light.keys]
+# Pinned: derived (`muted-foreground` 20% toward the background) this lands
+# below 4.5:1 on the popover, and it sets real text (menu shortcuts,
+# timestamps, empty states). The floor of the text ladder: 4.61:1 there.
+"text.disabled" = "#6c6c6c"
 "border.strong" = "#bdbdbd"
 "panel.input.background" = "#fafafa"
 "editor.foreground" = "#2b2b2b"

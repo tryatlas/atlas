@@ -29,7 +29,7 @@ interface Known {
 const CONTRAST: Known = {
   rule: "color-contrast",
   issue: "ATL-1006",
-  why: "Atlas dark muted-foreground (#585858) and disabled text sit at 2.4-2.95:1",
+  why: "the package's muted text passes since 0.1.18; desktop still dims it further (the sidebar's text-muted-foreground/60 branch names at 2.96:1), and the 'Working' status (3.75:1) and the composer placeholder sit under 4.5:1",
 };
 
 // What every screen with the sidebar showing carries. A modal (First run, the
@@ -68,7 +68,11 @@ export const KNOWN_VIOLATIONS: Record<string, Known[]> = {
   "command-palette": [CONTRAST, DIALOG_FOCUS_GUARDS],
   // Settings makes the workspace behind it inert, so the shell's rules are gone.
   settings: [
-    CONTRAST,
+    {
+      ...CONTRAST,
+      why: "the Windows-only disabled rows dim their description to 2.41:1",
+      engines: ["chromium"],
+    },
     {
       // Chromium's "Desktop Chrome" profile reports Windows, so Settings shows
       // its Windows-only disabled rows.

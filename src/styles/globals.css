@@ -303,10 +303,6 @@
   border-color: color-mix(in oklab, var(--atlas-file-chip-accent) 48%, var(--border));
   background: color-mix(in oklab, var(--atlas-file-chip-accent) 17%, transparent);
 }
-.atlas-file-chip:focus-visible {
-  outline: 1px solid var(--primary);
-  outline-offset: 1px;
-}
 .atlas-file-chip__icon {
   width: 1.17em;
   height: 1.17em;
@@ -1203,29 +1199,6 @@
   animation: atlas-jump-flash-kf 1.2s ease-out forwards;
 }
 
-/* Streaming caret — a thin blinking bar appended after the live
-   assistant text so an in-progress turn reads like a terminal cursor. */
-@keyframes atlas-blink {
-  0%,
-  49% {
-    opacity: 1;
-  }
-  50%,
-  100% {
-    opacity: 0;
-  }
-}
-.atlas-stream-caret {
-  display: inline-block;
-  width: 2px;
-  height: 1em;
-  margin-left: 2px;
-  vertical-align: text-bottom;
-  background: var(--primary);
-  border-radius: 1px;
-  animation: atlas-blink 1s steps(1, end) infinite;
-}
-
 /* Reduced-motion replacements: opacity only, so an entrance or exit keeps its
    fade (and its duration and easing) but loses the movement. */
 @keyframes atlas-rm-fade {
@@ -1245,21 +1218,18 @@
   }
 }
 
-/* Respect the OS "reduce motion" setting — hold the caret steady, stop the
-   loops, and swap movement in entrances/exits for a plain fade. */
+/* Respect the OS "reduce motion" setting — stop the loops, and swap movement
+   in entrances/exits for a plain fade. The package's `animate-*` utilities
+   (scale, card, pill and slide entrances, the scale-out exit, the send and
+   bell pulses) carry their own reduced-motion rule in `@tryatlas/design`;
+   this block covers desktop's own classes and the cases the package leaves
+   alone. */
 @media (prefers-reduced-motion: reduce) {
   .atlas-usage-in {
     animation: none;
   }
-  .atlas-stream-caret {
-    animation: none;
-  }
-  /* Attribute selectors so variant classes (`data-open:animate-scale-in`) match
-     too. Only the name is swapped — duration, easing, delay and fill-mode stay.
+  /* Only the name is swapped — duration, easing, delay and fill-mode stay.
      `animate-fade-in` / `.atlas-fade-in` are already opacity-only. */
-  [class*="animate-scale-in"],
-  [class*="animate-card-in"],
-  [class*="animate-slide-in-right"],
   .atlas-pill-in,
   .atlas-panel-in-br,
   .atlas-panel-in-tl,
@@ -1270,42 +1240,17 @@
   .atlas-pill-swap {
     animation-name: atlas-rm-fade !important;
   }
-  /* Animated icon glyphs: the shake and the flight are decoration, so they stop
-     dead rather than fading — a bell that fades in place reads as a bug. The
-     check draw stays: it is the state change itself, not an embellishment, and
-     under reduce it simply completes instantly.
-
-     All three collapse the DURATION rather than setting `animation: none`,
-     which would be the obvious way to write this and is a bug. `SendGlyph` and
-     `BellGlyph` are pulses — the caller raises the flag on submit and lowers it
-     from `onAnimationEnd`, because the animation should track the real send
-     rather than a timer guessing at it. `animation: none` never fires
-     `animationend`, so under reduced motion that flag would latch true forever
-     and the control would never pulse again. A ~0 duration is visually
-     identical (every one of these keyframes starts and ends at rest) and still
-     fires the event. */
-  [class*="animate-icon-send"],
-  [class*="animate-icon-bell-ring"],
+  /* The check draw is the state change itself, so under reduce it completes
+     instantly. The package plays it at full length; desktop keeps it short.
+     A ~0 duration rather than `animation: none`, which never fires
+     `animationend`. */
   [class*="animate-icon-check-draw"] {
     animation-duration: 0.01ms !important;
   }
-  /* A popover carries its enter AND exit classes at once, so the exit swap is
-     scoped to the closing state — otherwise it would also win while opening
-     and fade the popover out on entry.
-
-     Base UI marks the states with bare `data-open` / `data-closed` attributes.
-     It never sets `data-state`, which is the Radix spelling — so the escape
-     hatch on the last two selectors has to exclude `data-open` as well. Guarded
-     only by `:not([data-state])`, an OPENING popup matched the exit rule (it has
-     `data-open`, not `data-state`) and won on specificity over the entrance rule
-     above, so reduced motion played the popup out as it appeared. The
-     `[data-state="closed"]` pair that used to sit here matched nothing: the
-     Radix→Base UI migration is complete and `data-state` appears nowhere in the
-     app. The last two are for elements with NEITHER attribute — a plain exit
-     class on something that is not a Base UI popup. */
-  [data-closed][class*="animate-scale-out"],
+  /* The fade-out exit, scoped to the closing state as the package scopes its
+     scale-out: a Base UI popup carries its enter and exit classes at once, so
+     an unscoped exit rule would also win while it opens. */
   [data-closed][class*="animate-fade-out"],
-  [class*="animate-scale-out"]:not([data-open]):not([data-closed]),
   [class*="animate-fade-out"]:not([data-open]):not([data-closed]) {
     animation-name: atlas-rm-fade-out !important;
   }
@@ -1947,6 +1892,18 @@ html.platform-linux [data-slot="globe-live-dot"] {
 /* The package's CheckpointTrace: a live session's leading edge, a 2 s
    `motion-safe:animate-pulse`. */
 html.platform-linux [data-slot="checkpoint-trace-live-edge"] {
+  animation-timing-function: steps(24);
+}
+/* The package's `stream-caret`, a 1 s blink after a streaming reply. */
+html.platform-linux .stream-caret {
+  animation-timing-function: steps(12);
+}
+/* The package's `thinking-shimmer`, already 30 steps a 2.2 s sweep. */
+html.platform-linux .thinking-shimmer {
+  animation-timing-function: steps(26);
+}
+/* The package's `animate-pulse-ring`, a 2 s halo. */
+html.platform-linux [class*="animate-pulse-ring"] {
   animation-timing-function: steps(24);
 }
 html.platform-linux .atlas-live-pulse {

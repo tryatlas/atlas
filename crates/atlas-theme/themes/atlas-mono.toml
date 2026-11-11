@@ -15,16 +15,16 @@ license = "Apache-2.0"
 "primary" = "#ffff00"
 "primary-foreground" = "#000000"
 "secondary" = "#1a1a1a"
-"secondary-foreground" = "#8a8a8a"
+"secondary-foreground" = "#a4a4a4"
 "muted" = "#1a1a1a"
-"muted-foreground" = "#8a8a8a"
+"muted-foreground" = "#a4a4a4"
 "accent" = "#1a1a1a"
 "accent-foreground" = "#d0d0d0"
 "destructive" = "#b0b0b0"
 "destructive-foreground" = "#000000"
 "border" = "#2a2a2a"
 "input" = "#2a2a2a"
-"ring" = "#ffff00"
+"ring" = "#8f8f00"
 "chart-1" = "#ffff00"
 "chart-2" = "#e6e6e6"
 "chart-3" = "#c2c2c2"
@@ -37,7 +37,7 @@ license = "Apache-2.0"
 "sidebar-accent" = "#1a1a1a"
 "sidebar-accent-foreground" = "#d0d0d0"
 "sidebar-border" = "#1a1a1a"
-"sidebar-ring" = "#ffff00"
+"sidebar-ring" = "#8f8f00"
 "radius" = "8px"
 "tracking-normal" = "0em"
 "spacing" = "0.25rem"
@@ -60,6 +60,13 @@ purple = "#e6e6e6"
 pink = "#b0b0b0"
 
 [dark.keys]
+# Pinned: derived (`muted-foreground` 20% toward the background) this lands
+# below 4.5:1 on the popover, and it sets real text (menu shortcuts,
+# timestamps, empty states). The floor of the text ladder: 4.66:1 there.
+"text.disabled" = "#969696"
+# Pinned to its value before `muted-foreground` rose for contrast: a terminal's
+# bright black is dim by convention (shell autosuggestions use it).
+"terminal.ansi.bright_black" = "#8a8a8a"
 "border.subtle" = "#1a1a1a"
 "border.strong" = "#3d3d3d"
 "panel.background" = "#000000"
@@ -104,9 +111,9 @@ pink = "#b0b0b0"
 "primary" = "#8a7500"
 "primary-foreground" = "#ffffff"
 "secondary" = "#f4f4f4"
-"secondary-foreground" = "#6b6b6b"
+"secondary-foreground" = "#5d5d5d"
 "muted" = "#f4f4f4"
-"muted-foreground" = "#6b6b6b"
+"muted-foreground" = "#5d5d5d"
 "accent" = "#f4f4f4"
 "accent-foreground" = "#2e2e2e"
 "destructive" = "#545454"
@@ -149,6 +156,13 @@ purple = "#191919"
 pink = "#4f4f4f"
 
 [light.keys]
+# Pinned: derived (`muted-foreground` 20% toward the background) this lands
+# below 4.5:1 on the popover, and it sets real text (menu shortcuts,
+# timestamps, empty states). The floor of the text ladder: 4.61:1 there.
+"text.disabled" = "#696969"
+# Pinned to its value before `muted-foreground` rose for contrast: a terminal's
+# bright black is dim by convention (shell autosuggestions use it).
+"terminal.ansi.bright_black" = "#6b6b6b"
 "border.strong" = "#c2c2c2"
 "editor.gutter.foreground" = "#8f8f8f"
 "editor.selection.background" = "#cfcfcf"
