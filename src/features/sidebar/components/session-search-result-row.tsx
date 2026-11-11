@@ -80,7 +80,7 @@ export const SessionSearchResultRow = memo(function SessionSearchResultRow(props
           >
             {session.title}
           </span>
-          <span className="w-8 shrink-0 text-right text-xs tabular-nums text-muted-foreground/55">
+          <span className="w-8 shrink-0 text-right text-xs tabular-nums text-disabled">
             <RelativeTime iso={session.updatedAt} />
           </span>
         </TooltipPrimitive.Trigger>

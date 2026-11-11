@@ -359,7 +359,7 @@ export function DiffFilesView({
                     style={{ ...base, backgroundColor: "var(--diff-context-background)" }}
                     className="flex h-6 items-center border-x border-border px-2 font-mono text-2xs"
                   >
-                    <span className="truncate text-info/70 select-text">{row.header}</span>
+                    <span className="truncate text-info select-text">{row.header}</span>
                   </div>
                 );
               }

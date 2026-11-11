@@ -329,9 +329,7 @@ export function DiffView({
                       askHunk && ASK_ROW,
                     )}
                   >
-                    <span className="truncate flex-1 text-info/70 select-text">
-                      {row.hunk.header}
-                    </span>
+                    <span className="truncate flex-1 text-info select-text">{row.hunk.header}</span>
                     {askHunk && (
                       <AskAgentButton
                         context={[askHunk(row.file.path, row.hunk)]}
