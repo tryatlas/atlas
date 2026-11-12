@@ -61,6 +61,7 @@ export const chatSidePanels: Scenario = {
       used: 168_000,
       size: 200_000,
       cost: 0,
+      currency: null,
     }));
     await emitForLatest((ids) => ({
       kind: "usage_updated",
@@ -70,6 +71,9 @@ export const chatSidePanels: Scenario = {
         output_tokens: 18_400,
         cache_read_tokens: 1_920_000,
         cache_creation_tokens: 96_000,
+        reasoning_tokens: 0,
+        cost: 0,
+        currency: null,
       },
     }));
     const now = Math.floor(Date.now() / 1000);

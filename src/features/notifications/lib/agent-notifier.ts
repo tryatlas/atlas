@@ -35,6 +35,7 @@ import {
   permissionDedupeKey,
   questionDedupeKey,
   retryDedupeKey,
+  toAgentErrorKind,
   type AgentCtx,
   type AgentNotifyEvent,
 } from "./agent-notifier-rules";
@@ -219,7 +220,7 @@ function toNotifyEvent(env: AgentDelta, session: ChatSession): AgentNotifyEvent 
       return {
         type: "turn_failed",
         error: env.error,
-        errorKind: env.error_kind,
+        errorKind: toAgentErrorKind(env.error_kind),
         nonce: nonceFor(env.turn_seq),
       };
     case "agent_disconnected":

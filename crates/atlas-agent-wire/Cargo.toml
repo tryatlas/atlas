@@ -16,6 +16,13 @@ chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["sync"] }
+# The frontend's types for this wire are generated from these, so `tsc` is
+# what holds the two sides together (tests/bindings.rs). `serde-json-impl` is
+# left off on purpose: it renders `serde_json::Value` as a recursive `JsonValue`
+# that the frontend's own ACP payload types cannot be assigned or narrowed to,
+# so each opaque payload says `#[ts(type = "unknown")]` instead, and a new one
+# does not compile until it does.
+ts-rs = { workspace = true, features = ["chrono-impl", "uuid-impl"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # The workspace lint table is only real for members that opt in —

@@ -1,10 +1,32 @@
-import type { Subagent, ToolContentBlock } from "@/types/agent";
+// Wire shapes for the agent host's Rust surface.
+//
+// The session-delta wire (`crates/atlas-agent-wire`) is generated from the
+// Rust types into `src/bindings/agent-wire/` (`bun run bindings:gen`) and
+// re-exported here under the names the app reads it by. Everything declared
+// by hand below comes from elsewhere (`src-tauri`'s commands, `atlas-acp`) and
+// is kept in step with its Rust by hand.
 
-// Wire shapes for the `atlas-agents` Rust surface. These mirror
-// `crates/atlas-agents/src/{session,events,plugin,manager}.rs` — keep in sync
-// when the Rust types change.
-
+import type { Message as SessionMessage } from "@/bindings/agent-wire/Message";
+import type { PlanEntry } from "@/bindings/agent-wire/PlanEntry";
+import type { QueuedPrompt } from "@/bindings/agent-wire/QueuedPrompt";
+import type { SessionDeltaEnvelope } from "@/bindings/agent-wire/SessionDeltaEnvelope";
+import type { SessionStatus } from "@/bindings/agent-wire/SessionStatus";
+import type { Usage } from "@/bindings/agent-wire/Usage";
+import type { Subagent } from "@/types/agent";
 import type { AgentId, AcpSessionId } from "./acp";
+
+export type { Message as SessionMessage } from "@/bindings/agent-wire/Message";
+export type { MessageImage } from "@/bindings/agent-wire/MessageImage";
+export type { MessageMode } from "@/bindings/agent-wire/MessageMode";
+export type { MessageRole } from "@/bindings/agent-wire/MessageRole";
+export type { Origin } from "@/bindings/agent-wire/Origin";
+export type { PlanEntry } from "@/bindings/agent-wire/PlanEntry";
+export type { QueuedPrompt } from "@/bindings/agent-wire/QueuedPrompt";
+export type { RateLimitWindow } from "@/bindings/agent-wire/RateLimitWindow";
+export type { SessionStatus } from "@/bindings/agent-wire/SessionStatus";
+export type { ToolCall } from "@/bindings/agent-wire/ToolCall";
+export type { ToolCallStatus } from "@/bindings/agent-wire/ToolCallStatus";
+export type { Usage } from "@/bindings/agent-wire/Usage";
 
 export interface SessionKey {
   agent_id: AgentId;
@@ -23,95 +45,6 @@ export interface SessionInit {
 export interface ImageAttachment {
   mimeType: string;
   dataBase64: string;
-}
-
-export type SessionStatus = "idle" | "running" | "waiting" | "error";
-export type MessageRole = "user" | "assistant" | "system";
-export type MessageMode = "text" | "tool" | "thinking";
-export type ToolCallStatus = "pending" | "running" | "completed" | "failed";
-
-export interface ToolCall {
-  id: string;
-  tool_name: string;
-  title: string | null;
-  kind: string | null;
-  status: ToolCallStatus;
-  arguments: unknown;
-  result: string | null;
-  locations: unknown[];
-  /** Structural content blocks (P1.4). Omitted by Rust when empty. */
-  content_blocks?: ToolContentBlock[];
-  /** The subagent launch this call belongs to, when the agent attributed it.
-   *  Omitted by Rust for the parent's own work, which is almost every call. */
-  parent_tool_call_id?: string;
-  /** Epoch ms the thread first saw this call. Never moves on later updates. */
-  started_at_ms?: number;
-  /** Epoch ms the call first settled (completed, failed, rejected, cancelled).
-   *  Absent while it runs. */
-  ended_at_ms?: number;
-}
-
-export interface PlanEntry {
-  content: string;
-  priority?: string;
-  status: string;
-}
-
-export interface SessionMessage {
-  id: string;
-  role: MessageRole;
-  mode: MessageMode;
-  content: string;
-  thinking?: string;
-  tool_calls: ToolCall[];
-  plan?: PlanEntry[];
-  /** Model that produced this assistant message (stamped live or recovered
-   *  from the transcript on replay). Absent for user messages / old records. */
-  model?: string | null;
-  /** Images a user message carried. Absent when there are none — the Rust
-   *  side omits the key rather than sending an empty list. */
-  images?: MessageImage[];
-  timestamp: string;
-  /** True when `timestamp` is only when Atlas replayed the message (an agent's
-   *  `session/load` replay carries no per-message time). Absent otherwise. */
-  timestamp_approximate?: boolean;
-  /** Wall time of the turn this message ends, in ms. Snapshot only — the live
-   *  stream carries it as `turn_finished.started_at_ms`/`ended_at_ms`. Absent
-   *  on every message but a turn's last, and on replayed turns. */
-  worked_ms?: number;
-  /** How the turn this message ends stopped (`end_turn`, `cancelled`, …). Set
-   *  on the same message as `worked_ms`. */
-  stop_reason?: string;
-}
-
-/** An image on a snapshot `SessionMessage` (`atlas_agent_wire::MessageImage`). */
-export interface MessageImage {
-  mime_type: string;
-  data: string;
-}
-
-/** One rolling quota window from the native engine's account report. */
-export interface RateLimitWindow {
-  /** 0–100. */
-  used_percent: number;
-  window_minutes: number | null;
-  /** Epoch seconds. */
-  resets_at: number | null;
-}
-
-export interface Usage {
-  input_tokens: number;
-  output_tokens: number;
-  cache_creation_tokens: number;
-  cache_read_tokens: number;
-  /** Reasoning / thinking output, when the agent reports it apart from
-   *  `output_tokens` (the native engine does). Informational. */
-  reasoning_tokens?: number;
-  /** Cumulative cost as the AGENT reported it; 0 when it reported none
-   *  (every ACP adapter today) — the renderer estimates from pricing then. */
-  cost?: number;
-  /** ISO 4217 code `cost` is in; null/absent means USD. */
-  currency?: string | null;
 }
 
 /** One ACP-advertised session mode (e.g. Codex's read-only / auto / full-access). */
@@ -190,17 +123,6 @@ export interface SessionSnapshot {
   held?: boolean;
 }
 
-/** Who caused something in a session: the window's own user, or a remote
- *  principal steering it (Universal RC). Mirrors `atlas_agent_wire::Origin`. */
-export type Origin = { kind: "local" } | { kind: "remote"; id: string; name?: string };
-
-/** One prompt parked in a session's turn queue. `text` is what the strip shows. */
-export interface QueuedPrompt {
-  id: string;
-  text: string;
-  origin: Origin;
-}
-
 /** A still-open permission prompt on a snapshot — the `permission_request`
  *  delta's fields. */
 export interface PendingPermissionWire {
@@ -255,258 +177,8 @@ export type AgentStreamEvent = AgentDelta | LoadingStatusEvent | AgentUpdateEven
 
 /**
  * Single multiplexed delta stream emitted on the `atlas:agents` window event.
- * `kind` discriminates; `agent_id` + `session_id` route to the right tab.
- * Every delta also carries `seq`, its dense per-session stream position (see
+ * `kind` discriminates; `agent_id` + `session_id` route to the right tab, and
+ * `seq` is its dense per-session stream position (see
  * `SessionSnapshot.as_of_seq`).
  */
-export type AgentDelta = AgentDeltaBody & { seq?: number };
-
-type AgentDeltaBody =
-  | {
-      kind: "status";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      status: SessionStatus;
-      turn_seq?: number;
-    }
-  | {
-      kind: "message_appended";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      message: SessionMessage;
-    }
-  | {
-      kind: "text_chunk";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      message_id: string;
-      delta: string;
-    }
-  | {
-      kind: "thinking_chunk";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      message_id: string;
-      delta: string;
-    }
-  | {
-      kind: "tool_call_upserted";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      message_id: string;
-      tool_call: ToolCall;
-    }
-  | {
-      // Incremental live command output — append `delta` to the tool call's
-      // `result` (the streaming sibling of `tool_call_upserted`; full
-      // snapshots would re-ship the whole accumulated output per chunk).
-      kind: "tool_call_output_chunk";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      message_id: string;
-      tool_call_id: string;
-      delta: string;
-    }
-  | {
-      // A subagent was launched, made progress, or ended. The full snapshot
-      // travels, like `tool_call_upserted`, so nothing has to merge fields.
-      kind: "subagent_upserted";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      subagent: Subagent;
-    }
-  | {
-      kind: "plan_updated";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      plan: PlanEntry[];
-    }
-  | {
-      kind: "history_rewound";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      /** Whole exchanges removed from the end, counted by user messages. */
-      turns: number;
-    }
-  | {
-      /** The session's mode changed. `origin` names who set it — the window
-       *  or a remote driver — when it went through the host's steering entry;
-       *  absent when the agent changed it on its own. */
-      kind: "mode_changed";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      mode_id: string;
-      origin?: Origin;
-    }
-  | {
-      /** The session's model changed through the host. `origin` names who
-       *  picked it (see `mode_changed`). */
-      kind: "model_changed";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      model_id: string;
-      origin?: Origin;
-    }
-  | {
-      kind: "available_commands";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      commands: unknown[];
-    }
-  | {
-      kind: "usage_updated";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      usage: Usage;
-    }
-  | {
-      /** The agent is asking the user something mid-turn (P3.3). */
-      kind: "elicitation_requested";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      request_id: string;
-      mode: "form" | "url";
-      message: string;
-      requested_schema?: unknown;
-      url?: string | null;
-    }
-  | {
-      /** The agent named its own session (P3.1). Beats Atlas's
-       *  first-40-characters-of-the-prompt title. */
-      kind: "title_updated";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      title: string;
-    }
-  | {
-      /** The agent's own config options changed (P2.2) — a knob toggled inside
-       *  the agent rather than through Atlas. Raw JSON, same shape the snapshot
-       *  carries. */
-      kind: "config_options_updated";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      config_options: unknown[];
-      /** Who set the option, when the list is the confirmed echo of a set
-       *  through the host; absent when the agent changed it on its own. */
-      origin?: Origin;
-    }
-  | {
-      kind: "context_usage";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      used: number;
-      size: number;
-      cost: number;
-      /** ISO 4217 code `cost` is in; null/absent means USD. */
-      currency?: string | null;
-    }
-  | {
-      kind: "compaction";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      active: boolean;
-    }
-  | {
-      kind: "compression_saved";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      saved_tokens: number;
-    }
-  | {
-      /** The account's quota windows (native engine only; account-level, so
-       *  every live native session hears the same snapshot). */
-      kind: "rate_limits";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      primary: RateLimitWindow | null;
-      secondary: RateLimitWindow | null;
-      plan_type: string | null;
-    }
-  | {
-      kind: "permission_request";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      request_id: string;
-      tool_call: unknown;
-      options: unknown;
-    }
-  | {
-      kind: "permission_resolved";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      request_id: string;
-    }
-  | {
-      kind: "turn_finished";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      stop_reason: string;
-      turn_seq?: number;
-      /** Epoch ms the turn opened. Absent when the thread never saw it open. */
-      started_at_ms?: number;
-      /** Epoch ms the turn stopped. */
-      ended_at_ms?: number;
-      /** How long the turn ran, in ms, on Rust's monotonic clock — not
-       *  `ended_at_ms - started_at_ms`, which a sleep or a clock step bends. */
-      worked_ms?: number;
-    }
-  | {
-      kind: "turn_failed";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      error: string;
-      turn_seq?: number;
-      error_kind?: "auth" | "transient" | "fatal" | "process_dead" | "unknown";
-    }
-  | {
-      kind: "retry_status";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      attempt: number;
-      max_attempts: number;
-      delay_ms: number;
-      last_error: string;
-    }
-  | {
-      /** The computer slept while this turn was running, so the reply may have
-       *  been cut off. Emitted by the host on waking, for any agent. */
-      kind: "slept_mid_turn";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      turn_seq: number;
-      /** Roughly how long the machine was asleep. */
-      slept_secs: number;
-    }
-  | {
-      kind: "agent_disconnected";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      reason: string;
-    }
-  | {
-      /** A prompt reached the agent — sent from this window, a queue, or a
-       *  remote driver. `client_message_id` echoes the id the sender minted,
-       *  so the window adopts its own optimistic row instead of drawing a
-       *  second. `message.content` is what the agent was sent. */
-      kind: "user_message";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      message: SessionMessage;
-      origin: Origin;
-      client_message_id?: string;
-    }
-  | {
-      /** The session's whole turn queue, after a change. */
-      kind: "queue_changed";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      queue: QueuedPrompt[];
-    }
-  | {
-      /** A hold (Universal RC) now keeps — or no longer keeps — this session
-       *  running without its tab. */
-      kind: "hold_changed";
-      agent_id: AgentId;
-      session_id: AcpSessionId;
-      held: boolean;
-    };
+export type AgentDelta = SessionDeltaEnvelope;

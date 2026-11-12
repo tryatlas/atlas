@@ -23,7 +23,8 @@ const TAB = "tab-1";
 const SESSION = "sess-1";
 const AGENT = "agent-1";
 
-const route = { agent_id: AGENT, session_id: SESSION };
+// `seq` 0 is what an envelope built outside the projector carries.
+const route = { agent_id: AGENT, session_id: SESSION, seq: 0 };
 
 function userMessage(content: string): SessionMessage {
   return {

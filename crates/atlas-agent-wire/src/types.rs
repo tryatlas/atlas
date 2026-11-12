@@ -6,12 +6,14 @@
 //!
 //! - Adding an optional field or a new variant is ordinary work. Do it in the
 //!   same change as its consumers, plus `tests/contract.rs` and
-//!   `tests/wire-shape-contract.test.ts`.
+//!   `bun run bindings:gen`.
 //! - Renaming or removing a variant or field, or changing what a field means,
 //!   is a breaking change: every consumer (chat store / UI, capture recorder,
 //!   analytics/transcript/memory) is updated in the same change.
 //!
-//! The contract tests are the authority; the TS mirror is `src/types/agents.ts`.
+//! The contract tests are the authority. The frontend's TypeScript is generated
+//! from these types into `src/bindings/agent-wire/` (`tests/bindings.rs`), and
+//! `src/types/agents.ts` re-exports it.
 //!
 //! They live in their own crate because the protocol crates pin their schema
 //! crate exactly, so a wire type defined in one stack was unreachable from
@@ -21,8 +23,9 @@
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use ts_rs::TS;
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     Idle,
@@ -31,7 +34,7 @@ pub enum SessionStatus {
     Error,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
     User,
@@ -39,7 +42,7 @@ pub enum MessageRole {
     System,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageMode {
     Text,
@@ -47,7 +50,7 @@ pub enum MessageMode {
     Thinking,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCallStatus {
     Pending,
@@ -56,15 +59,17 @@ pub enum ToolCallStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 pub struct ToolCall {
     pub id: String,
     pub tool_name: String,
     pub title: Option<String>,
     pub kind: Option<String>,
     pub status: ToolCallStatus,
+    #[ts(type = "unknown")]
     pub arguments: serde_json::Value,
     pub result: Option<String>,
+    #[ts(type = "Array<unknown>")]
     pub locations: Vec<serde_json::Value>,
     /// The tool's own structured result (`rawOutput`), verbatim (P3.1).
     ///
@@ -73,6 +78,7 @@ pub struct ToolCall {
     /// is the human-readable flattening; this is what a tool actually returned,
     /// which is what a caller inspecting a failed structured call needs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "unknown")]
     pub raw_output: Option<serde_json::Value>,
     /// Content blocks that need STRUCTURE, not a flattened string (P1.4).
     ///
@@ -91,6 +97,7 @@ pub struct ToolCall {
     /// tool calls arrive on the same session as its parent's, interleaved; this
     /// is the only thing that tells them apart (`atlas_acp_thread::subagent`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub parent_tool_call_id: Option<String>,
     /// When Atlas first saw this call, as epoch milliseconds — the same clock
     /// and shape as [`Subagent::started_at_ms`]. Stamped once by the thread and
@@ -101,6 +108,7 @@ pub struct ToolCall {
     /// time (ACP carries no per-call time), so its start and end coincide and
     /// it reads as having no duration rather than a wrong one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub started_at_ms: Option<i64>,
     /// When the call first reached a terminal status (completed, failed,
     /// rejected or cancelled), as epoch milliseconds. Absent while it runs.
@@ -108,6 +116,7 @@ pub struct ToolCall {
     /// clock, so the difference is a duration a stepped wall clock cannot
     /// bend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub ended_at_ms: Option<i64>,
 }
 
@@ -116,7 +125,7 @@ pub struct ToolCall {
 /// Deliberately not [`ToolCallStatus`]: a subagent that the parent interrupted
 /// is neither completed nor failed, and a client that shows "failed" for one
 /// the user stopped is lying about it.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum SubagentStatus {
     Running,
@@ -130,7 +139,7 @@ pub enum SubagentStatus {
 /// Projected from the tool call that launched it, which is also its identity:
 /// ACP has no subagent concept, so there is no id to use but that call's
 /// (`atlas_acp_thread::subagent` documents what each adapter sends).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct Subagent {
     /// The launching tool call's id — the key a child's calls point back to.
@@ -142,12 +151,15 @@ pub struct Subagent {
     pub status: SubagentStatus,
     /// The child's instructions, when the launch carried them.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub prompt: Option<String>,
     /// The child's role: Claude's `subagent_type`, the engine's `agent_type`.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub role: Option<String>,
     /// What it reported back, once it finished.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub result: Option<String>,
     /// How many tool calls it has made so far — what a collapsed row counts.
     pub tool_call_count: u32,
@@ -157,11 +169,12 @@ pub struct Subagent {
     pub started_at_ms: i64,
     /// Set once it reached a terminal status.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub ended_at_ms: Option<i64>,
     /// The child ran on an agent thread of its own (the engine's subagents),
     /// so its work is not in this session: `tool_call_count` stays 0 however
     /// much it did. Omitted when false.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub own_thread: bool,
 }
 
@@ -170,7 +183,7 @@ pub struct Subagent {
 /// Deliberately NOT a mirror of the whole ACP `ToolCallContent` enum: text and
 /// anything text-shaped keeps flowing through `result`, so only the variants
 /// with a genuine non-text rendering appear here.
-#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ToolContentBlock {
     /// An edit the agent is proposing or has made. `old_text` is absent for a
@@ -179,6 +192,7 @@ pub enum ToolContentBlock {
     Diff {
         path: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         old_text: Option<String>,
         new_text: String,
     },
@@ -241,31 +255,34 @@ fn collect_content_blocks(value: &serde_json::Value, out: &mut Vec<ToolContentBl
     }
 }
 
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, TS)]
 pub struct PlanEntry {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[ts(optional)]
     pub priority: Option<String>,
     pub status: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 pub struct Message {
     pub id: String,
     pub role: MessageRole,
     pub mode: MessageMode,
     pub content: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub thinking: String,
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub plan: Option<Vec<PlanEntry>>,
     /// Model that produced this assistant message — the session's current
     /// model at creation time, or the transcript's recorded model on replay.
     /// Lets the UI's per-message badge survive session reloads instead of
     /// deriving it from live state (which mislabels after model switches).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub model: Option<String>,
     /// Images the user sent with this message (user messages only). Carried on
     /// snapshots so a reopened conversation shows what was attached; before
@@ -287,23 +304,25 @@ pub struct Message {
     /// on `turn_finished` instead. Absent for a replayed turn, which has no
     /// honest start to measure from.
     #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[ts(optional)]
     pub worked_ms: Option<u64>,
     /// How the turn this message ends stopped — the protocol's token, as
     /// `turn_finished.stop_reason` carries it (`end_turn`, `cancelled`, …).
     /// Set on the same message as [`Self::worked_ms`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[ts(optional)]
     pub stop_reason: Option<String>,
 }
 
 /// One image on a [`Message`]: base64 bytes plus their MIME type, the same
 /// pair an ACP image content block carries.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize, TS)]
 pub struct MessageImage {
     pub mime_type: String,
     pub data: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, TS)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -323,7 +342,7 @@ pub struct Usage {
 }
 
 /// One rolling quota window, as the native engine's account report gives it.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, TS)]
 pub struct RateLimitWindow {
     /// 0–100.
     pub used_percent: u8,
@@ -341,7 +360,7 @@ pub struct RateLimitWindow {
 /// (`user id`, `guest:{hex}`, `link:{linkId}`) and an optional display name —
 /// a label, never an authority. Tagged by `kind`, so the wire reads
 /// `{"kind":"local"}` or `{"kind":"remote","id":"…","name":"…"}`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Origin {
     #[default]
@@ -349,6 +368,7 @@ pub enum Origin {
     Remote {
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         name: Option<String>,
     },
 }
@@ -365,7 +385,7 @@ impl Origin {
 /// window's queued-message strip is a mirror of it. `text` is what the user
 /// typed and what the strip shows — not necessarily the exact bytes the agent
 /// will be sent (the window may append hidden directives to those).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize, TS)]
 pub struct QueuedPrompt {
     /// Stable for the item's life in the queue; what remove / send-now name.
     pub id: String,

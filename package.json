@@ -29,6 +29,7 @@
     "theme:keys:check": "node scripts/generate-theme-keys.mjs --check",
     "settings:gen": "node scripts/generate-settings.mjs",
     "settings:gen:check": "node scripts/generate-settings.mjs --check",
+    "bindings:gen": "ATLAS_BLESS=1 cargo test -p atlas-agent-wire --test bindings",
     "icons:render": "node scripts/app-icons.mjs",
     "icons:check": "node scripts/app-icons.mjs --check",
     "test:rust": "bash scripts/test-rust.sh",

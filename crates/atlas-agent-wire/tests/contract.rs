@@ -1,5 +1,5 @@
-//! The authority on the session-delta wire's shapes (the TS mirror is
-//! `tests/wire-shape-contract.test.ts`).
+//! The authority on the session-delta wire's shapes (the frontend's TypeScript
+//! is generated from these types; `tests/bindings.rs` keeps it current).
 //!
 //! The wire is additive-only: the Timeline, the capture record, analytics,
 //! transcripts, memory ingest and the whole chat UI pattern-match its concrete

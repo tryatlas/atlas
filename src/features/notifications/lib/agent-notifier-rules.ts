@@ -39,6 +39,20 @@ export type AgentCtx = Omit<Extract<NotificationTarget, { type: "session" }>, "t
 
 export type AgentErrorKind = "auth" | "transient" | "fatal" | "process_dead" | "unknown";
 
+const AGENT_ERROR_KINDS: readonly AgentErrorKind[] = [
+  "auth",
+  "transient",
+  "fatal",
+  "process_dead",
+  "unknown",
+];
+
+/** `turn_failed.error_kind` is a plain string on the wire; a token this build
+ *  does not know reads as no kind, which `failureBody` already handles. */
+export function toAgentErrorKind(kind: string | undefined): AgentErrorKind | undefined {
+  return AGENT_ERROR_KINDS.find((k) => k === kind);
+}
+
 /** What the agent adapter hands the classifier. `nonce` makes the dedupe key
  *  unique per occurrence (a turn_seq, or a counter for agents without one). */
 export type AgentNotifyEvent =

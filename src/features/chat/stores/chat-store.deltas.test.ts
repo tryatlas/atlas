@@ -29,13 +29,14 @@ const ACP = "acp-session-1";
 type Kind = AgentDelta["kind"];
 type Body<K extends Kind> = Omit<
   Extract<AgentDelta, { kind: K }>,
-  "kind" | "agent_id" | "session_id"
+  "kind" | "agent_id" | "session_id" | "seq"
 >;
 
-/** One wire delta for the bound session. */
+/** One wire delta for the bound session. `seq` 0 is what an envelope built
+ *  outside the projector carries. */
 function d<K extends Kind>(kind: K, body: Body<K>): AgentDelta {
   // One generic spread TypeScript cannot narrow back to the union member.
-  return { kind, agent_id: AGENT, session_id: ACP, ...body } as unknown as AgentDelta;
+  return { kind, agent_id: AGENT, session_id: ACP, seq: 0, ...body } as unknown as AgentDelta;
 }
 
 function wireMessage(over: Partial<SessionMessage> & Pick<SessionMessage, "id">): SessionMessage {
@@ -343,9 +344,12 @@ describe("applyAgentDelta: one delta kind at a time", () => {
             output_tokens: 5,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            reasoning_tokens: 0,
+            cost: 0,
+            currency: null,
           },
         }),
-        d("context_usage", { used: 1200, size: 200000, cost: 0.01 }),
+        d("context_usage", { used: 1200, size: 200000, cost: 0.01, currency: null }),
         d("compaction", { active: true }),
         d("rate_limits", {
           primary: { used_percent: 40, window_minutes: 300, resets_at: null },
@@ -372,6 +376,7 @@ describe("applyAgentDelta: one delta kind at a time", () => {
           mode: "form",
           message: "Which branch?",
           requested_schema: { type: "object" },
+          url: null,
         }),
       ],
       expect: () =>
@@ -576,7 +581,7 @@ describe("applyAgentDelta: turn terminals", () => {
     boundTab();
     apply(
       d("tool_call_upserted", { message_id: "t", tool_call: wireTool("tc1") }),
-      d("turn_finished", { stop_reason: "cancelled" }),
+      d("turn_finished", { stop_reason: "cancelled", turn_seq: 0 }),
     );
     expect(session().status).toBe("idle");
     expect(last().toolCalls[0].status).toBe("failed");
@@ -589,7 +594,7 @@ describe("applyAgentDelta: turn terminals", () => {
     "an empty turn ending %s leaves a placeholder instead of a vanishing spinner",
     (stop_reason, label, status) => {
       boundTab();
-      apply(d("turn_finished", { stop_reason }));
+      apply(d("turn_finished", { stop_reason, turn_seq: 0 }));
       expect(last()).toMatchObject({ role: "assistant", content: label });
       expect(session().status).toBe(status);
     },
@@ -597,7 +602,7 @@ describe("applyAgentDelta: turn terminals", () => {
 
   it("an empty cancelled turn adds nothing — Stop has its own UI", () => {
     boundTab();
-    apply(d("turn_finished", { stop_reason: "cancelled" }));
+    apply(d("turn_finished", { stop_reason: "cancelled", turn_seq: 0 }));
     expect(messages()).toHaveLength(1);
   });
 
@@ -605,7 +610,7 @@ describe("applyAgentDelta: turn terminals", () => {
     boundTab();
     apply(
       d("text_chunk", { message_id: "m", delta: "The files are" }),
-      d("turn_finished", { stop_reason: "max_tokens" }),
+      d("turn_finished", { stop_reason: "max_tokens", turn_seq: 0 }),
     );
     expect(messages().map((m) => m.content)).toEqual([
       "list the files",
@@ -805,7 +810,7 @@ describe("applyAgentDelta: turn terminals", () => {
     boundTab();
     apply(
       d("tool_call_upserted", { message_id: "t", tool_call: wireTool("tc1") }),
-      d("turn_failed", { error: "HTTP 400: bad request", error_kind: "fatal" }),
+      d("turn_failed", { error: "HTTP 400: bad request", error_kind: "fatal", turn_seq: 0 }),
     );
     expect(messages()[1].toolCalls[0].status).toBe("failed");
     expect(last()).toMatchObject({ role: "assistant", content: "Error: HTTP 400: bad request" });
@@ -818,7 +823,7 @@ describe("applyAgentDelta: turn terminals", () => {
     const onAuth = (e: Event) => seen.push((e as CustomEvent).detail);
     window.addEventListener("atlas:auth-required", onAuth);
     try {
-      apply(d("turn_failed", { error: "not logged in", error_kind: "auth" }));
+      apply(d("turn_failed", { error: "not logged in", error_kind: "auth", turn_seq: 0 }));
     } finally {
       window.removeEventListener("atlas:auth-required", onAuth);
     }
@@ -904,6 +909,9 @@ describe("applyAgentDelta: a whole turn, in wire order", () => {
           output_tokens: 12,
           cache_creation_tokens: 0,
           cache_read_tokens: 0,
+          reasoning_tokens: 0,
+          cost: 0,
+          currency: null,
         },
       }),
       d("turn_finished", { stop_reason: "end_turn", turn_seq: 1 }),

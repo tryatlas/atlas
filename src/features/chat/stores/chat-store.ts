@@ -2843,7 +2843,8 @@ function applyDeltaToDraft(s: ChatDraft, env: AgentDelta, addedToolCalls?: Set<s
       session.pendingElicitation = {
         agentId: env.agent_id,
         requestId: env.request_id,
-        mode: env.mode,
+        // A plain string on the wire; Rust only ever sends these two.
+        mode: env.mode === "url" ? "url" : "form",
         message: env.message,
         requestedSchema: env.requested_schema,
         url: env.url,

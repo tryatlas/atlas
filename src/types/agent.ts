@@ -1,5 +1,13 @@
 import type { ImageAttachment, SessionModeInfo } from "./agents";
 import type { MentionData } from "@/features/chat/lib/mentions";
+import type { Subagent } from "@/bindings/agent-wire/Subagent";
+import type { ToolContentBlock } from "@/bindings/agent-wire/ToolContentBlock";
+
+// Generated from the session-delta wire (`crates/atlas-agent-wire`); the
+// renderer reads these exactly as Rust sends them.
+export type { Subagent } from "@/bindings/agent-wire/Subagent";
+export type { SubagentStatus } from "@/bindings/agent-wire/SubagentStatus";
+export type { ToolContentBlock } from "@/bindings/agent-wire/ToolContentBlock";
 
 /** The agents Atlas has first-party BRANDING for — labels, brand icons and
  *  `.agent-*` CSS tokens, which are Atlas's own design rather than registry
@@ -547,17 +555,6 @@ export interface ChatMessage {
   model?: string;
 }
 
-/**
- * A tool-content block that renders structurally rather than as result text
- * (P1.4). Mirrors `atlas_agents::session::ToolContentBlock` — the Rust test
- * `blocks_serialize_to_the_shape_the_frontend_expects` pins this wire shape.
- */
-export type ToolContentBlock =
-  /** An edit the agent proposed or made. `oldText` is absent for a new file. */
-  | { type: "diff"; path: string; oldText?: string; newText: string }
-  /** A terminal the agent created via ACP `terminal/*`. */
-  | { type: "terminal"; terminalId: string };
-
 export interface ToolCallDisplay {
   id: string;
   toolName: string;
@@ -604,43 +601,6 @@ export interface ToolCallDisplay {
    * Absent when the agent sent none.
    */
   locations?: string[];
-}
-
-/** How far along a subagent is. Not a `ToolCall` status: a child the parent
- *  interrupted is neither completed nor failed. */
-export type SubagentStatus = "running" | "completed" | "failed" | "interrupted";
-
-/**
- * A child agent the running agent delegated work to.
- *
- * ACP has no subagent concept, so the call that launched one is also its
- * identity — see `atlas_acp_thread::subagent` for what each adapter sends and
- * how Atlas reads it.
- */
-export interface Subagent {
-  /** The launching tool call's id — what a child's calls point back to. */
-  toolCallId: string;
-  /** The message the launching call belongs to, so it can be placed in the
-   *  transcript as well as in a panel. */
-  messageId: string;
-  name: string;
-  status: SubagentStatus;
-  /** The child's instructions, when the launch carried them. */
-  prompt?: string;
-  /** The child's role: Claude's `subagent_type`, the engine's `agent_type`. */
-  role?: string;
-  /** What it reported back, once it finished. */
-  result?: string;
-  /** How many tool calls it has made — what a collapsed row counts. */
-  toolCallCount: number;
-  /** Epoch ms the launching call was first seen. The elapsed time is derived
-   *  from it rather than sent as a duration that is stale on arrival. */
-  startedAtMs: number;
-  endedAtMs?: number;
-  /** The child ran on an agent thread of its own (the engine's subagents), so
-   *  its work is not in this session and `toolCallCount` stays 0 however much
-   *  it did. Absent when false. */
-  ownThread?: boolean;
 }
 
 export interface FileChange {
