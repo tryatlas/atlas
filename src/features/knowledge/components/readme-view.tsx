@@ -112,9 +112,9 @@ const README_COMPONENTS: NonNullable<Options["components"]> = {
       {imageLabel(alt, src)}
     </span>
   ),
-  table: ({ node: _node, ...p }) => (
+  table: ({ node: _node, className, ...p }) => (
     <div className="overflow-x-auto">
-      <table {...p} />
+      <table {...p} className={className ? `${className} min-w-max table-auto` : "min-w-max table-auto"} />
     </div>
   ),
 };
