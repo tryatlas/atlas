@@ -5,8 +5,8 @@
 // This is the container: it reads the stores, owns the scroller and its
 // virtual window, and hands rows and sections their props. The drag is
 // `use-pinned-drag.ts`, the header search `use-session-search.ts`, the
-// shelves' rows `use-session-shelves.ts`; the sections below the active list
-// render from `views/session-list-sections.tsx`.
+// shelves' rows `use-session-shelves.ts`. What it draws is the package's
+// (`@tryatlas/design`): the rows, the scroller, the shelves and the states.
 //
 // Built for a thousand sessions and more:
 //  - The active list is virtualized; only the rows on screen (plus overscan)
@@ -36,7 +36,6 @@ import { Tooltip as TooltipPrimitive } from "@base-ui/react/tooltip";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { toast } from "sonner";
 import { useChatStore } from "@/features/chat/stores/chat-store";
-import { cn } from "@/lib/utils";
 import { registerSettleAndAdvance } from "@/features/chat/lib/settle-and-advance";
 import { useActionShortcut } from "@/features/keybindings/lib/use-action-shortcut";
 import { ImportThreadsModal } from "@/features/chat/components/import-threads-modal";
@@ -69,20 +68,24 @@ import { dropVerbFor, pinnedOffsets, usePinnedDrag } from "../hooks/use-pinned-d
 import { useSessionSearch } from "../hooks/use-session-search";
 import { useSessionShelves } from "../hooks/use-session-shelves";
 import { useSidebarStore } from "../stores/sidebar-store";
+import {
+  SESSION_ROW_CARD_HEIGHT,
+  SessionSidebarEmpty,
+  SessionSidebarError,
+  SessionSidebarListDivider,
+  SessionSidebarPinDropZone,
+  SessionSidebarScroller,
+  SessionSidebarSearchResults,
+  SessionSidebarSectionLabel,
+  SessionSidebarSettledShelf,
+  SessionSidebarSnoozedShelf,
+  sessionSearchResultId,
+} from "@tryatlas/design";
 import { SessionRow, type SessionRowHandlers } from "./session-row";
-import { CARD_ROW_HEIGHT } from "./views/session-row-controls";
 import { SessionSearchResultRow } from "./session-search-result-row";
 import { SessionRowMenu, type SessionMenuActions } from "./session-row-menu";
-import { SidebarSectionLabel } from "./sidebar-section-header";
-import { SidebarSessionHeader, searchResultId } from "./sidebar-session-header";
+import { SidebarSessionHeader } from "./sidebar-session-header";
 import { CustomSnoozeDialogHost } from "./custom-snooze-dialog";
-import {
-  SessionListEmptyView,
-  SessionListErrorView,
-  SessionSearchResultsView,
-  SettledShelfView,
-  SnoozedShelfView,
-} from "./views/session-list-sections";
 
 export function SidebarSessions() {
   const { partition, projects, scopeProjectId, isLoading, error } = useSidebarSessions();
@@ -218,7 +221,7 @@ export function SidebarSessions() {
     count: isSearching ? 0 : active.length,
     scrollMargin,
     getScrollElement: () => scrollerRef.current,
-    estimateSize: () => CARD_ROW_HEIGHT,
+    estimateSize: () => SESSION_ROW_CARD_HEIGHT,
     overscan: 8,
     getItemKey: (i) => active[i]?.threadId ?? i,
   });
@@ -325,162 +328,136 @@ export function SidebarSessions() {
         pendingRef={menuPendingRef}
       >
         <TooltipPrimitive.Provider delay={150} closeDelay={0} timeout={400}>
-          {/* The list's top edge, under the search row: a short fade from the
-              sidebar's colour, so rows scroll out under the header rather
-              than being cut by it — the footer dock's fade, mirrored. Over the
-              scroller, not in it, so it stays put while the rows move. Flush
-              against the search row: the room between them is the scroller's
-              top padding, not a gap in the column, so rows scroll right up to
-              the header instead of vanishing a strip short of it. */}
-          <div className="relative flex min-h-0 flex-1 flex-col">
-            <div
-              aria-hidden
-              className="pointer-events-none absolute inset-x-0 top-0 z-panel h-4 bg-gradient-to-b from-sidebar to-transparent"
-            />
-            <div
-              ref={scrollerRef}
-              onKeyDown={onListKeyDown}
-              onScroll={noteSessionListScroll}
-              className="hide-scrollbar relative min-h-0 flex-1 overflow-y-auto px-2 pt-1.5 pb-2"
-            >
-              {isSearching ? (
-                <SessionSearchResultsView
-                  query={search.search}
-                  results={results}
-                  renderResult={(session, index) => (
-                    <SessionSearchResultRow
-                      key={session.threadId}
-                      session={session}
-                      resultId={searchResultId(index)}
-                      isHighlighted={index === activeResultIndex}
-                      isActive={session.sessionId !== "" && session.sessionId === activeSessionId}
-                      onHighlight={search.highlight}
-                      onSelect={openSession}
-                      onMenuTarget={handlers.menuTarget}
-                    />
-                  )}
-                />
-              ) : (
-                <>
-                  {/* `role="list"` on a <div>, here and on the shelves: WebKit
+          <SessionSidebarScroller
+            ref={scrollerRef}
+            onKeyDown={onListKeyDown}
+            onScroll={noteSessionListScroll}
+          >
+            {isSearching ? (
+              <SessionSidebarSearchResults query={search.search} count={results.length}>
+                {results.map((session, index) => (
+                  <SessionSearchResultRow
+                    key={session.threadId}
+                    session={session}
+                    resultId={sessionSearchResultId(index)}
+                    isHighlighted={index === activeResultIndex}
+                    isActive={session.sessionId !== "" && session.sessionId === activeSessionId}
+                    onHighlight={search.highlight}
+                    onSelect={openSession}
+                    onMenuTarget={handlers.menuTarget}
+                  />
+                ))}
+              </SessionSidebarSearchResults>
+            ) : (
+              <>
+                {/* `role="list"` on a <div>, here and on the shelves: WebKit
                       drops a <ul>'s list role once its markers are styled
                       away, as Tailwind's reset does. */}
-                  <div
-                    ref={pinnedBlockRef}
-                    role="list"
-                    aria-label="Pinned sessions"
-                    className={cn(
-                      "flex flex-col",
-                      showPinDropZone && pinned.length === 0 && "min-h-9",
-                    )}
-                  >
-                    {showPinDropZone && pinned.length === 0 ? (
+                <div
+                  ref={pinnedBlockRef}
+                  role="list"
+                  aria-label="Pinned sessions"
+                  className={
+                    showPinDropZone && pinned.length === 0
+                      ? "flex min-h-9 flex-col"
+                      : "flex flex-col"
+                  }
+                >
+                  {showPinDropZone && pinned.length === 0 ? (
+                    <SessionSidebarPinDropZone over={drag?.pinnedIndex !== null} />
+                  ) : null}
+                  {pinned.map((session) => (
+                    <SessionRow
+                      key={session.threadId}
+                      {...rowProps(session)}
+                      variant="card"
+                      isPinned
+                      dragOffset={offsets.get(session.threadId) ?? 0}
+                      isDragging={drag?.active === true && drag.threadId === session.threadId}
+                      dropVerb={
+                        drag?.active && drag.threadId === session.threadId ? dropVerb : null
+                      }
+                    />
+                  ))}
+                </div>
+                {pinned.length > 0 && active.length > 0 ? <SessionSidebarListDivider /> : null}
+                <div
+                  ref={activeListRef}
+                  role="list"
+                  aria-label="Active sessions"
+                  style={{
+                    // Already net of scrollMargin (the virtualizer subtracts it).
+                    height: virtualizer.getTotalSize(),
+                    position: "relative",
+                  }}
+                >
+                  {virtualizer.getVirtualItems().map((item) => {
+                    const session = active[item.index];
+                    if (!session) return null;
+                    const dragging = drag?.active === true && drag.threadId === session.threadId;
+                    return (
+                      // Layout only: the row's list item belongs to the list
+                      // above, not to a list of its own.
                       <div
-                        role="listitem"
-                        className={cn(
-                          "flex h-9 items-center justify-center rounded-md border border-dashed text-xs",
-                          drag?.pinnedIndex !== null
-                            ? "border-primary/40 bg-primary/5 text-primary"
-                            : "border-border text-muted-foreground",
-                        )}
-                      >
-                        Drop to pin
-                      </div>
-                    ) : null}
-                    {pinned.map((session) => (
-                      <SessionRow
+                        role="presentation"
                         key={session.threadId}
-                        {...rowProps(session)}
-                        variant="card"
-                        isPinned
-                        dragOffset={offsets.get(session.threadId) ?? 0}
-                        isDragging={drag?.active === true && drag.threadId === session.threadId}
-                        dropVerb={
-                          drag?.active && drag.threadId === session.threadId ? dropVerb : null
-                        }
-                      />
-                    ))}
-                  </div>
-                  {pinned.length > 0 && active.length > 0 ? (
-                    <div aria-hidden className="mx-2 my-1 h-px bg-border-subtle" />
-                  ) : null}
-                  <div
-                    ref={activeListRef}
-                    role="list"
-                    aria-label="Active sessions"
-                    style={{
-                      // Already net of scrollMargin (the virtualizer subtracts it).
-                      height: virtualizer.getTotalSize(),
-                      position: "relative",
-                    }}
+                        className="absolute top-0 left-0 w-full"
+                        style={{ transform: `translateY(${item.start - scrollMargin}px)` }}
+                      >
+                        <SessionRow
+                          {...rowProps(session)}
+                          variant="card"
+                          isPinned={false}
+                          dragOffset={dragging ? drag.dy : 0}
+                          isDragging={dragging}
+                          dropVerb={dragging ? dropVerb : null}
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+                {snoozed.length > 0 ? (
+                  <SessionSidebarSnoozedShelf
+                    count={snoozed.length}
+                    expanded={shelves.snoozedExpanded}
+                    onToggle={() => sidebarActions.setSnoozedExpanded(!shelves.snoozedExpanded)}
                   >
-                    {virtualizer.getVirtualItems().map((item) => {
-                      const session = active[item.index];
-                      if (!session) return null;
-                      const dragging = drag?.active === true && drag.threadId === session.threadId;
-                      return (
-                        // Layout only: the row's list item belongs to the list
-                        // above, not to a list of its own.
-                        <div
-                          role="presentation"
-                          key={session.threadId}
-                          className="absolute top-0 left-0 w-full"
-                          style={{ transform: `translateY(${item.start - scrollMargin}px)` }}
-                        >
-                          <SessionRow
-                            {...rowProps(session)}
-                            variant="card"
-                            isPinned={false}
-                            dragOffset={dragging ? drag.dy : 0}
-                            isDragging={dragging}
-                            dropVerb={dragging ? dropVerb : null}
-                          />
-                        </div>
-                      );
-                    })}
-                  </div>
-                  {snoozed.length > 0 ? (
-                    <SnoozedShelfView
-                      count={snoozed.length}
-                      expanded={shelves.snoozedExpanded}
-                      onToggle={() => sidebarActions.setSnoozedExpanded(!shelves.snoozedExpanded)}
-                      rows={snoozedRows}
-                      renderRow={renderShelfRow}
-                    />
-                  ) : null}
-                  {settled.length > 0 ? (
-                    <SettledShelfView
-                      count={settled.length}
-                      expanded={shelves.settledExpanded}
-                      onToggle={() => sidebarActions.setSettledExpanded(!shelves.settledExpanded)}
-                      search={shelves.settledSearch}
-                      onSearchChange={sidebarActions.setSettledSearch}
-                      rows={shelfRows}
-                      renderRow={renderShelfRow}
-                      noMatches={shelves.settledNoMatches}
-                      hiddenCount={shelves.hiddenSettledCount}
-                      pageSize={SETTLED_SHELF_PAGE}
-                      onShowMore={shelves.showMoreSettled}
-                    />
-                  ) : null}
-                  {drag?.active && drag.from === "pinned" && drag.pinnedIndex === null ? (
-                    <SidebarSectionLabel tone="accent">Drop to unpin</SidebarSectionLabel>
-                  ) : null}
-                  {error &&
-                  pinned.length + active.length + snoozed.length + settled.length === 0 ? (
-                    <SessionListErrorView error={error} />
-                  ) : isEmpty ? (
-                    <SessionListEmptyView
-                      hasProjects={projects.length > 0}
-                      scopedProjectName={scopedProject?.name ?? null}
-                      onAddProject={() => void pickAndAddProject()}
-                      onImportSessions={() => setImportOpen(true)}
-                    />
-                  ) : null}
-                </>
-              )}
-            </div>
-          </div>
+                    {snoozedRows.map(renderShelfRow)}
+                  </SessionSidebarSnoozedShelf>
+                ) : null}
+                {settled.length > 0 ? (
+                  <SessionSidebarSettledShelf
+                    count={settled.length}
+                    expanded={shelves.settledExpanded}
+                    onToggle={() => sidebarActions.setSettledExpanded(!shelves.settledExpanded)}
+                    search={shelves.settledSearch}
+                    onSearchChange={sidebarActions.setSettledSearch}
+                    noMatches={shelves.settledNoMatches}
+                    hiddenCount={shelves.hiddenSettledCount}
+                    pageSize={SETTLED_SHELF_PAGE}
+                    onShowMore={shelves.showMoreSettled}
+                  >
+                    {shelfRows.map(renderShelfRow)}
+                  </SessionSidebarSettledShelf>
+                ) : null}
+                {drag?.active && drag.from === "pinned" && drag.pinnedIndex === null ? (
+                  <SessionSidebarSectionLabel tone="accent">
+                    Drop to unpin
+                  </SessionSidebarSectionLabel>
+                ) : null}
+                {error && pinned.length + active.length + snoozed.length + settled.length === 0 ? (
+                  <SessionSidebarError error={error} />
+                ) : isEmpty ? (
+                  <SessionSidebarEmpty
+                    hasProjects={projects.length > 0}
+                    scopedProjectName={scopedProject?.name ?? null}
+                    onAddProject={() => void pickAndAddProject()}
+                    onImportSessions={() => setImportOpen(true)}
+                  />
+                ) : null}
+              </>
+            )}
+          </SessionSidebarScroller>
         </TooltipPrimitive.Provider>
       </SessionRowMenu>
       <CustomSnoozeDialogHost />

@@ -1,9 +1,9 @@
 // One session in the sidebar's list: the container. It resolves the row's
 // status, holds its local UI state (the snooze menu, the pull request badge's
-// hover list), wires the list's handlers to the row, and hands one of two
-// views plain props: a card for the pinned and active sessions
-// (`views/session-row-card-view.tsx`), a slim row for the shelves
-// (`views/session-row-slim-view.tsx`). Search results have a row of their own
+// hover list), wires the list's handlers to the row, and hands one of the
+// package's two row shapes plain props and Atlas's own pieces as slots: a
+// card for the pinned and active sessions (`SessionRowCard`), a slim row for
+// the shelves (`SessionRowSlim`). Search results have a row of their own
 // (`session-search-result-row.tsx`).
 //
 // The rest of the row's actions are on right-click (or the context-menu key),
@@ -11,11 +11,20 @@
 //
 // Rows are memoised on their props, and every prop is either a primitive or
 // the list's one stable handler bag, so a delta that touches one session
-// re-renders one row. The clocks tick by themselves (`session-row-parts`), and
+// re-renders one row. The clocks tick by themselves (the package's), and
 // the hover card mounts its reads only while it is open.
 
 import { memo, useState, type KeyboardEvent, type MouseEvent } from "react";
 import type { PointerEvent } from "react";
+import {
+  SESSION_TOP_STATUS,
+  SessionRowCard,
+  SessionRowSlim,
+  type SessionDropVerb,
+  type SessionRowStatus,
+  type SessionRowViewProps,
+} from "@tryatlas/design";
+import { snoozePresets } from "@/features/chat/lib/session-snooze";
 import type { SidebarSession } from "../lib/sidebar-sessions";
 import { useSessionListScroll } from "../lib/session-list-scroll";
 import {
@@ -24,16 +33,19 @@ import {
   sessionRowLabel,
   shouldRecedeSessionRow,
   type SessionLiveStatus,
-  type SessionRowStatus,
 } from "../lib/session-row-status";
 import { requestCustomSnooze } from "./custom-snooze-dialog";
+import { SessionHoverCardPopup } from "./session-hover-card";
+import { SessionPullRequestBadge } from "./session-pull-request";
 import {
-  TOP_STATUS,
-  type SessionDropVerb,
-  type SessionRowViewProps,
-} from "./views/session-row-controls";
-import { SessionRowCardView } from "./views/session-row-card-view";
-import { SessionRowSlimView } from "./views/session-row-slim-view";
+  ProjectBadgeStack,
+  SessionAgentIcon,
+  SnoozeRemaining,
+  WorkingDuration,
+} from "./session-row-parts";
+
+/** The snooze menu's choices, from the moment it opens. */
+const getSnoozePresets = () => snoozePresets(new Date());
 
 /** Everything a row can ask the list to do. One object, stable for the
  *  list's lifetime, so it never breaks a row's memo. */
@@ -120,7 +132,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
 
   const accessibleLabel = sessionRowLabel({
     title: session.title,
-    statusLabel: topStatus ? TOP_STATUS[topStatus].label : null,
+    statusLabel: topStatus ? SESSION_TOP_STATUS[topStatus].label : null,
     projectName: session.projectName,
     attachedNames: session.attachedNames,
   });
@@ -152,12 +164,24 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
     onSettle: () => handlers.settle(session),
     onCommitRename: (title) => handlers.commitRename(session, title),
     onCancelRename: handlers.cancelRename,
+    badge: (
+      <ProjectBadgeStack
+        name={session.projectName}
+        path={session.projectPath}
+        attached={session.attachedProjects}
+        attachedNames={session.attachedNames}
+      />
+    ),
+    hoverCard: <SessionHoverCardPopup session={session} status={status} />,
   };
 
   if (variant === "slim") {
     return (
-      <SessionRowSlimView
+      <SessionRowSlim
         {...viewProps}
+        snoozeRemaining={
+          session.snoozedUntil !== null ? <SnoozeRemaining until={session.snoozedUntil} /> : null
+        }
         onWake={() => handlers.wake(session)}
         onUnsettle={() => handlers.unsettle(session)}
       />
@@ -165,16 +189,15 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   }
 
   return (
-    <SessionRowCardView
+    <SessionRowCard
       {...viewProps}
       isPinned={props.isPinned}
       dragOffset={props.dragOffset}
       dropVerb={props.dropVerb}
-      liveTabId={props.liveTabId}
       settleShortcut={props.settleShortcut}
       snoozeMenuOpen={snoozeMenuOpen}
       onSnoozeMenuOpenChange={setSnoozeMenuOpen}
-      onBadgeOpenChange={setBadgeOpen}
+      getSnoozePresets={getSnoozePresets}
       onPointerDown={handlePointerDown}
       onSnooze={(until) => handlers.snooze(session, until)}
       onCustomSnooze={() => {
@@ -184,6 +207,9 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
       }}
       onUnpin={() => handlers.unpin(session)}
       onAcknowledgeWoke={() => handlers.acknowledgeWoke(session)}
+      workingDuration={<WorkingDuration tabId={props.liveTabId} />}
+      pullRequest={<SessionPullRequestBadge session={session} onOpenChange={setBadgeOpen} />}
+      agentIcon={<SessionAgentIcon agent={session.agent} />}
     />
   );
 });

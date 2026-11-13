@@ -35,11 +35,10 @@ import { errInfo } from "@/features/chat/lib/agent-signin";
 import { formatFullTimestamp } from "@/lib/format-time";
 import { timeAgo } from "@/lib/time-ago";
 import { cn } from "@/lib/utils";
-import { GlassIconButton } from "@/features/sidebar/components/glass-icon-button";
 
 import { inbox, type InboxEntry, type InboxFilter, type InboxKind } from "../lib/inbox-api";
 import { useInboxStore } from "../stores/inbox-store";
-import { Button, HintGroup, HintItem, Segmented } from "@tryatlas/design";
+import { Button, GlassIconButton, HintGroup, HintItem, Segmented } from "@tryatlas/design";
 
 const KIND_ICON: Record<InboxKind, LucideIcon> = {
   artifact_mention: AtSign,

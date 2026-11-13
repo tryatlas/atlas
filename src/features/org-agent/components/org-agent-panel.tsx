@@ -27,9 +27,6 @@ import {
   Trash2,
 } from "lucide-react";
 
-import { GlassIconButton } from "@/features/sidebar/components/glass-icon-button";
-import { CollapsibleSectionHeader } from "@/features/sidebar/components/sidebar-section-header";
-import { WorkingRing } from "@/features/sidebar/components/session-row-parts";
 import { copyText } from "@/lib/clipboard";
 import { SPRING_RAIL } from "@/lib/motion";
 import { formatDateTime } from "@/lib/format-time";
@@ -49,7 +46,13 @@ import {
 } from "../stores/org-agent-store";
 import { OrgAgentLoops } from "./org-agent-loops";
 import { OrgAgentThread } from "./org-agent-thread";
-import { GradualBlur, Segmented } from "@tryatlas/design";
+import {
+  CollapsibleSectionHeader,
+  GlassIconButton,
+  GradualBlur,
+  Segmented,
+  WorkingRing,
+} from "@tryatlas/design";
 
 /** The page's views, switched from the history's header. */
 const VIEWS = [
@@ -261,7 +264,7 @@ export function OrgAgentPanel() {
 }
 
 /** A collapsible history section — the sidebar's own section header
- *  (`sidebar-section-header.tsx`): the label, a hairline, the chevron. */
+ *  (`CollapsibleSectionHeader`, `@tryatlas/design`): the label, a hairline, the chevron. */
 function Section({ label, children }: { label: string; children: React.ReactNode }) {
   const [open, setOpen] = useState(true);
   return (

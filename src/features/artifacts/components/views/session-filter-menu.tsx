@@ -2,7 +2,6 @@ import { useMemo, useRef, useState, type ReactNode } from "react";
 import { Popover } from "@base-ui/react/popover";
 import { ChevronDown, ChevronUp, Search, SlidersHorizontal } from "lucide-react";
 
-import { GlassIconButton } from "@/features/sidebar/components/glass-icon-button";
 import { cn } from "@/lib/utils";
 
 import {
@@ -12,7 +11,7 @@ import {
   type TimelineFilters,
 } from "../../types";
 import { PILL_BUTTON, PILL_BUTTON_ACTIVE, PILL_ICON } from "../footer-pill";
-import { HintItem, ScrollFade, useScrollEdges } from "@tryatlas/design";
+import { GlassIconButton, HintItem, ScrollFade, useScrollEdges } from "@tryatlas/design";
 
 /**
  * The filter menu: what the timeline shows, and a way through its Checkpoints.

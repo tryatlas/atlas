@@ -6,11 +6,14 @@
 // the reference ladder: anything asking for the user beats work in flight,
 // work in flight beats a failure, and only a quiet session shows "Woke" or
 // "Done".
+//
+// The statuses' names are the package's (`@tryatlas/design`'s session row
+// draws them); deciding which one a row wears is Atlas's, here.
+
+import type { SessionRowStatus, SessionTopStatus } from "@tryatlas/design";
 
 /** A live tab's state for a session, as the list reads it off the chat store. */
 export type SessionLiveStatus = "running" | "waiting" | "error" | null;
-
-export type SessionRowStatus = "input" | "working" | "failed" | "ready";
 
 export function resolveSessionRowStatus(input: {
   live: SessionLiveStatus;
@@ -29,8 +32,6 @@ export function resolveSessionRowStatus(input: {
   if (input.live === "error") return "failed";
   return "ready";
 }
-
-export type SessionTopStatus = "input" | "working" | "failed" | "woke" | "done";
 
 /** The status slot's label, or `null` for a quiet row (which shows its time). */
 export function resolveSessionTopStatus(input: {
@@ -67,18 +68,4 @@ export function sessionRowLabel(input: {
 }): string {
   const attached = input.attachedNames ? `attached: ${input.attachedNames}` : null;
   return [input.title, input.statusLabel, input.projectName, attached].filter(Boolean).join(", ");
-}
-
-/** "now", "5m", "3h", "2d", "4w" — the row's compact age. */
-export function compactAge(iso: string | null, now: number): string | null {
-  if (!iso) return null;
-  const at = Date.parse(iso);
-  if (Number.isNaN(at)) return null;
-  const s = Math.max(0, Math.floor((now - at) / 1000));
-  if (s < 60) return "now";
-  if (s < 3600) return `${Math.floor(s / 60)}m`;
-  if (s < 86_400) return `${Math.floor(s / 3600)}h`;
-  if (s < 7 * 86_400) return `${Math.floor(s / 86_400)}d`;
-  if (s < 365 * 86_400) return `${Math.floor(s / (7 * 86_400))}w`;
-  return `${Math.floor(s / (365 * 86_400))}y`;
 }

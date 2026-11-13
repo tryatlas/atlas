@@ -23,10 +23,20 @@
 // Docking and hiding do not animate: the toggle is a shortcut pressed many
 // times a day. Only the peek slides, because it comes and goes under the
 // pointer and has to read as laid over the session rather than replacing it.
+//
+// The look is the package's (`SessionSidebar` and its parts in
+// `@tryatlas/design`), so the web app can draw the same sidebar over its own
+// data. What is Atlas's stays here: the window's corner and its drag, the
+// stores each slot reads, and the peek's timing (`sidebar-peek.ts`).
 
 import { useEffect, useRef } from "react";
+import {
+  SessionSidebar,
+  SessionSidebarDestinations,
+  SessionSidebarDock,
+  SessionSidebarPeek,
+} from "@tryatlas/design";
 import { CornerCluster, useWindowDrag } from "@/components/titlebar";
-import { cn } from "@/lib/utils";
 import {
   KnowledgeButton,
   MemoryButton,
@@ -53,72 +63,39 @@ import {
 export function AppSidebar({ className }: { className?: string }) {
   const drag = useWindowDrag();
   return (
-    <aside
-      className={cn(
-        // `atlas-project-rail` is the surface and its divider (globals.css).
-        "atlas-project-rail flex h-screen w-full shrink-0 flex-col border-r",
-        className,
-      )}
+    <SessionSidebar
+      // The surface's divider and highlight are desktop's
+      // (`[data-slot="session-sidebar"]` in globals.css).
+      className={className}
+      header={
+        // The window's corner. Every stretch of it drags the window.
+        <div {...drag} className="flex h-titlebar shrink-0 select-none items-center">
+          <CornerCluster search />
+        </div>
+      }
+      picker={<SidebarProjectPicker />}
+      destinations={
+        <SessionSidebarDestinations>
+          <InboxButton />
+          <TeamChatButton />
+          <TimelineButton />
+          <AgentButton />
+        </SessionSidebarDestinations>
+      }
+      footer={
+        // Memory, the open project's views (greyed, saying why, with none
+        // open), Usage, and the notification bell at the far end.
+        <SessionSidebarDock trailing={<NotificationsButton iconOnly round />}>
+          <MemoryButton iconOnly round />
+          <KnowledgeButton iconOnly round />
+          <SourceControlButton iconOnly round />
+          <UsageButton iconOnly round />
+        </SessionSidebarDock>
+      }
     >
-      {/* The window's corner. Every stretch of it drags the window. */}
-      <div {...drag} className="flex h-titlebar shrink-0 select-none items-center">
-        <CornerCluster search />
-      </div>
-      {/* Room under the corner (traffic lights, toggle, search), so the
-          picker reads as the start of the sidebar's content, not part of the
-          window's controls. */}
-      <div className="px-[8px] pt-[0.35rem]">
-        <SidebarProjectPicker />
-      </div>
-      {/* More room below than above: the Organisation's destinations are a
-          block of their own, and the session search under them starts the
-          next one. */}
-      <div className="mt-1 mb-4">
-        <Destinations />
-      </div>
       <SidebarSessions />
       <GetStarted />
-      <SidebarFoot />
-    </aside>
-  );
-}
-
-/** The labelled destinations: the two views reached most often. */
-function Destinations() {
-  return (
-    <nav aria-label="Destinations" className="flex shrink-0 flex-col items-start gap-0.5 px-[8px]">
-      <InboxButton />
-      <TeamChatButton />
-      <TimelineButton />
-      <AgentButton />
-    </nav>
-  );
-}
-
-/** The sidebar's last row: a pill of icons — Memory, the open project's
- *  views (greyed, saying why, with none open), Usage — and the notification
- *  bell at the far end. A short fade
- *  from the sidebar's colour separates the scrolling session list from it. */
-function SidebarFoot() {
-  return (
-    <nav
-      aria-label="Sidebar tools"
-      className="relative flex shrink-0 items-center gap-0.5 px-[8px] pb-2 pt-1 before:pointer-events-none before:absolute before:inset-x-0 before:-top-4 before:h-4 before:bg-gradient-to-t before:from-sidebar before:to-transparent"
-    >
-      {/* The pill the title bar's dock used to be: one capsule with a glass
-          rim, so the three read as a set rather than three loose glyphs. */}
-      <div className="glass-rim flex items-center gap-0.5 rounded-full p-0.5">
-        <MemoryButton iconOnly className="rounded-full" />
-        <KnowledgeButton iconOnly className="rounded-full" />
-        <SourceControlButton iconOnly className="rounded-full" />
-        <UsageButton iconOnly className="rounded-full" />
-      </div>
-      {/* The bell in a capsule of its own, the dock's glass, so the row reads
-          as two pieces of one set. */}
-      <div className="glass-rim ml-auto flex items-center rounded-full p-0.5">
-        <NotificationsButton iconOnly className="rounded-full" />
-      </div>
-    </nav>
+    </SessionSidebar>
   );
 }
 
@@ -150,24 +127,16 @@ export function SidebarPeek() {
   useEffect(() => endPeek, []);
 
   return (
-    <>
-      {/* Below the title bar, so it never sits on the traffic lights. */}
-      <div
-        aria-hidden
-        className="absolute bottom-0 left-0 top-[var(--titlebar-height)] z-drawer w-2"
-        onPointerEnter={requestPeek}
-        onPointerLeave={releasePeek}
-      />
-      {open && (
-        <div
-          ref={panelRef}
-          className="absolute inset-y-0 left-0 z-drawer w-[244px] shadow-md motion-safe:animate-slide-in-left"
-          onPointerEnter={holdPeek}
-          onPointerLeave={releasePeek}
-        >
-          <AppSidebar />
-        </div>
-      )}
-    </>
+    <SessionSidebarPeek
+      open={open}
+      panelRef={panelRef}
+      onRequest={requestPeek}
+      onHold={holdPeek}
+      onRelease={releasePeek}
+      // Below the title bar, so the edge never sits on the traffic lights.
+      edgeClassName="top-[var(--titlebar-height)]"
+    >
+      <AppSidebar />
+    </SessionSidebarPeek>
   );
 }

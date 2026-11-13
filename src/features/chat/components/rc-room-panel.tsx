@@ -43,7 +43,6 @@ import {
 } from "lucide-react";
 
 import { AccountAvatar } from "@/features/auth/components/account-avatar";
-import { GlassIconButton } from "@/features/sidebar/components/glass-icon-button";
 import { useMembersStore } from "@/features/organisations/stores/members-store";
 import { cn } from "@/lib/utils";
 
@@ -66,6 +65,7 @@ import {
   useScrollEdges,
   Select,
   Switch,
+  GlassIconButton,
 } from "@tryatlas/design";
 
 const SURFACE_ICON: Record<RcSurface, typeof Globe> = {

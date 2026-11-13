@@ -14,7 +14,7 @@ import {
 import { searchSidebarSessions, type SidebarSession } from "../lib/sidebar-sessions";
 import { openSession } from "../lib/sidebar-actions";
 import { useSidebarStore } from "../stores/sidebar-store";
-import { searchResultId } from "../components/sidebar-session-header";
+import { sessionSearchResultId } from "@tryatlas/design";
 
 export function useSessionSearch(lists: {
   pinned: readonly SidebarSession[];
@@ -74,7 +74,7 @@ export function useSessionSearch(lists: {
   useEffect(() => {
     if (!isSearching) return;
     document
-      .getElementById(searchResultId(activeResultIndex))
+      .getElementById(sessionSearchResultId(activeResultIndex))
       ?.scrollIntoView({ block: "nearest" });
   }, [activeResultIndex, isSearching]);
 

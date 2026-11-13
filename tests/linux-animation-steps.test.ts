@@ -126,9 +126,4 @@ describe("infinite animations are stepped on Linux", () => {
     expect(main.indexOf("markPlatform();")).toBeLessThan(main.indexOf("createRoot("));
     expect(read("src/lib/platform.ts")).toMatch(/classList\.add\(`platform-\$\{name\}`\)/);
   });
-
-  it("the working ring sets its own step count for its 3 s turn", () => {
-    const ring = read("src/features/sidebar/components/session-row-parts.tsx");
-    expect(ring).toMatch(/\[animation-duration:3s\] \[--atlas-linux-spin-steps:36\]/);
-  });
 });

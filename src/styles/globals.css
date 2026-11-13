@@ -1379,7 +1379,9 @@
   --atlas-rail-divider: color-mix(in srgb, var(--border-strong) 65%, var(--background));
 }
 
-.atlas-project-rail {
+/* The app sidebar: the package's `SessionSidebar` frame, with desktop's
+   divider in place of its plain `sidebar-border`. */
+[data-slot="session-sidebar"] {
   background: var(--sidebar);
   /* Only the sides given a width draw: the right, docked or peeking. */
   border-color: var(--atlas-rail-divider);
@@ -1877,11 +1879,16 @@ html.platform-linux {
   --infinite-animation-fps: 12;
 }
 html.platform-linux .animate-spin {
-  /* 1 s spinners; the working ring sets 36 for its 3 s turn. */
-  animation-timing-function: steps(var(--atlas-linux-spin-steps, 12));
+  /* 1 s spinners. The 3 s turns (the working ring, the pipeline) have their
+     own rules below. */
+  animation-timing-function: steps(12);
 }
 html.platform-linux .animate-pulse {
   animation-timing-function: steps(24);
+}
+/* The package's WorkingRing (the session sidebar's "Working"): a 3 s turn. */
+html.platform-linux .animate-spin[data-slot="session-working-ring"] {
+  animation-timing-function: steps(36);
 }
 /* The package's SessionPipeline: a 3 s turn, like the working ring. */
 html.platform-linux .animate-spin[data-slot="session-pipeline-running"] {

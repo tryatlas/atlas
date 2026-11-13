@@ -36,8 +36,8 @@ import {
   MENU_SEARCH_INPUT,
   MENU_SURFACE,
 } from "../lib/menu-surface";
-import { RelativeTime, SessionAgentIcon, WorkingRing } from "./session-row-parts";
-import { Hint } from "@tryatlas/design";
+import { SessionAgentIcon } from "./session-row-parts";
+import { Hint, RelativeTime, WorkingRing } from "@tryatlas/design";
 
 /** The rows a query keeps: by title, case-insensitively. */
 function matches(session: SidebarSession, needle: string): boolean {

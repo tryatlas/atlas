@@ -9,15 +9,13 @@
 // one, and otherwise from one lookup made while the card is open
 // (`session-sharing.ts`).
 
-import { Tooltip as TooltipPrimitive } from "@base-ui/react/tooltip";
 import { CircleAlert, Eye, GitBranch, MessageSquare, Pencil, Users } from "lucide-react";
 import { agentMeta } from "@/features/agents/lib/agent-meta";
 import { useChatStore } from "@/features/chat/stores/chat-store";
 import { useChatCommentsStore } from "@/features/chat/stores/chat-comments-store";
 import { AGENT_TYPE_BY_SIDEBAR } from "@/features/chat/lib/sidebar-agents";
-import { cn } from "@/lib/utils";
 import type { SidebarSession } from "../lib/sidebar-sessions";
-import type { SessionRowStatus } from "../lib/session-row-status";
+import { SessionRowHoverCard, type SessionRowStatus } from "@tryatlas/design";
 import { useClosedSessionSharing } from "../lib/session-sharing";
 import { ProjectBadge, SessionAgentIcon } from "./session-row-parts";
 import { SessionPullRequestLines } from "./session-pull-request";
@@ -75,11 +73,7 @@ function SessionHoverCardBody({
           pull request's title), past the card's width; this one truncates. */}
       <div className="grid grid-cols-[minmax(0,1fr)] gap-1.5 pl-0.5 text-xs text-muted-foreground">
         <div className="flex min-w-0 items-center gap-2">
-          <ProjectBadge
-            name={session.projectName}
-            path={session.projectPath}
-            className="size-3 text-3xs"
-          />
+          <ProjectBadge name={session.projectName} path={session.projectPath} className="size-3" />
           <div className="min-w-0 truncate text-secondary-foreground">{session.projectName}</div>
         </div>
         {session.attachedProjects.map((project) => (
@@ -139,7 +133,8 @@ function SessionHoverCardBody({
   );
 }
 
-/** The card's popup, beside its row. The row is the tooltip's trigger. */
+/** The card's popup, beside its row (the package's frame). The row is the
+ *  tooltip's trigger. */
 export function SessionHoverCardPopup({
   session,
   status,
@@ -148,25 +143,8 @@ export function SessionHoverCardPopup({
   status: SessionRowStatus;
 }) {
   return (
-    <TooltipPrimitive.Portal>
-      <TooltipPrimitive.Positioner
-        side="right"
-        align="start"
-        sideOffset={4}
-        // Hidden while its row is clipped out of the list's view, rather
-        // than left pinned to the list's edge.
-        className="isolate z-tooltip data-anchor-hidden:invisible"
-      >
-        <TooltipPrimitive.Popup
-          className={cn(
-            "max-w-80 rounded-lg border border-border-subtle px-2 text-left whitespace-normal",
-            "glass-hud backdrop-blur-glass bg-gradient-to-b from-popover/85 to-card/90",
-            "origin-[var(--transform-origin)] animate-scale-in",
-          )}
-        >
-          <SessionHoverCardBody session={session} status={status} />
-        </TooltipPrimitive.Popup>
-      </TooltipPrimitive.Positioner>
-    </TooltipPrimitive.Portal>
+    <SessionRowHoverCard>
+      <SessionHoverCardBody session={session} status={status} />
+    </SessionRowHoverCard>
   );
 }

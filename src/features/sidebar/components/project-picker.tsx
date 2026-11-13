@@ -42,8 +42,7 @@ import { useProjectStore } from "@/features/projects/stores/project-store";
 import { type SidebarProject } from "../lib/sidebar-sessions";
 import { openProjectSettings } from "../lib/sidebar-actions";
 import { ProjectBadge } from "./session-row-parts";
-import { GlassIconButton } from "./glass-icon-button";
-import { DropdownMenuItem, Icon } from "@tryatlas/design";
+import { DropdownMenuItem, GlassIconButton, Icon } from "@tryatlas/design";
 
 /** Past this many projects the menu grows a search field. */
 export const SEARCH_THRESHOLD = 6;
@@ -143,7 +142,7 @@ export function ProjectPicker({
             <button
               type="button"
               aria-label={current ? `Project: ${label}` : label}
-              // The destinations' row (`DestinationButton`): the same height,
+              // The destinations' row (`SessionSidebarDestination`): the same height,
               // inset and icon-to-label gap, so the badge sits in their icon
               // column.
               className="flex h-7 min-w-0 cursor-pointer items-center gap-2.5 rounded-md px-2 text-sm leading-none font-medium text-foreground outline-none transition-colors hover:bg-element-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring data-popup-open:bg-element-hover"
@@ -153,11 +152,7 @@ export function ProjectPicker({
           {/* A 14px box, the destinations' icon (`Icon` md, in pixels). */}
           <span className="flex size-[14px] shrink-0 items-center justify-center">
             {current ? (
-              <ProjectBadge
-                name={current.name}
-                path={current.path}
-                className="size-[14px] text-3xs"
-              />
+              <ProjectBadge name={current.name} path={current.path} className="size-[14px]" />
             ) : (
               <Icon icon={Boxes} size="md" aria-hidden className="shrink-0 text-muted-foreground" />
             )}
