@@ -18,9 +18,9 @@ import {
   type SetStateAction,
 } from "react";
 import { isScrollHot } from "@/lib/scroll-hot";
-import { RowKind, type Row } from "../lib/turn-rows";
+import { RowKind, type Row } from "@tryatlas/design/session";
 import { useTranscriptScroll } from "../lib/use-transcript-scroll";
-import { TOP_BLUR_RAMP } from "../lib/transcript-insets";
+import { TOP_BLUR_RAMP } from "@tryatlas/design/session";
 
 /**
  * How many rows are added each time the window grows.

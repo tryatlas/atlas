@@ -14,7 +14,8 @@ import remarkParse from "remark-parse";
 import { unified } from "unified";
 
 import { TURN_RAIL_PERSISTENT_GUTTER } from "./row-metrics";
-import { RowKind, type Projection, type Row } from "./turn-rows";
+import { type Projection } from "./turn-rows";
+import { RowKind, type Row } from "@tryatlas/design/session";
 
 export interface TurnRailItem {
   /** The user row's id (`u:<messageId>`), which is also its `data-row-id`. */

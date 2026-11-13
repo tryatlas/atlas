@@ -921,23 +921,6 @@
   }
 }
 
-/* Pill enter animation — used by the floating row above the chat composer
-   (setup banner, scroll-to-bottom button). Slides up + fades in. */
-@keyframes atlas-pill-in {
-  from {
-    opacity: 0;
-    transform: translateY(6px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-.atlas-pill-in {
-  animation: atlas-pill-in 200ms ease-out both;
-}
-
 /* Plain fade-in with `both` fill so a staggered `animation-delay`
    holds the element hidden until its turn (the @theme `animate-fade-in`
    token has no fill-mode and would flash before the delay). */
@@ -1328,32 +1311,6 @@
   }
 }
 
-/* Row containment scopes reflow + style recalc to the row.
-   `layout style` only — deliberately NOT `paint` (it would clip the hover
-   action bar that sits at a row's top edge), and deliberately NOT
-   `content-visibility: auto`: that blanks the viewport on fast scrolls, which
-   the timeline already learned the hard way (see the `.atlas-entry` note).
-   Also no `will-change`/`translateZ` — promoting hundreds of virtualized rows
-   to layers makes WKWebView worse, not better. */
-.atlas-row {
-  contain: layout style;
-  /* DO NOT add `content-visibility: auto` here. Tried 2026-08-18 against the
-     scroll-blanking: on WKWebView, momentum scroll outruns skipped-row
-     materialization — during a fling nearly every row is in the skipped
-     state and the viewport goes FULLY black until the gesture settles.
-     Strictly worse than the blanking it was meant to fix. */
-}
-
-/* A turn's last response and its changed-files card are separate rows, but
-   one response: its hover footer sits after the card, in the turn footer row
-   (`TurnFooterRowView`), and hovering the response's text reveals it as
-   hovering the card does. An attribute on the row wrapper and a sibling
-   combinator, not `:has()`, so a hover invalidates only the next row. */
-.atlas-row[data-footer-below]:hover + .atlas-row [data-response-footer] {
-  pointer-events: auto;
-  opacity: 1;
-}
-
 /* The workspace rail: the theme's flat sidebar surface, with a 1px inner
    highlight along the top edge as the only "light source". Every colour comes
    off the theme. */
@@ -1398,117 +1355,6 @@
   pointer-events: none;
 }
 
-/* Marker rows: one line, muted, never wraps. */
-.atlas-marker {
-  height: 26px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  white-space: nowrap;
-  overflow: hidden;
-}
-
-/* Running-state shimmer for in-flight markers. Opacity only — no transform, no
-   layout, so it cannot affect a predicted height. */
-@keyframes atlas-marker-shimmer {
-  0%,
-  100% {
-    opacity: 0.45;
-  }
-  50% {
-    opacity: 1;
-  }
-}
-.atlas-marker-running {
-  animation: atlas-marker-shimmer 1.4s ease-in-out infinite;
-}
-
-/* Live status label ("Thinking…"): a highlight that travels across the glyphs.
-   Clipped to the text, so it animates paint only — no transform, no layout, and
-   nothing for the transcript's scroll loop to re-measure. Deliberately not a
-   spinner: the marker rows below it already carry per-tool running glyphs, and a
-   second spinning thing next to them reads as two separate jobs. */
-@keyframes atlas-thinking-sweep {
-  0% {
-    background-position: 140% 0;
-  }
-  100% {
-    background-position: -40% 0;
-  }
-}
-.atlas-thinking-shimmer {
-  background-image: linear-gradient(
-    90deg,
-    var(--muted-foreground) 0%,
-    var(--muted-foreground) 30%,
-    var(--foreground) 50%,
-    var(--muted-foreground) 70%,
-    var(--muted-foreground) 100%
-  );
-  background-size: 250% 100%;
-  background-clip: text;
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  /* Stepped: a moving background is a repaint per frame, and at 120Hz that
-     kept the display link busy for minutes on end. Thirty steps across the
-     sweep still reads as motion. */
-  animation: atlas-thinking-sweep 2.2s steps(30) infinite;
-}
-
-/* Nobody is looking: the window is hidden, the session sits in a background
-   tab (still laid out, where animations keep running), or the row is
-   scrolled away. See `src/lib/visible-animation.ts`. `animate-pulse` is the
-   package `Skeleton`'s loop, so loading placeholders park too. */
-:root[data-atlas-hidden]
-  :is(.atlas-thinking-shimmer, .atlas-marker-running, .atlas-pixel-cell, .animate-pulse),
-[data-atlas-offstage]
-  :is(.atlas-thinking-shimmer, .atlas-marker-running, .atlas-pixel-cell, .animate-pulse),
-[data-offscreen]
-  :is(.atlas-thinking-shimmer, .atlas-marker-running, .atlas-pixel-cell, .animate-pulse),
-:is(
-  .atlas-thinking-shimmer,
-  .atlas-marker-running,
-  .atlas-pixel-cell,
-  .animate-pulse
-)[data-offscreen] {
-  animation-play-state: paused;
-}
-@media (prefers-reduced-motion: reduce) {
-  .atlas-thinking-shimmer {
-    animation: none;
-    background-image: none;
-    -webkit-text-fill-color: var(--secondary-foreground);
-  }
-  /* The loop stops at full strength: its trough (0.45) is not readable text. */
-  .atlas-marker-running {
-    animation: none;
-  }
-}
-
-/* Pixel-grid loader cell (see `loading-state.tsx`). Opacity only — nine 2.5px
-   cells, no transform and no layout, so the loader sits inside the transcript
-   without ever touching the scroll path. Duration and delay come from the
-   pattern, inline. */
-@keyframes atlas-pixel-on {
-  0%,
-  100% {
-    opacity: 0.15;
-  }
-  40% {
-    opacity: 1;
-  }
-}
-.atlas-pixel-cell {
-  animation-name: atlas-pixel-on;
-  animation-timing-function: ease-in-out;
-  animation-iteration-count: infinite;
-}
-@media (prefers-reduced-motion: reduce) {
-  .atlas-pixel-cell {
-    animation: none;
-  }
-}
-
 /* Toast descriptions — sonner ships a light-theme colour we never overrode.
    `[data-sonner-toast][data-styled] [data-description]` is hardcoded to
    `#3f3f3f`, and the dark-theme rule that replaces it only applies when the
@@ -1530,9 +1376,8 @@
    One-shot, GPU-cheap, and they END AT IDENTITY (no fill-mode) — per the
    frosted-panel lesson, nothing here leaves a lingering transform behind.
 
-   `atlas-bubble-in`: entrance for a freshly-SENT user bubble only. Rows that
-   mount while scrolling up through history must not replay it — the caller
-   gates on message timestamp, not on mount.
+   `atlas-bubble-in` (a freshly-sent prompt's entrance) is the transcript's,
+   in `@tryatlas/design`'s `transcript.css`.
 
    `.cm-placeholder`: CodeMirror re-creates the placeholder element whenever
    its text changes (e.g. the agent switch retargets "Ask Claude Code…"), so
@@ -1540,19 +1385,6 @@
    CM internals. OPACITY ONLY: the placeholder is an inline element inside
    CM's line box — forcing `inline-block` to enable transforms shifted its
    baseline against the caret (visible misalignment), so no translate here. */
-@keyframes atlas-bubble-in {
-  from {
-    opacity: 0;
-    transform: translateY(6px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-.atlas-bubble-in {
-  animation: atlas-bubble-in 0.18s ease-out;
-}
 
 /* Indeterminate arc spinner for in-progress plan steps (SVG ring rotate).
    Continuous by design — it only renders while a step is actively running. */
@@ -1804,9 +1636,11 @@ html:root[data-code-font] {
   --font-mono: var(--atlas-code-font), monospace;
 }
 
-/* `chatWidth`: the transcript and composer column (`CONTENT_COLUMN`). */
+/* `chatWidth`: the transcript and composer column (`CONTENT_COLUMN`, and the
+   package's `TRANSCRIPT_COLUMN`, which reads `--transcript-column`). */
 :root {
   --atlas-chat-column: 760px;
+  --transcript-column: var(--atlas-chat-column);
 }
 html[data-chat-width="wide"] {
   --atlas-chat-column: 1080px;
@@ -1841,21 +1675,6 @@ html:root[data-diff-palette="blue-orange"] {
   --diff-removed-text: var(--status-warning-foreground);
   --diff-removed-background: color-mix(in srgb, var(--status-warning-foreground) 13%, transparent);
   --diff-removed-emphasis: color-mix(in srgb, var(--status-warning-foreground) 34%, transparent);
-}
-
-/* A thinking row's live thought (`ThinkingRowView`): at most four lines, the
-   newest ones, with the older text fading out at the top edge — only once
-   there is older text cut off there (`data-clipped`, set by `LiveThought`). */
-.atlas-live-thought {
-  display: flex;
-  flex-direction: column;
-  justify-content: flex-end;
-  max-height: calc(4 * 19px + 4px);
-  overflow: hidden;
-}
-
-.atlas-live-thought[data-clipped] {
-  mask-image: linear-gradient(to bottom, transparent, black 20px);
 }
 
 /* ── Linux: long-running animations at a stepped frame rate ───────────────

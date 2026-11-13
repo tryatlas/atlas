@@ -1,6 +1,13 @@
-// Row components for the new transcript.
+// Desktop's half of the transcript's rows.
 //
-// House rules, all of which exist to keep the thread quiet and cheap to scroll:
+// The rows themselves are `@tryatlas/design/session`'s: props-only views the
+// web app renders too. What they need from desktop arrives through one
+// `TranscriptProvider` value, built here: the markdown pipeline (the parse
+// cache, the worker, file chips), the actions under a message, comment pills,
+// the changed-files card, and what a click on a tool line or a subagent opens.
+//
+// House rules the rows keep, all of which exist to keep the thread quiet and
+// cheap to scroll:
 //
 //  1. No element grows on hover or on load. Anything expandable either toggles
 //     via row state (which reflows once, deliberately) or opens the detail
@@ -8,132 +15,195 @@
 //     that is what keeps a turn's cost bounded no matter what the agent did.
 //  2. The only things with colour are diff counts, the running-state glyph, and
 //     the turn footer's primary action. Everything else is foreground/muted
-//     grey. Per-tool icon SHAPES are fine and are what the marker rows use —
-//     per-tool icon COLOURS are the "moving blocks" problem in a new costume,
-//     and are the thing to resist.
+//     grey. Per-tool icon SHAPES are fine; per-tool icon COLOURS are the
+//     "moving blocks" problem in a new costume, and are the thing to resist.
 //  3. Rows never subscribe to the chat store or the detail-panel store. Data
-//     arrives as props; actions are fired imperatively via `getState()`.
-//
-// The rows themselves are props-only views under `./views/`. This module is
-// their public face: it re-exports them under the names the transcript and
-// other features import, and wraps the four rows that read something (a
-// comment count) or fire something (the detail panel, the turn diff) in thin
-// containers that do it and hand the view plain props.
+//     arrives as props; actions are fired imperatively via `getState()`. The
+//     components below are the only desktop code a row runs, and each reads
+//     only its own small slice (a comment count, the session's room).
 
-import { memo, useCallback, useMemo } from "react";
+import { createContext, memo, useContext, useMemo, type ReactNode } from "react";
+import {
+  TranscriptProvider,
+  type MarkerRow,
+  type SubagentRow,
+  type TranscriptChangedFilesProps,
+  type TranscriptCommentPillProps,
+  type TranscriptContextValue,
+  type TranscriptGroupCommentPillProps,
+  type TranscriptImagesProps,
+  type TranscriptMarkdownProps,
+  type TranscriptRemoteAuthorProps,
+  type TranscriptResponseActionsProps,
+  type TranscriptUserActionsProps,
+} from "@tryatlas/design/session";
+import { CachedMarkdown } from "@/lib/markdown-cache";
+import { formatTime } from "@/lib/format-time";
 import { openDetail } from "../stores/detail-panel-store";
 import { openTurnDiff } from "../lib/open-turn-diff";
-import { useGroupHasComments, useRowHasComments } from "./chat-comment-pills";
-import type { MarkerGroupRow, MarkerRow, SubagentRow, ThinkingRow } from "../lib/turn-rows";
-import { ThinkingRowBody } from "./views/thinking-row-view";
-import { MarkerGroupRowBody, MarkerRowBody, SubagentRowBody } from "./views/marker-row-views";
+import { retryLastTurn } from "../lib/retry-turn";
+import { CONTINUE_AFTER_SLEEP } from "../lib/interruption-copy";
+import {
+  GroupCommentPill,
+  RowCommentPill,
+  useGroupHasComments,
+  useRowHasComments,
+} from "./chat-comment-pills";
+import { ChangedFilesCard } from "./changed-files-card";
+import { ImageAttachmentStrip } from "./image-attachments";
+import { ProseRowActions } from "./prose-row-actions";
+import { RemoteAuthor } from "./remote-author";
+import { StreamingMarkdown } from "./streaming-markdown";
+import { UserRowActions } from "./user-row-actions";
 
-export { UserRowView } from "./views/user-row-view";
-export { ProseRowView } from "./views/prose-row-view";
-export { SeparatorRowView, TurnFooterRowView, WorkHeaderRowView } from "./views/turn-row-views";
-export {
-  formatCalls,
-  formatWorked,
-  LiveElapsed,
-  settledFigure,
-  SUBAGENT_STATE,
-} from "./views/transcript-row-parts";
+/** What every desktop slot below reads: resolved once by the transcript. */
+interface TranscriptScope {
+  tabId: string;
+  /** Pin scope for this thread. */
+  pinScopeKey: string;
+  /** The session's project root: paths in a message become file chips. */
+  fileRoot?: string;
+}
 
-// ── Thinking ───────────────────────────────────────────────────────────────
+const Scope = createContext<TranscriptScope>({ tabId: "", pinScopeKey: "" });
 
-export const ThinkingRowView = memo(function ThinkingRowView({
-  row,
+const Markdown = memo(function Markdown({
+  source,
+  priority,
+  streaming,
+  className,
+  trustedPaths,
+}: TranscriptMarkdownProps) {
+  const { fileRoot } = useContext(Scope);
+  // Settled prose goes through the plain cached renderer, whose root IS
+  // `.prose-session`, so a scrolled-back message is a pure cache hit. The
+  // streaming tail uses the block-splitting renderer, where only the
+  // trailing block re-parses per frame.
+  return streaming ? (
+    <StreamingMarkdown source={source} streaming priority={priority} fileRoot={fileRoot} />
+  ) : (
+    <CachedMarkdown
+      source={source}
+      priority={priority}
+      fileRoot={fileRoot}
+      trustedPaths={trustedPaths}
+      className={className}
+    />
+  );
+});
+
+function UserActions({ row, messageId, canRetry, toggleAbove }: TranscriptUserActionsProps) {
+  const { tabId, pinScopeKey } = useContext(Scope);
+  return (
+    <UserRowActions
+      tabId={tabId}
+      text={row.text}
+      canRetry={canRetry}
+      messageId={messageId}
+      timestamp={row.timestamp}
+      timestampApproximate={row.timestampApproximate === true}
+      pinScopeKey={pinScopeKey}
+      toggleAbove={toggleAbove}
+    />
+  );
+}
+
+function ResponseActions(props: TranscriptResponseActionsProps) {
+  const { tabId, pinScopeKey } = useContext(Scope);
+  return <ProseRowActions tabId={tabId} pinScopeKey={pinScopeKey} {...props} />;
+}
+
+function Images({ images, className }: TranscriptImagesProps) {
+  return <ImageAttachmentStrip images={images} className={className} />;
+}
+
+function Author({ id, fallback }: TranscriptRemoteAuthorProps) {
+  const { tabId } = useContext(Scope);
+  return <RemoteAuthor tabId={tabId} id={id} fallback={fallback} />;
+}
+
+function CommentPill({ anchorId }: TranscriptCommentPillProps) {
+  const { tabId } = useContext(Scope);
+  return <RowCommentPill tabId={tabId} chatKey={anchorId} />;
+}
+
+function GroupPill({ anchorIds, onOpen }: TranscriptGroupCommentPillProps) {
+  const { tabId } = useContext(Scope);
+  return <GroupCommentPill tabId={tabId} chatKeys={anchorIds} onOpen={onOpen} />;
+}
+
+function ChangedFiles({ row }: TranscriptChangedFilesProps) {
+  const { tabId } = useContext(Scope);
+  return <ChangedFilesCard turnKey={row.turnKey} tabId={tabId} files={row.files} />;
+}
+
+function useRowDiscussed(anchorId: string): boolean {
+  return useRowHasComments(useContext(Scope).tabId, anchorId);
+}
+
+function useGroupDiscussed(anchorIds: readonly string[]): boolean {
+  return useGroupHasComments(useContext(Scope).tabId, anchorIds);
+}
+
+const CLOCK: Intl.DateTimeFormatOptions = { hour: "2-digit", minute: "2-digit" };
+const clock = (timestamp: string) => formatTime(timestamp, CLOCK);
+
+/**
+ * The transcript's rows, as desktop wires them: the package's
+ * `TranscriptProvider` with desktop's slots, scoped to one tab.
+ */
+export function DesktopTranscriptProvider({
   tabId,
+  pinScopeKey,
+  fileRoot,
   onToggleExpand,
-}: {
-  row: ThinkingRow;
-  tabId: string;
-  onToggleExpand: (id: string) => void;
+  onToggleGroup,
+  children,
+}: TranscriptScope & {
+  onToggleExpand: (rowId: string) => void;
+  onToggleGroup: (rowId: string) => void;
+  children: ReactNode;
 }) {
-  // `th:<messageId>` — the key a comment on this thought is filed under.
-  const discussed = useRowHasComments(tabId, row.id.slice(3));
+  const scope = useMemo(() => ({ tabId, pinScopeKey, fileRoot }), [tabId, pinScopeKey, fileRoot]);
+  const value = useMemo<TranscriptContextValue>(
+    () => ({
+      Markdown,
+      UserActions,
+      ResponseActions,
+      Images,
+      RemoteAuthor: Author,
+      CommentPill,
+      GroupCommentPill: GroupPill,
+      ChangedFiles,
+      useRowDiscussed,
+      useGroupDiscussed,
+      formatTime: clock,
+      onToggleExpand,
+      onToggleGroup,
+      onOpenMarker: (row: MarkerRow) => {
+        if (row.opens === "diff") {
+          // Changes get the real viewer, not the sidebar. The turn id is what
+          // the diff is scoped by; the path just says which file to land on.
+          openTurnDiff(row.turnId, row.path);
+        } else if (row.opens === "output") {
+          openDetail(tabId, { kind: "output", toolCallId: row.toolCallId });
+        }
+      },
+      onOpenSubagent: (row: SubagentRow) =>
+        openDetail(tabId, { kind: "subagent", toolCallId: row.toolCallId }),
+      onRetry: () => void retryLastTurn(tabId),
+      // Continue is an ordinary message, sent through `atlas:chat-send` like a
+      // suggestion chip, so every agent gets it.
+      onContinue: () =>
+        window.dispatchEvent(
+          new CustomEvent("atlas:chat-send", { detail: { tabId, text: CONTINUE_AFTER_SLEEP } }),
+        ),
+    }),
+    [tabId, onToggleExpand, onToggleGroup],
+  );
   return (
-    <ThinkingRowBody
-      row={row}
-      tabId={tabId}
-      discussed={discussed}
-      onToggleExpand={onToggleExpand}
-    />
+    <Scope.Provider value={scope}>
+      <TranscriptProvider value={value}>{children}</TranscriptProvider>
+    </Scope.Provider>
   );
-});
-
-// ── Marker ─────────────────────────────────────────────────────────────────
-
-/** One tool call. See `MarkerRowBody` for what it renders. */
-export const MarkerRowView = memo(function MarkerRowView({
-  row,
-  tabId,
-  embedded = false,
-}: {
-  row: MarkerRow;
-  tabId: string;
-  embedded?: boolean;
-}) {
-  const onClick = useCallback(() => {
-    if (row.opens === "diff") {
-      // Changes get the real viewer, not the sidebar. The turn id is what the
-      // diff is scoped by; the path just says which file to land on.
-      openTurnDiff(row.turnId, row.path);
-    } else if (row.opens === "output") {
-      openDetail(tabId, { kind: "output", toolCallId: row.toolCallId });
-    }
-  }, [row.opens, row.path, row.toolCallId, tabId]);
-  const discussed = useRowHasComments(tabId, row.toolCallId);
-  return (
-    <MarkerRowBody
-      row={row}
-      tabId={tabId}
-      embedded={embedded}
-      discussed={discussed}
-      onClick={onClick}
-    />
-  );
-});
-
-/** A folded sequence of tool calls. See `MarkerGroupRowBody`. */
-export const MarkerGroupRowView = memo(function MarkerGroupRowView({
-  row,
-  tabId,
-  onExpandTurn,
-}: {
-  row: MarkerGroupRow;
-  tabId: string;
-  onExpandTurn: (turnId: string) => void;
-}) {
-  // The ids of the calls behind this line, which is what a comment on any of
-  // them is keyed by. Derived here rather than carried on the row: it is a map
-  // over a list the row already holds, and the projection would have to redo it
-  // on every marker state change.
-  const callIds = useMemo(() => row.markers.map((marker) => marker.toolCallId), [row.markers]);
-  const discussed = useGroupHasComments(tabId, callIds);
-  return (
-    <MarkerGroupRowBody
-      row={row}
-      tabId={tabId}
-      onExpandTurn={onExpandTurn}
-      callIds={callIds}
-      discussed={discussed}
-      Marker={MarkerRowView}
-    />
-  );
-});
-
-/** A delegated child. See `SubagentRowBody`. */
-export const SubagentRowView = memo(function SubagentRowView({
-  row,
-  tabId,
-}: {
-  row: SubagentRow;
-  tabId: string;
-}) {
-  const onOpen = useCallback(
-    () => openDetail(tabId, { kind: "subagent", toolCallId: row.toolCallId }),
-    [tabId, row.toolCallId],
-  );
-  return <SubagentRowBody row={row} onOpen={onOpen} />;
-});
+}

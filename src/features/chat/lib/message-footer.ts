@@ -23,7 +23,7 @@
 //    its own, not grouped with copy. It draws only when the message has a
 //    cloud anchor (`CommentAction`), a store fact the row resolves itself.
 
-import { RowKind, type Row } from "./turn-rows";
+import { RowKind, type Row } from "@tryatlas/design/session";
 
 export type MessageAction = "retry" | "copy" | "branch" | "pin" | "comment" | "edit";
 

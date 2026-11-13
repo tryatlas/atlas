@@ -1,8 +1,7 @@
 // The tool-call edges `chat-tools` leaves out: one call of every kind
 // (an MCP tool among them), a command with 50,000 lines of output, a turn the
 // user stopped mid-command and a turn that failed mid-command. For checking
-// how the transcript draws each, and what the session-view adapter
-// (`session-view-adapter.ts`) makes of them.
+// how the transcript draws each.
 
 import type { Scenario } from "../types";
 import { ended, lines, text, tool, tools, user, t } from "../fixtures/chat";

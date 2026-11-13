@@ -1,13 +1,6 @@
 import { describe, expect, it } from "vitest";
-import {
-  projectRows,
-  RowKind,
-  userMessageText,
-  type Projection,
-  type ProjectOptions,
-  type Row,
-  type UserRow,
-} from "./turn-rows";
+import { projectRows, userMessageText, type Projection, type ProjectOptions } from "./turn-rows";
+import { RowKind, type Row, type UserRow } from "@tryatlas/design/session";
 import { appendNextStepsDirective } from "./next-steps";
 import type { ChatMessage } from "@/types/agent";
 

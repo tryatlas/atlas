@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { INFINITE_ANIMATIONS, INFINITE_ANIMATION_FPS_VAR } from "@tryatlas/design/animations";
 
@@ -22,6 +23,11 @@ import { INFINITE_ANIMATIONS, INFINITE_ANIMATION_FPS_VAR } from "@tryatlas/desig
  * selector, and the JS loops (which no stylesheet reaches) need the
  * `--infinite-animation-fps` cap they read declared under the same class. A
  * package bump that adds one fails here until desktop caps it.
+ *
+ * The transcript's loops (`.atlas-marker-running`, `.atlas-pixel-cell`) are
+ * plain classes in the package's `transcript.css` rather than listed
+ * animations, so that sheet is scanned with `globals.css`: its infinite rules
+ * need the same override here.
  *
  * Also pinned: the class the block keys on is set at startup, and the
  * ring whose 3 s turn would drop to 4 fps under the default step count sets
@@ -60,10 +66,18 @@ function blocks(source: string): { selector: string; body: string }[] {
 
 describe("infinite animations are stepped on Linux", () => {
   const css = read("src/styles/globals.css");
+  const transcriptCss = readFileSync(
+    path.join(
+      path.dirname(createRequire(import.meta.url).resolve("@tryatlas/design/package.json")),
+      "src/styles/transcript.css",
+    ),
+    "utf8",
+  );
   const all = blocks(css);
+  const scanned = [...all, ...blocks(transcriptCss)];
   // Nested blocks (`@media { … }`, `@keyframes { … }`) are flattened out here;
   // the rules that matter are top-level class rules.
-  const infinite = all.filter(
+  const infinite = scanned.filter(
     (b) =>
       b.selector.startsWith(".") &&
       /\binfinite\b/.test(b.body) &&

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { projectRows, RowKind, type InterruptionRow } from "./turn-rows";
-import { formatSlept, interruptionHeadline } from "./interruption-copy";
+import { projectRows } from "./turn-rows";
+import { RowKind, type InterruptionRow } from "@tryatlas/design/session";
+import { formatSlept, interruptionHeadline } from "@tryatlas/design/session";
 import type { ChatMessage, TurnInterruption } from "@/types/agent";
 
 const OPTS = { expanded: new Set<string>(), streaming: false, expandedTurns: new Set<string>() };

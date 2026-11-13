@@ -14,7 +14,7 @@ import { useMemo, useState, type ReactNode } from "react";
 import { ChevronDown, CornerLeftUp, Ellipsis, GitFork, Plus } from "lucide-react";
 
 import { catalogEntry } from "@/features/agents/lib/agent-meta";
-import { LiveElapsed, settledFigure } from "@/features/chat/components/transcript-rows";
+import { LiveElapsed, settledFigure } from "@tryatlas/design/session";
 import { useSubagents } from "@/features/chat/hooks/use-subagents";
 import { forkSessionToNewTab } from "@/features/chat/lib/fork-session";
 import { displayName, elapsedMs, isRunning, isTerminal } from "@/features/chat/lib/subagents";

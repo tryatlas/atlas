@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { latestResponseRowId, responseFooterActions, userFooterActions } from "./message-footer";
-import { RowKind, type Row } from "./turn-rows";
+import { RowKind, type Row } from "@tryatlas/design/session";
 
 describe("userFooterActions", () => {
   it("keeps pin and copy inline and tucks edit into the menu", () => {

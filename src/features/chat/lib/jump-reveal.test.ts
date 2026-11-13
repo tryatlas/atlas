@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { revealStep } from "./jump-reveal";
-import { projectRows, RowKind, type Row } from "./turn-rows";
+import { projectRows } from "./turn-rows";
+import { RowKind, type Row } from "@tryatlas/design/session";
 import type { ChatMessage, ToolCallDisplay } from "@/types/agent";
 
 // A comment on a row the transcript has folded away — a call inside a

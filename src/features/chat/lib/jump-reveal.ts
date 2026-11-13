@@ -7,7 +7,7 @@
 // is. The transcript asks this one fold at a time (the turn first, then the
 // run inside it), re-projecting in between, until the row is shown.
 
-import { RowKind, type Row } from "./turn-rows";
+import { RowKind, type Row } from "@tryatlas/design/session";
 
 export type RevealStep =
   /** On screen: `rowId` is the `data-row-id` to land on — the row itself, or
