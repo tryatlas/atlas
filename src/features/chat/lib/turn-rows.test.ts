@@ -1,15 +1,13 @@
 import { describe, expect, it } from "vitest";
+import { projectRows, type ProjectOptions, memoryToolOf } from "./turn-rows";
 import {
-  projectRows,
   RowKind,
   type MarkerGroupRow,
   type MarkerRow,
-  type ProjectOptions,
   type WorkHeaderRow,
   toolDisplayName,
-  memoryToolOf,
   mcpToolOf,
-} from "./turn-rows";
+} from "@tryatlas/design/session";
 import type { ChatMessage, ToolCallDisplay } from "@/types/agent";
 
 /** Every fixture's assistant turn starts at message `m1`, and a settled turn

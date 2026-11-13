@@ -1,10 +1,7 @@
 // The Memory surface's history rail, props-only: a hairline in a 32px gutter
-// with a round node per row, the shape the session timeline draws
-// (`SessionTimeline`'s `Rail` in `@tryatlas/design`). The package does not
-// export its rail, so memory draws the same one here; the geometry (gutter,
-// gap, node size, the hairline stopping at the end nodes' centres) is kept
-// identical so the two read as one product. Package gap: an exported
-// `TimelineRail`/`RailNode` would replace this file.
+// with a round node per row, the shape the package's old `SessionTimeline`
+// drew before the transcript replaced it. The geometry (gutter, gap, node
+// size, the hairline stopping at the end nodes' centres) is memory's own.
 
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";

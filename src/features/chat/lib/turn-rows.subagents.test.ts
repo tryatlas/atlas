@@ -10,7 +10,8 @@
 
 import { describe, expect, it } from "vitest";
 
-import { projectRows, RowKind, type ProjectOptions, type SubagentRow } from "./turn-rows";
+import { projectRows, type ProjectOptions } from "./turn-rows";
+import { RowKind, type SubagentRow } from "@tryatlas/design/session";
 import type { ChatMessage, Subagent, ToolCallDisplay } from "@/types/agent";
 
 const OPEN_WORK = "wk:t:m1";

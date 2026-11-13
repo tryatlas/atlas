@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { projectRows, RowKind } from "./turn-rows";
+import { projectRows } from "./turn-rows";
+import { RowKind } from "@tryatlas/design/session";
 import { detectInjectedPrompt } from "./injected-prompt";
 import { latestResponseRowId } from "./message-footer";
 import type { ChatMessage } from "@/types/agent";

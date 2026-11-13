@@ -73,7 +73,7 @@ import { AgentElicitationHost } from "@/features/chat/components/agent-elicitati
 import { UiActionBridge } from "@/features/ui-actions/components/ui-action-bridge";
 import { OrgActionLogBridge } from "@/features/org-actions/components/org-action-log-bridge";
 import { initWindowFocusTracking, isWindowFocused } from "@/lib/window-focus";
-import { initAnimationVisibility } from "@/lib/visible-animation";
+import { initAnimationVisibility } from "@tryatlas/design/session";
 import { initDockBadgeClearing } from "@/lib/dock-badge";
 import { primeNativeNotificationPermission } from "@/lib/native-notify";
 import {

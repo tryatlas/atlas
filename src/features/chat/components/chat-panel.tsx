@@ -52,8 +52,8 @@ import { useChatPanelHotkeys } from "../hooks/use-chat-panel-hotkeys";
 import { useAcpPrewarm } from "../hooks/use-acp-prewarm";
 import { useChatPanelEvents, useQueueDrain, type ChatSendHandler } from "../hooks/use-queue-drain";
 import { ChatPanelLayout } from "./views/chat-panel-layout";
-import { ChatPanelSkeleton, LoadingTranscriptState } from "./views/transcript-loading";
-import { JumpToBottomPill } from "./views/jump-to-bottom-pill";
+import { ChatPanelSkeleton } from "./views/transcript-loading";
+import { JumpToBottomPill, LoadingTranscriptState } from "@tryatlas/design/session";
 import { WelcomeStateView } from "./views/welcome-state-view";
 
 /** When this app run first saw each bound session (ms). The "Memory updated"

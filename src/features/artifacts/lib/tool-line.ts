@@ -30,13 +30,13 @@
  */
 
 import { bashCommandOf, isBashToolCall } from "@/features/chat/lib/tool-calls";
-import { parseShellCommand } from "@/features/chat/lib/parse-shell-command";
+import { parseShellCommand } from "@tryatlas/design/session";
 import {
   classifyToolFileKind,
   getFilePathFromInput,
   isFileCreated,
 } from "@/features/chat/lib/tool-files";
-import { shortPath, toolIconFor, type MarkerTool } from "@/features/chat/lib/turn-rows";
+import { shortPath, toolIconFor, type MarkerTool } from "@tryatlas/design/session";
 
 import type { TimelineEntry } from "../types";
 

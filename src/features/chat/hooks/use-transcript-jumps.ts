@@ -12,7 +12,8 @@ import {
   type RefObject,
   type SetStateAction,
 } from "react";
-import type { Projection, Row } from "../lib/turn-rows";
+import type { Projection } from "../lib/turn-rows";
+import type { Row } from "@tryatlas/design/session";
 import { revealStep } from "../lib/jump-reveal";
 import {
   deriveTurnRailItems,

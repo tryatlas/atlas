@@ -26,7 +26,9 @@
 //
 // This file is the CONTAINER: it reads the stores, projects the rows and owns
 // the window (`use-transcript-window.ts`) and the jumps
-// (`use-transcript-jumps.ts`). What it renders is props-only, under `./views/`.
+// (`use-transcript-jumps.ts`). What it renders is props-only:
+// `@tryatlas/design/session`'s rows and frame, wired to desktop by
+// `DesktopTranscriptProvider` (`transcript-rows.tsx`).
 
 import {
   Fragment,
@@ -45,7 +47,8 @@ import {
   switchableAgentOf,
 } from "@/features/agents/lib/agent-meta";
 import { useIsTabVisible } from "@/features/layout/lib/use-tab-visible";
-import { projectRows, RowKind, type Projection, type Row, type Segment } from "../lib/turn-rows";
+import { projectRows, type Projection, type Segment } from "../lib/turn-rows";
+import { RowKind, type Row } from "@tryatlas/design/session";
 import { useThawed } from "../lib/use-thawed";
 import { useChatStore } from "../stores/chat-store";
 import { sessionCanRetry } from "../lib/retry-gate";
@@ -55,8 +58,10 @@ import { pinScope } from "../stores/chat-pins-store";
 import { projectPathForTab } from "../lib/tab-project";
 import { useTranscriptWindow } from "../hooks/use-transcript-window";
 import { useTranscriptJumps } from "../hooks/use-transcript-jumps";
-import { RowView } from "./views/transcript-row-view";
-import { TranscriptView } from "./views/transcript-view";
+import { TranscriptRowItem, TranscriptView } from "@tryatlas/design/session";
+import { DesktopTranscriptProvider } from "./transcript-rows";
+import { ResponseSelectionActions } from "./response-selection-actions";
+import { TurnRail } from "./turn-rail";
 
 /** Shared with the composer — see `switchableAgentOf`. */
 const switchable = switchableAgentOf;
@@ -358,52 +363,27 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(function
     (segment: Segment, from: number) => (
       <Fragment key={segment.id}>
         {segment.rows.slice(from).map((row, i) => (
-          // `group` is the hover scope for the user row's action bar
+          // The row's wrapper is the hover scope for the user row's action bar
           // (`user-row-actions.tsx`), which is hidden until the row is hovered.
           // The fling hover-suspension in `use-transcript-scroll.ts` keeps hover
           // styles from firing as rows pass under a resting pointer mid-scroll.
-          // `data-footer-below` marks a response whose hover footer is drawn by
-          // the turn footer row after it; hovering the response reveals it too
-          // (`globals.css`).
-          <div
+          <TranscriptRowItem
             key={row.id}
-            className="atlas-row group group/row"
-            data-row-id={row.id}
-            data-footer-below={row.kind === RowKind.Prose && row.footerBelow ? "" : undefined}
-          >
-            <RowView
-              row={row}
-              tabId={tabId}
-              agentLabel={agentLabel}
-              justSentMessageId={entranceMessageId}
-              onExpandTurn={toggleTurn}
-              // Absolute position in the thread, so the newest messages — the
-              // ones on screen after a history load — are parsed first. An
-              // index within the window would shift as the window grows.
-              priority={segment.offset + from + i}
-              onToggleExpand={toggleExpand}
-              canRetryRowId={canRetryRowId}
-              canBranchRowId={canBranchRowId}
-              canContinue={canContinue}
-              pinScopeKey={pinScopeKey}
-              fileRoot={fileRoot}
-            />
-          </div>
+            row={row}
+            agentLabel={agentLabel}
+            justSentMessageId={entranceMessageId}
+            // Absolute position in the thread, so the newest messages — the
+            // ones on screen after a history load — are parsed first. An
+            // index within the window would shift as the window grows.
+            priority={segment.offset + from + i}
+            canRetryRowId={canRetryRowId}
+            canBranchRowId={canBranchRowId}
+            canContinue={canContinue}
+          />
         ))}
       </Fragment>
     ),
-    [
-      tabId,
-      agentLabel,
-      entranceMessageId,
-      canRetryRowId,
-      canBranchRowId,
-      canContinue,
-      pinScopeKey,
-      fileRoot,
-      toggleTurn,
-      toggleExpand,
-    ],
+    [agentLabel, entranceMessageId, canRetryRowId, canBranchRowId, canContinue],
   );
   const segmentViews = useMemo(
     () => ({ render: renderRows, held: new WeakMap<Segment, ReactElement>() }),
@@ -432,28 +412,45 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(function
   }, [projection, safeStart, segmentViews]);
 
   return (
-    <TranscriptView
-      scrollRef={scrollRef}
-      contentRef={contentRef}
-      onScroll={onScroll}
+    <DesktopTranscriptProvider
       tabId={tabId}
-      live={live}
-      topInset={topInset}
-      empty={rows.length === 0 && !isStreaming}
-      rowViews={rowViews}
-      turnInProgress={turnInProgress}
-      footer={footer}
-      working={working}
-      workingEpoch={workingEpoch}
-      workingLabel={workingLabel}
-      onStallRestart={onStallRestart}
-      onStallSwitch={onStallSwitch}
-      onStallCopyDiagnostics={onStallCopyDiagnostics}
-      more={more}
-      turnRailItems={turnRailItems}
-      windowStart={safeStart}
-      getTurnRailPreview={getTurnRailPreview}
-      onSelectTurnRailItem={selectTurnRailItem}
-    />
+      pinScopeKey={pinScopeKey}
+      fileRoot={fileRoot}
+      onToggleExpand={toggleExpand}
+      onToggleGroup={toggleTurn}
+    >
+      <TranscriptView
+        scrollRef={scrollRef}
+        contentRef={contentRef}
+        onScroll={onScroll}
+        topInset={topInset}
+        empty={rows.length === 0 && !isStreaming}
+        rowViews={rowViews}
+        turnInProgress={turnInProgress}
+        footer={footer}
+        working={working}
+        workingEpoch={workingEpoch}
+        workingLabel={workingLabel}
+        onStallRestart={onStallRestart}
+        onStallSwitch={onStallSwitch}
+        onStallCopyDiagnostics={onStallCopyDiagnostics}
+        more={more}
+        overlays={
+          <>
+            <ResponseSelectionActions viewportRef={scrollRef} tabId={tabId} enabled={live} />
+            {/* Hangs left into the gutter outside this box; takes no space. */}
+            <TurnRail
+              items={turnRailItems}
+              scrollRef={scrollRef}
+              contentRef={contentRef}
+              topInset={topInset}
+              windowStart={safeStart}
+              getPreview={getTurnRailPreview}
+              onSelect={selectTurnRailItem}
+            />
+          </>
+        }
+      />
+    </DesktopTranscriptProvider>
   );
 });

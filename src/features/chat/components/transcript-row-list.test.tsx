@@ -25,13 +25,16 @@ vi.mock("@tauri-apps/api/event", () => ({
 vi.mock("@/features/layout/lib/use-tab-visible", () => ({ useIsTabVisible: () => true }));
 
 const renders = new Map<string, number>();
-vi.mock("./views/transcript-row-view", () => ({
-  RowView: ({ row, priority }: { row: { id: string }; priority: number }) => {
+vi.mock("@tryatlas/design/session", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@tryatlas/design/session")>()),
+  TranscriptRowItem: ({ row, priority }: { row: { id: string }; priority: number }) => {
     renders.set(row.id, (renders.get(row.id) ?? 0) + 1);
-    return <span data-priority={priority} />;
+    return (
+      <div data-row-id={row.id}>
+        <span data-priority={priority} />
+      </div>
+    );
   },
-}));
-vi.mock("./views/transcript-view", () => ({
   TranscriptView: (props: {
     scrollRef: RefObject<HTMLDivElement | null>;
     contentRef: RefObject<HTMLDivElement | null>;

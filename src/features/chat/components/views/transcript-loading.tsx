@@ -1,18 +1,6 @@
 import type { RefObject } from "react";
 import { PanelSkeleton } from "@/components/panel-skeleton";
 
-export function LoadingTranscriptState() {
-  // Structural skeleton over a centered transcript-width column, so opening a
-  // historical chat reads as "loading messages" instead of a blank spinner.
-  return (
-    <div className="h-full overflow-hidden">
-      <div className="mx-auto w-full max-w-(--atlas-chat-column)">
-        <PanelSkeleton rows={6} />
-      </div>
-    </div>
-  );
-}
-
 /** The chat panel before its session exists. Normally a single frame; on a
  *  first-ever launch it also covers the brief wait for the probe that decides
  *  which agent this chat starts on. */

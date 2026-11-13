@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { projectRows, RowKind, type ProjectOptions, type Projection } from "./turn-rows";
+import { projectRows, type ProjectOptions, type Projection } from "./turn-rows";
+import { RowKind } from "@tryatlas/design/session";
 import type { ChatMessage, ToolCallDisplay } from "@/types/agent";
 
 // `projectRows` re-uses the previous projection's turns when their inputs are

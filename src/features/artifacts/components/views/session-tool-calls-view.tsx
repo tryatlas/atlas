@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { ChevronDown, ChevronRight, MessageSquare } from "lucide-react";
 
-import { ToolGlyph } from "@/features/chat/components/tool-glyph";
+import { ToolGlyph } from "@tryatlas/design/session";
 import { cn } from "@/lib/utils";
 
 import type { TimelineEntry } from "../../types";

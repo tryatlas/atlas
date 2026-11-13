@@ -169,7 +169,7 @@ export const TabContentContainer = memo(function TabContentContainer({
                   className="absolute inset-0"
                   inert={hidden}
                   // Pauses the session's working shimmers while it is hidden
-                  // (`src/lib/visible-animation.ts`): `visibility:hidden` does
+                  // (`@tryatlas/design/session`'s `visible-animation.ts`): `visibility:hidden` does
                   // not stop CSS animations the way `display:none` does.
                   data-atlas-offstage={hidden || undefined}
                   style={{
