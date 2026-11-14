@@ -9,6 +9,8 @@
 //                  empty item ends the list, as on Enter. Ctrl+J is the
 //                  terminal's newline, beside the Ctrl+A / Ctrl+E that macOS
 //                  gives every text field.
+//   Alt+Enter      a plain newline, always: no list or quote continuation,
+//                  and a selection is replaced.
 //   ⌘/Ctrl+Enter   send, always.
 //   Backspace      right after a list or quote marker, removes the marker.
 //   Tab / ⇧Tab     indent / outdent a list line by two spaces; elsewhere the
@@ -325,6 +327,7 @@ export const ComposerKeymap = Extension.create<ComposerKeymapOptions>({
       }),
       "Shift-Enter": guard(() => newline(this.editor, true)),
       "Ctrl-j": guard(() => newline(this.editor, true)),
+      "Alt-Enter": guard(() => newline(this.editor, false)),
       "Mod-Enter": guard(() => {
         this.options.onSubmit();
         return true;

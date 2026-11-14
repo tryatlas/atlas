@@ -47,7 +47,7 @@ const serializer: ComposerSerializer = {
 afterEach(cleanup);
 
 /** A composer holding `text`, the caret at `|` (which is removed). */
-function composer(marked: string) {
+function composer(marked: string, { enterToSend = false, onSubmit = () => {} } = {}) {
   const caret = marked.indexOf("|");
   const text = marked.replace("|", "");
   const ref = createRef<ComposerEditorHandle>();
@@ -57,7 +57,8 @@ function composer(marked: string) {
       extensions={EXTENSIONS}
       serializer={serializer}
       initialValue={text}
-      enterToSend={false}
+      enterToSend={enterToSend}
+      onSubmit={onSubmit}
     />,
   );
   const dom = container.querySelector(".ProseMirror") as HTMLElement;
@@ -84,6 +85,7 @@ const KEY_CODES: Record<string, number> = {
   "[": 219,
   "]": 221,
   j: 74,
+  z: 90,
   k: 75,
   K: 75,
 };
@@ -179,6 +181,44 @@ describe("markdown lists", () => {
     const plain = composer("plain|");
     press(plain.dom, "Ctrl-j");
     expect(plain.value()).toBe("plain\n");
+  });
+});
+
+describe("Alt+Enter", () => {
+  it.each([true, false])("is a plain newline, never a send (enterToSend: %s)", (enterToSend) => {
+    const onSubmit = vi.fn();
+    const { dom, value } = composer("plain|", { enterToSend, onSubmit });
+    press(dom, "Alt-Enter");
+    expect(value()).toBe("plain\n");
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("does not continue a list or quote", () => {
+    const list = composer("- item|");
+    press(list.dom, "Alt-Enter");
+    expect(list.value()).toBe("- item\n");
+    const quote = composer("> quoted|");
+    press(quote.dom, "Alt-Enter");
+    expect(quote.value()).toBe("> quoted\n");
+  });
+
+  it("replaces the selection", () => {
+    const { editor, dom, value } = composer("one two three");
+    act(() => {
+      editor.view.dispatch(
+        editor.state.tr.setSelection(TextSelection.create(editor.state.doc, 5, 8)),
+      );
+    });
+    press(dom, "Alt-Enter");
+    expect(value()).toBe("one \n three");
+  });
+
+  it("is one undo step", () => {
+    const { dom, value } = composer("a|");
+    press(dom, "Alt-Enter");
+    expect(value()).toBe("a\n");
+    press(dom, "Mod-z");
+    expect(value()).toBe("a");
   });
 });
 
