@@ -7,11 +7,13 @@ import { cn } from "@/lib/utils";
 import { useEditorStore } from "../stores/editor-store";
 import { useAppStore } from "@/features/app/stores/app-store";
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
+import { useIsTabVisible } from "@/features/layout/lib/use-tab-visible";
 import { logEvent } from "@/features/log/lib/log";
 import { gitDiffLineStatus } from "@/features/git/lib/git-diff-api";
 import { gitBlameFile } from "@/features/git/lib/git-blame-api";
 import { MarkdownFile } from "@/lib/markdown-fileviewer";
 import { openFileAs } from "@/lib/open-file";
+import { isUnderRoot } from "@/lib/file-links";
 import { useProjectSetting } from "@/features/settings/lib/use-scoped-setting";
 import { useWordWrap } from "@/features/settings/lib/use-word-wrap";
 import { OpenInEditorButton } from "@/features/external-editor/components/open-in-editor-button";
@@ -43,6 +45,7 @@ import {
   writeRenderedPreference,
 } from "../lib/file-preview-mode";
 import { useFileSaveCoordinator } from "../lib/use-file-save-coordinator";
+import { useGitMarksRefresh } from "../lib/use-git-marks-refresh";
 import { CodeMirrorFileView, type CodeMirrorFileViewHandle } from "./codemirror-file-view";
 import { DelimitedTablePreview } from "./delimited-table-preview";
 import { FileBreadcrumbsRow, type FileBreadcrumbsProps } from "./file-breadcrumbs";
@@ -253,6 +256,15 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
       .catch(() => {});
   }, [path, projectPath, relPath, isUntitled, gitBlameInline]);
 
+  // Both, but only for a tab someone can see: a hidden tab marks them stale
+  // and repaints once it is shown (`use-git-marks-refresh.ts`).
+  const tabVisible = useIsTabVisible(tabId);
+  const repaintGitMarks = useCallback(() => {
+    refreshDiffGutter();
+    refreshBlame();
+  }, [refreshDiffGutter, refreshBlame]);
+  const refreshGitMarks = useGitMarksRefresh(tabVisible, repaintGitMarks);
+
   // ── Save ──
   const persistedMtime = useRef(0);
   const markClean = useCallback(
@@ -295,8 +307,7 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
           void git.actions.refreshStatusNow(git.repoPath);
         }
       });
-      refreshDiffGutter();
-      refreshBlame();
+      refreshGitMarks();
     },
   });
 
@@ -349,10 +360,9 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
       reloadBuffer(path, content, mtime);
       save.reset(content);
       setDocVersion((v) => v + 1);
-      refreshDiffGutter();
-      refreshBlame();
+      refreshGitMarks();
     },
-    [path, reloadBuffer, save, refreshDiffGutter, refreshBlame],
+    [path, reloadBuffer, save, refreshGitMarks],
   );
 
   // Reconcile with disk when the file may have changed externally (agent or
@@ -408,15 +418,16 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
 
   // Repaint bars and blame when the working tree changes elsewhere (commits,
   // stage/unstage, external edits) — the event the git store listens to.
+  // Every watched project and worktree sends it, so only the one holding
+  // this file counts.
   useEffect(() => {
-    const un = onGitChanged(() => {
-      refreshDiffGutter();
-      refreshBlame();
+    const un = onGitChanged((payload) => {
+      if (isUnderRoot(path, payload.project)) refreshGitMarks();
     });
     return () => {
       void un.then((u) => u());
     };
-  }, [refreshDiffGutter, refreshBlame]);
+  }, [path, refreshGitMarks]);
 
   // Reconcile with disk on the signals of an external edit: the buffer
   // mounting (a close-then-reopen must not show a stale cached buffer), the
@@ -447,9 +458,8 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
   // Paint once the inputs settle (the project path can resolve after mount).
   useEffect(() => {
     if (!hasBuffer) return;
-    refreshDiffGutter();
-    refreshBlame();
-  }, [hasBuffer, refreshDiffGutter, refreshBlame]);
+    refreshGitMarks();
+  }, [hasBuffer, refreshGitMarks]);
 
   // ── Rendered or source ──
   const renderedMode = isUntitled ? null : renderedModeOf(path);
@@ -691,10 +701,7 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
             reveal={pendingReveal}
             onRevealed={(nonce) => consumeReveal(path, nonce)}
             onChange={(content) => save.change(content)}
-            onReady={() => {
-              refreshDiffGutter();
-              refreshBlame();
-            }}
+            onReady={refreshGitMarks}
           />
         </div>
       )}
