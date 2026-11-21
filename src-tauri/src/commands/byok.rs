@@ -117,6 +117,7 @@ const ENV_KEY_VARS: &[(&str, &[&str])] = &[
     ("standardcompute", &["STANDARDCOMPUTE_API_KEY"]),
     ("uberllm", &["UBERLLM_API_KEY"]),
     ("trustedrouter", &["TRUSTEDROUTER_API_KEY"]),
+    ("aigrow", &["AIGROW_API_KEY"]),
 ];
 
 /// One env-imported key: which provider it maps to, the variable it came from,
@@ -834,5 +835,15 @@ mod tests {
         assert!(entry.is_some(), "trustedrouter must be in ENV_KEY_VARS");
         let (_, vars) = entry.unwrap();
         assert_eq!(vars, &["TRUSTEDROUTER_API_KEY"]);
+    }
+
+    #[test]
+    fn test_aigrow_env_vars() {
+        let entry = ENV_KEY_VARS
+            .iter()
+            .find(|(provider, _)| *provider == "aigrow");
+        assert!(entry.is_some(), "aigrow must be in ENV_KEY_VARS");
+        let (_, vars) = entry.unwrap();
+        assert_eq!(vars, &["AIGROW_API_KEY"]);
     }
 }
