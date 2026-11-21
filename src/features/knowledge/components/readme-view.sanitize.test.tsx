@@ -78,3 +78,27 @@ describe("ReadmeView raw HTML", () => {
     expect(container.textContent).toContain("overlay");
   });
 });
+
+describe("ReadmeView tables", () => {
+  it("holds a prose column to a readable width inside its scroll box", () => {
+    const { container } = render(
+      <ReadmeView
+        source={[
+          "| Flag | Meaning |",
+          "| --- | ---: |",
+          "| `-w` | Ignores whitespace-only changes when it attributes each line to a commit. |",
+        ].join("\n")}
+      />,
+    );
+    const cells = [...container.querySelectorAll("th, td")];
+
+    expect(cells.map((c) => c.classList.contains("min-w-[24ch]"))).toEqual([
+      false,
+      false,
+      false,
+      true,
+    ]);
+    expect((cells[3] as HTMLElement).style.textAlign).toBe("right");
+    expect(container.querySelector("table")!.parentElement!.className).toBe("overflow-x-auto");
+  });
+});

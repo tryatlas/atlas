@@ -10,6 +10,8 @@ import { documentFileRoot } from "@/lib/file-links";
 import { onMarkdownClick } from "@/lib/markdown-links";
 import { cachedPreviewImage, previewImage } from "@/lib/markdown-preview-image";
 import { PREVIEW_SANITIZE_SCHEMA } from "@/lib/markdown-sanitize";
+import { readableCellClass } from "@/lib/markdown-table";
+import { cn } from "@/lib/utils";
 
 const REMARK_PLUGINS: NonNullable<Options["remarkPlugins"]> = [remarkGfm];
 
@@ -89,6 +91,7 @@ interface Props {
    * the document's own folder: `documentFileRoot`). Unset, no chips.
    */
   projectRoot?: string | null;
+  /** On the document's root: its measure and placement in the host. */
   className?: string;
 }
 export const MarkdownFile = memo(function MarkdownFile({
@@ -96,6 +99,7 @@ export const MarkdownFile = memo(function MarkdownFile({
   trusted = false,
   docPath,
   projectRoot,
+  className,
 }: Props) {
   // File paths become chips rooted at the document's project; relative links
   // resolve from the document's own folder. They are added after the
@@ -128,7 +132,10 @@ export const MarkdownFile = memo(function MarkdownFile({
       ref={host.ref}
       onClick={host.onClick}
       onKeyDown={host.onKeyDown}
-      className="text-md leading-relaxed text-[var(--foreground)] break-words select-text"
+      className={cn(
+        "text-md leading-relaxed text-[var(--foreground)] break-words select-text",
+        className,
+      )}
     >
       <ReactMarkdown
         remarkPlugins={REMARK_PLUGINS}
@@ -223,12 +230,14 @@ export const MarkdownFile = memo(function MarkdownFile({
 
           hr: () => <hr className="my-6 border-border-subtle" />,
 
+          // Columns keep a readable width and wrap above it; a table wider
+          // than the document scrolls in its own box (`markdown-table.ts`).
           table: (p) => (
             <div
               className="my-4 overflow-x-auto rounded-md border border-[var(--border)]"
               onWheel={handleWheel}
             >
-              <table className="min-w-max text-base">{p.children}</table>
+              <table className="text-base">{p.children}</table>
             </div>
           ),
 
@@ -238,16 +247,26 @@ export const MarkdownFile = memo(function MarkdownFile({
             <tr className="border-b border-border-subtle last:border-b-0">{p.children}</tr>
           ),
 
-          th: (p) => (
-            <th className="border-r border-[var(--border)] border-b border-[var(--border)] px-3 py-2 text-left text-sm font-semibold whitespace-nowrap text-[var(--secondary-foreground)] last:border-r-0">
-              {p.children}
-            </th>
+          // `{...p}` keeps a GFM column's alignment (`:--:`), which arrives
+          // as a `style`.
+          th: ({ node, ...p }) => (
+            <th
+              {...p}
+              className={cn(
+                "border-r border-[var(--border)] border-b border-[var(--border)] px-3 py-2 text-left text-sm font-semibold text-[var(--secondary-foreground)] last:border-r-0",
+                readableCellClass(node),
+              )}
+            />
           ),
 
-          td: (p) => (
-            <td className="border-r border-border-subtle px-3 py-2 align-top whitespace-nowrap text-base text-[var(--foreground)] last:border-r-0">
-              {p.children}
-            </td>
+          td: ({ node, ...p }) => (
+            <td
+              {...p}
+              className={cn(
+                "border-r border-border-subtle px-3 py-2 align-top text-base text-[var(--foreground)] last:border-r-0",
+                readableCellClass(node),
+              )}
+            />
           ),
 
           ...(trusted && {

@@ -110,3 +110,44 @@ describe("markdown preview raw HTML", () => {
     expect(container.querySelector("details summary")?.textContent).toBe("More");
   });
 });
+
+describe("markdown preview tables", () => {
+  const TABLE = [
+    "| # | Setting | What it does |",
+    "| -: | :-: | --- |",
+    "| 1 | `wordWrap` | Wraps long lines in the editor and the diff viewer instead of scrolling them sideways. |",
+  ].join("\n");
+
+  for (const trusted of [true, false]) {
+    it(`keeps prose columns readable and lets them wrap (${trusted ? "trusted" : "untrusted"})`, () => {
+      const { container } = render(
+        <MarkdownFile trusted={trusted} docPath={DOC}>
+          {TABLE}
+        </MarkdownFile>,
+      );
+      const cells = [...container.querySelectorAll("th, td")];
+      const floored = cells.map((c) => c.classList.contains("min-w-[24ch]"));
+
+      // Only the prose cell holds its column to a readable measure.
+      expect(floored).toEqual([false, false, false, false, false, true]);
+      // Nothing is held to one line, and the table is not sized to its
+      // max-content width: a long cell wraps.
+      for (const el of [container.querySelector("table")!, ...cells]) {
+        expect(el.className).not.toMatch(/whitespace-nowrap|min-w-max|w-max/);
+      }
+      // A table wider than the document scrolls in its own box.
+      expect(container.querySelector("table")!.parentElement!.className).toContain(
+        "overflow-x-auto",
+      );
+      // GFM column alignment survives.
+      expect((cells[3] as HTMLElement).style.textAlign).toBe("right");
+      expect((cells[1] as HTMLElement).style.textAlign).toBe("center");
+    });
+  }
+
+  it("puts the host's class on the document's root", () => {
+    const { container } = render(<MarkdownFile className="mx-auto max-w-4xl">{"Hi"}</MarkdownFile>);
+
+    expect(container.firstElementChild!.className).toContain("max-w-4xl");
+  });
+});
