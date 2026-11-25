@@ -196,34 +196,6 @@ const ROWS: Row[] = [
     retry: refuse("mode-unrestored"),
   },
   {
-    name: "live elsewhere",
-    state: sendStateOf(BOUND, { heldElsewhere: true }),
-    composer: "blocked",
-    direct: queue("live-elsewhere"),
-    recorded: { do: "keep-held", why: "live-elsewhere" },
-    stop: cancel,
-    // Kept as found: a retry does not check live-elsewhere.
-    retry,
-  },
-  {
-    name: "live elsewhere, mid-turn",
-    state: sendStateOf({ ...BOUND, status: "running" }, { heldElsewhere: true }),
-    composer: "enqueue",
-    direct: queue("live-elsewhere"),
-    recorded: { do: "keep-held", why: "live-elsewhere" },
-    stop: cancel,
-    retry: refuse("turn-running"),
-  },
-  {
-    name: "live elsewhere and a mode unrestored: the mode is met first",
-    state: sendStateOf({ ...BOUND, unrestoredModeId: "plan" }, { heldElsewhere: true }),
-    composer: "blocked",
-    direct: queue("mode-unrestored"),
-    recorded: queue("mode-unrestored"),
-    stop: cancel,
-    retry: refuse("mode-unrestored"),
-  },
-  {
     name: "no AI grant",
     state: sendStateOf(BOUND, { grantHold: true }),
     composer: "blocked",
@@ -306,8 +278,7 @@ function composerPlan(row: Row): Row["composer"] {
     running: composerRunning(row),
     remoteDriving: gates.remoteDriving,
     modeUnrestored: gates.modeUnrestored,
-    heldForTerminal: gates.heldForTerminal,
-    supportsFork: false,
+    atlasCommands: { fork: null, queue: "queue" },
   });
   if (kind !== "send" && kind !== "blocked" && kind !== "enqueue") {
     throw new Error(`plain text never plans "${kind}"`);
@@ -363,7 +334,7 @@ describe("the composer and the send handler read one gate", () => {
       case "send":
         return d.do === "dispatch" || waitsForBind;
       case "blocked":
-        return d.do === "keep-held" || (d.do === "queue" && !waitsForBind);
+        return d.do === "queue" && !waitsForBind;
       case "enqueue":
         return d.do === "queue";
     }
@@ -378,10 +349,9 @@ describe("the composer and the send handler read one gate", () => {
     for (const row of ROWS.filter((r) => r.composer === "blocked" && !r.differs)) {
       const gates = composerGates(row.state, composerRunning(row));
       const d = settled(row);
-      const why = d.do === "queue" || d.do === "keep-held" ? d.why : null;
+      const why = d.do === "queue" ? d.why : null;
       expect({
         "mode-unrestored": gates.modeUnrestored,
-        "live-elsewhere": gates.heldForTerminal,
         "no-grant": gates.blockedByGrant,
       }).toHaveProperty([why ?? ""], true);
     }
@@ -404,11 +374,10 @@ describe("the gate", () => {
     });
   });
 
-  it("closes the drain for a resume, an unrestored mode and a session live elsewhere", () => {
+  it("closes the drain for a resume and an unrestored mode", () => {
     for (const state of [
       sendStateOf({ ...BOUND, resumePending: true }),
       sendStateOf({ ...BOUND, unrestoredModeId: "plan" }),
-      sendStateOf(BOUND, { heldElsewhere: true }),
     ]) {
       expect(sendGate(state)).toMatchObject({ closed: true, holdsQueue: true });
     }

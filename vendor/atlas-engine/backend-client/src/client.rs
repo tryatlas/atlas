@@ -1044,7 +1044,7 @@ mod tests {
         let atlas_engine_client = test_client("https://example.test", PathStyle::AtlasEngineApi);
         assert_eq!(
             atlas_engine_client.send_add_credits_nudge_email_url(),
-            "https://example.test/api/codex/accounts/send_add_credits_nudge_email"
+            "https://example.test/api/atlas-agent/accounts/send_add_credits_nudge_email"
         );
 
         let chatgpt_client = test_client("https://chatgpt.com/backend-api", PathStyle::ChatGptApi);
@@ -1074,7 +1074,7 @@ mod tests {
         let atlas_engine_client = test_client("https://example.test", PathStyle::AtlasEngineApi);
         assert_eq!(
             atlas_engine_client.token_usage_profile_url(),
-            "https://example.test/api/codex/profiles/me"
+            "https://example.test/api/atlas-agent/profiles/me"
         );
 
         let chatgpt_client = test_client("https://chatgpt.com/backend-api", PathStyle::ChatGptApi);
@@ -1089,7 +1089,7 @@ mod tests {
         let atlas_engine_client = test_client("https://example.test", PathStyle::AtlasEngineApi);
         assert_eq!(
             atlas_engine_client.workspace_messages_url(),
-            "https://example.test/api/codex/workspace-messages"
+            "https://example.test/api/atlas-agent/workspace-messages"
         );
 
         let chatgpt_client = test_client("https://chatgpt.com/backend-api", PathStyle::ChatGptApi);

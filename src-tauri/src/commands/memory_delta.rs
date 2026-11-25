@@ -626,14 +626,12 @@ mod tests {
             .expect("the job after the panic ran");
     }
 
-    // ── Known gaps ──────────────────────────────────────────────────────────
+    // ── Credentials as transcripts carry them ───────────────────────────────
     //
     // The two redaction cases above are the shapes `looks_secret` was written
-    // for, so they pass by construction. These are credentials as they actually turn
-    // up in agent transcripts. The ignored ones reach the shared log today
-    // (ATL-1013). They are ignored rather than deleted so the gap stays
-    // recorded and executable: `cargo test -p atlas memory_delta -- --ignored`
-    // shows what is still missed.
+    // for, so they pass by construction. These are credentials as they actually
+    // turn up in agent transcripts (ATL-1013). Each was once a recorded gap;
+    // `atlas_redact`'s credential layer now covers all of them.
 
     /// Asserts `secret` does not survive redaction of `input`.
     fn assert_redacted(input: &str, secret: &str) {
@@ -644,12 +642,10 @@ mod tests {
     /// The separator is followed by a space, so the key and the value are two
     /// tokens and neither looks like an assignment on its own.
     #[test]
-    #[ignore = "known gap: atlas_memory::record::redact misses this; see redaction migration"]
     fn password_after_a_colon_and_space_is_redacted() {
         assert_redacted("password: hunter2hunter2", "hunter2hunter2");
     }
 
-    /// Recorded here as a gap once; redacted today, so it runs.
     #[test]
     fn password_in_a_postgres_dsn_is_redacted() {
         assert_redacted(
@@ -661,7 +657,6 @@ mod tests {
     /// `Bearer` alone is under the 12-character floor, and a JWT's dots fail
     /// the opaque-blob check.
     #[test]
-    #[ignore = "known gap: atlas_memory::record::redact misses this; see redaction migration"]
     fn bearer_token_in_an_authorization_header_is_redacted() {
         assert_redacted(
             "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJl",
@@ -670,7 +665,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known gap: atlas_memory::record::redact misses this; see redaction migration"]
     fn password_field_in_yaml_is_redacted() {
         assert_redacted(
             "database:\n  user: app\n  password: hunter2hunter2\n",
@@ -678,7 +672,6 @@ mod tests {
         );
     }
 
-    /// Recorded here as a gap once; redacted today, so it runs.
     #[test]
     fn password_field_in_json_is_redacted() {
         assert_redacted(

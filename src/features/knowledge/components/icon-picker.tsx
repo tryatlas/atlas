@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 import { useEffect, useMemo, useState } from "react";
 import { Input, Popover, PopoverContent } from "@tryatlas/design";
 import { cn } from "@/lib/utils";
@@ -178,7 +179,7 @@ export function IconPicker({ value, anchorRect, onPick, onClose }: IconPickerPro
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") {
+              if (e.key === "Enter" && !isComposingKey(e)) {
                 onPick(draft.trim() || null);
                 onClose();
               }

@@ -24,16 +24,14 @@
 //! }
 //! ```
 //!
-//! Writes are debounced 300 ms behind an `Arc<Mutex<...>>` so rapid edits
-//! coalesce into one disk hit. `atlas:knowledge:meta-changed` fires after
-//! every successful write so any view rendering icon/status/tag pills can
-//! refresh.
+//! Each mutation reads, updates and atomically commits under one writer lock.
+//! The command acknowledges only after persistence. Failed reads preserve the
+//! original file and can be retried after repair.
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use parking_lot::Mutex;
@@ -67,6 +65,8 @@ pub struct KnowledgeMetaFile {
     pub version: u32,
     #[serde(default)]
     pub pages: HashMap<String, PageMeta>,
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
 }
 
 fn default_version() -> u32 {
@@ -94,6 +94,8 @@ pub struct PageMeta {
     pub created_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
 }
 
 /// Patch input — every field is optional so callers can update one
@@ -138,22 +140,9 @@ impl PageMetaPatch {
     }
 }
 
-/// One pending write per project; the writer task wakes after the
-/// debounce window and flushes the latest snapshot.
-struct ProjectWriter {
-    snapshot: KnowledgeMetaFile,
-    /// When false → no scheduled flush is in flight. Set true while we
-    /// wait out the debounce window.
-    flush_scheduled: bool,
-    /// Tracks the most recent edit so a rapid sequence of patches keeps
-    /// extending the window instead of firing N times.
-    last_dirty_at: Instant,
-}
-
 #[derive(Default)]
 pub struct KnowledgeMetaState {
-    /// `<project_path> → in-memory snapshot + debounce flag`.
-    by_project: Mutex<HashMap<String, ProjectWriter>>,
+    write_lock: Mutex<()>,
 }
 
 impl KnowledgeMetaState {
@@ -168,165 +157,104 @@ fn meta_path(project_path: &str) -> PathBuf {
         .join("_meta.json")
 }
 
-fn load_from_disk(project_path: &str) -> KnowledgeMetaFile {
-    let path = meta_path(project_path);
-    if !path.exists() {
-        return KnowledgeMetaFile {
+fn load_from_disk(project_path: &str) -> Result<KnowledgeMetaFile, String> {
+    match fs::read_to_string(meta_path(project_path)) {
+        Ok(raw) => serde_json::from_str(&raw).map_err(|e| format!("read _meta.json: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(KnowledgeMetaFile {
             version: 1,
-            pages: HashMap::new(),
-        };
+            ..Default::default()
+        }),
+        Err(e) => Err(format!("read _meta.json: {e}")),
     }
-    let raw = match fs::read_to_string(&path) {
-        Ok(r) => r,
-        Err(_) => {
-            return KnowledgeMetaFile {
-                version: 1,
-                pages: HashMap::new(),
-            }
-        }
-    };
-    serde_json::from_str(&raw).unwrap_or(KnowledgeMetaFile {
-        version: 1,
-        pages: HashMap::new(),
-    })
 }
 
 fn write_to_disk(project_path: &str, file: &KnowledgeMetaFile) -> Result<(), String> {
     let body = serde_json::to_string_pretty(file).map_err(|e| e.to_string())?;
-    // Replaced whole, so a crash mid-write doesn't truncate the existing
-    // _meta.json.
     atlas_fs::replace_file(meta_path(project_path), body).map_err(|e| e.to_string())
 }
 
-const DEBOUNCE: Duration = Duration::from_millis(300);
-
-fn ensure_snapshot(state: &Arc<KnowledgeMetaState>, project_path: &str) {
-    let mut by_proj = state.by_project.lock();
-    if !by_proj.contains_key(project_path) {
-        let snapshot = load_from_disk(project_path);
-        by_proj.insert(
-            project_path.to_string(),
-            ProjectWriter {
-                snapshot,
-                flush_scheduled: false,
-                last_dirty_at: Instant::now(),
-            },
+fn update_file<T>(
+    state: &KnowledgeMetaState,
+    project_path: &str,
+    change: impl FnOnce(&mut KnowledgeMetaFile) -> T,
+) -> Result<T, String> {
+    let _guard = state.write_lock.lock();
+    let mut snapshot = load_from_disk(project_path)?;
+    if snapshot.version != 1 {
+        return Err(
+            "This version of _meta.json is read-only. Update Atlas before editing it.".into(),
         );
     }
+    let result = change(&mut snapshot);
+    write_to_disk(project_path, &snapshot)?;
+    Ok(result)
 }
 
-fn schedule_flush(state: Arc<KnowledgeMetaState>, app: AppHandle, project_path: String) {
-    {
-        let mut by_proj = state.by_project.lock();
-        let writer = match by_proj.get_mut(&project_path) {
-            Some(w) => w,
-            None => return,
-        };
-        writer.last_dirty_at = Instant::now();
-        if writer.flush_scheduled {
-            return;
-        }
-        writer.flush_scheduled = true;
-    }
-
-    tauri::async_runtime::spawn(async move {
-        loop {
-            tokio::time::sleep(DEBOUNCE).await;
-            let (snapshot, drained) = {
-                let mut by_proj = state.by_project.lock();
-                let Some(writer) = by_proj.get_mut(&project_path) else {
-                    return;
-                };
-                // Another patch arrived during the wait — loop again.
-                if writer.last_dirty_at.elapsed() < DEBOUNCE {
-                    continue;
-                }
-                writer.flush_scheduled = false;
-                (writer.snapshot.clone(), true)
-            };
-            if !drained {
-                return;
-            }
-            let path_clone = project_path.clone();
-            let write_result =
-                tokio::task::spawn_blocking(move || write_to_disk(&path_clone, &snapshot))
-                    .await
-                    .map_err(|e| e.to_string())
-                    .and_then(|r| r);
-            if write_result.is_ok() {
-                // Project-scoped event so multiple open projects don't
-                // cross-fire. Frontend's listener checks the payload.
-                let _ = app.emit(
-                    "atlas:knowledge:meta-changed",
-                    serde_json::json!({ "projectPath": project_path }),
-                );
-            }
-            return;
-        }
-    });
-}
-
-/* ── Commands ───────────────────────────────────────────────────── */
-
-#[tauri::command(async)]
-pub fn knowledge_meta_load(
+#[tauri::command]
+pub async fn knowledge_meta_load(
     project_path: String,
     state: State<'_, Arc<KnowledgeMetaState>>,
 ) -> Result<KnowledgeMetaFile, String> {
-    ensure_snapshot(state.inner(), &project_path);
-    let by_proj = state.by_project.lock();
-    Ok(by_proj
-        .get(&project_path)
-        .map(|w| w.snapshot.clone())
-        .unwrap_or_default())
+    let state = Arc::clone(state.inner());
+    tokio::task::spawn_blocking(move || {
+        let _guard = state.write_lock.lock();
+        load_from_disk(&project_path)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
-#[tauri::command(async)]
-pub fn knowledge_meta_patch(
+#[tauri::command]
+pub async fn knowledge_meta_patch(
     project_path: String,
     entry_id: String,
     patch: PageMetaPatch,
     state: State<'_, Arc<KnowledgeMetaState>>,
     app: AppHandle,
 ) -> Result<PageMeta, String> {
-    ensure_snapshot(state.inner(), &project_path);
-    let now = Utc::now().to_rfc3339();
-    let updated_meta = {
-        let mut by_proj = state.by_project.lock();
-        let writer = by_proj
-            .get_mut(&project_path)
-            .ok_or("project snapshot missing")?;
-        let entry = writer
-            .snapshot
-            .pages
-            .entry(entry_id)
-            .or_insert_with(PageMeta::default);
-        if entry.created_at.is_none() {
-            entry.created_at = Some(now.clone());
-        }
-        patch.apply(entry);
-        entry.updated_at = Some(now);
-        entry.clone()
-    };
-    schedule_flush(Arc::clone(state.inner()), app, project_path);
-    Ok(updated_meta)
+    let state = Arc::clone(state.inner());
+    let path = project_path.clone();
+    let updated = tokio::task::spawn_blocking(move || {
+        update_file(&state, &path, |file| {
+            let now = Utc::now().to_rfc3339();
+            let entry = file.pages.entry(entry_id).or_default();
+            if entry.created_at.is_none() {
+                entry.created_at = Some(now.clone());
+            }
+            patch.apply(entry);
+            entry.updated_at = Some(now);
+            entry.clone()
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let _ = app.emit(
+        "atlas:knowledge:meta-changed",
+        serde_json::json!({ "projectPath": project_path }),
+    );
+    Ok(updated)
 }
 
-#[tauri::command(async)]
-pub fn knowledge_meta_delete(
+#[tauri::command]
+pub async fn knowledge_meta_delete(
     project_path: String,
     entry_id: String,
     state: State<'_, Arc<KnowledgeMetaState>>,
     app: AppHandle,
 ) -> Result<(), String> {
-    ensure_snapshot(state.inner(), &project_path);
-    {
-        let mut by_proj = state.by_project.lock();
-        if let Some(writer) = by_proj.get_mut(&project_path) {
-            writer.snapshot.pages.remove(&entry_id);
-        }
-    }
-    schedule_flush(Arc::clone(state.inner()), app, project_path);
+    let state = Arc::clone(state.inner());
+    let path = project_path.clone();
+    tokio::task::spawn_blocking(move || {
+        update_file(&state, &path, |file| {
+            file.pages.remove(&entry_id);
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let _ = app.emit(
+        "atlas:knowledge:meta-changed",
+        serde_json::json!({ "projectPath": project_path }),
+    );
     Ok(())
 }
 
@@ -352,6 +280,7 @@ mod tests {
             owner,
             created_at,
             updated_at,
+            extra,
         } = got;
         assert_eq!(icon, want.icon, "icon");
         assert_eq!(cover, want.cover, "cover");
@@ -361,6 +290,7 @@ mod tests {
         assert_eq!(owner, want.owner, "owner");
         assert_eq!(created_at, want.created_at, "created_at");
         assert_eq!(updated_at, want.updated_at, "updated_at");
+        assert_eq!(extra, want.extra, "unknown fields");
     }
 
     /// A restart: what was written for a page is what the next launch reads,
@@ -377,6 +307,7 @@ mod tests {
             owner: Some("sayan".into()),
             created_at: Some("2026-05-25T10:00:00+00:00".into()),
             updated_at: Some("2026-05-26T11:30:00+00:00".into()),
+            ..Default::default()
         };
         let empty = PageMeta {
             icon: None,
@@ -387,6 +318,7 @@ mod tests {
             owner: None,
             created_at: None,
             updated_at: None,
+            ..Default::default()
         };
         let saved = KnowledgeMetaFile {
             version: 1,
@@ -394,10 +326,13 @@ mod tests {
                 ("full".to_string(), full.clone()),
                 ("empty".to_string(), empty.clone()),
             ]),
+            ..Default::default()
         };
 
         write_to_disk(&path, &saved).unwrap();
-        let KnowledgeMetaFile { version, mut pages } = load_from_disk(&path);
+        let KnowledgeMetaFile {
+            version, mut pages, ..
+        } = load_from_disk(&path).unwrap();
 
         assert_eq!(version, 1);
         assert_eq!(pages.len(), 2);
@@ -406,45 +341,34 @@ mod tests {
         assert!(!meta_path(&path).with_extension("json.tmp").exists());
     }
 
-    /// What the file tolerates today. No file, and a file that does not
-    /// parse, are both an empty version-1 file. A missing field is its
-    /// default and an unknown key is ignored. And a version this build does
-    /// not know is loaded as it stands: nothing reads `version` back.
     #[test]
-    fn a_missing_file_a_short_page_and_a_newer_version_load_as_they_do_today() {
+    fn invalid_files_survive_mutations_and_repair_is_seen_without_restart() {
         let (_dir, path) = project();
-        let missing = load_from_disk(&path);
-        assert_eq!((missing.version, missing.pages.len()), (1, 0));
-
+        let state = KnowledgeMetaState::new();
+        assert_eq!(load_from_disk(&path).unwrap().version, 1);
         let file = meta_path(&path);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
-        fs::write(&file, "{ not json").unwrap();
-        let corrupt = load_from_disk(&path);
-        assert_eq!((corrupt.version, corrupt.pages.len()), (1, 0));
-
+        for original in ["{ not json", r#"{"version":2,"pages":{"a":{}}}"#] {
+            fs::write(&file, original).unwrap();
+            assert!(update_file(&state, &path, |data| {
+                data.pages.clear();
+            })
+            .is_err());
+            assert_eq!(fs::read_to_string(&file).unwrap(), original);
+        }
         fs::write(
             &file,
-            r#"{ "pages": { "a": { "status": "Draft", "pinned": true } } }"#,
+            r#"{"pages":{"a":{"pinned":true},"b":{"title":"Retained"}},"future":42}"#,
         )
         .unwrap();
-        let mut short = load_from_disk(&path);
-        assert_eq!(short.version, 1);
-        assert_same_page(
-            short.pages.remove("a").unwrap(),
-            PageMeta {
-                icon: None,
-                cover: None,
-                title: None,
-                status: Some("Draft".into()),
-                tags: Vec::new(),
-                owner: None,
-                created_at: None,
-                updated_at: None,
-            },
-        );
-
-        fs::write(&file, r#"{ "version": 2, "pages": { "a": {} } }"#).unwrap();
-        let newer = load_from_disk(&path);
-        assert_eq!((newer.version, newer.pages.len()), (2, 1));
+        update_file(&state, &path, |data| {
+            data.pages.get_mut("a").unwrap().title = Some("Changed".into());
+        })
+        .unwrap();
+        let restored = load_from_disk(&path).unwrap();
+        assert_eq!(restored.pages["a"].title.as_deref(), Some("Changed"));
+        assert_eq!(restored.pages["a"].extra["pinned"], true);
+        assert_eq!(restored.pages["b"].title.as_deref(), Some("Retained"));
+        assert_eq!(restored.extra["future"], 42);
     }
 }

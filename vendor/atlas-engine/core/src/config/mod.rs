@@ -220,7 +220,6 @@ pub(crate) const HARD_MIN_MULTI_AGENT_V2_TIMEOUT_MS: i64 = 0;
 pub(crate) const HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS: i64 =
     DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS;
 pub(crate) const DEFAULT_AGENT_MAX_DEPTH: i32 = 1;
-const LOCAL_DEV_BUILD_VERSION: &str = "0.0.0";
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
 const CONFIG_PROFILE_V2_SUFFIX: &str = ".config.toml";
@@ -235,32 +234,6 @@ fn resolve_sqlite_home_env(resolved_cwd: &Path) -> Option<AbsolutePathBuf> {
         trimmed,
         resolved_cwd,
     ))
-}
-
-fn resolve_cli_auth_credentials_store_mode(
-    configured: AuthCredentialsStoreMode,
-    package_version: &str,
-) -> AuthCredentialsStoreMode {
-    match (package_version, configured) {
-        (
-            LOCAL_DEV_BUILD_VERSION,
-            AuthCredentialsStoreMode::Keyring | AuthCredentialsStoreMode::Auto,
-        ) => AuthCredentialsStoreMode::File,
-        (_, mode) => mode,
-    }
-}
-
-fn resolve_mcp_oauth_credentials_store_mode(
-    configured: OAuthCredentialsStoreMode,
-    package_version: &str,
-) -> OAuthCredentialsStoreMode {
-    match (package_version, configured) {
-        (
-            LOCAL_DEV_BUILD_VERSION,
-            OAuthCredentialsStoreMode::Keyring | OAuthCredentialsStoreMode::Auto,
-        ) => OAuthCredentialsStoreMode::File,
-        (_, mode) => mode,
-    }
 }
 
 #[cfg(test)]
@@ -4016,18 +3989,12 @@ impl Config {
             include_environment_context,
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
             // is important in code to differentiate the mode from the store implementation.
-            cli_auth_credentials_store_mode: resolve_cli_auth_credentials_store_mode(
-                cfg.cli_auth_credentials_store.unwrap_or_default(),
-                env!("CARGO_PKG_VERSION"),
-            ),
+            cli_auth_credentials_store_mode: cfg.cli_auth_credentials_store.unwrap_or_default(),
             mcp_servers,
             non_prefixed_mcp_tool_servers,
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
             // is important in code to differentiate the mode from the store implementation.
-            mcp_oauth_credentials_store_mode: resolve_mcp_oauth_credentials_store_mode(
-                cfg.mcp_oauth_credentials_store.unwrap_or_default(),
-                env!("CARGO_PKG_VERSION"),
-            ),
+            mcp_oauth_credentials_store_mode: cfg.mcp_oauth_credentials_store.unwrap_or_default(),
             mcp_oauth_callback_port: cfg.mcp_oauth_callback_port,
             mcp_oauth_callback_url: cfg.mcp_oauth_callback_url.clone(),
             model_providers,

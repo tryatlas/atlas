@@ -8,7 +8,6 @@ mod commands;
 mod fs_events;
 mod keep_awake;
 mod logging;
-#[cfg(target_os = "macos")]
 mod menu;
 mod nav_guard;
 mod notifier;
@@ -77,12 +76,16 @@ pub fn run_bridge_if_asked() -> bool {
         }
     };
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    if let Err(e) = runtime.block_on(commands::memory_bridge::bridge(
-        &url,
-        &token,
-        stdin,
-        tokio::io::stdout(),
-    )) {
+    // Until stdin ends or the session does: its token file goes with it.
+    let result = runtime.block_on(commands::tool_servers::bridge_until_session_ends(
+        commands::memory_bridge::bridge(&url, &token, stdin, tokio::io::stdout()),
+        std::path::Path::new(&token_file),
+        commands::tool_servers::BRIDGE_REAP_INTERVAL,
+    ));
+    // Not a plain drop: tokio's stdin read sits on a blocking thread the
+    // drop would wait on, forever, when the bridge ended with stdin open.
+    runtime.shutdown_background();
+    if let Err(e) = result {
         eprintln!("mcp-bridge: {e:#}");
         std::process::exit(1);
     }
@@ -146,12 +149,6 @@ pub fn run() {
         applied.log();
     }
 
-    // Load a `.env` from the current dir (if any) so source / fork builds can
-    // point telemetry at their own PostHog OSS project via POSTHOG_KEY /
-    // POSTHOG_HOST without a rebuild. No-op when absent. Must run before the
-    // telemetry client resolves its key in `setup()`.
-    let _ = dotenvy::dotenv();
-
     // Strip CLAUDECODE so child ACP agents (canonical claude-code-acp) don't
     // refuse to start when Atlas was launched from a parent Claude Code shell.
     atlas_agent_servers::sanitize_host_env();
@@ -174,7 +171,7 @@ pub fn run() {
     // "second instance", forwards its (empty) argv, and exits. Skipping it in
     // debug lets dev and the installed app coexist.
     #[cfg(not(debug_assertions))]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
         use tauri::Emitter;
         tracing::info!(target: "atlas::cli", "second-instance argv: {argv:?}");
         if let Some(window) = app.get_webview_window("main") {
@@ -183,7 +180,9 @@ pub fn run() {
         }
         // argv[0] is the executable path — strip it before parsing.
         let positional = argv.get(1..).unwrap_or(&[]);
-        if let Some(path) = commands::cli::parse_project_path(positional) {
+        if let Some(path) =
+            commands::cli::parse_project_path_from(positional, std::path::Path::new(&cwd))
+        {
             let _ = app.emit("atlas:cli-open-project", path);
         }
     }));
@@ -191,13 +190,13 @@ pub fn run() {
     // The app menu bar, built from `menu.json`; every custom item hands its
     // id to the renderer, which runs it. See `menu.rs`.
     //
-    // macOS only. Elsewhere a native menu is a Win32/GTK bar drawn inside the
-    // window under Atlas's own titlebar, so the frontend draws the same model
-    // in that titlebar instead (`src/features/menu/`).
-    #[cfg(target_os = "macos")]
+    // The hidden Win32/GTK menu retains accelerators for embedded browser
+    // focus; the frontend draws its visible menu from the same model.
     let builder = builder.menu(menu::build).on_menu_event(|app, event| {
         let id = event.id().as_ref();
-        if menu::is_custom(app, id) {
+        if id == menu::QUIT_MENU_ID {
+            commands::quit_guard::request_quit(app);
+        } else if menu::is_custom(app, id) {
             use tauri::Emitter;
             let _ = app.emit(menu::MENU_EVENT, id);
         }
@@ -255,6 +254,8 @@ pub fn run() {
                 // tao leaves `trafficLightPosition` unapplied until the first
                 // resize; see the function.
                 commands::window::apply_traffic_light_inset(&window);
+                #[cfg(not(target_os = "macos"))]
+                let _ = window.hide_menu();
             }
             // Arrow keys the webview leaves unhandled are not typed into the
             // focused field; see the module.
@@ -302,9 +303,8 @@ pub fn run() {
                     telemetry::run_flush_loop(tclient, rx).await;
                 });
             }
-            // Crash capture: best-effort synchronous POST from the panic hook
-            // (a panicking process may not live to run the async flush task, so
-            // it can't be relied on). Chains to the previously-installed hook. `location` is
+            // Panic metadata enters the bounded background queue without
+            // delaying unwinding. Chains to the prior hook. `location` is
             // Atlas's own `file:line`; `message` is redacted of path/URL tokens.
             {
                 let tclient = telemetry.clone();
@@ -324,7 +324,7 @@ pub fn run() {
                                 .map(std::string::String::as_str)
                         })
                         .unwrap_or("panic");
-                    tclient.capture_panic_blocking(serde_json::json!({
+                    tclient.capture_panic(serde_json::json!({
                         "location": location,
                         "message": telemetry::redact_message(msg, 160),
                     }));
@@ -463,6 +463,7 @@ pub fn run() {
         .manage(TerminalState::new())
         .manage(commands::modelchat::ModelChatState::new())
         .manage(FileIndexState::new())
+        .manage(commands::media::MediaState::default())
         .manage(GitWatcherState::new())
         .manage(commands::instruction_sync::InstructionSyncState::new())
         .manage(commands::git_autofetch::GitAutoFetchState::new())
@@ -486,6 +487,9 @@ pub fn run() {
                 tauri::WindowEvent::Destroyed => {
                     let label = window.label();
                     window.state::<FileIndexState>().drop_window(label);
+                    window
+                        .state::<commands::media::MediaState>()
+                        .drop_window(label);
                     window.state::<MentionCacheState>().drop_window(label);
                     window
                         .state::<commands::git_autofetch::GitAutoFetchState>()
@@ -496,11 +500,9 @@ pub fn run() {
                 }
                 // Closing the main window ends Atlas, so it asks the same
                 // question a quit does (`confirmQuitWhileRunning`).
-                tauri::WindowEvent::CloseRequested { api, .. }
-                    if window.label() == "main"
-                        && commands::quit_guard::hold_quit(window.app_handle()) =>
-                {
+                tauri::WindowEvent::CloseRequested { api, .. } if window.label() == "main" => {
                     api.prevent_close();
+                    commands::quit_guard::request_quit(window.app_handle());
                 }
                 // Coming back to Atlas is when a stale Pull badge misleads.
                 tauri::WindowEvent::Focused(true) => {
@@ -574,6 +576,11 @@ pub fn run() {
             commands::spaces::spaces_cycle,
             commands::spaces::spaces_send_control,
             commands::spaces::spaces_send_binary,
+            commands::spaces::spaces_outbox_enqueue,
+            commands::spaces::spaces_outbox_load,
+            commands::spaces::spaces_outbox_acknowledge,
+            commands::spaces::spaces_outbox_save_snapshot,
+            commands::spaces::spaces_outbox_snapshot,
             commands::spaces::spaces_summary,
             commands::spaces::spaces_media_upload,
             commands::spaces::spaces_media_fetch,
@@ -592,6 +599,7 @@ pub fn run() {
             commands::clipboard::clipboard_file_paths,
             commands::clipboard::clipboard_paste_paths,
             commands::clipboard::clipboard_write_text,
+            commands::clipboard::clipboard_read_text,
             commands::clipboard::scratch_write_bytes,
             commands::fonts::list_font_families,
             commands::window::set_window_title,
@@ -618,6 +626,9 @@ pub fn run() {
             commands::fs::is_text_file,
             commands::fs::file_mtime_ms,
             commands::fs::asset_allow_dir,
+            commands::fs::asset_allow_file,
+            commands::media::media_open,
+            commands::media::media_close,
             commands::fs::write_file_content,
             commands::fs::write_file_base64,
             commands::fs::ensure_atlas_gitignore,
@@ -916,6 +927,8 @@ pub fn run() {
             commands::catalog::agents_catalog_refresh,
             commands::agent_config::agents_configure,
             commands::agent_config::agents_open_config_file,
+            commands::agent_config::agents_restart_to_apply,
+            commands::agent_config::agents_set_auth_env,
             commands::agents::agents_list_running,
             commands::agents::agents_spawn,
             commands::agents::agents_kill,
@@ -961,6 +974,7 @@ pub fn run() {
             commands::agents::agents_queue_clear,
             commands::agents::agents_queue_pause,
             commands::agents::agents_queue_drain,
+            commands::agents::agents_queue_resume,
             commands::agents::agents_queue_send_now,
             commands::agents::agents_set_hold,
             commands::agents::agents_set_mode,
@@ -979,6 +993,7 @@ pub fn run() {
             commands::agents::agents_rewind_last_turn,
             commands::agents::agents_run_auth_method,
             commands::agents::agents_authenticate,
+            commands::agents::agents_cancel_authentication,
             commands::agents::agents_drop_session,
             commands::byok::byok_env_list,
             commands::byok::byok_env_entries,
@@ -1100,10 +1115,13 @@ pub fn run() {
                 tauri::RunEvent::ExitRequested { code, api, .. } => {
                     // A user quit (no code) with an agent mid-turn asks first;
                     // the frontend answers through `quit_guard_answer`.
-                    if code.is_none() && commands::quit_guard::hold_quit(app_handle) {
+                    if commands::quit_guard::hold_exit(app_handle, code) {
                         api.prevent_exit();
                         return;
                     }
+                    // `save_app_state` writes on a detached thread; wait
+                    // (bounded) for the last one so the exit cannot cut it.
+                    commands::app_state::flush_app_state_saves();
                     // Quit sweep (M7): stop native turns (cancel tokens kill
                     // tool process groups) and tear down every ACP subprocess
                     // (dropping each driver's shutdown channel closes the

@@ -47,6 +47,9 @@ pub(super) async fn download_to(
 ) -> Result<(), String> {
     // One pooled client shared by every connection.
     let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(15 * 60))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
 
@@ -82,6 +85,7 @@ async fn probe_size(client: &reqwest::Client, uri: &str) -> (u64, bool) {
     let resp = client
         .get(uri)
         .header(reqwest::header::RANGE, "bytes=0-0")
+        .timeout(Duration::from_secs(30))
         .send()
         .await;
     let Ok(resp) = resp else { return (0, false) };

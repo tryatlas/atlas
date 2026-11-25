@@ -435,6 +435,7 @@ async fn repo_ancestry_stops_at_project_root_and_preserves_root_to_cwd_order() {
         vec![
             repository.join(".agents/skills"),
             repository.join("nested/.agents/skills"),
+            nested.join(".agents/skills"),
         ]
     );
 }
@@ -527,11 +528,16 @@ async fn repo_ancestry_limits_concurrent_probes_and_preserves_order() {
     }
     fs::create_dir_all(&cwd).expect("create nested cwd");
 
-    let expected_roots = [0, CONCURRENCY_LIMIT / 2, CONCURRENCY_LIMIT].map(|index| {
+    for index in [0, CONCURRENCY_LIMIT / 2, CONCURRENCY_LIMIT] {
         let path = directories[index].join(".agents/skills");
         fs::create_dir_all(&path).expect("create repo skill root");
-        path
-    });
+    }
+    // Missing roots remain watchable, so creating the first skill in any
+    // ancestor is discovered without restarting the session.
+    let expected_roots = directories
+        .iter()
+        .map(|directory| directory.join(".agents/skills"))
+        .collect::<Vec<_>>();
     let expected_probes = directories
         .iter()
         .map(|directory| PathUri::from_abs_path(&directory.join(".agents/skills")))
@@ -653,7 +659,12 @@ async fn resolved_config_and_repo_roots_preserve_order_and_dedupe_paths_not_name
         vec![user_skills],
     )
     .await;
-    assert_eq!(roots.len(), 8);
+    assert_eq!(roots.len(), 9);
+    assert!(
+        roots
+            .iter()
+            .any(|root| root.path == cwd.join(".agents/skills"))
+    );
     let outcome = load_and_merge_host_skill_roots(
         roots,
         &Semaphore::new(MAX_CONCURRENT_ROOT_SCANS),

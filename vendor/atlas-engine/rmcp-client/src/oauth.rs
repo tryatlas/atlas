@@ -52,6 +52,7 @@ use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -707,28 +708,34 @@ impl OAuthPersistor {
                     expires_at,
                 };
                 if last_credentials.as_ref() != Some(&stored) {
-                    self.inner.credential_store.save(
-                        &DefaultKeyringStore,
-                        &self.inner.server_name,
-                        &stored,
-                    )?;
+                    let inner = Arc::clone(&self.inner);
+                    let to_save = stored.clone();
+                    tokio::task::spawn_blocking(move || {
+                        inner.credential_store.save(
+                            &DefaultKeyringStore,
+                            &inner.server_name,
+                            &to_save,
+                        )
+                    })
+                    .await
+                    .context("OAuth credential persistence task failed")??;
                     *last_credentials = Some(stored);
                 }
             }
             None => {
                 let mut last_credentials = self.inner.last_credentials.lock().await;
-                if last_credentials.take().is_some()
-                    && let Err(error) = self.inner.credential_store.delete(
-                        &DefaultKeyringStore,
-                        &self.inner.server_name,
-                        &self.inner.url,
-                    )
-                {
-                    warn!(
-                        server_name = %self.inner.server_name,
-                        error = %error,
-                        "failed to remove MCP OAuth credentials from the resolved store"
-                    );
+                if last_credentials.is_some() {
+                    let inner = Arc::clone(&self.inner);
+                    tokio::task::spawn_blocking(move || {
+                        inner.credential_store.delete(
+                            &DefaultKeyringStore,
+                            &inner.server_name,
+                            &inner.url,
+                        )
+                    })
+                    .await
+                    .context("OAuth credential deletion task failed")??;
+                    *last_credentials = None;
                 }
             }
         }
@@ -1000,15 +1007,21 @@ fn write_fallback_file(store: &FallbackFile) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let serialized = serde_json::to_string(store)?;
-    fs::write(&path, serialized)?;
-
+    let parent = path.parent().context("credentials file has no parent")?;
+    let mut replacement = tempfile::NamedTempFile::new_in(parent)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&path, perms)?;
+        replacement
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
     }
+    serde_json::to_writer(&mut replacement, store)?;
+    replacement.flush()?;
+    replacement.as_file().sync_all()?;
+    replacement.persist(&path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    fs::File::open(parent)?.sync_all()?;
 
     Ok(())
 }
@@ -1037,6 +1050,37 @@ mod tests {
     mod persistor_tests;
 
     use super::test_support::TempAtlasAgentHome;
+
+    #[test]
+    fn fallback_token_updates_replace_the_file_and_keep_credentials_private() -> Result<()> {
+        let _env = TempAtlasAgentHome::new();
+        let mut tokens = sample_tokens();
+        save_oauth_tokens_to_file(&tokens)?;
+        let path = fallback_file_path()?;
+        let original = fs::File::open(&path)?;
+        let original_bytes = fs::read(&path)?;
+        tokens
+            .token_response
+            .0
+            .set_access_token(AccessToken::new("refreshed-access-token".into()));
+        save_oauth_tokens_to_file(&tokens)?;
+        let mut old_reader = original;
+        let mut old_bytes = Vec::new();
+        std::io::Read::read_to_end(&mut old_reader, &mut old_bytes)?;
+        assert_eq!(
+            old_bytes, original_bytes,
+            "readers of the previous file must never see a torn update"
+        );
+        let replacement = fs::read_to_string(&path)?;
+        assert!(replacement.contains("refreshed-access-token"));
+        serde_json::from_str::<FallbackFile>(&replacement)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        }
+        Ok(())
+    }
 
     #[test]
     fn stored_oauth_credentials_ignore_derived_expiration_and_track_token_changes() -> Result<()> {

@@ -471,6 +471,7 @@ fn hook_migration_ignores_unsupported_handlers() {
         &mut migration,
         Some(Path::new("/repo/.atlas-agent")),
         TEST_REWRITE_PROFILE,
+        Path::new("/repo/.claude"),
     );
 
     assert_eq!(
@@ -755,6 +756,43 @@ fn hook_script_copy_keeps_existing_target_scripts() {
 }
 
 #[test]
+fn imported_hooks_preserve_scripts_from_other_scopes() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("project/.claude");
+    let target = root.path().join("project/.atlas-agent/hooks.json");
+    let foreign = root.path().join("other/.claude/hooks/foreign.sh");
+    std::fs::create_dir_all(source.join("hooks")).unwrap();
+    std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+    std::fs::write(source.join("hooks/local.sh"), "local").unwrap();
+    std::fs::write(&foreign, "foreign").unwrap();
+    let local_command = format!("sh {}/hooks/local.sh", source.display());
+    let foreign_command = format!("sh {}", foreign.display());
+    std::fs::write(
+        source.join("settings.json"),
+        serde_json::to_vec(&serde_json::json!({"hooks": {"SessionStart": [{"hooks": [
+            {"type": "command", "command": local_command},
+            {"type": "command", "command": foreign_command}
+        ]}]}}))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(super::hooks_cla::import_hooks_cla(&source, &target, TEST_REWRITE_PROFILE).unwrap());
+    let migrated: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+    assert_eq!(
+        migrated["hooks"]["SessionStart"][0]["hooks"][1]["command"],
+        foreign_command
+    );
+    assert!(
+        migrated["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains(".atlas-agent/hooks/local.sh")
+    );
+    assert!(target.parent().unwrap().join("hooks/local.sh").is_file());
+}
+
+#[test]
 fn hook_migration_drops_negative_timeouts() {
     let settings = serde_json::json!({
         "hooks": {
@@ -774,6 +812,7 @@ fn hook_migration_drops_negative_timeouts() {
         &mut migration,
         /*target_config_dir*/ None,
         TEST_REWRITE_PROFILE,
+        Path::new("/repo/.claude"),
     );
 
     assert_eq!(

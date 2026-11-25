@@ -76,8 +76,13 @@ export interface AtlasWindowEvents {
    *  transcript moves. */
   "atlas:chat-jump": ChatJumpDetail;
   "atlas:chat-focus": ForTab;
-  /** A composer took the focus: its tab binds an agent if it has none. */
+  /** A composer took the focus. Retries a saved conversation's load that
+   *  could not start; it starts no new session, since a composer takes the
+   *  focus on its own whenever its tab is shown. */
   "atlas:chat-input-focused": ForTab;
+  /** The user is writing in a composer whose tab has no agent session yet:
+   *  the tab starts one. */
+  "atlas:chat-input-started": ForTab;
   /** Replace a composer's draft. Without `tabId` every mounted one does. */
   "atlas:chat-prefill": { text: string; tabId?: string };
   /** Write into a composer's draft, keeping what is there. */

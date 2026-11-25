@@ -36,6 +36,10 @@ const CHOKEPOINT: &str = "crates/atlas-git/src/exec.rs";
 /// characters, checked).
 const ALLOWED: &[(&str, &str)] = &[
     (
+        "crates/atlas-agent-servers/src/test_support/scenarios.rs",
+        "a scripted fake agent's tool-call input JSON names git as argv data; nothing is spawned",
+    ),
+    (
         "src-tauri/src/commands/pull_requests/checkout.rs",
         "names the default program it hands to GitCommand::program, whose other value is a test's script",
     ),

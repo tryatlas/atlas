@@ -421,7 +421,7 @@ fn query_matches(query_constraints: &[QueryConstraint], req: &Request) -> bool {
 
     query_constraints.iter().all(|constraint| {
         actual_values.get(&constraint.name).is_some_and(|actual| {
-            actual.iter().any(|candidate| {
+            actual.iter().all(|candidate| {
                 constraint
                     .allowed_values
                     .iter()
@@ -441,7 +441,7 @@ fn headers_match(header_constraints: &[HeaderConstraint], req: &Request) -> bool
             return true;
         }
 
-        actual.iter().any(|value| {
+        actual.iter().all(|value| {
             value.to_str().ok().is_some_and(|candidate| {
                 constraint
                     .allowed_values
@@ -848,6 +848,40 @@ mod tests {
                 actions: hooks.get("api.github.com").unwrap()[0].actions.clone(),
             }
         );
+    }
+
+    #[test]
+    fn evaluate_refuses_ambiguous_duplicate_credentials_constraints() {
+        let mut config = base_config();
+        let mut hook = github_hook();
+        hook.matcher.query = BTreeMap::from([("state".to_string(), vec!["open".to_string()])]);
+        hook.matcher.headers =
+            BTreeMap::from([("x-scope".to_string(), vec!["public".to_string()])]);
+        config.mitm_hooks = vec![hook];
+        let hooks = compile_mitm_hooks_with_resolvers(
+            &config,
+            |_| Some("secret".to_string()),
+            |_| Err(anyhow!("unexpected file lookup")),
+        )
+        .unwrap();
+        for (query, headers) in [
+            ("state=open&state=private", vec!["public"]),
+            ("state=private&state=open", vec!["public"]),
+            ("state=open", vec!["public", "private"]),
+            ("state=open", vec!["private", "public"]),
+        ] {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/repos/openai/atlas-agent/issues?{query}"));
+            for value in headers {
+                request = request.header("x-scope", value);
+            }
+            let request = request.body(Body::empty()).unwrap();
+            assert_eq!(
+                evaluate_mitm_hooks(&hooks, "api.github.com", &request),
+                HookEvaluation::HookedHostNoMatch
+            );
+        }
     }
 
     #[test]

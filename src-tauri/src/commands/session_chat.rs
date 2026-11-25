@@ -565,15 +565,49 @@ fn exact_hits(
 /// One file's diff in one commit. `None` when git cannot resolve it — a moved
 /// repository or a rewritten history, both of which are normal states here.
 fn git_show(root: &Path, sha: &str, path: &str) -> Option<String> {
-    run_git(root, &["show", "--format=", "--no-color", sha, "--", path])
+    let commit = resolve_commit(root, sha)?;
+    run_git(
+        root,
+        &[
+            "--literal-pathspecs",
+            "show",
+            "--format=",
+            "--no-color",
+            &commit,
+            "--",
+            path,
+        ],
+    )
 }
 
 fn git_show_commit(root: &Path, sha: &str) -> Option<String> {
-    run_git(root, &["show", "--stat", "--no-color", sha])
+    let commit = resolve_commit(root, sha)?;
+    run_git(root, &["show", "--stat", "--no-color", &commit, "--"])
+}
+
+fn resolve_commit(root: &Path, sha: &str) -> Option<String> {
+    // Shared timeline rows can come from another account or an older client.
+    // Preserve unique abbreviations while resolving only a local commit object.
+    if !(4..=64).contains(&sha.len()) || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    run_git(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{sha}^{{commit}}"),
+        ],
+    )
 }
 
 fn run_git(root: &Path, args: &[&str]) -> Option<String> {
-    let out = atlas_git::GitCommand::new(root, args).output().ok()?;
+    let out = atlas_git::GitCommand::new(root, args)
+        .read_only()
+        .timeout(std::time::Duration::from_secs(5))
+        .output()
+        .ok()?;
     if !out.success() {
         return None;
     }
@@ -752,6 +786,43 @@ fn clip(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_commit_reads_require_a_commit_id_and_match_literal_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            atlas_git::GitCommand::new(dir.path(), args)
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@atlas.invalid")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@atlas.invalid")
+                .run()
+                .unwrap()
+                .stdout
+                .trim()
+                .to_string()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.path().join("[id].txt"), "selected\n").unwrap();
+        std::fs::write(dir.path().join("i.txt"), "other\n").unwrap();
+        git(&["add", "--all"]);
+        git(&["commit", "-qm", "fixture"]);
+        let sha = git(&["rev-parse", "HEAD"]);
+        let diff = git_show(dir.path(), &sha[..7], "[id].txt").unwrap();
+        assert!(diff.contains("+selected"));
+        assert!(!diff.contains("+other"));
+        assert!(git_show_commit(dir.path(), &sha).is_some());
+        let blob = git(&["hash-object", "[id].txt"]);
+        for invalid in ["HEAD", "", "--stat", "1234567", &blob] {
+            assert!(git_show(dir.path(), invalid, "[id].txt").is_none());
+            assert!(git_show_commit(dir.path(), invalid).is_none());
+        }
+    }
 
     fn entry(id: &str, kind: EntryKind, text: &str, turn: i64) -> TimelineEntry {
         TimelineEntry {

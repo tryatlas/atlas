@@ -10,6 +10,44 @@ const CHILD_MODE_ENV_VAR: &str = "ATLAS_AGENT_SHELL_ENVIRONMENT_SCRUBBER_TEST_MO
 const TEST_NAME: &str =
     "shell_environment::tests::command_scrubber_removes_names_from_real_child_environment";
 
+#[cfg(target_os = "linux")]
+#[test]
+fn tool_policy_removes_appimage_runtime_paths_before_applying_explicit_overrides() {
+    let vars = [
+        ("APPDIR", "/tmp/.mount_atlas"),
+        (
+            "LD_LIBRARY_PATH",
+            "/tmp/.mount_atlas/usr/lib;/opt/host/lib:/usr/local/lib",
+        ),
+        (
+            "LD_PRELOAD",
+            "/tmp/.mount_atlas/usr/lib/bundle.so /opt/host/a.so:/opt/host/b.so",
+        ),
+        ("GTK_PATH", "/tmp/.mount_atlas/usr/lib/gtk"),
+        ("GTK_THEME", "Adwaita"),
+        ("ATLAS_HOST_GTK_THEME", "UserTheme"),
+    ]
+    .map(|(name, value)| (name.to_string(), value.to_string()));
+    let mut policy = ShellEnvironmentPolicy {
+        inherit: ShellEnvironmentPolicyInherit::All,
+        ..Default::default()
+    };
+    let env = create_env_from_vars(vars.clone(), &policy, None);
+    assert_eq!(env["LD_LIBRARY_PATH"], "/opt/host/lib:/usr/local/lib");
+    assert_eq!(env["LD_PRELOAD"], "/opt/host/a.so:/opt/host/b.so");
+    assert!(!env.contains_key("GTK_PATH"));
+    assert_eq!(env["GTK_THEME"], "UserTheme");
+    policy
+        .r#set
+        .insert("GTK_PATH".into(), "/explicit/tool/modules".into());
+    policy
+        .r#set
+        .insert("GTK_THEME".into(), "ExplicitTheme".into());
+    let env = create_env_from_vars(vars, &policy, None);
+    assert_eq!(env["GTK_PATH"], "/explicit/tool/modules");
+    assert_eq!(env["GTK_THEME"], "ExplicitTheme");
+}
+
 #[test]
 fn non_inheritable_environment_is_removed_after_policy_overrides() {
     let vars = [

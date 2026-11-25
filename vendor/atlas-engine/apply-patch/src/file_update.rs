@@ -57,9 +57,9 @@ pub(crate) async fn derive_new_contents_from_chunks(
             let replacements =
                 compute_replacements(&original_lines, &path_text, chunks, update_file_mode)?;
             let mut new_lines = apply_replacements(original_lines, &replacements);
-            if !new_lines.last().is_some_and(String::is_empty) {
-                new_lines.push(String::new());
-            }
+            // Every entry is a real line, including a blank final line. The
+            // terminal newline needs its own split sentinel in either case.
+            new_lines.push(String::new());
             new_lines.join("\n")
         }
         ApplyPatchFileUpdateMode::PreserveLineEndings => {
@@ -109,18 +109,10 @@ fn compute_replacements(
         }
 
         if chunk.old_lines.is_empty() {
-            // Preserve the legacy split representation's handling of a final
-            // empty line. `SourceFile` only exposes real source lines, so its
-            // insertion point is always after the final line.
-            let insertion_idx = match update_file_mode {
-                ApplyPatchFileUpdateMode::NormalizeToLf => {
-                    if original_lines.last().is_some_and(String::is_empty) {
-                        original_lines.len() - 1
-                    } else {
-                        original_lines.len()
-                    }
-                }
-                ApplyPatchFileUpdateMode::PreserveLineEndings => original_lines.len(),
+            let insertion_idx = if chunk.change_context.is_some() {
+                line_index
+            } else {
+                original_lines.len()
             };
             replacements.push((insertion_idx, 0, chunk.new_lines.clone()));
             continue;

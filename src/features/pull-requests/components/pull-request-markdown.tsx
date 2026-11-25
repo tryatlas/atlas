@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 // Markdown as a pull request writes it, and the editor for it. The renderer
 // is lazy (`pull-request-markdown-impl.tsx`); while its chunk loads the raw
 // text shows, so nothing jumps from blank to filled.
@@ -73,8 +74,8 @@ export function PullRequestMarkdownEditor({
     <div
       className={cn("space-y-2", className)}
       onKeyDown={(event) => {
-        if (event.nativeEvent.isComposing) return;
-        if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+        if (isComposingKey(event)) return;
+        if (event.key === "Enter" && !isComposingKey(event) && (event.metaKey || event.ctrlKey)) {
           event.preventDefault();
           event.stopPropagation();
           if (!saveDisabled && !event.repeat) onSave(draft);

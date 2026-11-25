@@ -23,6 +23,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 const VIEWPORT = { width: 1200, height: 900 };
 beforeEach(() => {
+  vi.spyOn(useUsageStore.getState().actions, "refresh").mockResolvedValue(undefined);
   vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
     () =>
       ({
@@ -69,8 +70,8 @@ afterEach(() => {
 });
 
 function seed(data = fixture(40)) {
-  // `fetchedAt` now + a matching signature makes the mount-time refresh a no-op.
-  useUsageStore.setState({ data, fetchedAt: Date.now(), projectSig: "" } as never);
+  // Fetch ownership is covered by the store suite; these tests exercise rendering.
+  useUsageStore.setState({ data, fetchedAt: Date.now() });
   return data;
 }
 

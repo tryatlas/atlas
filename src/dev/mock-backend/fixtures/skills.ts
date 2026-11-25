@@ -1376,6 +1376,8 @@ export interface SkillsResponses {
   agents_catalog_refresh: AgentCatalog;
   agents_configure: AgentCatalogEntry;
   agents_open_config_file: string;
+  agents_restart_to_apply: Unit;
+  agents_set_auth_env: Unit;
 }
 
 export const skillsHandlers: TypedHandlers<SkillsResponses> = {
@@ -1756,4 +1758,29 @@ export const skillsHandlers: TypedHandlers<SkillsResponses> = {
   },
   /** The real command creates the file; the mock only expands `~`. */
   agents_open_config_file: ({ path }): string => String(path).replace(/^~(?=\/|$)/, "/Users/dev"),
+  /** The real command stops the agent and starts it again; no fake agent
+   *  holds launch settings, so there is nothing to restart. */
+  agents_restart_to_apply: ({ agentId }): null => {
+    if (!catalogEntryFor(String(agentId))) {
+      throw new Error(`'${String(agentId)}' is not an agent Atlas knows`);
+    }
+    return null;
+  },
+  /** Saved as sensitive variables beside the agent's others, as the real
+   *  command saves them to the keychain; the values never come back. */
+  agents_set_auth_env: ({ agentId, values }): null => {
+    const entry = catalogEntryFor(String(agentId));
+    if (!entry?.launch) throw new Error(`'${String(agentId)}' has no launch settings`);
+    const set = values as { name: string; value: string }[];
+    const names = new Set(set.map((v) => v.name));
+    applyAgentConfig(entry, {
+      launch: {
+        variables: [
+          ...entry.launch.variables.filter((v) => !names.has(v.name)),
+          ...set.map((v) => ({ name: v.name, value: v.value, sensitive: true })),
+        ],
+      },
+    });
+    return null;
+  },
 };

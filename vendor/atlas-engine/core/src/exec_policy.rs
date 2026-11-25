@@ -327,117 +327,125 @@ impl ExecPolicyManager {
             allow_prefix_rules,
         } = req;
         let exec_policy = self.current_for_prefix_rules(allow_prefix_rules);
-        let ExecPolicyCommands {
-            commands,
-            used_complex_parsing,
-            command_origin,
-        } = commands_for_exec_policy(command);
-        // Keep heredoc prefix parsing for the rules that apply to this model,
-        // but avoid reusable approvals for cyber models or when only the
-        // heredoc fallback parser matched.
-        let auto_amendment_allowed =
-            !used_complex_parsing && allow_prefix_rules == AllowPrefixRules::Honor;
-        let exec_policy_fallback = |cmd: &[String]| {
-            render_decision_for_unmatched_command(
-                cmd,
-                UnmatchedCommandContext {
-                    approval_policy,
-                    permission_profile: &permission_profile,
-                    windows_sandbox_level,
-                    sandbox_permissions,
-                    used_complex_parsing,
-                    command_origin,
-                },
-            )
-        };
-        let match_options = MatchOptions {
-            resolve_host_executables: true,
-        };
-        let evaluation = exec_policy.check_multiple_with_options(
-            commands.iter(),
-            &exec_policy_fallback,
-            &match_options,
-        );
-
-        let requested_amendment = if auto_amendment_allowed {
-            derive_requested_execpolicy_amendment_from_prefix_rule(
-                prefix_rule.as_ref(),
-                &evaluation.matched_rules,
-                exec_policy.as_ref(),
-                &commands,
+        let command = command.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let ExecPolicyCommands {
+                commands,
+                used_complex_parsing,
+                command_origin,
+            } = commands_for_exec_policy(&command);
+            // Keep heredoc prefix parsing for the rules that apply to this model,
+            // but avoid reusable approvals for cyber models or when only the
+            // heredoc fallback parser matched.
+            let auto_amendment_allowed =
+                !used_complex_parsing && allow_prefix_rules == AllowPrefixRules::Honor;
+            let exec_policy_fallback = |cmd: &[String]| {
+                render_decision_for_unmatched_command(
+                    cmd,
+                    UnmatchedCommandContext {
+                        approval_policy,
+                        permission_profile: &permission_profile,
+                        windows_sandbox_level,
+                        sandbox_permissions,
+                        used_complex_parsing,
+                        command_origin,
+                    },
+                )
+            };
+            let match_options = MatchOptions {
+                resolve_host_executables: true,
+            };
+            let evaluation = exec_policy.check_multiple_with_options(
+                commands.iter(),
                 &exec_policy_fallback,
                 &match_options,
-            )
-        } else {
-            None
-        };
+            );
 
-        match evaluation.decision {
-            Decision::Forbidden => ExecApprovalRequirement::Forbidden {
-                reason: derive_forbidden_reason(
-                    command,
-                    &evaluation,
-                    dangerous_command_match_for_heuristics(
+            let requested_amendment = if auto_amendment_allowed {
+                derive_requested_execpolicy_amendment_from_prefix_rule(
+                    prefix_rule.as_ref(),
+                    &evaluation.matched_rules,
+                    exec_policy.as_ref(),
+                    &commands,
+                    &exec_policy_fallback,
+                    &match_options,
+                )
+            } else {
+                None
+            };
+
+            match evaluation.decision {
+                Decision::Forbidden => ExecApprovalRequirement::Forbidden {
+                    reason: derive_forbidden_reason(
+                        &command,
                         &evaluation,
-                        Decision::Forbidden,
-                        command_origin,
-                    ),
-                ),
-            },
-            Decision::Prompt => {
-                let prompt_is_rule = evaluation.matched_rules.iter().any(|rule_match| {
-                    is_policy_match(rule_match) && rule_match.decision() == Decision::Prompt
-                });
-                match prompt_is_rejected_by_policy(approval_policy, prompt_is_rule) {
-                    Some(reason) if prompt_is_rule => ExecApprovalRequirement::Forbidden {
-                        reason: reason.to_string(),
-                    },
-                    Some(reason) => ExecApprovalRequirement::Forbidden {
-                        reason: derive_rejected_prompt_reason(
-                            reason,
-                            dangerous_command_match_for_heuristics(
-                                &evaluation,
-                                Decision::Prompt,
-                                command_origin,
-                            ),
+                        dangerous_command_match_for_heuristics(
+                            &evaluation,
+                            Decision::Forbidden,
+                            command_origin,
                         ),
-                    },
-                    None => ExecApprovalRequirement::NeedsApproval {
-                        reason: derive_prompt_reason(command, &evaluation),
-                        proposed_execpolicy_amendment: requested_amendment.or_else(|| {
-                            if auto_amendment_allowed {
-                                try_derive_execpolicy_amendment_for_prompt_rules(
-                                    &evaluation.matched_rules,
-                                )
-                            } else {
-                                None
-                            }
-                        }),
-                    },
-                }
-            }
-            Decision::Allow => ExecApprovalRequirement::Skip {
-                // Bypass sandbox only when every parsed command segment is
-                // explicitly allowed by execpolicy.
-                bypass_sandbox: commands.iter().all(|command| {
-                    exec_policy
-                        .matches_for_command_with_options(
-                            command,
-                            /*heuristics_fallback*/ None,
-                            &match_options,
-                        )
-                        .iter()
-                        .any(|rule_match| {
-                            is_policy_match(rule_match) && rule_match.decision() == Decision::Allow
-                        })
-                }),
-                proposed_execpolicy_amendment: if auto_amendment_allowed {
-                    try_derive_execpolicy_amendment_for_allow_rules(&evaluation.matched_rules)
-                } else {
-                    None
+                    ),
                 },
-            },
-        }
+                Decision::Prompt => {
+                    let prompt_is_rule = evaluation.matched_rules.iter().any(|rule_match| {
+                        is_policy_match(rule_match) && rule_match.decision() == Decision::Prompt
+                    });
+                    match prompt_is_rejected_by_policy(approval_policy, prompt_is_rule) {
+                        Some(reason) if prompt_is_rule => ExecApprovalRequirement::Forbidden {
+                            reason: reason.to_string(),
+                        },
+                        Some(reason) => ExecApprovalRequirement::Forbidden {
+                            reason: derive_rejected_prompt_reason(
+                                reason,
+                                dangerous_command_match_for_heuristics(
+                                    &evaluation,
+                                    Decision::Prompt,
+                                    command_origin,
+                                ),
+                            ),
+                        },
+                        None => ExecApprovalRequirement::NeedsApproval {
+                            reason: derive_prompt_reason(&command, &evaluation),
+                            proposed_execpolicy_amendment: requested_amendment.or_else(|| {
+                                if auto_amendment_allowed {
+                                    try_derive_execpolicy_amendment_for_prompt_rules(
+                                        &evaluation.matched_rules,
+                                    )
+                                } else {
+                                    None
+                                }
+                            }),
+                        },
+                    }
+                }
+                Decision::Allow => ExecApprovalRequirement::Skip {
+                    // Bypass sandbox only when every parsed command segment is
+                    // explicitly allowed by execpolicy.
+                    bypass_sandbox: commands.iter().all(|command| {
+                        exec_policy
+                            .matches_for_command_with_options(
+                                command,
+                                /*heuristics_fallback*/ None,
+                                &match_options,
+                            )
+                            .iter()
+                            .any(|rule_match| {
+                                is_policy_match(rule_match)
+                                    && rule_match.decision() == Decision::Allow
+                            })
+                    }),
+                    proposed_execpolicy_amendment: if auto_amendment_allowed {
+                        try_derive_execpolicy_amendment_for_allow_rules(&evaluation.matched_rules)
+                    } else {
+                        None
+                    },
+                },
+            }
+        })
+        .await
+        .unwrap_or_else(|error| ExecApprovalRequirement::Forbidden {
+            reason: format!("Command safety evaluation failed: {error}"),
+        })
     }
 
     pub(crate) async fn append_amendment_and_update(

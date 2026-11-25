@@ -3,6 +3,8 @@ import { Download, Pause, Play, Volume2, VolumeX } from "lucide-react";
 import { HintGroup, HintItem, Icon, IconButton } from "@tryatlas/design";
 import { cn } from "@/lib/utils";
 import { ArcProgress } from "./arc-progress";
+import { decodePeaks } from "../lib/audio-peaks";
+import { toast } from "sonner";
 
 /**
  * A compact audio block: play/pause, a seekable waveform, mute, download.
@@ -20,44 +22,6 @@ import { ArcProgress } from "./arc-progress";
  */
 
 const BARS = 40;
-
-const peakCache = new Map<string, number[]>();
-
-async function decodePeaks(src: string): Promise<number[] | null> {
-  const cached = peakCache.get(src);
-  if (cached) return cached;
-  try {
-    const buf = await (await fetch(src)).arrayBuffer();
-    const ctx = new AudioContext();
-    try {
-      const audio = await ctx.decodeAudioData(buf);
-      const data = audio.getChannelData(0);
-      const stride = Math.max(1, Math.floor(data.length / BARS));
-      const peaks: number[] = [];
-      for (let i = 0; i < BARS; i++) {
-        let max = 0;
-        const from = i * stride;
-        const to = Math.min(data.length, from + stride);
-        // Sample within the bucket rather than scanning every frame — a
-        // 10-minute track is ~50M samples and this runs on the main thread.
-        const step = Math.max(1, Math.floor((to - from) / 200));
-        for (let j = from; j < to; j += step) {
-          const v = Math.abs(data[j]);
-          if (v > max) max = v;
-        }
-        peaks.push(max);
-      }
-      const top = Math.max(0.01, ...peaks);
-      const scaled = peaks.map((p) => Math.max(0.12, p / top));
-      peakCache.set(src, scaled);
-      return scaled;
-    } finally {
-      void ctx.close();
-    }
-  } catch {
-    return null;
-  }
-}
 
 /** Seconds an arrow key moves the playhead; Page Up/Down move further. */
 const SEEK_STEP_S = 5;
@@ -97,27 +61,34 @@ export const AudioPlayer = memo(function AudioPlayer({
   const [time, setTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [peaks, setPeaks] = useState<number[] | null>(null);
+  const [playError, setPlayError] = useState(false);
+  const failedPlayback = useCallback(() => {
+    setPlaying(false);
+    setPlayError(true);
+    toast.error("This audio could not be played. Download it to open in another player.");
+  }, []);
   // Set when the user hit play before the file was local; consumed on arrival.
   const wantsPlay = useRef(false);
 
   useEffect(() => {
-    if (!src) return;
+    setPeaks(null);
+    if (!src || !Number.isFinite(duration) || duration <= 0) return;
     let live = true;
-    void decodePeaks(src).then((p) => {
+    void decodePeaks(src, duration).then((p) => {
       if (live && p) setPeaks(p);
     });
     return () => {
       live = false;
     };
-  }, [src]);
+  }, [src, duration]);
 
   // Autoplay once the requested file lands.
   useEffect(() => {
     if (src && wantsPlay.current) {
       wantsPlay.current = false;
-      void audioRef.current?.play().catch(() => {});
+      void audioRef.current?.play().catch(failedPlayback);
     }
-  }, [src]);
+  }, [src, failedPlayback]);
 
   const toggle = useCallback(() => {
     if (!src) {
@@ -127,9 +98,11 @@ export const AudioPlayer = memo(function AudioPlayer({
     }
     const el = audioRef.current;
     if (!el) return;
-    if (el.paused) void el.play().catch(() => {});
-    else el.pause();
-  }, [src, onRequestSrc]);
+    if (el.paused) {
+      setPlayError(false);
+      void el.play().catch(failedPlayback);
+    } else el.pause();
+  }, [src, onRequestSrc, failedPlayback]);
 
   /** Move the playhead to `seconds`, clamped to the clip. False when there is
    *  no clip loaded to seek in. */
@@ -186,6 +159,7 @@ export const AudioPlayer = memo(function AudioPlayer({
             muted={muted}
             onPlay={() => setPlaying(true)}
             onPause={() => setPlaying(false)}
+            onError={failedPlayback}
             onEnded={() => {
               setPlaying(false);
               setTime(0);
@@ -215,7 +189,7 @@ export const AudioPlayer = memo(function AudioPlayer({
                 <Icon icon={Play} size="sm" className="ml-px" />
               )
             }
-            label={playing ? "Pause" : "Play"}
+            label={playError ? "Retry playback" : playing ? "Pause" : "Play"}
             size="sm"
             variant="secondary"
             shape="round"

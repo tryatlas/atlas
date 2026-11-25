@@ -115,168 +115,196 @@ const UNCLAIMED_COMPLETIONS: usize = 16;
 
 #[derive(Default)]
 pub struct TurnWaiters {
-    waiters: Mutex<HashMap<String, oneshot::Sender<v2::Turn>>>,
-    active: Mutex<HashMap<String, String>>,
-    /// Retry notices seen for a turn, so the pill can say *which* attempt.
-    ///
-    /// Counted here rather than read off the event, because the engine's
-    /// stream-error notification carries a message and a `will_retry` flag and
-    /// no attempt number (D8). The count is the honest reconstruction.
-    attempts: Mutex<HashMap<String, usize>>,
-    /// Completions that arrived before anyone asked for them. See the module
-    /// docs: this is what closes the register-after-response race.
-    unclaimed: Mutex<std::collections::VecDeque<v2::Turn>>,
-    /// Threads whose prompt is between entry and [`TurnWaiters::register`] —
-    /// the window in which a stop has no turn id to interrupt (#57). The
-    /// register-after-response race has a cancel half too: `active` is only
-    /// written by `register`, which runs after the `turn/start` round trip, so
-    /// a stop pressed during that round trip used to find nothing and return —
-    /// while the UI, whose `running_turn` was already taken, dropped the Stop
-    /// button in the same instant. The turn then ran to completion with no way
-    /// to stop it.
-    starting: Mutex<std::collections::HashSet<String>>,
-    /// Stops pressed inside that window. Recorded here by [`TurnWaiters::cancel_requested`]
-    /// and honoured by the prompt path the moment the turn id exists.
-    pending_cancel: Mutex<std::collections::HashSet<String>>,
+    state: Mutex<TurnState>,
+}
+
+#[derive(Default)]
+struct TurnState {
+    waiters: HashMap<String, oneshot::Sender<v2::Turn>>,
+    active: HashMap<String, String>,
+    attempts: HashMap<String, usize>,
+    unclaimed: std::collections::VecDeque<v2::Turn>,
+    starting: HashMap<String, u64>,
+    next_start: u64,
+    pending_cancel: std::collections::HashSet<u64>,
 }
 
 impl TurnWaiters {
+    fn state(&self) -> std::sync::MutexGuard<'_, TurnState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
     fn register(&self, thread_id: &str, turn_id: &str) -> oneshot::Receiver<v2::Turn> {
+        self.register_generation(thread_id, turn_id, None)
+    }
+
+    fn register_generation(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        generation: Option<u64>,
+    ) -> oneshot::Receiver<v2::Turn> {
         let (tx, rx) = oneshot::channel();
-
-        // The completion may already have arrived. Claim it rather than parking
-        // on a notification that has been and gone.
-        let mut unclaimed = self.unclaimed();
-        if let Some(pos) = unclaimed.iter().position(|t| t.id == turn_id) {
-            let turn = unclaimed.remove(pos).expect("position just found");
-            drop(unclaimed);
+        // One lock owns both sides of the hand-off: a completion can neither
+        // miss the waiter nor land between checking and consuming the buffer.
+        let mut state = self.state();
+        if let Some(pos) = state.unclaimed.iter().position(|t| t.id == turn_id) {
+            let turn = state.unclaimed.remove(pos).expect("position just found");
             let _ = tx.send(turn);
-            return rx;
+        } else {
+            state.waiters.insert(turn_id.to_string(), tx);
+            if generation
+                .is_none_or(|generation| state.starting.get(thread_id) == Some(&generation))
+            {
+                state
+                    .active
+                    .insert(thread_id.to_string(), turn_id.to_string());
+            }
         }
-        drop(unclaimed);
-
-        self.waiters().insert(turn_id.to_string(), tx);
-        self.active()
-            .insert(thread_id.to_string(), turn_id.to_string());
         rx
     }
 
-    /// Called from the pump.
     pub(crate) fn complete(&self, thread_id: &str, turn: v2::Turn) {
-        // Clear the active entry first, and only if it still names *this* turn.
-        // A later turn on the same thread must not have its entry removed by a
-        // straggling completion from the previous one.
-        let mut active = self.active();
-        if active.get(thread_id).is_some_and(|id| id == &turn.id) {
-            active.remove(thread_id);
+        let mut state = self.state();
+        if state.active.get(thread_id).is_some_and(|id| id == &turn.id) {
+            state.active.remove(thread_id);
         }
-        drop(active);
-
-        self.attempts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&turn.id);
-
-        if let Some(tx) = self.waiters().remove(&turn.id) {
+        state.attempts.remove(&turn.id);
+        if let Some(tx) = state.waiters.remove(&turn.id) {
             let _ = tx.send(turn);
-            return;
-        }
-        // Nobody is waiting yet. Hold it for the register that is about to
-        // happen; drop the oldest if this connection somehow accrues them.
-        let mut unclaimed = self.unclaimed();
-        unclaimed.push_back(turn);
-        while unclaimed.len() > UNCLAIMED_COMPLETIONS {
-            unclaimed.pop_front();
+        } else {
+            state.unclaimed.push_back(turn);
+            while state.unclaimed.len() > UNCLAIMED_COMPLETIONS {
+                state.unclaimed.pop_front();
+            }
         }
     }
 
-    /// Records one retry notice for a turn and returns its attempt number,
-    /// counting from 1.
+    /// Register engine-driven turns too, so Stop can interrupt a goal's
+    /// automatic continuations. Returns whether the host owns no prompt for it.
+    pub(crate) fn started(&self, thread_id: &str, turn_id: &str) -> bool {
+        let mut state = self.state();
+        let autonomous =
+            !state.starting.contains_key(thread_id) && !state.waiters.contains_key(turn_id);
+        state
+            .active
+            .insert(thread_id.to_string(), turn_id.to_string());
+        autonomous
+    }
+
     pub(crate) fn note_retry(&self, turn_id: &str) -> usize {
-        let mut attempts = self
-            .attempts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let counter = attempts.entry(turn_id.to_string()).or_insert(0);
+        let mut state = self.state();
+        let counter = state.attempts.entry(turn_id.to_string()).or_insert(0);
         *counter += 1;
         *counter
     }
 
-    fn unclaimed(&self) -> std::sync::MutexGuard<'_, std::collections::VecDeque<v2::Turn>> {
-        self.unclaimed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// The turn to interrupt for a session, if one is running.
+    #[cfg(test)]
     pub(crate) fn active_turn(&self, thread_id: &str) -> Option<String> {
-        self.active().get(thread_id).cloned()
+        self.state().active.get(thread_id).cloned()
     }
 
-    /// Whether a turn is running or starting on this thread — the state in
-    /// which a mode switch would relabel the picker without touching the
-    /// turn's frozen context (#61).
     pub(crate) fn is_busy(&self, thread_id: &str) -> bool {
-        self.active().contains_key(thread_id) || self.starting().contains(thread_id)
+        let state = self.state();
+        state.active.contains_key(thread_id) || state.starting.contains_key(thread_id)
     }
 
-    /// The prompt path is about to send `turn/start`. Until [`TurnWaiters::end_prompt`]
-    /// a cancel for this thread has no turn id; it is recorded instead and
-    /// honoured when the id exists.
-    fn begin_prompt(&self, thread_id: &str) {
-        self.starting().insert(thread_id.to_string());
+    pub(crate) fn has_prompt(&self, thread_id: &str, turn_id: &str) -> bool {
+        let state = self.state();
+        state.starting.contains_key(thread_id) || state.waiters.contains_key(turn_id)
     }
 
-    /// A cancel arrived with no active turn. Records it if a prompt is inside
-    /// its starting window, and answers whether it was recorded — `false`
-    /// means nothing is running or starting, a true no-op.
-    pub(crate) fn cancel_requested(&self, thread_id: &str) -> bool {
-        if !self.starting().contains(thread_id) {
-            return false;
+    fn begin_prompt(&self, thread_id: &str) -> u64 {
+        let mut state = self.state();
+        state.next_start = state.next_start.wrapping_add(1);
+        let generation = state.next_start;
+        state.starting.insert(thread_id.to_string(), generation);
+        generation
+    }
+
+    /// Lookup and queuing are one transition. A new prompt can be setting up
+    /// while the preceding turn is still completing, so Stop covers both.
+    fn request_cancel(&self, thread_id: &str) -> Option<String> {
+        let mut state = self.state();
+        if let Some(generation) = state.starting.get(thread_id).copied() {
+            state.pending_cancel.insert(generation);
         }
-        self.pending_cancel().insert(thread_id.to_string());
+        state.active.get(thread_id).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel_requested(&self, thread_id: &str) -> bool {
+        let mut state = self.state();
+        let Some(generation) = state.starting.get(thread_id).copied() else {
+            return false;
+        };
+        state.pending_cancel.insert(generation);
         true
     }
 
-    /// The starting window is over — the turn registered, failed to start, or
-    /// finished before it could be waited on. Answers whether a cancel arrived
-    /// inside the window; the flag is consumed either way, so a stop aimed at
-    /// a turn that never ran cannot leak into the next one.
+    fn is_cancelled(&self, thread_id: &str, generation: u64) -> bool {
+        let state = self.state();
+        state.starting.get(thread_id) != Some(&generation)
+            || state.pending_cancel.contains(&generation)
+    }
+
+    fn end_start(&self, thread_id: &str, generation: u64) -> bool {
+        let mut state = self.state();
+        let superseded = state.starting.get(thread_id) != Some(&generation);
+        if !superseded {
+            state.starting.remove(thread_id);
+        }
+        state.pending_cancel.remove(&generation) || superseded
+    }
+
+    #[cfg(test)]
     fn end_prompt(&self, thread_id: &str) -> bool {
-        self.starting().remove(thread_id);
-        self.pending_cancel().remove(thread_id)
-    }
-
-    fn starting(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<String>> {
-        self.starting
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn pending_cancel(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<String>> {
-        self.pending_cancel
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        let generation = self.state().starting.get(thread_id).copied();
+        generation.is_some_and(|generation| self.end_start(thread_id, generation))
     }
 
     fn forget(&self, thread_id: &str, turn_id: &str) {
-        self.waiters().remove(turn_id);
-        let mut active = self.active();
-        if active.get(thread_id).is_some_and(|id| id == turn_id) {
-            active.remove(thread_id);
+        let mut state = self.state();
+        state.waiters.remove(turn_id);
+        if state.active.get(thread_id).is_some_and(|id| id == turn_id) {
+            state.active.remove(thread_id);
         }
     }
+}
 
-    fn waiters(&self) -> std::sync::MutexGuard<'_, HashMap<String, oneshot::Sender<v2::Turn>>> {
-        self.waiters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// Keep Stop live from prompt entry, including setup awaits, and retire the
+/// starting flag even if the host drops the future before it sends a request.
+struct StartingPrompt {
+    turns: Arc<TurnWaiters>,
+    thread_id: String,
+    generation: u64,
+    finished: bool,
+}
+
+impl StartingPrompt {
+    fn new(turns: Arc<TurnWaiters>, thread_id: String) -> Self {
+        let generation = turns.begin_prompt(&thread_id);
+        Self {
+            turns,
+            thread_id,
+            generation,
+            finished: false,
+        }
     }
+    fn finish(&mut self) -> bool {
+        self.finished = true;
+        self.turns.end_start(&self.thread_id, self.generation)
+    }
+}
 
-    fn active(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
-        self.active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+impl Drop for StartingPrompt {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.turns.end_start(&self.thread_id, self.generation);
+        }
     }
 }
 
@@ -659,26 +687,56 @@ impl EngineConnection {
         cwd: &std::path::Path,
         session_id: Option<&acp::SessionId>,
     ) -> (SessionMcpOffer, Option<HashMap<String, serde_json::Value>>) {
-        let offer = atlas_agent_servers::session_mcp::offer_for(
-            self.session_mcp.as_ref(),
-            &SessionMcpRequest {
-                agent_id: self.id.clone(),
-                http_mcp: true,
-                // In-process: the one connection Atlas vouches for, so it may
-                // be handed the UI tool server (ADR-0012).
-                ui_control: true,
-                // And, for the same reason, organisation access: it may be
-                // handed the organisation tool server (ADR-0014).
-                org_access: true,
-                // The engine runs in this process and reads the entries from
-                // memory: a header never reaches a command line (ADR-0020).
-                in_process: true,
-                cwd: cwd.to_path_buf(),
-                session_id: session_id.cloned(),
-            },
-        );
-        let config = mcp::thread_config(offer.servers(), offer.ask_first());
-        (offer, config)
+        native_mcp_offer(&self.id, self.session_mcp.as_ref(), cwd, session_id)
+    }
+
+    async fn replay_subagents(
+        &self,
+        parent: &acp::SessionId,
+        thread: &AcpThreadHandle,
+        stored: &[v2::Turn],
+    ) {
+        use futures::StreamExt;
+        let mut children = HashMap::new();
+        for item in stored.iter().flat_map(|turn| &turn.items) {
+            if let v2::ThreadItem::SubAgentActivity {
+                agent_thread_id,
+                agent_path,
+                ..
+            } = item
+            {
+                self.sessions.note_spawned_child(&parent.to_string(), item);
+                children.insert(agent_thread_id.clone(), agent_path.clone());
+            }
+        }
+        let outcomes = futures::stream::iter(children)
+            .map(|(child, path)| async move {
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    self.call::<v2::ThreadReadResponse>(|request_id| ClientRequest::ThreadRead {
+                        request_id,
+                        params: v2::ThreadReadParams {
+                            thread_id: child.clone(),
+                            include_turns: true,
+                        },
+                    }),
+                )
+                .await;
+                (child, path, read.ok().and_then(Result::ok))
+            })
+            .buffer_unordered(8)
+            .collect::<Vec<_>>()
+            .await;
+        let mut locked = thread
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (child, path, read) in outcomes {
+            let active = read
+                .as_ref()
+                .is_some_and(|r| matches!(r.thread.status, v2::ThreadStatus::Active { .. }));
+            let last = read.as_ref().and_then(|r| r.thread.turns.last());
+            crate::engine::replay::replay_child_turn(&mut locked, &child, &path, active, last);
+        }
     }
 
     fn new_thread(
@@ -687,7 +745,7 @@ impl EngineConnection {
         work_dirs: Vec<PathBuf>,
         title: Option<Arc<str>>,
     ) -> AcpThreadHandle {
-        let events = (self.thread_events)(&session_id);
+        let events = (self.thread_events)(&self.id, &session_id);
         let mut thread = AcpThread::new(
             session_id,
             self.clone() as Arc<dyn AgentConnection>,
@@ -710,6 +768,34 @@ impl EngineConnection {
         ));
         Arc::new(Mutex::new(thread))
     }
+}
+
+fn native_mcp_offer(
+    agent_id: &AgentId,
+    provider: Option<&Arc<dyn SessionMcpServers>>,
+    cwd: &std::path::Path,
+    session_id: Option<&acp::SessionId>,
+) -> (SessionMcpOffer, Option<HashMap<String, serde_json::Value>>) {
+    let offer = atlas_agent_servers::session_mcp::offer_for(
+        provider,
+        &SessionMcpRequest {
+            agent_id: agent_id.clone(),
+            http_mcp: true,
+            // In-process: the one connection Atlas vouches for, so it may
+            // be handed the UI tool server (ADR-0012).
+            ui_control: true,
+            // And, for the same reason, organisation access: it may be
+            // handed the organisation tool server (ADR-0014).
+            org_access: true,
+            // The engine runs in this process and reads the entries from
+            // memory: a header never reaches a command line (ADR-0020).
+            in_process: true,
+            cwd: cwd.to_path_buf(),
+            session_id: session_id.cloned(),
+        },
+    );
+    let config = mcp::thread_config(offer.servers(), offer.ask_first());
+    (offer, config)
 }
 
 /// An answer to an engine server request, on its way back to the pump.
@@ -1545,18 +1631,36 @@ impl AgentConnection for EngineConnection {
         .boxed()
     }
 
-    /// Load IS advertised now, because reopening genuinely replays.
-    ///
-    /// This was `false` through the cutover, which is what produced D6's
-    /// "resumed without history" notice — correct then, because the seam threw
-    /// the engine's stored turns away and every reopened session really did
-    /// continue from nothing. The turns are replayed now (`engine::replay`),
-    /// so reporting `WithoutHistory` over a fully repainted transcript would
-    /// be the notice lying in the other direction.
-    ///
-    /// The one row that still opens empty is a pre-cutover id the engine has
-    /// never seen: the fresh-thread fallback inside [`Self::resume_session`].
-    /// D6 accepted that loss, and it now applies only where it is true.
+    fn release_session(
+        self: Arc<Self>,
+        session_id: acp::SessionId,
+    ) -> BoxFuture<'static, Result<()>> {
+        async move {
+            self.cancel(&session_id);
+            self.sessions.remove(&session_id);
+            self.session_modes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&session_id);
+            self.roots_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&session_id);
+            let _: v2::ThreadUnsubscribeResponse = self
+                .call(|request_id| ClientRequest::ThreadUnsubscribe {
+                    request_id,
+                    params: v2::ThreadUnsubscribeParams {
+                        thread_id: session_id.to_string(),
+                    },
+                })
+                .await?;
+            Ok(())
+        }
+        .boxed()
+    }
+
+    /// Reopening replays stored engine turns. Only a pre-cutover id unknown to
+    /// the engine uses the empty-thread fallback in `resume_session`.
     fn supports_load_session(&self) -> bool {
         true
     }
@@ -1632,13 +1736,9 @@ impl AgentConnection for EngineConnection {
         true
     }
 
-    /// Reopen a stored row without replaying it (D6).
-    ///
-    /// Two cases reach here and both end the same way for the user. A thread
-    /// the engine knows resumes; a pre-cutover row it has never heard of does
-    /// not, and gets a fresh thread instead. Neither replays into the
-    /// transcript, because no converter from the old format exists and D6
-    /// accepts that loss rather than owning one forever.
+    /// Reopen a stored engine thread and replay its history. A pre-cutover id
+    /// unknown to the engine gets a fresh thread; no converter for the retired
+    /// format exists, and D6 accepts that bounded loss.
     ///
     /// The failure is not treated as an error: a stored row that will not open
     /// is worse than one that opens empty, and "the row is from before the
@@ -1752,7 +1852,7 @@ impl AgentConnection for EngineConnection {
             );
             mcp_offer.bind(&engine_session_id);
             let thread = self.new_thread(engine_session_id.clone(), work_dirs, title);
-            {
+            let boundaries = {
                 // The response carried the thread's whole stored history — the
                 // primary source for what a reopened session shows. Replayed
                 // before the handle leaves, so the first snapshot already has
@@ -1762,13 +1862,17 @@ impl AgentConnection for EngineConnection {
                 let mut locked = thread
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                crate::engine::replay::replay_turns(&mut locked, &stored_turns);
-            }
+                crate::engine::replay::replay_turns(&mut locked, &stored_turns)
+            };
             self.sessions.insert(
                 engine_session_id.clone(),
                 &thread,
                 cwd.to_string_lossy().into_owned(),
             );
+            self.sessions
+                .set_turn_boundaries(&engine_session_id, boundaries);
+            self.replay_subagents(&engine_session_id, &thread, &stored_turns)
+                .await;
             let mode = self
                 .default_mode
                 .clone()
@@ -1899,54 +2003,16 @@ impl AgentConnection for EngineConnection {
             // to match so the transcript shows what the model now remembers.
             Some(crate::engine::commands::Command::Undo) => {
                 let sessions = self.sessions.clone();
+                let handle = self.clone_rewind_handle();
                 let session_id = params.session_id;
                 return async move {
-                    let rolled = requests
-                        .request_typed::<v2::ThreadRollbackResponse>(
-                            ClientRequest::ThreadRollback {
-                                request_id,
-                                params: v2::ThreadRollbackParams {
-                                    thread_id,
-                                    num_turns: 1,
-                                },
-                            },
-                        )
-                        .await;
-                    let reply = match rolled {
-                        Ok(_) => {
-                            if let Some(thread) = sessions.thread(&session_id) {
-                                let mut locked = thread
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                // The LAST user entry is "/undo" itself — the
-                                // host pushed it before prompt() ran. The
-                                // exchange being undone starts at the user
-                                // entry BEFORE it; both go.
-                                let user_indices: Vec<usize> = locked
-                                    .entries()
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(_, entry)| {
-                                        matches!(
-                                            entry,
-                                            atlas_acp_thread::AgentThreadEntry::UserMessage(_)
-                                        )
-                                    })
-                                    .map(|(ix, _)| ix)
-                                    .collect();
-                                if let Some(from) = user_indices.iter().rev().nth(1).copied() {
-                                    locked.remove_entries_from(from);
-                                } else if let Some(only) = user_indices.last().copied() {
-                                    locked.remove_entries_from(only);
-                                }
-                            }
-                            "Rewound the last exchange — the conversation continues from \
-                             before it."
+                    let reply = match handle.rewind_last_turn(&session_id).await {
+                        Ok(Some(_)) => {
+                            "Rewound the last exchange — the conversation continues from before it."
                                 .to_string()
                         }
-                        // The engine refuses when there is nothing to drop;
-                        // that is an answer, not a failure.
-                        Err(_) => "Nothing to rewind yet.".to_string(),
+                        Ok(None) => "Nothing to rewind yet.".to_string(),
+                        Err(error) => format!("Could not reconcile the rewound history: {error}"),
                     };
                     if let Some(thread) = sessions.thread(&session_id) {
                         thread
@@ -2026,6 +2092,9 @@ impl AgentConnection for EngineConnection {
             // parent thread's model, which the gateway serves.
             Some(crate::engine::commands::Command::Review(instructions)) => {
                 let request_ids = self.request_ids.clone();
+                let sessions = self.sessions.clone();
+                let prompt_entry = sessions.prompt_entry(&params.session_id);
+                let mut starting = StartingPrompt::new(turns.clone(), thread_id.clone());
                 return async move {
                     let target = match instructions {
                         Some(instructions) => v2::ReviewTarget::Custom { instructions },
@@ -2034,7 +2103,10 @@ impl AgentConnection for EngineConnection {
                     // The review runs as a turn, so it has the same stop
                     // window as a prompt: no id to interrupt until
                     // `review/start` answers (#57).
-                    turns.begin_prompt(&thread_id);
+                    if turns.is_cancelled(&thread_id, starting.generation) {
+                        starting.finish();
+                        return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
+                    }
                     let started = match requests
                         .request_typed::<v2::ReviewStartResponse>(ClientRequest::ReviewStart {
                             request_id,
@@ -2048,16 +2120,23 @@ impl AgentConnection for EngineConnection {
                     {
                         Ok(started) => started,
                         Err(e) => {
-                            turns.end_prompt(&thread_id);
+                            starting.finish();
                             return Err(anyhow!("the review could not start: {e}"));
                         }
                     };
+                    if let Some((entry, prompt)) = prompt_entry {
+                        sessions.record_turn(&thread_id, &started.turn.id, entry, prompt);
+                    }
                     if started.turn.status != v2::TurnStatus::InProgress {
-                        turns.end_prompt(&thread_id);
+                        starting.finish();
                         return Ok(acp::PromptResponse::new(stop_reason(&started.turn)?));
                     }
-                    let waiter = turns.register(&thread_id, &started.turn.id);
-                    if turns.end_prompt(&thread_id) {
+                    let waiter = turns.register_generation(
+                        &thread_id,
+                        &started.turn.id,
+                        Some(starting.generation),
+                    );
+                    if starting.finish() {
                         send_interrupt(
                             &requests,
                             &request_ids,
@@ -2094,6 +2173,8 @@ impl AgentConnection for EngineConnection {
         let request_ids = self.request_ids.clone();
         let sessions = self.sessions.clone();
         let roots = self.clone_handle();
+        let mut starting = StartingPrompt::new(turns.clone(), thread_id.clone());
+        let prompt_entry = sessions.prompt_entry(&params.session_id);
         async move {
             // Attached projects changed during the last turn: the sandbox
             // this turn starts with has to carry them.
@@ -2114,9 +2195,10 @@ impl AgentConnection for EngineConnection {
                     "host MCP servers still starting; this turn goes ahead without their tools"
                 );
             }
-            // Opens the window a stop can land in with no turn id to
-            // interrupt. Every exit below closes it via `end_prompt` (#57).
-            turns.begin_prompt(&thread_id);
+            if turns.is_cancelled(&thread_id, starting.generation) {
+                starting.finish();
+                return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
+            }
             let started = match requests
                 .request_typed::<v2::TurnStartResponse>(ClientRequest::TurnStart {
                     request_id,
@@ -2138,25 +2220,30 @@ impl AgentConnection for EngineConnection {
                 Err(e) => {
                     // The turn never ran; a stop aimed at it succeeded
                     // vacuously and must not leak into the next turn.
-                    turns.end_prompt(&thread_id);
+                    starting.finish();
                     return Err(anyhow!("{e}"));
                 }
             };
+
+            if let Some((entry, prompt)) = prompt_entry {
+                sessions.record_turn(&thread_id, &started.turn.id, entry, prompt);
+            }
 
             // If the turn already finished, its outcome is in the response and
             // no notification is coming — registering a waiter for it would
             // hang forever.
             if started.turn.status != v2::TurnStatus::InProgress {
-                turns.end_prompt(&thread_id);
+                starting.finish();
                 return Ok(acp::PromptResponse::new(stop_reason(&started.turn)?));
             }
 
-            let waiter = turns.register(&thread_id, &started.turn.id);
+            let waiter =
+                turns.register_generation(&thread_id, &started.turn.id, Some(starting.generation));
             // A stop pressed while `turn/start` was in flight had no id to
             // interrupt. It was recorded; honour it now that the id exists.
             // The engine answers by completing the turn as `Interrupted`,
             // which the waiter below reports the usual way.
-            if turns.end_prompt(&thread_id) {
+            if starting.finish() {
                 send_interrupt(
                     &requests,
                     &request_ids,
@@ -2203,6 +2290,9 @@ impl AgentConnection for EngineConnection {
             sessions: self.sessions.clone(),
             catalogue: self.catalogue.clone(),
             provider_id: self.settings.provider.id.clone(),
+            agent_id: self.id.clone(),
+            session_mcp: self.session_mcp.clone(),
+            fallback_cwd: self.settings.cwd.clone(),
             session_id: session_id.clone(),
         }))
     }
@@ -2285,26 +2375,7 @@ impl AgentConnection for EngineConnection {
                 }
             });
         }
-        let Some(turn_id) = self.turns.active_turn(&thread_id) else {
-            // No turn is registered — but one may be mid-`turn/start`, with
-            // no id to interrupt yet. That stop used to be silently dropped,
-            // and the Stop button disappeared with it (#57): recorded now,
-            // and the prompt path honours it the moment the id exists.
-            if self.turns.cancel_requested(&thread_id) {
-                tracing::info!(
-                    target: "atlas_native_agent::engine",
-                    "cancel for {thread_id} recorded while its turn is still starting",
-                );
-            } else {
-                // Nothing running or starting. Not an error — a cancel can
-                // race a turn that just finished — but worth saying, because
-                // the other reading is that the turn was never recorded and
-                // cancel is silently dead.
-                tracing::debug!(
-                    target: "atlas_native_agent::engine",
-                    "cancel for {thread_id} with no turn in flight",
-                );
-            }
+        let Some(turn_id) = self.turns.request_cancel(&thread_id) else {
             return;
         };
         let requests = self.requests.clone();
@@ -2633,6 +2704,50 @@ mod tests {
         assert!(err.to_string().contains("failed"));
     }
 
+    #[test]
+    fn a_superseded_setup_cannot_clear_or_cancel_the_next_prompt() {
+        let turns = Arc::new(TurnWaiters::default());
+        let mut old = StartingPrompt::new(turns.clone(), "thread".into());
+        turns.request_cancel("thread");
+        let mut next = StartingPrompt::new(turns.clone(), "thread".into());
+        assert!(old.finish());
+        assert!(turns.is_busy("thread"));
+        assert!(!turns.is_cancelled("thread", next.generation));
+        assert!(!next.finish());
+        assert!(!turns.is_busy("thread"));
+    }
+
+    #[tokio::test]
+    async fn completion_racing_registration_always_delivers() {
+        for n in 0..200 {
+            let turns = Arc::new(TurnWaiters::default());
+            let racing = turns.clone();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let other = barrier.clone();
+            let id = format!("turn-{n}");
+            let completed = id.clone();
+            let worker = std::thread::spawn(move || {
+                other.wait();
+                racing.complete(
+                    "thread",
+                    turn_with_id(&completed, v2::TurnStatus::Completed),
+                );
+            });
+            barrier.wait();
+            let waiter = turns.register("thread", &id);
+            worker.join().unwrap();
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                id
+            );
+            assert_eq!(turns.active_turn("thread"), None);
+        }
+    }
+
     #[tokio::test]
     async fn a_turn_completion_reaches_the_waiter_that_registered_for_it() {
         let waiters = TurnWaiters::default();
@@ -2738,11 +2853,11 @@ mod tests {
                 turn_with_id(&format!("t{i}"), v2::TurnStatus::Completed),
             );
         }
-        assert_eq!(waiters.unclaimed().len(), UNCLAIMED_COMPLETIONS);
+        assert_eq!(waiters.state().unclaimed.len(), UNCLAIMED_COMPLETIONS);
         // The oldest were dropped, the newest survive.
         let newest = format!("t{}", UNCLAIMED_COMPLETIONS + 7);
-        assert!(waiters.unclaimed().iter().any(|t| t.id == newest));
-        assert!(!waiters.unclaimed().iter().any(|t| t.id == "t0"));
+        assert!(waiters.state().unclaimed.iter().any(|t| t.id == newest));
+        assert!(!waiters.state().unclaimed.iter().any(|t| t.id == "t0"));
     }
 
     #[test]
@@ -3814,6 +3929,9 @@ struct EngineSessionFork {
     sessions: Arc<EngineSessions>,
     catalogue: Arc<RwLock<LiveCatalogue>>,
     provider_id: String,
+    agent_id: AgentId,
+    session_mcp: Option<Arc<dyn SessionMcpServers>>,
+    fallback_cwd: PathBuf,
     session_id: acp::SessionId,
 }
 
@@ -3835,6 +3953,13 @@ impl AgentSessionFork for EngineSessionFork {
                     .default_model
                     .clone()
             });
+        let cwd = self
+            .sessions
+            .cwd(&session_id)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.fallback_cwd.clone());
+        let (offer, config) =
+            native_mcp_offer(&self.agent_id, self.session_mcp.as_ref(), &cwd, None);
         let request = ClientRequest::ThreadFork {
             request_id: self.request_ids.next(),
             params: v2::ThreadForkParams {
@@ -3845,28 +3970,45 @@ impl AgentSessionFork for EngineSessionFork {
                 model: Some(model),
                 model_provider: Some(self.provider_id.clone()),
                 service_tier: None,
-                cwd: self.sessions.cwd(&session_id),
+                cwd: Some(cwd.to_string_lossy().into_owned()),
                 runtime_workspace_roots: None,
                 approval_policy: None,
                 approvals_reviewer: None,
                 sandbox: None,
                 permissions: None,
-                config: None,
+                config,
                 base_instructions: None,
                 developer_instructions: None,
                 ephemeral: false,
                 thread_source: None,
                 exclude_turns: true,
-                defer_goal_continuation: false,
+                defer_goal_continuation: true,
             },
         };
         let requests = self.requests.clone();
+        let unsubscribe_id = self.request_ids.next();
         async move {
             let response = requests
                 .request_typed::<v2::ThreadForkResponse>(request)
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
-            Ok(acp::SessionId::new(response.thread.id))
+            let id = acp::SessionId::new(response.thread.id.clone());
+            offer.bind(&id);
+            // Fork is a stored conversation, opened by the host afterwards.
+            // Release this subscriber so reopen actually applies its fresh
+            // MCP grant instead of rejoining a loaded thread with stale config.
+            requests
+                .request_typed::<v2::ThreadUnsubscribeResponse>(ClientRequest::ThreadUnsubscribe {
+                    request_id: unsubscribe_id,
+                    params: v2::ThreadUnsubscribeParams {
+                        thread_id: response.thread.id,
+                    },
+                })
+                .await
+                .map_err(|error| {
+                    anyhow!("fork created but could not release its loaded thread: {error}")
+                })?;
+            Ok(id)
         }
         .boxed()
     }
@@ -3909,9 +4051,8 @@ impl RewindHandle {
     /// a silently shortened thread — and splitting them here is what lets the
     /// host report the two apart.
     ///
-    /// Unlike `/undo` this is not itself a turn, so there is no `/undo` user
-    /// entry to skip: the turn being dropped starts at the LAST user entry,
-    /// not the second-to-last.
+    /// Engine turn ids select the transcript boundary. Local slash exchanges
+    /// between model turns are not part of the engine's rollback count.
     ///
     /// `None` means the engine declined — almost always an empty thread. It is
     /// NOT a promise that nothing moved: the request layer folds a refusal and
@@ -3940,17 +4081,13 @@ impl RewindHandle {
                 },
             })
             .await;
-        if let Err(e) = rolled {
-            // A refusal and a broken channel are the same value here — the
-            // request layer does not distinguish "the engine said no" from "the
-            // engine never answered", and a transport error can also arrive
-            // AFTER the rollback ran. So this is honestly `None` only in the
-            // first case, and the caller is told as much rather than being
-            // promised the history is untouched. Erring instead would put a
-            // scary message in front of the far commoner empty-thread case.
-            tracing::debug!("thread/rollback declined or failed: {e}");
-            return Ok(None);
-        }
+        let rolled = match rolled {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::debug!("thread/rollback declined or failed: {error}");
+                return Ok(None);
+            }
+        };
 
         // Past this point the durable history has ALREADY shrunk. Reporting
         // `None` — "nothing to rewind" — from here would tell the user nothing
@@ -3965,24 +4102,14 @@ impl RewindHandle {
         let mut locked = thread
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let last_user =
-            locked
-                .entries()
-                .iter()
-                .enumerate()
-                .rev()
-                .find_map(|(ix, entry)| match entry {
-                    atlas_acp_thread::AgentThreadEntry::UserMessage(msg) => {
-                        Some((ix, msg.prompt_text()))
-                    }
-                    _ => None,
-                });
-        let Some((from, text)) = last_user else {
-            return Err(anyhow!(
-                "rewound the engine's history but the transcript holds no prompt to \
-                 replay; reopen the conversation to resynchronize"
-            ));
+        let Some(boundary) = self
+            .sessions
+            .rolled_back_boundary(session_id, &rolled.thread.turns)
+        else {
+            return Err(anyhow!("rewound the engine's history but no matching transcript turn was recorded; reopen the conversation to resynchronize"));
         };
+        let from = boundary.entry;
+        let text = boundary.prompt;
         // `EntriesRemoved` is what the delta projector turns into
         // `HistoryRewound`, which is what trims the store's mirror and
         // resolves any permission request stranded by the removal.

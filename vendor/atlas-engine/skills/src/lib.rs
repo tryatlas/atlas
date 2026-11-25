@@ -215,4 +215,21 @@ mod tests {
                 .is_ok()
         );
     }
+
+    /// Atlas: every bundled skill must parse. A licence-notice comment above the
+    /// frontmatter once made three of them unloadable with no error anywhere;
+    /// their notice lives in ATLAS-CHANGES.md instead.
+    #[test]
+    fn every_bundled_skill_has_parseable_frontmatter() {
+        let skills: Vec<_> = SYSTEM_SKILLS_DIR
+            .dirs()
+            .filter_map(|dir| dir.get_file(dir.path().join("SKILL.md")))
+            .collect();
+        assert!(!skills.is_empty(), "no bundled SKILL.md found");
+        for file in skills {
+            let contents = file.contents_utf8().expect("SKILL.md is UTF-8");
+            super::parser::parse_skill_frontmatter_metadata(contents, || "fallback".to_string())
+                .unwrap_or_else(|err| panic!("{}: {err:?}", file.path().display()));
+        }
+    }
 }

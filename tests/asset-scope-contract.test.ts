@@ -79,10 +79,10 @@ describe("asset protocol scope", () => {
   });
 
   it("keeps hidden directories hidden rather than widening the whole home", () => {
-    // Unset means Tauri's Unix default (true). `false` would be the tempting
+    // Windows defaults to false: require an explicit cross-platform true. `false` would be the tempting
     // one-line fix for the Linux symptom, and it exposes `~/.ssh`, `~/.aws`
     // and every other dotfile to the webview.
-    expect(scope.requireLiteralLeadingDot).not.toBe(false);
+    expect(scope.requireLiteralLeadingDot).toBe(true);
     expect(scope["require-literal-leading-dot"]).not.toBe(false);
   });
 

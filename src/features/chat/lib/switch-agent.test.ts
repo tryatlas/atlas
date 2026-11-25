@@ -601,7 +601,11 @@ describe("switchAgentForTab with rememberBeforeSwitch", () => {
     expect(sessionSend.state(TAB).switchPending).toBe(false);
     // Held for the new bind, like a first message sent while starting.
     const sess = useChatStore.getState().sessions[TAB];
-    expect(sess.pendingSend).toEqual({ content: "now add a retry", mentions: [] });
+    expect(sess.pendingSend).toEqual({
+      content: "now add a retry",
+      mentions: [],
+      clientMessageId: sess.messages[0].id,
+    });
     expect(sess.messages.map((m) => m.content)).toEqual(["now add a retry"]);
     expect(useChatStore.getState().queues[TAB] ?? []).toEqual([]);
     expect(sends).toEqual([{ tabId: TAB, text: "/remember" }]);

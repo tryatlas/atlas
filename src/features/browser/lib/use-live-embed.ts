@@ -54,6 +54,11 @@ export function useLiveEmbed({
   // ── Live (embedded native webview) state ────────────────────────────────
   const [liveNav, setLiveNav] = useState<BrowserNav | null>(null);
   const createdRef = useRef(false);
+  const lifetimeRef = useRef(0);
+  const disposedRef = useRef(false);
+  const creatingRef = useRef(false);
+  const pendingUrlRef = useRef<string | null>(null);
+  const ensureRef = useRef<(url: string) => Promise<void>>(async () => {});
   const placeholderRef = useRef<HTMLDivElement>(null);
   const modeRef = useRef<BrowserMode>(mode);
   modeRef.current = mode;
@@ -185,6 +190,14 @@ export function useLiveEmbed({
     idleFramesRef.current = 0;
     if (rafRef.current !== null) return; // already running; the reset above extends it
     const step = () => {
+      if (
+        !disposedRef.current &&
+        modeRef.current === "live" &&
+        pendingUrlRef.current &&
+        !creatingRef.current &&
+        currentRect()
+      )
+        void ensureRef.current(pendingUrlRef.current);
       const moving = syncVisibility();
       idleFramesRef.current = moving ? 0 : idleFramesRef.current + 1;
       if (idleFramesRef.current >= SETTLE_FRAMES) {
@@ -194,51 +207,63 @@ export function useLiveEmbed({
       rafRef.current = requestAnimationFrame(step);
     };
     rafRef.current = requestAnimationFrame(step);
-  }, [syncVisibility]);
+  }, [syncVisibility, currentRect]);
 
   const ensureLive = useCallback(
     async (url: string) => {
-      const rect = currentRect();
-      if (!rect) return;
+      pendingUrlRef.current = url;
+      if (disposedRef.current || creatingRef.current || modeRef.current !== "live") return;
+      if (!createdRef.current && !currentRect()) return;
+      creatingRef.current = true;
+      const lifetime = lifetimeRef.current;
       try {
-        if (!createdRef.current) {
-          logEvent({
-            source: "atlas",
-            kind: "browser-embed",
-            summary: `Creating embedded browser child webview ${embedId} for ${url}`,
-            status: "success",
-            payload: { id: embedId, url, rect },
-          });
-          await browserEmbedCreate(embedId, url, rect);
-          createdRef.current = true;
-          registerEmbed();
-          setEmbedError(null);
-          requestAnimationFrame(() => {
-            requestAnimationFrame(() => {
-              pump();
-            });
-          });
-        } else {
-          await browserEmbedNavigate(embedId, url);
-          // A later successful navigation has to retire the fallback, or one
-          // transient failure pins the panel to the error UI for the rest of
-          // the tab's life even though the embed is working again.
-          setEmbedError(null);
+        while (pendingUrlRef.current && !disposedRef.current && lifetime === lifetimeRef.current) {
+          const requested = pendingUrlRef.current;
+          const rect = currentRect();
+          if (!createdRef.current && !rect) break;
+          pendingUrlRef.current = null;
+          if (!createdRef.current) {
+            await browserEmbedCreate(embedId, requested, rect!);
+            if (disposedRef.current || lifetime !== lifetimeRef.current) {
+              await browserEmbedDestroy(embedId);
+              return;
+            }
+            createdRef.current = true;
+            registerEmbed();
+            if (modeRef.current !== "live" || !currentRect() || overlayOpenRef.current) {
+              await browserEmbedSetVisible(embedId, false);
+              lastVisibleRef.current = false;
+            }
+            pump();
+          } else await browserEmbedNavigate(embedId, requested);
+          if (!disposedRef.current && lifetime === lifetimeRef.current) setEmbedError(null);
         }
-      } catch (e) {
-        const errorMsg = String(e);
-        setEmbedError(errorMsg);
+      } catch (error) {
+        if (disposedRef.current || lifetime !== lifetimeRef.current) return;
+        const message = String(error);
+        setEmbedError(message);
         logEvent({
           source: "atlas",
           kind: "browser-embed",
-          summary: `Failed to load ${url} in embedded browser; activating fallback`,
+          summary: "Embedded browser could not load the page",
           status: "failure",
-          payload: { url, error: errorMsg },
+          payload: { url, error: message },
         });
+      } finally {
+        creatingRef.current = false;
+        if (
+          !disposedRef.current &&
+          pendingUrlRef.current &&
+          modeRef.current === "live" &&
+          currentRect()
+        )
+          void ensureRef.current(pendingUrlRef.current);
       }
     },
     [embedId, currentRect, registerEmbed, pump],
   );
+
+  ensureRef.current = ensureLive;
 
   // Listen for Rust-owned navigation deltas for this embed.
   useEffect(() => {
@@ -323,8 +348,13 @@ export function useLiveEmbed({
 
   // Destroy the native webview when the tab closes (panel unmounts).
   useEffect(() => {
+    disposedRef.current = false;
     return () => {
+      disposedRef.current = true;
+      lifetimeRef.current += 1;
+      pendingUrlRef.current = null;
       if (createdRef.current) {
+        createdRef.current = false;
         browserEmbedDestroy(embedId).catch(() => {});
         unregisterEmbed();
       }

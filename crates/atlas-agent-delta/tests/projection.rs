@@ -88,7 +88,7 @@ impl Harness {
 
         // The sink is handed out before the thread exists, exactly as
         // `ConnectOptions` does it.
-        let events = (projector.thread_events())(&session_id);
+        let events = (projector.thread_events())(&"stub".into(), &session_id);
         let thread = Arc::new(Mutex::new(AcpThread::new(
             session_id.clone(),
             stub_connection(),
@@ -1537,12 +1537,12 @@ async fn a_first_empty_plan_still_says_nothing() {
     );
 }
 
-/// Regression, ATL-224. An assistant chunk carrying only an image flattens to
-/// the empty string. The live stream announced a message for it anyway while
-/// the snapshot skipped it, so the same conversation had a blank bubble before
-/// a reload and no bubble after one.
+/// Regression, ATL-224, and audit #19. The live stream and the snapshot must
+/// agree about an image-only assistant turn: it once had a blank bubble before
+/// a reload and none after. Both now show the same labelled placeholder, since
+/// rendering nothing made the reply look like no reply at all.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_image_only_assistant_turn_is_absent_from_both_the_stream_and_the_snapshot() {
+async fn an_image_only_assistant_turn_is_the_same_placeholder_in_the_stream_and_the_snapshot() {
     let harness = Harness::start();
 
     harness.update(serde_json::json!({
@@ -1551,19 +1551,25 @@ async fn an_image_only_assistant_turn_is_absent_from_both_the_stream_and_the_sna
     }));
     harness.pump();
 
-    assert!(
-        !harness
-            .recorder
-            .kinds()
-            .contains(&"message_appended".to_string()),
-        "an image-only turn put a blank bubble on the wire: {:?}",
-        harness.recorder.kinds()
+    let streamed: Vec<String> = harness
+        .recorder
+        .deltas()
+        .into_iter()
+        .filter_map(|delta| match delta {
+            SessionDelta::MessageAppended { message } => Some(message.content),
+            _ => None,
+        })
+        .collect();
+    let snapshot: Vec<String> =
+        atlas_agent_delta::project::snapshot_messages(&lock(&harness.thread), None)
+            .into_iter()
+            .map(|message| message.content)
+            .collect();
+    assert_eq!(
+        streamed,
+        vec![atlas_acp_thread::IMAGE_PLACEHOLDER.to_string()]
     );
-    let snapshot = atlas_agent_delta::project::snapshot_messages(&lock(&harness.thread), None);
-    assert!(
-        snapshot.is_empty(),
-        "the snapshot and the stream disagree: {snapshot:?}"
-    );
+    assert_eq!(snapshot, streamed, "the snapshot and the stream disagree");
 }
 
 /// The other half of ATL-224: a run held back as empty is not lost. The moment
@@ -1573,10 +1579,9 @@ async fn an_image_only_assistant_turn_is_absent_from_both_the_stream_and_the_sna
 async fn a_run_held_back_as_empty_is_announced_once_it_has_text() {
     let harness = Harness::start();
 
-    harness.update(serde_json::json!({
-        "sessionUpdate": "agent_message_chunk",
-        "content": { "type": "image", "mimeType": "image/png", "data": "iVBORw0KGgo=" },
-    }));
+    // An empty chunk: what still renders as nothing now that an image shows
+    // a placeholder.
+    harness.update(text_chunk(""));
     harness.update(text_chunk("here is what it shows"));
     harness.expect(1);
 
@@ -1660,7 +1665,7 @@ async fn a_session_whose_stream_ends_leaves_no_routes_behind() {
     let projector = DeltaProjector::new(recorder.clone());
     let session_id = acp::SessionId::new("sess-closing");
 
-    let events = (projector.thread_events())(&session_id);
+    let events = (projector.thread_events())(&"stub".into(), &session_id);
     let thread = Arc::new(Mutex::new(AcpThread::new(
         session_id.clone(),
         stub_connection(),
@@ -1730,18 +1735,96 @@ async fn a_stream_for_a_session_that_never_opened_is_swept() {
 
     // A load that failed: the sink was handed out, the thread that would have
     // owned it was dropped with the error, and `register` was never called.
-    let orphan = (projector.thread_events())(&acp::SessionId::new("sess-failed"));
+    let orphan = (projector.thread_events())(&"stub".into(), &acp::SessionId::new("sess-failed"));
     assert_eq!(projector.pending_len(), 1);
     drop(orphan);
 
     // The next session opened sweeps it, because that is the one moment the
     // projector learns anything about session lifetimes.
-    let _live = (projector.thread_events())(&acp::SessionId::new("sess-next"));
+    let _live = (projector.thread_events())(&"stub".into(), &acp::SessionId::new("sess-next"));
     assert_eq!(
         projector.pending_len(),
         1,
         "the failed session's stream was retained alongside the live one"
     );
+}
+
+#[tokio::test]
+async fn a_closed_sessions_delayed_drain_cannot_touch_its_replacement() {
+    let recorder = Arc::new(Recorder::default());
+    let projector = DeltaProjector::new(recorder.clone());
+    let session_id = acp::SessionId::new("reopened");
+    let make_thread = || {
+        Arc::new(Mutex::new(AcpThread::new(
+            session_id.clone(),
+            stub_connection(),
+            vec![PathBuf::from("/tmp")],
+            None,
+            (projector.thread_events())(&"stub".into(), &session_id),
+        )))
+    };
+    let old = make_thread();
+    projector.attach(AgentId::new(), old.clone());
+    lock(&old)
+        .handle_session_update(acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new(acp::ContentBlock::from("stale")),
+        ))
+        .unwrap();
+    // On this single-threaded runtime the old drain has not run yet.
+    projector.close_session(&session_id);
+    let new = make_thread();
+    projector.attach(AgentId::new(), new.clone());
+    drop(old);
+    tokio::task::yield_now().await;
+    assert_eq!(
+        recorder.len(),
+        0,
+        "the stale stream emitted into the new binding"
+    );
+
+    lock(&new)
+        .handle_session_update(acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new(acp::ContentBlock::from("current")),
+        ))
+        .unwrap();
+    await_until("the replacement still projects events", || {
+        recorder.len() > 0
+    })
+    .await;
+    let deltas = serde_json::to_string(&recorder.deltas()).unwrap();
+    assert!(deltas.contains("current"));
+    assert!(!deltas.contains("stale"));
+    projector.close_session(&session_id);
+}
+
+#[tokio::test]
+async fn reopening_the_still_alive_thread_installs_a_new_event_stream() {
+    let recorder = Arc::new(Recorder::default());
+    let projector = DeltaProjector::new(recorder.clone());
+    let session_id = acp::SessionId::new("same-live-thread");
+    let thread = Arc::new(Mutex::new(AcpThread::new(
+        session_id.clone(),
+        stub_connection(),
+        vec![PathBuf::from("/tmp")],
+        None,
+        (projector.thread_events())(&"stub".into(), &session_id),
+    )));
+    projector.attach(AgentId::new(), thread.clone());
+    projector.close_session(&session_id);
+    // A prompt owns this thread after tab close, so the connection hands it
+    // back on reopen without invoking the event sink factory again.
+    projector.attach_settled(AgentId::new(), thread.clone());
+    tokio::task::yield_now().await;
+    lock(&thread)
+        .handle_session_update(acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new(acp::ContentBlock::from("after reopen")),
+        ))
+        .unwrap();
+    await_until("reopened events arrive", || recorder.len() > 0).await;
+    assert!(serde_json::to_string(&recorder.deltas())
+        .unwrap()
+        .contains("after reopen"));
+    projector.close_session(&session_id);
 }
 
 /// Regression, ATL-225 finding 4. A rewind removes entries from the thread, and
@@ -2582,6 +2665,7 @@ async fn every_delta_is_numbered_densely_in_emit_order() {
             id: "q-1".into(),
             text: "next".into(),
             origin: Origin::Local,
+            truncated: None,
         }],
     );
     harness
@@ -3087,4 +3171,148 @@ fn a_changed_message_id_starts_a_new_message() {
     drop(thread);
     let texts: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
     assert_eq!(texts, ["Checking the file.", "Here is the fix"]);
+}
+
+// ------------------------------------------------------ remediation batch B1
+
+/// Audit #17: a turn's end drained after the host has already labelled and
+/// opened the next turn must still carry its OWN turn's number. Stamped with
+/// the host's current number, it read as the new turn finishing, and the
+/// client went idle while that turn streamed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_drained_behind_the_next_turn_keeps_its_own_turn_seq() {
+    let harness = Harness::start();
+    harness.projector.set_turn_seq(&harness.session_id, 1);
+    let first = lock(&harness.thread).begin_turn();
+    harness.pump();
+
+    // Turn 1 ends and turn 2 is dispatched before the drain catches up.
+    lock(&harness.thread).end_turn_unless_superseded(first, acp::StopReason::EndTurn);
+    harness.projector.set_turn_seq(&harness.session_id, 2);
+    lock(&harness.thread).begin_turn();
+    harness.pump();
+
+    let deltas = harness.recorder.deltas();
+    let finished: Vec<u64> = deltas
+        .iter()
+        .filter_map(|delta| match delta {
+            SessionDelta::TurnFinished { turn_seq, .. } => Some(*turn_seq),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finished, vec![1], "only turn 1 finished, and says so");
+    let last_status = deltas
+        .iter()
+        .rev()
+        .find_map(|delta| match delta {
+            SessionDelta::Status { status, turn_seq } => Some((*status, *turn_seq)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        last_status,
+        (atlas_agent_delta::SessionStatus::Running, 2),
+        "the session is running turn 2"
+    );
+}
+
+/// Audit, lower list: a `usage_update` with `size: 0` (no window known) still
+/// carries the session's cost, and dropping the update lost it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_usage_update_with_no_window_keeps_its_cost() {
+    let harness = Harness::start();
+
+    harness.update(serde_json::json!({
+        "sessionUpdate": "usage_update",
+        "used": 0,
+        "size": 0,
+        "cost": { "amount": 1.25, "currency": "USD" },
+    }));
+    harness.pump();
+
+    let costs: Vec<(u64, f64, Option<String>)> = harness
+        .recorder
+        .deltas()
+        .into_iter()
+        .filter_map(|delta| match delta {
+            SessionDelta::ContextUsage {
+                size,
+                cost,
+                currency,
+                ..
+            } => Some((size, cost, currency)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(costs, vec![(0, 1.25, Some("USD".to_string()))]);
+}
+
+/// Audit #19: an image-only reply was announced as nothing at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_image_only_reply_is_announced_with_a_placeholder() {
+    let harness = Harness::start();
+
+    harness.update(serde_json::json!({
+        "sessionUpdate": "agent_message_chunk",
+        "content": { "type": "image", "data": "aGk=", "mimeType": "image/png" },
+    }));
+    harness.pump();
+
+    let contents: Vec<String> = harness
+        .recorder
+        .deltas()
+        .into_iter()
+        .filter_map(|delta| match delta {
+            SessionDelta::MessageAppended { message } => Some(message.content),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        contents,
+        vec![atlas_acp_thread::IMAGE_PLACEHOLDER.to_string()]
+    );
+}
+
+/// Audit #96: a child's narration, forwarded on the parent session with its
+/// launch in `_meta`, is not the parent's prose.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_childs_narration_is_not_announced_as_the_parents_prose() {
+    let harness = Harness::start();
+
+    harness.update(serde_json::json!({
+        "sessionUpdate": "agent_message_chunk",
+        "content": { "type": "text", "text": "Child: scanning the repo" },
+        "_meta": { "claudeCode": { "parentToolUseId": "toolu_1" } },
+    }));
+    harness.update(text_chunk("The parent speaks."));
+    harness.pump();
+
+    let contents: Vec<String> = harness
+        .recorder
+        .deltas()
+        .into_iter()
+        .filter_map(|delta| match delta {
+            SessionDelta::MessageAppended { message } => Some(message.content),
+            SessionDelta::TextChunk { delta, .. } => Some(delta),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(contents, vec!["The parent speaks.".to_string()]);
+
+    let snapshot = harness
+        .projector
+        .snapshot(&harness.session_id, true, None)
+        .expect("the session is attached");
+    let prose: Vec<&str> = snapshot
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect();
+    assert_eq!(prose, vec!["The parent speaks."]);
+    let from_thread: Vec<String> =
+        atlas_agent_delta::project::snapshot_messages(&lock(&harness.thread), None)
+            .into_iter()
+            .map(|message| message.content)
+            .collect();
+    assert_eq!(from_thread, vec!["The parent speaks.".to_string()]);
 }

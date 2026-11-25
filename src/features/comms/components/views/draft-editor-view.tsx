@@ -2,6 +2,7 @@ import type { ReactNode, Ref } from "react";
 import { Copy, Hash, Link2, Play } from "lucide-react";
 import {
   AvatarStack,
+  Button,
   HintGroup,
   HintItem,
   type LabelTone,
@@ -25,6 +26,9 @@ export interface DraftEditorViewProps {
   convName: string | null;
   sent: boolean;
   ready: boolean;
+  syncError?: string | null;
+  pending?: boolean;
+  onRetrySync?: () => void;
   /** Where the container mounts CodeMirror. */
   editorHost: Ref<HTMLDivElement>;
   onCopy: () => void;
@@ -46,6 +50,9 @@ export function DraftEditorView({
   convName,
   sent,
   ready,
+  syncError,
+  pending,
+  onRetrySync,
   editorHost,
   onCopy,
   onSendToAgent,
@@ -54,6 +61,19 @@ export function DraftEditorView({
 }: DraftEditorViewProps) {
   return (
     <div data-view="draft-editor" className="flex min-h-0 flex-1 flex-col">
+      {(syncError || pending) && (
+        <div
+          role="status"
+          className="flex items-center gap-2 border-b border-border px-3 py-2 text-xs text-muted-foreground"
+        >
+          <span className="flex-1">{syncError ?? "Changes are waiting to sync."}</span>
+          {syncError && (
+            <Button size="sm" variant="ghost" onClick={onRetrySync}>
+              Retry sync
+            </Button>
+          )}
+        </div>
+      )}
       <div className="flex h-[32px] shrink-0 items-center gap-1.5 border-b border-border px-1.5">
         <span className="flex min-w-0 items-center gap-1 pl-1 text-xs font-medium text-secondary-foreground">
           <Hash size={11} className="shrink-0 text-muted-foreground" />

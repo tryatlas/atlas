@@ -606,5 +606,7 @@ impl ServerHandler for CodeTools {
 /// shared-memory toggle — code search holds no memory.
 pub fn tenant(tools: CodeTools) -> Tenant {
     let gate = tools.gate.clone();
-    Tenant::new(CODE_SERVER_NAME, CODE_PATH, tools).gated_by(gate, "code tools are off in Settings")
+    Tenant::new(CODE_SERVER_NAME, CODE_PATH, tools)
+        .advertising(crate::commands::tool_servers::tool_names(&tools_list()))
+        .gated_by(gate, "code tools are off in Settings")
 }

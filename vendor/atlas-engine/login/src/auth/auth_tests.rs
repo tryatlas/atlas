@@ -1307,6 +1307,38 @@ struct FailingExternalAuth {
     resolve_count: AtomicUsize,
 }
 
+struct TransientExternalAuth(FailingExternalAuth);
+
+impl ExternalAuth for TransientExternalAuth {
+    fn resolve(&self) -> ExternalAuthFuture<'_, AtlasEngineAuth> {
+        self.0.resolve()
+    }
+    fn refresh(
+        &self,
+        context: ExternalAuthRefreshContext,
+    ) -> ExternalAuthFuture<'_, AtlasEngineAuth> {
+        self.0.refresh(context)
+    }
+}
+
+#[tokio::test]
+async fn request_auth_propagates_transient_mint_errors_without_losing_credentials() {
+    let manager = AuthManager::from_auth_for_testing(AtlasEngineAuth::from_api_key("seed"));
+    let auth = AtlasEngineAuth::from_api_key("cached-external-token");
+    manager
+        .set_external_auth(Arc::new(TransientExternalAuth(FailingExternalAuth {
+            auth: auth.clone(),
+            resolve_count: AtomicUsize::new(0),
+        })))
+        .await
+        .unwrap();
+    assert!(matches!(
+        manager.auth_for_request().await,
+        Err(RefreshTokenError::Transient(_))
+    ));
+    assert_eq!(manager.auth_cached(), Some(auth));
+}
+
 impl ExternalAuth for FailingExternalAuth {
     fn resolve(&self) -> ExternalAuthFuture<'_, AtlasEngineAuth> {
         let resolve_count = self.resolve_count.fetch_add(1, Ordering::SeqCst);

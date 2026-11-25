@@ -277,6 +277,33 @@ fn try_symlink(target: &Path, link: &Path) -> bool {
 }
 
 #[test]
+fn external_symlinked_rule_sources_are_not_mirrored() {
+    let dir = project();
+    let external = project();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".claude/rules")).unwrap();
+    fs::write(external.path().join("private.md"), "outside instructions").unwrap();
+    if !try_symlink(
+        &external.path().join("private.md"),
+        &root.join(".claude/CLAUDE.md"),
+    ) {
+        return;
+    }
+    assert!(try_symlink(
+        &external.path().join("private.md"),
+        &root.join(".claude/rules/private.md")
+    ));
+    fs::write(root.join(".claude/rules/local.md"), "project instructions").unwrap();
+    let (claude, rules) = read_sources(root, &[]).unwrap();
+    assert!(claude.is_none());
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].body, "project instructions");
+    assert!(!render(claude.as_deref(), &rules)
+        .unwrap()
+        .contains("outside instructions"));
+}
+
+#[test]
 fn a_symlinked_agents_md_is_not_replaced() {
     let dir = project();
     let root = dir.path();

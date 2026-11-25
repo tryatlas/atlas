@@ -511,7 +511,12 @@ fn switching_cloud_project_requeues_every_row_for_the_new_destination() {
         )
         .unwrap();
     // The old destination accepted the session; a message failed against it.
-    store.mark_sent(&session).unwrap();
+    let batch = store
+        .pending_artifacts(WORKSPACE, "remote", "org", 100, 1_000_000)
+        .unwrap();
+    store
+        .mark_sent(batch.iter().find(|a| a.row_id() == session).unwrap())
+        .unwrap();
     let message_id = store.messages_for_session(&session).unwrap()[0].id.clone();
     store.mark_failed(&message_id).unwrap();
     assert_eq!(
@@ -559,4 +564,17 @@ fn switching_cloud_project_requeues_every_row_for_the_new_destination() {
             .unwrap(),
         0
     );
+}
+
+#[test]
+fn git_detection_never_reenables_a_paused_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(dir.path());
+    bind(&store, WORKSPACE, dir.path(), ProjectMode::Local).unwrap();
+    disable(&store).unwrap();
+    init_repo(dir.path());
+    commit(dir.path(), "a.rs", "one", "initial");
+    let binding = refresh_detection(&store, dir.path()).unwrap().unwrap();
+    assert!(!binding.is_capturing());
+    assert!(!store.binding().unwrap().unwrap().is_capturing());
 }

@@ -61,7 +61,12 @@ const useUpdaterStoreBase = create<UpdaterState>()((set) => ({
       }),
     setReady: (version) =>
       set({ phase: "ready", version, progress: null, error: null, modalOpen: true }),
-    setError: (message) => set({ phase: "error", error: message, modalOpen: true }),
+    setError: (message) =>
+      set((s) => ({
+        phase: "error",
+        error: message,
+        modalOpen: s.modalOpen || s.phase === "applying",
+      })),
     setChecking: (checking) => set({ checking }),
     beginApply: () => set({ phase: "applying" }),
     openModal: () => set({ modalOpen: true }),

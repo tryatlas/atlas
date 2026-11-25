@@ -1,3 +1,4 @@
+// Modified by Atlas from upstream OpenAI Codex (Apache-2.0). See CONTEXT.md.
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::fs::File;
@@ -21,8 +22,9 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::Result;
+#[cfg(not(unix))]
 use portable_pty::CommandBuilder;
-#[cfg(not(windows))]
+#[cfg(not(any(unix, windows)))]
 use portable_pty::native_pty_system;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -50,12 +52,14 @@ pub fn conpty_supported() -> bool {
     true
 }
 
+#[cfg(not(unix))]
 struct PtyChildTerminator {
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     #[cfg(unix)]
     process_group_id: Option<u32>,
 }
 
+#[cfg(not(unix))]
 impl ChildTerminator for PtyChildTerminator {
     fn signal(&mut self, signal: ProcessSignal) -> std::io::Result<()> {
         match signal {
@@ -110,6 +114,7 @@ impl ChildTerminator for RawPidTerminator {
     }
 }
 
+#[cfg(not(unix))]
 fn platform_native_pty_system() -> Box<dyn portable_pty::PtySystem + Send> {
     #[cfg(windows)]
     {
@@ -141,14 +146,19 @@ pub async fn spawn_process(
     let _ = inherited_fds;
 
     #[cfg(unix)]
-    if !inherited_fds.is_empty() {
-        return spawn_process_preserving_fds(program, args, cwd, env, arg0, size, inherited_fds)
-            .await;
+    {
+        // Retain the native wait status even with no inherited descriptors.
+        // portable-pty replaces a signal termination with the ordinary code 1.
+        spawn_process_preserving_fds(program, args, cwd, env, arg0, size, inherited_fds).await
     }
 
-    spawn_process_portable(program, args, cwd, env, arg0, size).await
+    #[cfg(not(unix))]
+    {
+        spawn_process_portable(program, args, cwd, env, arg0, size).await
+    }
 }
 
+#[cfg(not(unix))]
 async fn spawn_process_portable(
     program: &str,
     args: &[String],

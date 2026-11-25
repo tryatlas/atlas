@@ -183,13 +183,15 @@ pub async fn memory_policies(
     let doc_vecs = indexed_vectors(&registry, &provider, &project_path, &docs).await;
 
     let pp = project_path.clone();
-    tokio::task::spawn_blocking(move || compute_policies(embedder, pp, docs, doc_vecs))
+    let model_key = provider.provider_name().to_owned();
+    tokio::task::spawn_blocking(move || compute_policies(embedder, model_key, pp, docs, doc_vecs))
         .await
         .map_err(|e| format!("policy task: {e}"))?
 }
 
 fn compute_policies(
     embedder: Arc<Embedder>,
+    model_key: String,
     project_path: String,
     docs: Vec<super::agent_memory::MemoryDoc>,
     mut doc_vecs: HashMap<String, Vec<f32>>,
@@ -235,7 +237,7 @@ fn compute_policies(
                 break;
             }
             for line in split_statements(&docs[*di].text) {
-                let h = hash_text(&line);
+                let h = hash_text(&format!("{model_key}\0{line}"));
                 let v = if let Some(v) = cache.get(&h) {
                     v.clone()
                 } else {
@@ -326,14 +328,13 @@ pub async fn memory_policy_update(
     new_text: String,
 ) -> Result<(), String> {
     let home = dirs::home_dir().unwrap_or_default();
-    if !allowed_memory_path(&home, Path::new(&file_path)) {
-        return Err("path not allowed".into());
-    }
     if old_text.is_empty() {
         return Err("empty original text".into());
     }
     tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let content = std::fs::read_to_string(&file_path).map_err(|e| format!("read: {e}"))?;
+        let target =
+            allowed_memory_target(&home, Path::new(&file_path)).ok_or("path not allowed")?;
+        let content = std::fs::read_to_string(&target).map_err(|e| format!("read: {e}"))?;
         let Some(pos) = content.find(&old_text) else {
             return Err("original text not found in file".into());
         };
@@ -341,7 +342,18 @@ pub async fn memory_policy_update(
         updated.push_str(&content[..pos]);
         updated.push_str(&new_text);
         updated.push_str(&content[pos + old_text.len()..]);
-        std::fs::write(&file_path, updated).map_err(|e| format!("write: {e}"))
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&target)
+                .map_err(|e| e.to_string())?
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        #[cfg(not(unix))]
+        let mode = 0o600;
+        atlas_fs::replace_file_with_mode(&target, updated, mode).map_err(|e| format!("write: {e}"))
     })
     .await
     .map_err(|e| format!("update task: {e}"))?
@@ -352,12 +364,10 @@ pub async fn memory_policy_update(
 /// or is named exactly `CLAUDE.md` / `AGENTS.md`. Judged on the resolved
 /// path, so `~/.claude/../.zshrc` and a symlink named `AGENTS.md` pointing
 /// at a dotfile are both refused.
-fn allowed_memory_path(home: &Path, p: &Path) -> bool {
-    let Ok(real) = dunce::canonicalize(p) else {
-        return false;
-    };
+fn allowed_memory_target(home: &Path, p: &Path) -> Option<PathBuf> {
+    let real = dunce::canonicalize(p).ok()?;
     if !real.is_file() {
-        return false;
+        return None;
     }
     let under = |dir: &str| {
         let base = home.join(dir);
@@ -368,12 +378,39 @@ fn allowed_memory_path(home: &Path, p: &Path) -> bool {
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n == "CLAUDE.md" || n == "AGENTS.md");
-    under(".claude") || under(".codex") || named
+    (under(".claude") || under(".codex") || named).then_some(real)
 }
 
 #[cfg(test)]
 mod path_tests {
-    use super::allowed_memory_path;
+    fn allowed_memory_path(home: &std::path::Path, path: &std::path::Path) -> bool {
+        super::allowed_memory_target(home, path).is_some()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_edit_preserves_the_symlink_and_private_target_mode() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("CLAUDE.md");
+        let link = dir.path().join("AGENTS.md");
+        std::fs::write(&target, "before\nbefore\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &link).unwrap();
+        super::memory_policy_update(
+            link.to_string_lossy().into(),
+            "before".into(),
+            "after".into(),
+        )
+        .await
+        .unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "after\nbefore\n");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     #[test]
     fn only_agent_memory_files_may_be_edited() {

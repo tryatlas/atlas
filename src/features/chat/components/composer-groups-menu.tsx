@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useMemo } from "react";
 import { useActionShortcut } from "@/features/keybindings/lib/use-action-shortcut";
 import { useChatStore } from "../stores/chat-store";
+import { onClaudeModeList } from "../lib/session-configuration";
 import { useNativeModelsStore } from "../stores/native-models-store";
 import type { SwitchableAgent } from "@/types/agent";
 import { agentMeta, useSwitchableAgents } from "@/features/agents/lib/agent-meta";
@@ -142,7 +143,9 @@ export function ComposerGroupsMenu({
     }));
   }, [openGroup, switchableAgents, agentType, models, refreshingModels]);
 
-  const isClaude = agentType === "claude-code";
+  // Atlas's own permission-mode record, read off the session rather than
+  // its agent's id (ADR-0002).
+  const isClaude = useChatStore((s) => onClaudeModeList(s.sessions[tabId]));
   const hasAcpModes = !!availableModes && availableModes.length > 0;
   const showMode = isClaude || hasAcpModes || modesPending;
   const toggle = (g: ComposerGroup) => {

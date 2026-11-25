@@ -49,7 +49,9 @@ pub struct TokenFiles {
 struct Written {
     path: std::path::PathBuf,
     token: String,
-    session: Option<String>,
+    /// The session it was bound to, as (agent, session id): two agents can
+    /// share a session id (#86), and one ending must not take the other's.
+    session: Option<(String, String)>,
 }
 
 /// A launch directory not written for this long, whose launch has ended,
@@ -140,27 +142,32 @@ impl TokenFiles {
         Ok(path)
     }
 
-    /// The file at `path` now belongs to `session_id`: it goes when that
-    /// session ends. Any earlier file of that session goes now (binding a
-    /// new token revoked the old one).
-    pub fn bind(&self, path: &std::path::Path, session_id: &str) {
+    /// The file at `path` now belongs to `agent`'s session `session_id`: it
+    /// goes when that session ends. Any earlier file of that session goes
+    /// now (binding a new token revoked the old one).
+    pub fn bind(&self, path: &std::path::Path, agent: &str, session_id: &str) {
+        let session = (agent.to_string(), session_id.to_string());
         let mut written = self.written();
         written.retain(|w| {
-            let earlier = w.path != path && w.session.as_deref() == Some(session_id);
+            let earlier = w.path != path && w.session.as_ref() == Some(&session);
             if earlier {
                 let _ = std::fs::remove_file(&w.path);
             }
             !earlier
         });
         if let Some(w) = written.iter_mut().find(|w| w.path == path) {
-            w.session = Some(session_id.to_string());
+            w.session = Some(session);
         }
     }
 
-    /// Remove the files of `session_id`, which has ended. Idempotent.
-    pub fn session_ended(&self, session_id: &str) {
+    /// Remove the files of `agent`'s session `session_id`, which has ended.
+    /// Idempotent.
+    pub fn session_ended(&self, agent: &str, session_id: &str) {
         self.written().retain(|w| {
-            let ended = w.session.as_deref() == Some(session_id);
+            let ended = w
+                .session
+                .as_ref()
+                .is_some_and(|(a, id)| a == agent && id == session_id);
             if ended {
                 let _ = std::fs::remove_file(&w.path);
             }
@@ -256,13 +263,57 @@ pub fn read_token_file(path: &std::path::Path) -> Result<String> {
     Ok(token.to_string())
 }
 
+/// How long one forwarded request may go unanswered before the bridge answers
+/// it with an error itself. Generous: a tool may be waiting on the user (an
+/// approval, a question), and that is not a hang. What it bounds is a request
+/// the server never answers, which would otherwise leave the agent's tool
+/// call open for good.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The JSON-RPC error code the bridge answers a timed-out request with (in
+/// the implementation-defined server-error range).
+const TIMED_OUT: i64 = -32001;
+
 /// Forward `input` to the server at `url` until `input` ends.
+///
+/// Requests are forwarded concurrently and answered as they finish, in
+/// whatever order that is: one tool waiting on the user must not hold up
+/// every other tool call of the session (audit #88). The handshake and every
+/// notification still go one at a time, in order, before the next line is
+/// read — `notifications/initialized` must reach the server ahead of the
+/// requests that follow it, and a cancel ahead of what it cancels.
 pub async fn bridge(
     url: &str,
     token: &str,
     input: impl AsyncBufRead + Unpin,
-    mut output: impl AsyncWrite + Unpin,
+    output: impl AsyncWrite + Unpin,
 ) -> Result<()> {
+    bridge_with(url, token, input, output, REQUEST_TIMEOUT).await
+}
+
+/// The session a bridge forwards into, shared by its requests in flight.
+#[derive(Default)]
+struct Session {
+    id: Option<String>,
+    protocol: Option<String>,
+}
+
+/// The client's handshake, kept to open a new session with.
+#[derive(Default)]
+struct Handshake {
+    initialize: Option<String>,
+    initialized: Option<String>,
+}
+
+async fn bridge_with(
+    url: &str,
+    token: &str,
+    input: impl AsyncBufRead + Unpin,
+    mut output: impl AsyncWrite + Unpin,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    use futures::stream::{FuturesUnordered, StreamExt};
+
     let server = Server {
         url: loopback_url(url)?,
         // Loopback only, so never through a proxy from the agent's
@@ -271,80 +322,186 @@ pub async fn bridge(
         client: reqwest::Client::builder().no_proxy().build()?,
         token,
     };
-    let mut session: Option<String> = None;
-    let mut protocol: Option<String> = None;
-    // The client's handshake, kept to open a new session with.
-    let mut initialize: Option<String> = None;
-    let mut initialized: Option<String> = None;
+    // Held across a re-handshake, so requests that find the session gone
+    // together open one new session between them, not one each.
+    let session = tokio::sync::Mutex::new(Session::default());
+    // Never held across an await: the read loop writes it.
+    let handshake = std::sync::Mutex::new(Handshake::default());
+    let mut in_flight = FuturesUnordered::new();
+    // An ordered message (the handshake, a notification) is in flight: the
+    // next line waits for it.
+    let mut ordered_pending = false;
+    let mut input_done = false;
+    // The first fatal answer. The bridge stops reading, lets what is already
+    // in flight answer, then ends with it.
+    let mut fatal: Option<anyhow::Error> = None;
     let mut lines = input.lines();
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
+    loop {
+        let reading = !input_done && !ordered_pending && fatal.is_none();
+        if !reading && in_flight.is_empty() {
+            break;
         }
-        let message: Value = serde_json::from_str(&line).unwrap_or_default();
-        let method = message.get("method").and_then(Value::as_str);
-        match method {
-            Some("initialize") => initialize = Some(line.clone()),
-            Some("notifications/initialized") => initialized = Some(line.clone()),
-            _ => {}
-        }
-        // `initialize` carries its version in the body, and a header that
-        // disagreed with it would be refused.
-        let is_init = method == Some("initialize");
-        let mut answer = server
-            .post(
-                &line,
-                session.as_deref(),
-                protocol.as_deref().filter(|_| !is_init),
-            )
-            .await?;
-        if answer.status == reqwest::StatusCode::NOT_FOUND
-            && session.is_some()
-            && !answer.is_jsonrpc()
-        {
-            // The server no longer knows the session (it idled out, or the
-            // app restarted the server): open a new one with the client's
-            // handshake, dropping its answers, and retry this line once.
-            if let Some(init) = &initialize {
-                let opened = server.post(init, None, None).await?;
-                protocol = opened.protocol_version().or(protocol);
-                session = opened.session;
-                if let Some(note) = &initialized {
-                    server
-                        .post(note, session.as_deref(), protocol.as_deref())
-                        .await?;
+        tokio::select! {
+            line = lines.next_line(), if reading => {
+                let Some(line) = line? else {
+                    input_done = true;
+                    continue;
+                };
+                if line.trim().is_empty() {
+                    continue;
                 }
-                answer = server
-                    .post(
-                        &line,
-                        session.as_deref(),
-                        protocol.as_deref().filter(|_| !is_init),
+                let message: Value = serde_json::from_str(&line).unwrap_or_default();
+                let method = message.get("method").and_then(Value::as_str);
+                {
+                    let mut kept = handshake.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    match method {
+                        Some("initialize") => kept.initialize = Some(line.clone()),
+                        Some("notifications/initialized") => kept.initialized = Some(line.clone()),
+                        _ => {}
+                    }
+                }
+                // `initialize` carries its version in the body, and a header
+                // that disagreed with it would be refused.
+                let is_init = method == Some("initialize");
+                let id = message.get("id").cloned();
+                let ordered = is_init || id.is_none();
+                ordered_pending |= ordered;
+                let (server, session, handshake) = (&server, &session, &handshake);
+                in_flight.push(async move {
+                    let forwarded = tokio::time::timeout(
+                        timeout,
+                        forward(server, session, handshake, &line, is_init),
                     )
-                    .await?;
+                    .await;
+                    let answered = match forwarded {
+                        Ok(answered) => answered.map(|answer| answer.messages),
+                        Err(_) => Ok(timed_out(id, timeout).into_iter().collect()),
+                    };
+                    (ordered, answered)
+                });
+            }
+            Some((ordered, answered)) = in_flight.next(), if !in_flight.is_empty() => {
+                if ordered {
+                    ordered_pending = false;
+                }
+                match answered {
+                    Ok(messages) => {
+                        for message in &messages {
+                            output.write_all(message.as_bytes()).await?;
+                            output.write_all(b"\n").await?;
+                        }
+                        output.flush().await?;
+                    }
+                    Err(e) => {
+                        fatal.get_or_insert(e);
+                    }
+                }
             }
         }
+    }
+    match fatal {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// The error a request the server left unanswered is given, so the client's
+/// call ends. `None` for a notification, which nothing waits on.
+fn timed_out(id: Option<Value>, timeout: std::time::Duration) -> Option<String> {
+    let id = id?;
+    tracing::warn!(target: "atlas::mcp_bridge", %id, "a request went unanswered for {timeout:?}");
+    Some(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": TIMED_OUT,
+                "message": format!("Atlas's tool server did not answer within {} s", timeout.as_secs()),
+            },
+        })
+        .to_string(),
+    )
+}
+
+/// Forward one message, opening the session again when the server has
+/// dropped it, and answer what the server said.
+async fn forward(
+    server: &Server<'_>,
+    session: &tokio::sync::Mutex<Session>,
+    handshake: &std::sync::Mutex<Handshake>,
+    line: &str,
+    is_init: bool,
+) -> Result<Answer> {
+    let (id, protocol) = {
+        let s = session.lock().await;
+        (s.id.clone(), s.protocol.clone())
+    };
+    let mut answer = server
+        .post(
+            line,
+            id.as_deref(),
+            protocol.as_deref().filter(|_| !is_init),
+        )
+        .await?;
+    if answer.status == reqwest::StatusCode::NOT_FOUND && id.is_some() && !answer.is_jsonrpc() {
+        // The server no longer knows the session (it idled out, or the app
+        // restarted the server): open a new one with the client's handshake,
+        // dropping its answers, and retry this line once.
+        let (init, note) = {
+            let kept = handshake
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (kept.initialize.clone(), kept.initialized.clone())
+        };
+        if let Some(init) = init {
+            // Opened, and its handshake finished, before any other request
+            // can see it — but without holding the session's lock across the
+            // round trips, so no other request waits on them. If another
+            // request reopened it meanwhile, that session wins and this one
+            // is left to idle out on the server.
+            let opened = server.post(&init, None, None).await?;
+            let opened_protocol = opened.protocol_version().or_else(|| protocol.clone());
+            if let Some(note) = &note {
+                server
+                    .post(note, opened.session.as_deref(), opened_protocol.as_deref())
+                    .await?;
+            }
+            let (id, protocol) = {
+                let mut s = session.lock().await;
+                if s.id == id {
+                    s.protocol = opened_protocol;
+                    s.id = opened.session;
+                }
+                (s.id.clone(), s.protocol.clone())
+            };
+            answer = server
+                .post(
+                    line,
+                    id.as_deref(),
+                    protocol.as_deref().filter(|_| !is_init),
+                )
+                .await?;
+        }
+    }
+    {
+        let mut s = session.lock().await;
         if let Some(id) = answer.session.take() {
-            session = Some(id);
+            s.id = Some(id);
         }
         if is_init {
-            protocol = answer.protocol_version().or(protocol);
+            s.protocol = answer.protocol_version().or(s.protocol.take());
         }
-        // A JSON-RPC error is the client's to read, whatever the status;
-        // only an answer that is not JSON-RPC at all ends the bridge.
-        if !answer.status.is_success() && !answer.is_jsonrpc() {
-            bail!(
-                "the memory server answered {}: {}",
-                answer.status,
-                answer.body.trim()
-            );
-        }
-        for message in &answer.messages {
-            output.write_all(message.as_bytes()).await?;
-            output.write_all(b"\n").await?;
-        }
-        output.flush().await?;
     }
-    Ok(())
+    // A JSON-RPC error is the client's to read, whatever the status; only an
+    // answer that is not JSON-RPC at all ends the bridge.
+    if !answer.status.is_success() && !answer.is_jsonrpc() {
+        bail!(
+            "the memory server answered {}: {}",
+            answer.status,
+            answer.body.trim()
+        );
+    }
+    Ok(answer)
 }
 
 /// `url` parsed, when it names Atlas's loopback server: plain `http` to
@@ -670,15 +827,30 @@ mod tests {
         let files = TokenFiles::in_temp();
         let first = files.write("t1", |_| true).unwrap();
         let other = files.write("t2", |_| true).unwrap();
-        files.bind(&first, "s1");
-        files.bind(&other, "s2");
+        files.bind(&first, "a", "s1");
+        files.bind(&other, "a", "s2");
         let again = files.write("t3", |_| true).unwrap();
-        files.bind(&again, "s1");
+        files.bind(&again, "a", "s1");
         assert!(!first.exists(), "the session's earlier file goes on rebind");
-        files.session_ended("s1");
+        files.session_ended("a", "s1");
         assert!(!again.exists(), "an ended session's file goes");
         assert!(other.exists(), "another session's file stays");
-        files.session_ended("s1");
+        files.session_ended("a", "s1");
+    }
+
+    /// #86: two agents can both mint `"1"`. One binding or ending its session
+    /// leaves the other agent's file alone.
+    #[test]
+    fn two_agents_with_the_same_session_id_keep_their_own_token_files() {
+        let files = TokenFiles::in_temp();
+        let a = files.write("ta", |_| true).unwrap();
+        let b = files.write("tb", |_| true).unwrap();
+        files.bind(&a, "agent-a", "1");
+        files.bind(&b, "agent-b", "1");
+        assert!(a.exists(), "B's bind is not a rebind of A's session");
+        files.session_ended("agent-b", "1");
+        assert!(!b.exists());
+        assert!(a.exists(), "B's session ending leaves A's file");
     }
 
     #[test]
@@ -793,6 +965,117 @@ mod tests {
             third.contains(r#""id":3"#) && third.contains(r#""result""#),
             "{third}"
         );
+        drop(to_bridge);
+        run.await.unwrap().unwrap();
+    }
+
+    /// A stand-in server whose `slow` method answers only after a minute and
+    /// whose every other request answers at once, echoing its id.
+    async fn stalling_server() -> String {
+        let app = axum::Router::new().route(
+            "/mcp",
+            axum::routing::post(|body: String| async move {
+                let message: Value = serde_json::from_str(&body).unwrap_or_default();
+                if message["method"] == "slow" {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+                // A notification is accepted with nothing to say.
+                let Some(id) = message.get("id").cloned() else {
+                    return (
+                        axum::http::StatusCode::ACCEPTED,
+                        [("content-type", "application/json")],
+                        String::new(),
+                    );
+                };
+                (
+                    axum::http::StatusCode::OK,
+                    [("content-type", "application/json")],
+                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}}).to_string(),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        format!("http://{addr}/mcp")
+    }
+
+    async fn send(to_bridge: &mut tokio::io::DuplexStream, lines: &[&str]) {
+        for line in lines {
+            to_bridge.write_all(line.as_bytes()).await.unwrap();
+            to_bridge.write_all(b"\n").await.unwrap();
+        }
+    }
+
+    /// One tool waiting (on the user, say) does not hold up the session's
+    /// other tool calls: requests are forwarded concurrently and answered as
+    /// they finish (audit #88).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_request_does_not_hold_up_the_next() {
+        let url = stalling_server().await;
+        let (mut to_bridge, bridge_in) = tokio::io::duplex(64 * 1024);
+        let (bridge_out, from_bridge) = tokio::io::duplex(64 * 1024);
+        let _run =
+            tokio::spawn(
+                async move { bridge(&url, "t", BufReader::new(bridge_in), bridge_out).await },
+            );
+        send(
+            &mut to_bridge,
+            &[
+                INITIALIZE,
+                INITIALIZED,
+                r#"{"jsonrpc":"2.0","id":2,"method":"slow"}"#,
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call"}"#,
+            ],
+        )
+        .await;
+        let mut lines = BufReader::new(from_bridge).lines();
+        let first = lines.next_line().await.unwrap().unwrap();
+        assert!(first.contains(r#""id":1"#), "{first}");
+        let second = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("the fast request waited behind the slow one")
+            .unwrap()
+            .unwrap();
+        assert!(second.contains(r#""id":3"#), "{second}");
+    }
+
+    /// A request the server never answers is answered by the bridge with an
+    /// error once the timeout passes, so the agent's tool call ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_left_unanswered_times_out_with_an_error() {
+        let url = stalling_server().await;
+        let (mut to_bridge, bridge_in) = tokio::io::duplex(64 * 1024);
+        let (bridge_out, from_bridge) = tokio::io::duplex(64 * 1024);
+        let run = tokio::spawn(async move {
+            bridge_with(
+                &url,
+                "t",
+                BufReader::new(bridge_in),
+                bridge_out,
+                Duration::from_millis(300),
+            )
+            .await
+        });
+        send(
+            &mut to_bridge,
+            &[INITIALIZE, r#"{"jsonrpc":"2.0","id":7,"method":"slow"}"#],
+        )
+        .await;
+        let mut lines = BufReader::new(from_bridge).lines();
+        let _init = lines.next_line().await.unwrap().unwrap();
+        let answer: Value = serde_json::from_str(
+            &tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("the bridge never answered the stalled request")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(answer["id"], 7);
+        assert_eq!(answer["error"]["code"], TIMED_OUT);
         drop(to_bridge);
         run.await.unwrap().unwrap();
     }

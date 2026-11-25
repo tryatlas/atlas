@@ -109,6 +109,11 @@ pub struct LiveThreadUpdate {
     pub title: Option<Arc<str>>,
     pub worktree_paths: WorktreePaths,
     pub remote_connection: Option<serde_json::Value>,
+    /// Something happened in the conversation: a new entry, a turn ending, a
+    /// question. Only then does an existing row's `updated_at` move; opening a
+    /// session, or the agent replaying it, records what it is without making
+    /// an old conversation read "updated just now".
+    pub activity: bool,
 }
 
 /// Atlas's session history.
@@ -147,6 +152,10 @@ enum DbOperation {
     DeleteAlias(acp::SessionId),
     /// A session was branched from another: (child, parent).
     SaveFork(acp::SessionId, acp::SessionId),
+    /// Atlas opened this session itself (`session/new`), and when.
+    MarkSessionOpened(acp::SessionId, DateTime<Utc>),
+    /// Something was sent to it: it has a row, and is no longer unused.
+    UnmarkSessionOpened(acp::SessionId),
 }
 
 /// What a queued write is *about*, so a burst about the same thing collapses.
@@ -157,6 +166,7 @@ enum OpKey {
     DeletedSession(acp::SessionId),
     Alias(acp::SessionId),
     Fork(acp::SessionId),
+    Opened(acp::SessionId),
 }
 
 impl DbOperation {
@@ -173,6 +183,8 @@ impl DbOperation {
                 OpKey::Alias(alias.clone())
             }
             DbOperation::SaveFork(child, _) => OpKey::Fork(child.clone()),
+            DbOperation::MarkSessionOpened(session_id, _)
+            | DbOperation::UnmarkSessionOpened(session_id) => OpKey::Opened(session_id.clone()),
         }
     }
 }
@@ -182,7 +194,11 @@ struct Cache {
     threads: HashMap<ThreadId, ThreadMetadata>,
     by_paths: HashMap<PathList, HashSet<ThreadId>>,
     by_main_paths: HashMap<PathList, HashSet<ThreadId>>,
-    by_session: HashMap<acp::SessionId, ThreadId>,
+    /// Rows by session id. A list, not one row: ACP scopes a session id to
+    /// its connection, so two agents can both own `"1"` (#86). A lookup that
+    /// names the agent picks its row; one by the bare id answers only when a
+    /// single row carries it ([`Cache::sole_row_for`]).
+    by_session: HashMap<acp::SessionId, Vec<ThreadId>>,
     /// Agents the one-time first-run backfill has already run for.
     backfilled: HashSet<AgentId>,
     /// Sessions whose rows the user deleted (schema V4). Disjoint from
@@ -192,6 +208,11 @@ struct Cache {
     aliases: HashMap<acp::SessionId, acp::SessionId>,
     /// Branched sessions, child → parent (`session_forks`).
     forks: HashMap<acp::SessionId, acp::SessionId>,
+    /// Sessions Atlas opened itself and has sent nothing to
+    /// (`opened_sessions`). Disjoint from `by_session`: writing a
+    /// conversation's row for one removes it from here. With when each was
+    /// opened.
+    opened: HashMap<acp::SessionId, DateTime<Utc>>,
 }
 
 /// Lets a caller wait for the queue to reach the disk, and reports what failed
@@ -247,6 +268,18 @@ impl ThreadMetadataStore {
             .session_forks()?
             .into_iter()
             .map(|(child, parent)| (acp::SessionId::new(child), acp::SessionId::new(parent)))
+            .collect();
+        cache.opened = db
+            .opened_sessions()?
+            .into_iter()
+            .map(|(id, at)| {
+                // An unreadable time reads as "long ago", which is the side
+                // that never deletes anything (`opened_unused_since`).
+                let at = DateTime::parse_from_rfc3339(&at)
+                    .map(|at| at.with_timezone(&Utc))
+                    .unwrap_or(DateTime::<Utc>::MIN_UTC);
+                (acp::SessionId::new(id), at)
+            })
             .collect();
 
         let (ops_tx, ops_rx) = mpsc::channel::<DbOperation>();
@@ -304,6 +337,10 @@ impl ThreadMetadataStore {
                             DbOperation::SaveFork(child, parent) => {
                                 db.save_session_fork(&child.0, &parent.0)
                             }
+                            DbOperation::MarkSessionOpened(id, at) => {
+                                db.mark_session_opened(&id.0, *at)
+                            }
+                            DbOperation::UnmarkSessionOpened(id) => db.unmark_session_opened(&id.0),
                         };
                         if let Err(e) = outcome {
                             tracing::warn!(error = %e, "thread-metadata write failed");
@@ -367,11 +404,25 @@ impl ThreadMetadataStore {
         read(&self.inner.cache).threads.get(&thread_id).cloned()
     }
 
-    /// The thread that owns `session_id`, if Atlas knows it.
+    /// The thread that owns `session_id`, if Atlas knows it and only one
+    /// agent's row carries the id. Two agents can mint the same session id
+    /// (#86); a caller that knows the agent uses
+    /// [`Self::thread_for_agent_session`], which tells them apart.
     pub fn thread_for_session(&self, session_id: &acp::SessionId) -> Option<ThreadMetadata> {
         let cache = read(&self.inner.cache);
-        let thread_id = cache.by_session.get(session_id)?;
-        cache.threads.get(thread_id).cloned()
+        let thread_id = cache.sole_row_for(session_id)?;
+        cache.threads.get(&thread_id).cloned()
+    }
+
+    /// The thread one agent's `session_id` belongs to, if Atlas knows it.
+    pub fn thread_for_agent_session(
+        &self,
+        agent_id: &AgentId,
+        session_id: &acp::SessionId,
+    ) -> Option<ThreadMetadata> {
+        let cache = read(&self.inner.cache);
+        let thread_id = cache.row_of(agent_id, session_id)?;
+        cache.threads.get(&thread_id).cloned()
     }
 
     /// Has the one-time first-run backfill already run for this agent?
@@ -394,10 +445,13 @@ impl ThreadMetadataStore {
         self.enqueue(DbOperation::MarkBackfilled(agent_id.clone()));
     }
 
-    /// Every session id the store knows — those with a row, and those whose
-    /// row the user deleted. Import dedupes against this, which is what keeps
-    /// a deleted session deleted while its agent still lists it; the watcher
-    /// reads it to tell a new session from one already accounted for.
+    /// Every session id the store knows — those with a row, those whose row
+    /// the user deleted, confirmed aliases, and those Atlas opened itself and
+    /// has not sent to.
+    /// Import dedupes against this, which is what keeps a deleted session
+    /// deleted while its agent still lists it, and Atlas's own sessions from
+    /// being imported back as somebody else's; the watcher reads it to tell
+    /// a new session from one already accounted for.
     pub fn known_session_ids(&self) -> HashSet<acp::SessionId> {
         let cache = read(&self.inner.cache);
         cache
@@ -405,8 +459,61 @@ impl ThreadMetadataStore {
             .keys()
             .chain(cache.deleted.iter())
             .chain(cache.aliases.keys())
+            .chain(cache.opened.keys())
             .cloned()
             .collect()
+    }
+
+    /// Record that Atlas opened this session itself (`session/new`). From
+    /// here on it is known (`known_session_ids`), across restarts: as this
+    /// record while nothing has been sent to it, and by its row afterwards
+    /// (`record_live_update` ends the record when the row is written). A
+    /// repeat is a no-op, and so is a session that already has a row.
+    pub fn record_session_opened(&self, session_id: &acp::SessionId) {
+        let at = Utc::now();
+        {
+            let mut cache = write(&self.inner.cache);
+            if cache.by_session.contains_key(session_id) || cache.opened.contains_key(session_id) {
+                return;
+            }
+            cache.opened.insert(session_id.clone(), at);
+        }
+        self.enqueue(DbOperation::MarkSessionOpened(session_id.clone(), at));
+    }
+
+    /// Whether Atlas opened this session itself and nothing has been sent to
+    /// it since. A recorded fact, never inferred from the session having no
+    /// row: a row moves to another id when an agent resumes a conversation
+    /// under a fresh one, and the session it left is not unused.
+    pub fn is_opened_unused(&self, session_id: &acp::SessionId) -> bool {
+        self.opened_unused_since(session_id).is_some()
+    }
+
+    /// When Atlas opened a session it has sent nothing to since, or `None`
+    /// for any other session. What a caller compares an agent's own "last
+    /// updated" against, before treating the session as still empty: Atlas
+    /// sending nothing does not mean nobody did (the session can be picked
+    /// up in the agent's own terminal).
+    pub fn opened_unused_since(&self, session_id: &acp::SessionId) -> Option<DateTime<Utc>> {
+        let cache = read(&self.inner.cache);
+        // A row written by any other route (an import, a restore) is a
+        // conversation too.
+        if cache.by_session.contains_key(session_id) {
+            return None;
+        }
+        cache.opened.get(session_id).copied()
+    }
+
+    /// Stop counting a session as Atlas's own unused one: it turned out to
+    /// have been used somewhere else. It is not known any more
+    /// (`known_session_ids`), so the next import lists it like any session
+    /// started outside Atlas. Answers whether it was recorded.
+    pub fn forget_session_opened(&self, session_id: &acp::SessionId) -> bool {
+        if write(&self.inner.cache).opened.remove(session_id).is_none() {
+            return false;
+        }
+        self.enqueue(DbOperation::UnmarkSessionOpened(session_id.clone()));
+        true
     }
 
     /// Every confirmed transcript alias, alias → owner session id.
@@ -585,7 +692,9 @@ impl ThreadMetadataStore {
                 let Some(session_id) = row.session_id.as_ref() else {
                     continue;
                 };
-                if cache.by_session.contains_key(session_id) || cache.deleted.contains(session_id) {
+                if cache.row_of(&row.agent_id, session_id).is_some()
+                    || cache.deleted.contains(session_id)
+                {
                     continue;
                 }
                 cache.insert(row.clone());
@@ -626,6 +735,7 @@ impl ThreadMetadataStore {
         } else {
             update.session_id
         };
+        let is_new = existing.is_none();
         let mut row = existing.unwrap_or_else(|| {
             let mut fresh = ThreadMetadata::new(
                 update.thread_id,
@@ -639,7 +749,9 @@ impl ThreadMetadataStore {
         row.session_id = session_id;
         row.agent_id = update.agent_id;
         row.title = update.title;
-        row.updated_at = updated_at;
+        if update.activity || is_new {
+            row.updated_at = updated_at;
+        }
         row.created_at = row.created_at.or(Some(updated_at));
         row.worktree_paths = update.worktree_paths;
         row.remote_connection = update.remote_connection;
@@ -647,6 +759,10 @@ impl ThreadMetadataStore {
         if let Some(session_id) = row.session_id.as_ref() {
             if cache.deleted.remove(session_id) {
                 self.enqueue(DbOperation::UnmarkSessionDeleted(session_id.clone()));
+            }
+            // The conversation has a row: the session is used, for good.
+            if cache.opened.remove(session_id).is_some() {
+                self.enqueue(DbOperation::UnmarkSessionOpened(session_id.clone()));
             }
         }
         cache.insert(row.clone());
@@ -1421,9 +1537,8 @@ impl ThreadMetadataStore {
     ) -> bool {
         let mut cache = write(&self.inner.cache);
         let Some(mut thread) = cache
-            .by_session
-            .get(session_id)
-            .and_then(|id| cache.threads.get(id))
+            .sole_row_for(session_id)
+            .and_then(|id| cache.threads.get(&id))
             .cloned()
         else {
             return false;
@@ -1553,16 +1668,18 @@ impl Cache {
                 );
             }
             if previous.session_id != metadata.session_id {
-                if let Some(session_id) = previous.session_id.as_ref() {
-                    self.by_session.remove(session_id);
+                if let Some(session_id) = previous.session_id.clone() {
+                    self.unindex_session(&session_id, metadata.thread_id);
                 }
             }
         }
 
         // A draft has no session id yet, so it is not indexed by one.
         if let Some(session_id) = metadata.session_id.as_ref() {
-            self.by_session
-                .insert(session_id.clone(), metadata.thread_id);
+            let rows = self.by_session.entry(session_id.clone()).or_default();
+            if !rows.contains(&metadata.thread_id) {
+                rows.push(metadata.thread_id);
+            }
         }
         if !metadata.folder_paths().is_empty() {
             self.by_paths
@@ -1579,10 +1696,36 @@ impl Cache {
         self.threads.insert(metadata.thread_id, metadata);
     }
 
+    /// The row `agent_id`'s session `session_id` writes to.
+    fn row_of(&self, agent_id: &AgentId, session_id: &acp::SessionId) -> Option<ThreadId> {
+        self.by_session.get(session_id)?.iter().copied().find(|id| {
+            self.threads
+                .get(id)
+                .is_some_and(|row| &row.agent_id == agent_id)
+        })
+    }
+
+    /// The one row carrying `session_id`; `None` when none or several do.
+    fn sole_row_for(&self, session_id: &acp::SessionId) -> Option<ThreadId> {
+        match self.by_session.get(session_id)?.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        }
+    }
+
+    fn unindex_session(&mut self, session_id: &acp::SessionId, thread_id: ThreadId) {
+        if let Some(rows) = self.by_session.get_mut(session_id) {
+            rows.retain(|id| *id != thread_id);
+            if rows.is_empty() {
+                self.by_session.remove(session_id);
+            }
+        }
+    }
+
     fn remove(&mut self, thread_id: ThreadId) -> Option<ThreadMetadata> {
         let removed = self.threads.remove(&thread_id)?;
         if let Some(session_id) = removed.session_id.as_ref() {
-            self.by_session.remove(session_id);
+            self.unindex_session(session_id, thread_id);
         }
         remove_from(&mut self.by_paths, removed.folder_paths(), thread_id);
         remove_from(

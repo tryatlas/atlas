@@ -37,7 +37,7 @@ fn list_tasks_url_omits_empty_query_and_encodes_all_parameters() {
                 /*cursor*/ None,
             )
             .unwrap(),
-        "https://example.test/api/codex/tasks/list"
+        "https://example.test/api/atlas-agent/tasks/list"
     );
     assert_eq!(
         client
@@ -48,7 +48,7 @@ fn list_tasks_url_omits_empty_query_and_encodes_all_parameters() {
                 /*cursor*/ Some("next=page"),
             )
             .unwrap(),
-        "https://example.test/api/codex/tasks/list?limit=10&task_filter=mine+%2F+shared&cursor=next%3Dpage&environment_id=env%26one"
+        "https://example.test/api/atlas-agent/tasks/list?limit=10&task_filter=mine+%2F+shared&cursor=next%3Dpage&environment_id=env%26one"
     );
 }
 

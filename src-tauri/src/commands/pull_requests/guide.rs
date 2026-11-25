@@ -144,10 +144,12 @@ pub async fn pr_guide_prepare(
     head_sha: String,
     head_branch: String,
     base_branch: String,
+    pr_url: String,
 ) -> Result<PrGuideCheckout, PrError> {
     let path = super::checkout(&path)?.to_string();
     let number = super::pull_number(number)?;
     let runs = data_dir(&app)?.join("runs");
+    let base_source = base_source(Path::new(&path), &pr_url, number).await?;
     prepare(
         Path::new(&path),
         &runs,
@@ -155,6 +157,7 @@ pub async fn pr_guide_prepare(
         head_sha.trim(),
         head_branch.trim(),
         base_branch.trim(),
+        &base_source,
     )
     .await
 }
@@ -305,6 +308,56 @@ async fn remotes(root: &Path) -> Vec<String> {
     names
 }
 
+/// Repository identity, independent of whether the checkout uses HTTPS or SSH.
+fn remote_identity(remote: &str) -> Option<(String, String)> {
+    let (host, path) = if let Ok(url) = url::Url::parse(remote) {
+        (url.host_str()?.to_string(), url.path().to_string())
+    } else {
+        let (host, path) = remote.split_once(':')?;
+        (host.rsplit('@').next()?.to_string(), path.to_string())
+    };
+    let path = path.trim_matches('/').trim_end_matches(".git");
+    let parts: Vec<_> = path.split('/').collect();
+    if parts.len() != 2 || parts.iter().any(|part| part.is_empty() || *part == "..") {
+        return None;
+    }
+    Some((host.to_ascii_lowercase(), path.to_ascii_lowercase()))
+}
+
+async fn base_source(root: &Path, pr_url: &str, number: u64) -> Result<String, PrError> {
+    let mut url = url::Url::parse(pr_url)
+        .map_err(|_| PrError::invalid("The pull request has no valid repository URL."))?;
+    let parts: Vec<_> = url.path_segments().into_iter().flatten().collect();
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || parts.len() != 4
+        || parts[2] != "pull"
+        || parts[3].parse::<u64>().ok() != Some(number)
+    {
+        return Err(PrError::invalid(
+            "The pull request has no valid repository URL.",
+        ));
+    }
+    let repo_path = format!("/{}/{}.git", parts[0], parts[1]);
+    url.set_path(&repo_path);
+    url.set_query(None);
+    url.set_fragment(None);
+    let identity = remote_identity(url.as_str())
+        .ok_or_else(|| PrError::invalid("The pull request has no valid repository URL."))?;
+    for remote in remotes(root).await {
+        if let Ok(remote_url) = git(root, &["remote", "get-url", "--", &remote]).await {
+            if remote_identity(remote_url.trim()).as_ref() == Some(&identity) {
+                return Ok(remote);
+            }
+        }
+    }
+    // An unconfigured upstream is still authoritative. Never substitute the
+    // fork's same-named branch when this fetch fails.
+    Ok(url.to_string())
+}
+
 async fn fetch(root: &Path, remote: &str, refspec: &str, timeout: Duration) -> Result<(), String> {
     run_networked(
         root,
@@ -374,6 +427,7 @@ async fn prepare(
     head_sha: &str,
     head_branch: &str,
     base_branch: &str,
+    base_source: &str,
 ) -> Result<PrGuideCheckout, PrError> {
     let sha = head_sha.to_lowercase();
     if !is_commit_hash(&sha) {
@@ -400,11 +454,9 @@ async fn prepare(
         .map_err(|_| PrError::invalid("This folder is not a git checkout."))?;
     // What a quit or a crash left behind, before adding more.
     prune_stale_runs(&root, runs, super::gh::now_ms()).await;
-    let remotes = remotes(&root).await;
-    if remotes.is_empty() {
-        return Err(PrError::invalid(
-            "This checkout has no remote to fetch from.",
-        ));
+    let mut remotes = remotes(&root).await;
+    if !remotes.iter().any(|remote| remote == base_source) {
+        remotes.push(base_source.to_string());
     }
 
     let run_id = format!(
@@ -417,18 +469,13 @@ async fn prepare(
     // change from its base.
     let base = base_ref(&run_id);
     let spec = format!("+refs/heads/{base_branch}:{base}");
-    let mut fetched = false;
-    for remote in &remotes {
-        if fetch(&root, remote, &spec, NETWORK_TIMEOUT).await.is_ok() {
-            fetched = true;
-            break;
-        }
-    }
-    if !fetched {
-        return Err(PrError::failed(
-            "Could not fetch the pull request's base branch.",
-        ));
-    }
+    fetch(&root, base_source, &spec, NETWORK_TIMEOUT)
+        .await
+        .map_err(|e| {
+            PrError::failed(format!(
+                "Could not fetch the pull request's base repository: {e}"
+            ))
+        })?;
 
     let head = match find_head(&root, &remotes, number, &sha, head_branch).await {
         Ok(head) => head,
@@ -891,7 +938,7 @@ mod tests {
             ],
         );
         let runs = dir.path().join("runs");
-        let out = prepare(&clone, &runs, 9, &head, "feat", "main")
+        let out = prepare(&clone, &runs, 9, &head, "feat", "main", "origin")
             .await
             .unwrap();
         assert_eq!(out.head_commit, head);
@@ -911,7 +958,7 @@ mod tests {
         .is_err());
 
         // A run nobody finished is pruned once it is stale, ref and all.
-        let left = prepare(&clone, &runs, 9, &head, "feat", "main")
+        let left = prepare(&clone, &runs, 9, &head, "feat", "main", "origin")
             .await
             .unwrap();
         let started = run_started_ms(&left.run_id).unwrap();

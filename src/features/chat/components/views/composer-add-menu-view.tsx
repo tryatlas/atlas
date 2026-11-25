@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 // The composer's "+" attach menu, drawn from props alone. The container
 // (`../composer-add-menu.tsx`) owns the open state, the menu-exclusion event
 // and every list the submenus show.
@@ -411,7 +412,7 @@ function SearchBox({
           value={value}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") onEnter?.();
+            if (e.key === "Enter" && !isComposingKey(e)) onEnter?.();
           }}
           placeholder={placeholder}
         />

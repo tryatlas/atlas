@@ -1439,12 +1439,18 @@ async fn find_thread_path_by_id_str_in_subdir(
                 ..Default::default()
             };
 
-            let results = file_search::run(
-                id_str,
-                vec![root.clone()],
-                options,
-                /*cancel_flag*/ None,
-            )
+            let search_id = id_str.to_owned();
+            let search_root = root.clone();
+            let results = tokio::task::spawn_blocking(move || {
+                file_search::run(
+                    &search_id,
+                    vec![search_root],
+                    options,
+                    /*cancel_flag*/ None,
+                )
+            })
+            .await
+            .map_err(|error| io::Error::other(format!("file search task failed: {error}")))?
             .map_err(|e| io::Error::other(format!("file search failed: {e}")))?;
 
             let found = results

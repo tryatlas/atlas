@@ -178,57 +178,36 @@ fn parse_plain_command_from_node(cmd: tree_sitter::Node, src: &str) -> Option<Ve
         return None;
     }
     let mut words = Vec::new();
+    let mut previous_end = None;
     let mut cursor = cmd.walk();
     for child in cmd.named_children(&mut cursor) {
-        match child.kind() {
-            "command_name" => {
-                let word_node = child.named_child(0)?;
-                if word_node.kind() != "word" {
-                    return None;
-                }
-                words.push(word_node.utf8_text(src.as_bytes()).ok()?.to_owned());
-            }
-            "word" | "number" => {
-                words.push(child.utf8_text(src.as_bytes()).ok()?.to_owned());
-            }
-            "string" => {
-                let parsed = parse_double_quoted_string(child, src)?;
-                words.push(parsed);
-            }
-            "raw_string" => {
-                let parsed = parse_raw_string(child, src)?;
-                words.push(parsed);
-            }
-            "concatenation" => {
-                // Handle concatenated arguments like -g"*.py"
-                let mut concatenated = String::new();
-                let mut concat_cursor = child.walk();
-                for part in child.named_children(&mut concat_cursor) {
-                    match part.kind() {
-                        "word" | "number" => {
-                            concatenated
-                                .push_str(part.utf8_text(src.as_bytes()).ok()?.to_owned().as_str());
-                        }
-                        "string" => {
-                            let parsed = parse_double_quoted_string(part, src)?;
-                            concatenated.push_str(&parsed);
-                        }
-                        "raw_string" => {
-                            let parsed = parse_raw_string(part, src)?;
-                            concatenated.push_str(&parsed);
-                        }
-                        _ => return None,
-                    }
-                }
-                if concatenated.is_empty() {
-                    return None;
-                }
-                words.push(concatenated);
-            }
-            _ => return None,
-        }
+        let word = if child.kind() == "command_name" {
+            parse_literal_shell_word(child.named_child(0)?, src)?
+        } else {
+            parse_literal_shell_word(child, src)?
+        };
+        append_shell_word(&mut words, &mut previous_end, child, src, word);
     }
     Some(words)
+}
+
+fn append_shell_word(
+    words: &mut Vec<String>,
+    previous_end: &mut Option<usize>,
+    node: Node<'_>,
+    src: &str,
+    word: String,
+) {
+    // tree-sitter treats a line continuation between unquoted fragments as
+    // separate nodes, but the shell removes it before splitting words.
+    let continues_word = previous_end
+        .is_some_and(|end| src[end..node.start_byte()].split("\\\n").all(str::is_empty));
+    if continues_word && let Some(previous) = words.last_mut() {
+        previous.push_str(&word);
+    } else {
+        words.push(word);
+    }
+    *previous_end = Some(node.end_byte());
 }
 
 fn parse_literal_command_from_node(cmd: Node<'_>, src: &str) -> Option<Vec<String>> {
@@ -238,14 +217,15 @@ fn parse_literal_command_from_node(cmd: Node<'_>, src: &str) -> Option<Vec<Strin
 
     let mut words = Vec::new();
     let mut found_command_name = false;
+    let mut previous_end = None;
     let mut cursor = cmd.walk();
     for child in cmd.named_children(&mut cursor) {
         if child.kind() == "command_name" {
             let command_name = parse_literal_shell_word(child.named_child(0)?, src)?;
-            words.push(command_name);
+            append_shell_word(&mut words, &mut previous_end, child, src, command_name);
             found_command_name = true;
         } else if found_command_name && let Some(word) = parse_literal_shell_word(child, src) {
-            words.push(word);
+            append_shell_word(&mut words, &mut previous_end, child, src, word);
         }
     }
 
@@ -255,7 +235,7 @@ fn parse_literal_command_from_node(cmd: Node<'_>, src: &str) -> Option<Vec<Strin
 fn parse_literal_shell_word(node: Node<'_>, src: &str) -> Option<String> {
     match node.kind() {
         "word" | "number" if is_literal_word_or_number(node) => {
-            Some(node.utf8_text(src.as_bytes()).ok()?.to_owned())
+            unescape_shell_word(node.utf8_text(src.as_bytes()).ok()?, false)
         }
         "string" => parse_double_quoted_string(node, src),
         "raw_string" => parse_raw_string(node, src),
@@ -287,13 +267,13 @@ fn parse_heredoc_command_words(cmd: Node<'_>, src: &str) -> Option<Vec<String>> 
                 {
                     return None;
                 }
-                words.push(word_node.utf8_text(src.as_bytes()).ok()?.to_owned());
+                words.push(parse_literal_shell_word(word_node, src)?);
             }
             "word" | "number" => {
                 if !is_literal_word_or_number(child) {
                     return None;
                 }
-                words.push(child.utf8_text(src.as_bytes()).ok()?.to_owned());
+                words.push(parse_literal_shell_word(child, src)?);
             }
             // Allow heredoc constructs that attach stdin to a single command
             // without changing argv matching semantics for the executable
@@ -375,7 +355,30 @@ fn parse_double_quoted_string(node: Node, src: &str) -> Option<String> {
     let stripped = raw
         .strip_prefix('"')
         .and_then(|text| text.strip_suffix('"'))?;
-    Some(stripped.to_string())
+    unescape_shell_word(stripped, true)
+}
+
+// Quote removal happens after parsing. Outside quotes a backslash quotes any
+// character; inside double quotes it only quotes these shell metacharacters.
+// A backslash-newline pair is a continuation and contributes no argument bytes.
+fn unescape_shell_word(raw: &str, double_quoted: bool) -> Option<String> {
+    let mut result = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            result.push(ch);
+            continue;
+        }
+        let escaped = chars.next()?;
+        if escaped == '\n' {
+            continue;
+        }
+        if double_quoted && !matches!(escaped, '$' | '`' | '"' | '\\') {
+            result.push('\\');
+        }
+        result.push(escaped);
+    }
+    Some(result)
 }
 
 fn parse_raw_string(node: Node, src: &str) -> Option<String> {
@@ -416,6 +419,23 @@ mod tests {
             vec!["wc".to_string(), "-l".to_string()],
         ];
         assert_eq!(cmds, expected);
+    }
+
+    #[test]
+    fn literal_words_follow_their_quoting_context() {
+        assert_eq!(
+            parse_seq(r#"echo one\ word '-\x' "-\x" "a\\b" "a\"b""#).unwrap(),
+            vec![
+                vec!["echo", "one word", r"-\x", r"-\x", r"a\b", "a\"b"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            ]
+        );
+        assert_eq!(
+            parse_seq("echo a\\\nb").unwrap(),
+            vec![vec!["echo".to_owned(), "ab".to_owned()]]
+        );
     }
 
     #[test]

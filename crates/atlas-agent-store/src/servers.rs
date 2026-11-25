@@ -29,9 +29,9 @@ use futures::FutureExt as _;
 use tokio::sync::watch;
 
 use crate::archive::{
-    github_release_archive_from_url, github_release_digest, install_archive,
+    github_release_archive_from_url, github_release_digest, install_archive_reporting,
     registry_archive_kind_for_url, remove_stale_versioned_archive_cache_dirs,
-    sanitize_path_component, versioned_archive_cache_dir,
+    sanitize_path_component, versioned_archive_cache_dir, InstallLimits,
 };
 use crate::http::HttpClient;
 use crate::node::{
@@ -62,7 +62,10 @@ pub struct InheritedProjectEnvironment;
 
 impl ProjectEnvironment for InheritedProjectEnvironment {
     fn project_env(&self) -> BoxFuture<'static, HashMap<String, String>> {
-        let env = std::env::vars().collect();
+        let env = atlas_process::host_environment()
+            .into_iter()
+            .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+            .collect();
         Box::pin(async move { env })
     }
 }
@@ -260,7 +263,7 @@ impl ExternalAgentServer for LocalRegistryArchiveAgent {
                 }
 
                 let (version_dir, _) = ensure_archive(
-                    &*http,
+                    http.clone(),
                     &installation_dir,
                     &version,
                     target,
@@ -328,7 +331,7 @@ impl LocalRegistryArchiveAgent {
                 return Ok(false);
             };
             let (_, installed) =
-                ensure_archive(&*http, &installation_dir, &version, target, None).await?;
+                ensure_archive(http.clone(), &installation_dir, &version, target, None).await?;
             Ok(installed)
         })
     }
@@ -340,36 +343,41 @@ impl LocalRegistryArchiveAgent {
 /// Serialized per installation directory: a background prefetch and a
 /// connect can both arrive here for the same version, and two extractions
 /// into one directory corrupt it.
-#[expect(
-    clippy::await_holding_invalid_type,
-    reason = "the install lock must span the install so a prefetch and a connect never write one directory at once"
-)]
+///
+/// The download itself runs detached ([`download_archive`]), holding the
+/// install lock. A bind that is killed or times out drops this future, and
+/// dropping it used to drop the download with it: the staging directory was
+/// deleted, and the retry started again from the first byte, on exactly the
+/// slow link that had made the first attempt too slow (audit #63). Now the
+/// download carries on without anyone waiting for it, and the next attempt
+/// waits on the lock and finds the finished copy.
 async fn ensure_archive(
-    http: &dyn HttpClient,
+    http: Arc<dyn HttpClient>,
     installation_dir: &std::path::Path,
     version: &str,
     target: &RegistryTargetConfig,
     loading_status: Option<&watch::Sender<Option<String>>>,
 ) -> Result<(PathBuf, bool)> {
-    let archive_url = &target.archive;
     let version_dir = versioned_archive_cache_dir(
         installation_dir,
         Some(version),
-        archive_url,
+        &target.archive,
         target.sha256.as_deref(),
     );
     let lock = install_lock(installation_dir);
-    let _guard = match lock.try_lock() {
+    let guard = match lock.clone().try_lock_owned() {
         Ok(guard) => guard,
         Err(_busy) => {
             // Someone else's install of this agent is running and there was
             // no older copy to start instead. Say so while waiting on it: the
             // install that holds the lock may be a background one with no
-            // status of its own, and a silent wait reads as a hang.
+            // status of its own, and a silent wait reads as a hang. One a
+            // killed bind left running reports its bytes on this same
+            // channel, so the wait shows them.
             if let Some(tx) = loading_status {
                 tx.send(Some(format!("Installing {version}…"))).ok();
             }
-            lock.lock().await
+            lock.lock_owned().await
         }
     };
     if is_dir(&version_dir).await {
@@ -379,19 +387,102 @@ async fn ensure_archive(
         tx.send(Some(format!("Installing {version}…"))).ok();
     }
 
+    let download = tokio::spawn(download_archive(
+        http,
+        target.archive.clone(),
+        target.sha256.clone(),
+        version_dir.clone(),
+        version.to_string(),
+        loading_status.cloned(),
+        guard,
+    ));
+    download
+        .await
+        .context("the archive download stopped unexpectedly")??;
+    Ok((version_dir, true))
+}
+
+/// Download, verify and extract one archive into `version_dir`, reporting the
+/// bytes received to `loading_status`. Holds `_guard`, the install lock, until
+/// it is done, so whoever asks next waits for this download instead of
+/// starting another.
+async fn download_archive(
+    http: Arc<dyn HttpClient>,
+    archive_url: String,
+    registry_sha256: Option<String>,
+    version_dir: PathBuf,
+    version: String,
+    loading_status: Option<watch::Sender<Option<String>>>,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+) -> Result<()> {
     // The registry's own checksum wins; failing that, GitHub's recorded digest
     // for the release asset. Both absent means an unverified install.
-    let sha256 = match &target.sha256 {
-        Some(sha256) => Some(sha256.clone()),
-        None => match github_release_archive_from_url(archive_url) {
-            Some(release) => github_release_digest(http, &release).await,
+    let sha256 = match registry_sha256 {
+        Some(sha256) => Some(sha256),
+        None => match github_release_archive_from_url(&archive_url) {
+            Some(release) => github_release_digest(&*http, &release).await,
             None => None,
         },
     };
 
-    let kind = registry_archive_kind_for_url(archive_url)?;
-    install_archive(http, archive_url, sha256.as_deref(), &version_dir, &kind).await?;
-    Ok((version_dir, true))
+    let kind = registry_archive_kind_for_url(&archive_url)?;
+    let progress = DownloadProgress::new(version, loading_status);
+    install_archive_reporting(
+        &*http,
+        &archive_url,
+        sha256.as_deref(),
+        &version_dir,
+        &kind,
+        InstallLimits::default(),
+        &|received| progress.report(received),
+    )
+    .await
+}
+
+/// Turns a byte count into status text, sent only when the text changes.
+///
+/// The bind deadline re-arms on every new status text, so a download that is
+/// moving keeps its bind alive however slow it is; one that has stalled stops
+/// changing the text and is timed out as before. A tenth of a megabyte is
+/// fine enough to move on a slow link and coarse enough not to flood the
+/// channel on a fast one.
+struct DownloadProgress {
+    version: String,
+    status: Option<watch::Sender<Option<String>>>,
+    /// The last count reported, in tenths of a megabyte.
+    reported: std::sync::atomic::AtomicU64,
+}
+
+impl DownloadProgress {
+    fn new(version: String, status: Option<watch::Sender<Option<String>>>) -> Self {
+        Self {
+            version,
+            status,
+            reported: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn report(&self, received: u64) {
+        let Some(tx) = &self.status else {
+            return;
+        };
+        let tenths = received / 100_000;
+        if tenths == 0
+            || self
+                .reported
+                .swap(tenths, std::sync::atomic::Ordering::Relaxed)
+                == tenths
+        {
+            return;
+        }
+        tx.send(Some(format!(
+            "Installing {}… {}.{} MB",
+            self.version,
+            tenths / 10,
+            tenths % 10
+        )))
+        .ok();
+    }
 }
 
 /// One async mutex per install directory, for the life of the process.
@@ -541,10 +632,16 @@ fn relative_target_cmd(cmd: &str) -> Result<&str> {
         !cmd.contains(".."),
         "command path cannot contain '..': {cmd}"
     );
-    cmd.strip_prefix("./")
+    let relative = cmd
+        .strip_prefix("./")
         .or_else(|| cmd.strip_prefix(".\\"))
         .or_else(|| (!cmd.is_empty() && !cmd.contains(['/', '\\', ':'])).then_some(cmd))
-        .with_context(|| format!("command must be relative (start with './'): {cmd}"))
+        .with_context(|| format!("command must be relative (start with './'): {cmd}"))?;
+    anyhow::ensure!(
+        !relative.is_empty() && !relative.starts_with(['/', '\\']) && !relative.contains(':'),
+        "command escapes its archive: {cmd}"
+    );
+    Ok(relative)
 }
 
 // ------------------------------------------------------- registry: npx target
@@ -596,6 +693,12 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
             let Ok(resolved) = resolve_install_dir(&install_dir).await else {
                 return false;
             };
+            if read_wanted_spec(&resolved).await.is_some_and(|record| {
+                record.starts_with(&format!("{package}#newest-available="))
+                    || record.starts_with(&format!("{package}#stale="))
+            }) {
+                return false;
+            }
             let (package_name, _) = bounded_npm_package_spec(&package);
             install_needed(&resolved, package_name, &package, npm_platform())
                 .await
@@ -730,6 +833,8 @@ async fn ensure_npx_package(
     version: &str,
     loading_status: Option<&watch::Sender<Option<String>>>,
 ) -> Result<bool> {
+    let (package_name, _) = bounded_npm_package_spec(package);
+    let before = installed_package_version(&install_dir.join("node_modules"), package_name).await;
     let job = {
         let lock = install_lock(lock_key);
         let _guard = lock.lock().await;
@@ -772,8 +877,18 @@ async fn ensure_npx_package(
     let Some(job) = job else {
         return Ok(false);
     };
-    job.await.map_err(|error| anyhow::anyhow!("{error:#}"))?;
-    Ok(true)
+    let ticker = loading_status
+        .map(|tx| crate::node::tick_status(tx.clone(), format!("Installing {package} {version}")));
+    let result = job.await.map_err(|error| anyhow::anyhow!("{error:#}"));
+    if let Some(ticker) = ticker {
+        ticker.abort();
+    }
+    if let Some(tx) = loading_status {
+        let _ = tx.send(None);
+    }
+    result?;
+    let after = installed_package_version(&install_dir.join("node_modules"), package_name).await;
+    Ok(before != after)
 }
 
 /// One install's result, shared by everyone who waited for it.
@@ -1556,6 +1671,9 @@ mod tests {
             "bin/agent",
             "./../agent",
             "..\\agent.exe",
+            ".//usr/bin/agent",
+            ".\\\\server\\share\\agent.exe",
+            "./C:/agent.exe",
         ] {
             assert!(relative_target_cmd(cmd).is_err(), "accepted {cmd:?}");
         }
@@ -1717,6 +1835,35 @@ mod tests {
         assert!(needed(dir.path(), PACKAGE, spec, PLATFORM).await.is_some());
     }
 
+    #[tokio::test]
+    async fn an_expired_npm_recheck_does_not_restart_a_running_agent() {
+        let dir = installed("1.9.0");
+        let spec = "@scope/agent@1.11.0";
+        let agent = LocalRegistryNpxAgent {
+            node: NodeRuntime::unavailable("no install should run"),
+            project_env: Arc::new(InheritedProjectEnvironment),
+            install_dir: dir.path().to_path_buf(),
+            version: Arc::from("1.11.0"),
+            package: spec.to_string(),
+            args: Vec::new(),
+            distribution_env: HashMap::new(),
+            settings_args: Vec::new(),
+            settings_env: HashMap::new(),
+            secret_env: SecretEnv::default(),
+            byok_env: HashMap::new(),
+            loading_status: None,
+        };
+        let expired = SystemTime::UNIX_EPOCH;
+        for record in [
+            resolved_sidecar(spec, "1.9.0", expired),
+            stale_sidecar(spec, "1.9.0", expired),
+        ] {
+            write_wanted_spec(dir.path(), &record).await;
+            assert!(!agent.update_pending().await);
+            assert!(needed(dir.path(), PACKAGE, spec, PLATFORM).await.is_some());
+        }
+    }
+
     /// The listing reads the version on disk per card, and the Update button
     /// drops the sidecar — including a `newest-available` one, which is the
     /// record that would otherwise keep an older copy from ever being retried.
@@ -1870,5 +2017,125 @@ mod tests {
         assert!(sidecar(&dir).is_some());
         // Idempotent on an already-clean dir.
         wipe_install_tree(dir.path()).await.unwrap();
+    }
+
+    /// An archive host that serves one body a chunk at a time, as the test
+    /// releases them, and counts the downloads it was asked for.
+    struct DrippingHost {
+        requests: std::sync::atomic::AtomicUsize,
+        chunks: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>>,
+    }
+
+    impl crate::http::HttpClient for DrippingHost {
+        fn get(&self, _url: &str) -> BoxFuture<'static, Result<crate::http::HttpResponse>> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let chunks = self.chunks.lock().unwrap().take();
+            Box::pin(async move {
+                let chunks = chunks.context("the archive was downloaded a second time")?;
+                let body = futures::StreamExt::boxed(futures::stream::unfold(
+                    chunks,
+                    |mut chunks| async move { chunks.recv().await.map(|chunk| (Ok(chunk), chunks)) },
+                ));
+                Ok(crate::http::HttpResponse { status: 200, body })
+            })
+        }
+    }
+
+    fn dripping_host() -> (
+        Arc<DrippingHost>,
+        tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let host = Arc::new(DrippingHost {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+            chunks: std::sync::Mutex::new(Some(rx)),
+        });
+        (host, tx)
+    }
+
+    fn raw_binary_target() -> RegistryTargetConfig {
+        RegistryTargetConfig {
+            archive: "https://example.invalid/agent-bin".into(),
+            cmd: "./agent-bin".into(),
+            args: Vec::new(),
+            sha256: None,
+            env: HashMap::new(),
+        }
+    }
+
+    /// Audit #63: an archive install said "Installing…" once and then nothing
+    /// for the whole download, so the bind deadline, which re-arms only when
+    /// the status text changes, timed a slow but healthy download out. Every
+    /// tenth of a megabyte that arrives is now new status text.
+    #[tokio::test]
+    async fn an_archive_download_reports_its_bytes_as_they_arrive() {
+        let dir = tempfile::tempdir().unwrap();
+        let (http, chunks) = dripping_host();
+        let (status, mut seen) = watch::channel(None);
+        let install = tokio::spawn({
+            let dir = dir.path().to_path_buf();
+            async move { ensure_archive(http, &dir, "1.0.0", &raw_binary_target(), Some(&status)).await }
+        });
+
+        for expected in ["Installing 1.0.0… 0.2 MB", "Installing 1.0.0… 0.5 MB"] {
+            chunks.send(vec![0u8; 250_000]).unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                seen.wait_for(|text| text.as_deref() == Some(expected)),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("never reported {expected:?}"))
+            .unwrap();
+        }
+        drop(chunks);
+        let (_, installed) = install.await.unwrap().expect("it installs");
+        assert!(installed);
+    }
+
+    /// Audit #63: a bind killed mid-download dropped the download with it,
+    /// staging directory and all, and the retry started from the first byte.
+    /// The download now outlives the attempt that started it, and the next
+    /// attempt waits for it rather than downloading again.
+    #[tokio::test]
+    async fn a_killed_attempt_leaves_its_download_running_for_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let (http, chunks) = dripping_host();
+        let target = raw_binary_target();
+
+        let first = tokio::spawn({
+            let (dir, http, target) = (dir.path().to_path_buf(), http.clone(), target.clone());
+            async move { ensure_archive(http, &dir, "1.0.0", &target, None).await }
+        });
+        chunks.send(vec![1u8; 1024]).unwrap();
+        while http.requests.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // The bind is killed: its connect future is dropped mid-download.
+        first.abort();
+        let _ = first.await;
+
+        let second = tokio::spawn({
+            let (dir, http, target) = (dir.path().to_path_buf(), http.clone(), target.clone());
+            async move { ensure_archive(http, &dir, "1.0.0", &target, None).await }
+        });
+        chunks.send(vec![2u8; 1024]).unwrap();
+        drop(chunks);
+        let (version_dir, installed) = second
+            .await
+            .unwrap()
+            .expect("the next attempt gets the download the first one started");
+
+        assert!(
+            !installed,
+            "the download already in flight installed it, not a second one"
+        );
+        assert_eq!(
+            http.requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the archive is downloaded once"
+        );
+        let binary = std::fs::read(version_dir.join("agent-bin")).unwrap();
+        assert_eq!(binary.len(), 2048, "with both halves of it");
     }
 }

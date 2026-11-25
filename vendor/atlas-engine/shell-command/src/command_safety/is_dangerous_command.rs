@@ -1,3 +1,4 @@
+// Modified by Atlas from upstream OpenAI Codex (Apache-2.0). See CONTEXT.md.
 use crate::bash::parse_shell_lc_literal_commands;
 use std::path::Path;
 #[cfg(windows)]
@@ -267,6 +268,28 @@ mod tests {
         assert_eq!(
             dangerous_command_match(&vec_str(&["rm", "-f", "/"])),
             Some(DangerousCommandMatch::ForcedRm)
+        );
+    }
+
+    #[test]
+    fn escaped_forced_removal_is_recognized_without_changing_literal_arguments() {
+        for script in [
+            r"\rm --force example",
+            r"rm --\force example",
+            r#"rm --fo"rce" example"#,
+        ] {
+            assert_eq!(
+                dangerous_command_match(&vec_str(&["bash", "-lc", script])),
+                Some(DangerousCommandMatch::ForcedRm)
+            );
+        }
+        assert_eq!(
+            dangerous_command_match(&vec_str(&[r"\rm", "--force", "example"])),
+            None
+        );
+        assert_eq!(
+            dangerous_command_match(&vec_str(&["bash", "-lc", r"rm '--\force' example"])),
+            None
         );
     }
 

@@ -129,6 +129,13 @@ fn copy_resources(
     let mut synchronized_projects = Vec::new();
     let mut failures = Vec::new();
     for &project_key in selected_memory {
+        if !valid_project_key(project_key) {
+            failures.push(MemoryImportFailure {
+                project_key: project_key.to_string(),
+                message: "memory project key must be a single directory name".to_string(),
+            });
+            continue;
+        }
         let sync_result = match files_by_project.get(project_key) {
             Some(project_files) => {
                 if let Some(project_cwd) = project_cwd(project_files) {
@@ -317,7 +324,22 @@ fn replace_project_resources(
     Ok(())
 }
 
+fn valid_project_key(project_key: &str) -> bool {
+    !project_key.is_empty()
+        && !project_key.contains(['/', '\\', ':'])
+        && !matches!(project_key, "." | "..")
+        && matches!(
+            Path::new(project_key).components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+}
+
 fn remove_project_resources(atlas_agent_home: &Path, project_key: &str) -> io::Result<bool> {
+    if !valid_project_key(project_key) {
+        return Err(invalid_data_error(
+            "memory project key must be a single directory name",
+        ));
+    }
     let target_root = resources_root(atlas_agent_home).join(project_key);
     match fs::symlink_metadata(&target_root) {
         Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(&target_root)?,

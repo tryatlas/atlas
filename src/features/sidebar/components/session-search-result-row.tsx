@@ -23,7 +23,6 @@ export const SessionSearchResultRow = memo(function SessionSearchResultRow(props
   const isSettled = session.settledAt !== null;
   const status = resolveSessionRowStatus({
     live: null,
-    liveElsewhere: session.liveElsewhere,
     heldWorking: session.heldWorking,
     watching: session.pullRequests.some((p) => p.watching),
   });

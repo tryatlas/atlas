@@ -283,7 +283,7 @@ fn should_bootstrap_chatgpt_agent_identity(
         && matches!(auth, Some(AtlasEngineAuth::Chatgpt(_)))
 }
 
-fn bearer_auth_for_provider(
+pub(crate) fn bearer_auth_for_provider(
     provider: &ModelProviderInfo,
 ) -> atlas_engine_protocol::error::Result<Option<BearerAuthProvider>> {
     if let Some(api_key) = provider.api_key()? {

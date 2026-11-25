@@ -1,4 +1,4 @@
-//! Native macOS application menu, built from `src-tauri/menu.json`.
+//! Native application menu, built from `src-tauri/menu.json`.
 //!
 //! The menu model is shared: the frontend draws the same menus inside the
 //! Windows/Linux titlebar (`src/features/menu/`), so the two cannot list
@@ -31,6 +31,8 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu, SubmenuBuilder};
 use tauri::Manager;
 
 /// The one event every custom menu item emits; the payload is the item id.
+pub const QUIT_MENU_ID: &str = "atlas-quit";
+
 pub const MENU_EVENT: &str = "atlas:menu-command";
 
 const MODEL_JSON: &str = include_str!("../menu.json");
@@ -95,8 +97,29 @@ pub fn build(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     for def in model().menus {
         let mut submenu = SubmenuBuilder::with_id(app, def.id.as_str(), def.label.as_str());
         for item in &def.items {
+            #[cfg(not(target_os = "macos"))]
+            if matches!(
+                item,
+                ItemDef::Role {
+                    role: Role::Services
+                        | Role::Hide
+                        | Role::HideOthers
+                        | Role::ShowAll
+                        | Role::BringAllToFront
+                }
+            ) {
+                continue;
+            }
+
             submenu = match item {
                 ItemDef::Separator => submenu.separator(),
+                ItemDef::Role { role: Role::Quit } => submenu.item(&MenuItem::with_id(
+                    app,
+                    QUIT_MENU_ID,
+                    "Quit Atlas",
+                    true,
+                    Some("CmdOrCtrl+Q"),
+                )?),
                 ItemDef::Role { role } => submenu.item(&predefined(app, *role)?),
                 ItemDef::Action { id, label } | ItemDef::Command { id, label } => {
                     let entry = MenuItem::with_id(app, id.as_str(), label, true, None::<&str>)?;
@@ -118,7 +141,7 @@ fn predefined(app: &tauri::AppHandle, role: Role) -> tauri::Result<PredefinedMen
         Role::Hide => PredefinedMenuItem::hide(app, None),
         Role::HideOthers => PredefinedMenuItem::hide_others(app, None),
         Role::ShowAll => PredefinedMenuItem::show_all(app, None),
-        Role::Quit => PredefinedMenuItem::quit(app, None),
+        Role::Quit => unreachable!("Quit is a custom item so persistence can finish before exit"),
         Role::Cut => PredefinedMenuItem::cut(app, None),
         Role::Copy => PredefinedMenuItem::copy(app, None),
         Role::Paste => PredefinedMenuItem::paste(app, None),

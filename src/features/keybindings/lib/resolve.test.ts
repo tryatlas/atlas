@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+// Registry overlap examples below describe the macOS defaults.
+vi.mock("@/lib/platform", () => ({ isMac: true, isWindows: false, isLinux: false }));
+import { describe, expect, it, vi } from "vitest";
 import { ACTIONS } from "./actions";
 import { bindingsForCombo, findConflicts, resolveProfile } from "./resolve";
 import { parseCombo } from "./combo";

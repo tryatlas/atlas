@@ -41,7 +41,7 @@ use tokio::time::timeout;
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[tokio::test]
-async fn thread_shell_command_history_responses_exclude_persisted_command_executions() -> Result<()>
+async fn thread_shell_command_history_responses_replay_completed_command_executions() -> Result<()>
 {
     let tmp = TempDir::new()?;
     let atlas_agent_home = tmp.path().join("atlas_agent_home");
@@ -127,7 +127,8 @@ async fn thread_shell_command_history_responses_exclude_persisted_command_execut
         })
         .await?;
     assert_eq!(thread.turns.len(), 1);
-    assert_no_command_executions(&thread.turns[0].items, "thread/read");
+    assert_no_running_command_executions(&thread.turns[0].items, "thread/read");
+    assert_completed_command_replayed(&thread.turns[0].items, &command_id, "thread/read");
 
     let ThreadTurnsListResponse { data, .. } = mcp
         .request(|request_id| ClientRequest::ThreadTurnsList {
@@ -142,7 +143,7 @@ async fn thread_shell_command_history_responses_exclude_persisted_command_execut
         })
         .await?;
     assert_eq!(data.len(), 1);
-    assert_no_command_executions(&data[0].items, "thread/turns/list");
+    assert_no_running_command_executions(&data[0].items, "thread/turns/list");
 
     let ThreadForkResponse { thread, .. } = mcp
         .request(|request_id| ClientRequest::ThreadFork {
@@ -154,7 +155,7 @@ async fn thread_shell_command_history_responses_exclude_persisted_command_execut
         })
         .await?;
     assert_eq!(thread.turns.len(), 1);
-    assert_no_command_executions(&thread.turns[0].items, "thread/fork");
+    assert_no_running_command_executions(&thread.turns[0].items, "thread/fork");
 
     Ok(())
 }
@@ -325,17 +326,41 @@ async fn thread_shell_command_uses_existing_active_turn() -> Result<()> {
         })
         .await?;
     assert_eq!(thread.turns.len(), 1);
-    assert_no_command_executions(&thread.turns[0].items, "thread/read");
+    assert_no_running_command_executions(&thread.turns[0].items, "thread/read");
 
     Ok(())
 }
 
-fn assert_no_command_executions(items: &[ThreadItem], context: &str) {
+/// Atlas persists `ExecCommandEnd` (rollout `policy.rs`), so a reopened thread
+/// shows the commands its turns ran, where upstream dropped them. Only the end
+/// event is persisted: a replayed command is never left looking like it still
+/// runs.
+fn assert_no_running_command_executions(items: &[ThreadItem], context: &str) {
     assert!(
-        items
-            .iter()
-            .all(|item| !matches!(item, ThreadItem::CommandExecution { .. })),
-        "{context} should always exclude command executions from returned turns"
+        items.iter().all(|item| !matches!(
+            item,
+            ThreadItem::CommandExecution {
+                status: CommandExecutionStatus::InProgress,
+                ..
+            }
+        )),
+        "{context} must not replay a command execution as still running: {items:?}"
+    );
+}
+
+/// The completed user-shell command, replayed from its persisted end event.
+fn assert_completed_command_replayed(items: &[ThreadItem], command_id: &str, context: &str) {
+    assert!(
+        items.iter().any(|item| matches!(
+            item,
+            ThreadItem::CommandExecution {
+                id,
+                source: CommandExecutionSource::UserShell,
+                status: CommandExecutionStatus::Completed,
+                ..
+            } if id == command_id
+        )),
+        "{context} should replay the completed command {command_id}: {items:?}"
     );
 }
 

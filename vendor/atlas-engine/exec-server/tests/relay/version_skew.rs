@@ -48,25 +48,22 @@ const VERSION_SKEW_TIMEOUT: Duration = Duration::from_secs(30);
 const EXPECTED_OUTPUT: &str = "executor-version-skew-ok";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires two binaries; run exec-server/testing/run_version_skew.sh"]
 async fn current_app_server_runs_commands_on_released_exec_server_over_noise() -> Result<()> {
-    let Some((current, released)) = version_skew_binaries()? else {
-        return Ok(());
-    };
+    let (current, released) = version_skew_binaries()?;
     assert_noise_version_skew(&current, &released).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires two binaries; run exec-server/testing/run_version_skew.sh"]
 async fn released_app_server_runs_commands_on_current_exec_server_over_noise() -> Result<()> {
-    let Some((current, released)) = version_skew_binaries()? else {
-        return Ok(());
-    };
+    let (current, released) = version_skew_binaries()?;
     assert_noise_version_skew(&released, &current).await
 }
 
-fn version_skew_binaries() -> Result<Option<(PathBuf, PathBuf)>> {
-    let Some(released) = std::env::var_os(RELEASED_ATLAS_AGENT_ENV_VAR) else {
-        return Ok(None);
-    };
+fn version_skew_binaries() -> Result<(PathBuf, PathBuf)> {
+    let released = std::env::var_os(RELEASED_ATLAS_AGENT_ENV_VAR)
+        .with_context(|| format!("{RELEASED_ATLAS_AGENT_ENV_VAR} must name a released binary"))?;
     let current = std::env::var_os(CURRENT_ATLAS_AGENT_ENV_VAR).with_context(|| {
         format!("{CURRENT_ATLAS_AGENT_ENV_VAR} must name the current Atlas Agent binary")
     })?;
@@ -82,7 +79,7 @@ fn version_skew_binaries() -> Result<Option<(PathBuf, PathBuf)>> {
         "released Atlas Agent does not exist: {}",
         released.display()
     );
-    Ok(Some((current, released)))
+    Ok((current, released))
 }
 
 async fn assert_noise_version_skew(app_binary: &Path, executor_binary: &Path) -> Result<()> {

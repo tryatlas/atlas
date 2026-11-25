@@ -34,10 +34,12 @@ import {
 } from "react";
 import { Tooltip as TooltipPrimitive } from "@base-ui/react/tooltip";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { toast } from "sonner";
 import { useChatStore } from "@/features/chat/stores/chat-store";
 import { cn } from "@/lib/utils";
-import { registerSettleAndAdvance } from "@/features/chat/lib/settle-and-advance";
+import {
+  registerSettleAndAdvance,
+  settleOutsideSidebar,
+} from "@/features/chat/lib/settle-and-advance";
 import { useActionShortcut } from "@/features/keybindings/lib/use-action-shortcut";
 import { ImportThreadsModal } from "@/features/chat/components/import-threads-modal";
 import { pickAndAddProject } from "@/features/projects/lib/pick-project";
@@ -180,7 +182,7 @@ export function SidebarSessions() {
             )
           : undefined;
         if (!session) {
-          toast.info("Nothing to settle: this session has no messages yet.");
+          settleOutsideSidebar(tabId);
           return;
         }
         if (session.settledAt !== null) unsettleSession(session);

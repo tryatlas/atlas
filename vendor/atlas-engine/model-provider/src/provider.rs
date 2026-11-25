@@ -25,6 +25,7 @@ use crate::amazon_bedrock::AmazonBedrockModelProvider;
 use crate::auth::ProviderAuthScope;
 use crate::auth::ResolvedProviderAuth;
 use crate::auth::auth_manager_for_provider;
+use crate::auth::bearer_auth_for_provider;
 use crate::auth::resolve_provider_auth;
 use crate::auth::resolve_provider_auth_for_scope;
 use crate::models_endpoint::OpenAiModelsEndpoint;
@@ -165,6 +166,28 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
     /// Returns the current provider-scoped auth value, if one is configured.
     fn auth(&self) -> ModelProviderFuture<'_, Option<AtlasEngineAuth>>;
 
+    fn request_auth(
+        &self,
+    ) -> ModelProviderFuture<'_, atlas_engine_protocol::error::Result<Option<AtlasEngineAuth>>>
+    {
+        Box::pin(async move {
+            match self.auth_manager() {
+                Some(manager) => manager
+                    .auth_for_request()
+                    .await
+                    .map_err(|error| match error {
+                        atlas_engine_login::RefreshTokenError::Permanent(error) => {
+                            AtlasEngineErr::RefreshTokenFailed(error)
+                        }
+                        atlas_engine_login::RefreshTokenError::Transient(error) => {
+                            AtlasEngineErr::Io(error)
+                        }
+                    }),
+                None => Ok(self.auth().await),
+            }
+        })
+    }
+
     /// Returns the current app-visible account state for this provider.
     fn account_state(&self) -> ProviderAccountResult;
 
@@ -196,7 +219,10 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
         &self,
     ) -> ModelProviderFuture<'_, atlas_engine_protocol::error::Result<SharedAuthProvider>> {
         Box::pin(async move {
-            let auth = self.auth().await;
+            if let Some(auth) = bearer_auth_for_provider(self.info())? {
+                return Ok(Arc::new(auth) as SharedAuthProvider);
+            }
+            let auth = self.request_auth().await?;
             resolve_provider_auth(auth.as_ref(), self.info())
         })
     }
@@ -210,7 +236,7 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
             if !provider_uses_first_party_auth_path(self.info()) {
                 return self.api_auth().await.map(ResolvedProviderAuth::new);
             }
-            let auth = self.auth().await;
+            let auth = self.request_auth().await?;
             resolve_provider_auth_for_scope(self.auth_manager(), auth.as_ref(), self.info(), scope)
                 .await
         })
@@ -513,6 +539,8 @@ impl ModelProvider for ConfiguredModelProvider {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use atlas_engine_http_client::HttpClientFactory;
     use atlas_engine_http_client::OutboundProxyPolicy;
@@ -539,6 +567,59 @@ mod tests {
 
     use super::*;
     use crate::auth::AgentIdentitySessionFallback;
+
+    struct FailsAfterInstallation(AtomicUsize);
+
+    impl atlas_engine_login::ExternalAuth for FailsAfterInstallation {
+        fn resolve(&self) -> atlas_engine_login::ExternalAuthFuture<'_, AtlasEngineAuth> {
+            let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                if first {
+                    Ok(AtlasEngineAuth::from_api_key("last-known-token"))
+                } else {
+                    Err(std::io::Error::other("gateway token service unavailable"))
+                }
+            })
+        }
+
+        fn refresh(
+            &self,
+            _: atlas_engine_login::ExternalAuthRefreshContext,
+        ) -> atlas_engine_login::ExternalAuthFuture<'_, AtlasEngineAuth> {
+            self.resolve()
+        }
+    }
+
+    #[tokio::test]
+    async fn request_auth_failure_is_not_converted_to_an_anonymous_provider() {
+        let manager = AuthManager::from_auth_for_testing(AtlasEngineAuth::from_api_key("seed"));
+        manager
+            .set_external_auth(Arc::new(FailsAfterInstallation(AtomicUsize::new(0))))
+            .await
+            .unwrap();
+        let info = provider_for("http://gateway.test".into());
+        let provider = create_model_provider(info.clone(), Some(Arc::clone(&manager)));
+        let result = provider.api_auth().await;
+        assert!(result.is_err());
+        assert_eq!(
+            manager
+                .auth_cached()
+                .and_then(|auth| auth.api_key().map(str::to_owned)),
+            Some("last-known-token".into())
+        );
+
+        // A provider with its own configured token does not depend on the Atlas token service.
+        let mut independent_info = info;
+        independent_info.experimental_bearer_token = Some("independent-token".into());
+        let independent = create_model_provider(independent_info, Some(manager));
+        let auth = independent.api_auth().await.unwrap();
+        let mut headers = http::HeaderMap::new();
+        auth.add_auth_headers(&mut headers);
+        assert_eq!(
+            headers[http::header::AUTHORIZATION],
+            "Bearer independent-token"
+        );
+    }
 
     /// A gateway error, as the transport hands it up.
     fn gateway_http_error(

@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 // The container for every permission prompt a session raises: it reads the
 // head of the session's permission queue, answers on the wire, and picks one
 // of three props-only views to draw it —
@@ -21,7 +22,7 @@ import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { deepActiveElement } from "@/lib/deep-active-element";
 import { Markdown } from "@/lib/markdown";
 import { extractPlanMarkdown } from "../lib/plans";
-import { exitPlanOffersBypass } from "../lib/exit-plan-modes";
+import { exitPlanModeForOption, exitPlanOffersBypass } from "../lib/exit-plan-modes";
 import { composeAnswers, extractQuestions } from "../lib/questions";
 import { ApprovalCardView, type Answer } from "./views/approval-card-view";
 import { PermissionCardView, type PermissionOptionItem } from "./views/permission-card-view";
@@ -72,7 +73,9 @@ function keyReachesCard(tabId: string, anchor: HTMLElement | null): boolean {
   if (!document.hasFocus()) return false;
   const focused = deepActiveElement();
   if (!focused || !takesTyping(focused)) return true;
-  return (anchor.closest("[data-chat-composer-stack]") ?? anchor).contains(focused);
+  if (anchor.contains(focused)) return true;
+  const composer = focused.closest(".atlas-composer");
+  return !!composer && !!anchor.closest("[data-chat-composer-stack]")?.contains(composer);
 }
 
 // Some agents bake their own brand into permission-option labels (e.g.
@@ -165,7 +168,15 @@ function PermissionModalImpl({ tabId, onSendMessage }: PermissionModalProps) {
     };
     const onKey = (e: KeyboardEvent) => {
       // A chord being recorded in Settings → Keybindings is not an answer.
-      if (isRecordingShortcut()) return;
+      if (
+        isRecordingShortcut() ||
+        isComposingKey(e) ||
+        e.metaKey ||
+        e.ctrlKey ||
+        e.altKey ||
+        e.shiftKey
+      )
+        return;
       // Nor is a key from someone not looking at this card. Read per key, not
       // per render: a tab switch must not leave a listener answering for the
       // tab it hid until the effect catches up.
@@ -310,10 +321,16 @@ function PermissionModalImpl({ tabId, onSendMessage }: PermissionModalProps) {
   // tools — with no bypass choice at all. Bypass is still in the session's
   // advertised modes, only the prompt omits it, so Atlas adds the action back:
   // approve plainly, then push `bypassPermissions`.
+  //
+  // Offered on the prompt's shape, never on the agent's id (ADR-0002): a plan
+  // review whose options are the mode-encoding family `exit-plan-modes.ts`
+  // knows, none of them bypass. Any agent speaking that shape gets it — the
+  // same adapter installed under another id included.
+  const optionIds = current.options.map((o) => o.optionId);
   const bypassOptionId =
-    agentType === "claude-code" &&
     planMarkdown &&
-    !exitPlanOffersBypass(current.options.map((o) => o.optionId))
+    optionIds.some((id) => exitPlanModeForOption(id) !== null) &&
+    !exitPlanOffersBypass(optionIds)
       ? (current.options.find((o) => o.optionId === "exit-plan-default")?.optionId ??
         current.options.find((o) => isAllow(o.kind))?.optionId ??
         null)
@@ -348,6 +365,7 @@ function PermissionModalImpl({ tabId, onSendMessage }: PermissionModalProps) {
           <ApprovalCardView
             key={current.requestId}
             questions={questions}
+            canHandleKey={() => keyReachesCard(tabId, anchorRef.current)}
             queueNote={queueNote}
             onSubmit={submitQuestionAnswers}
           />

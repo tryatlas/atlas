@@ -72,8 +72,11 @@ fn is_legacy_commit_attribution_fragment(role: &str, text: &str) -> bool {
 fn is_enabled_fragment(role: &str, text: &str) -> bool {
     role == "developer"
         && text.trim_start().starts_with(START_MARKER)
-        && text.contains("Co-authored-by: Atlas Agent <noreply@openai.com>")
-        && (text.contains("Generated with [Atlas Agent](https://openai.com/codex/).")
-            || text.contains("Generated with Atlas Agent."))
+        // The same spelling ENABLED_INSTRUCTIONS emits. A matcher that names the
+        // agent differently never recognises the fragment, so resume renders it
+        // a second time.
+        && text.contains("Co-authored-by: AtlasEngine <noreply@openai.com>")
+        && (text.contains("Generated with [AtlasEngine](https://openai.com/codex/).")
+            || text.contains("Generated with AtlasEngine."))
         && text.trim_end().ends_with(END_MARKER)
 }

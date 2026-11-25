@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
-import { matchesAction } from "@/features/keybindings/lib/use-scoped-hotkeys";
+import { useScopedHotkeys } from "@/features/keybindings/lib/use-scoped-hotkeys";
 import { useActionShortcut } from "@/features/keybindings/lib/use-action-shortcut";
 import { readFileBase64 } from "@/features/editor/lib/editor-fs-api";
 import { toast } from "sonner";
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
-import { usePdfAnnotationStore } from "../stores/pdf-annotation-store";
+import { usePdfAnnotationStore, pdfDocumentKey } from "../stores/pdf-annotation-store";
+import { projectPathForTab } from "@/features/chat/lib/tab-project";
+import { useAppStore } from "@/features/app/stores/app-store";
 import type { PdfAnnotation } from "../lib/pdf-annotations";
 import { PdfViewerView } from "./views/pdf-viewer-view";
 
@@ -16,6 +18,9 @@ interface PdfViewerProps {
 const NO_ANNOTATIONS: PdfAnnotation[] = [];
 
 export function PdfViewer({ filePath, tabId }: PdfViewerProps) {
+  const activeProjectPath = useAppStore((state) => state.currentProject?.path ?? "");
+  const projectPath = (tabId ? projectPathForTab(tabId) : null) ?? activeProjectPath;
+  const key = pdfDocumentKey(projectPath, filePath);
   const [fileData, setFileData] = useState<Uint8Array | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [zoom, setZoom] = useState(1); // 1 = fit-to-width
@@ -25,7 +30,7 @@ export function PdfViewer({ filePath, tabId }: PdfViewerProps) {
   const tool = usePdfAnnotationStore((s) => s.tool);
   const color = usePdfAnnotationStore((s) => s.color);
   const selectedId = usePdfAnnotationStore((s) => s.selectedId);
-  const annotations = usePdfAnnotationStore((s) => s.byPath)[filePath] ?? NO_ANNOTATIONS;
+  const annotations = usePdfAnnotationStore((s) => s.byPath[key]) ?? NO_ANNOTATIONS;
   const {
     load,
     save: saveAnnotations,
@@ -37,7 +42,7 @@ export function PdfViewer({ filePath, tabId }: PdfViewerProps) {
     updateNoteText,
   } = usePdfAnnotationStore((s) => s.actions);
   const saveShortcut = useActionShortcut("pdf.save");
-  const isDirty = !!dirtyMap[filePath];
+  const isDirty = !!dirtyMap[key];
 
   const fileName = filePath.split("/").pop() ?? filePath;
 
@@ -62,8 +67,10 @@ export function PdfViewer({ filePath, tabId }: PdfViewerProps) {
 
   // Load persisted (editable) annotations for this PDF.
   useEffect(() => {
-    void load(filePath);
-  }, [filePath, load]);
+    void load(filePath, projectPath).catch((e) =>
+      setError(`Annotations could not be loaded: ${String(e)}`),
+    );
+  }, [filePath, projectPath, load]);
 
   // Reflect unsaved annotations in the tab's dirty dot.
   useEffect(() => {
@@ -77,23 +84,23 @@ export function PdfViewer({ filePath, tabId }: PdfViewerProps) {
   const save = useCallback(async () => {
     setSaving(true);
     try {
-      await saveAnnotations(filePath);
+      await saveAnnotations(filePath, projectPath);
       toast.success("Annotations saved");
+    } catch (e) {
+      toast.error(`Annotations could not be saved: ${String(e)}`);
     } finally {
       setSaving(false);
     }
-  }, [filePath, saveAnnotations]);
+  }, [filePath, projectPath, saveAnnotations]);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (matchesAction(e, "pdf.save")) {
-        e.preventDefault();
+  useScopedHotkeys({
+    tabId: tabId ?? `pdf:${filePath}`,
+    handlers: {
+      "pdf.save": () => {
         if (!saving) void save();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [save, saving]);
+      },
+    },
+  });
 
   return (
     <PdfViewerView
@@ -112,10 +119,10 @@ export function PdfViewer({ filePath, tabId }: PdfViewerProps) {
       onZoomOut={() => setZoom((z) => Math.max(0.5, z - 0.2))}
       onToolChange={setTool}
       onColorChange={setColor}
-      onAdd={(a) => add(filePath, a)}
-      onRemove={(id) => remove(filePath, id)}
+      onAdd={(a) => add(filePath, a, projectPath)}
+      onRemove={(id) => remove(filePath, id, projectPath)}
       onSelect={select}
-      onNoteTextChange={(id, text) => updateNoteText(filePath, id, text)}
+      onNoteTextChange={(id, text) => updateNoteText(filePath, id, text, projectPath)}
     />
   );
 }

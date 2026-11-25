@@ -3572,7 +3572,7 @@ pub struct RealtimeConversationListVoicesResponseEvent {
 pub enum Product {
     #[serde(alias = "CHATGPT")]
     Chatgpt,
-    #[serde(alias = "ATLAS_AGENT")]
+    #[serde(alias = "ATLAS_AGENT", alias = "atlas-agent", alias = "atlas_engine")]
     AtlasEngine,
     #[serde(alias = "ATLAS")]
     Atlas,
@@ -4452,6 +4452,21 @@ mod tests {
             SessionSource::from_startup_arg(" Atlas ").unwrap(),
             SessionSource::Custom("atlas".to_string())
         );
+    }
+
+    #[test]
+    fn product_accepts_platform_and_legacy_names_without_changing_its_wire_value() {
+        for spelling in ["atlasengine", "atlas-agent", "atlas_engine", "ATLAS_AGENT"] {
+            assert_eq!(
+                serde_json::from_value::<Product>(json!(spelling)).unwrap(),
+                Product::AtlasEngine
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(Product::AtlasEngine).unwrap(),
+            json!("atlasengine")
+        );
+        assert!(serde_json::from_value::<Product>(json!("unknown-product")).is_err());
     }
 
     #[test]

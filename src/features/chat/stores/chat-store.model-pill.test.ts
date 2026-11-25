@@ -424,3 +424,62 @@ describe("a refused model pick", () => {
     expect(toastError).not.toHaveBeenCalled();
   });
 });
+
+describe("the mode pill's live list (#43)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useChatStore.setState({ sessions: {}, activeSessionId: null });
+  });
+
+  function modeOption(currentValue: string, ids: string[]) {
+    return {
+      id: "mode",
+      name: "Mode",
+      category: "mode",
+      type: "select",
+      currentValue,
+      options: ids.map((id) => ({ value: id, name: id.toUpperCase() })),
+    };
+  }
+
+  function advertisedSession() {
+    const { actions } = useChatStore.getState();
+    actions.createSession(TAB, "opencode");
+    actions.setAcpBinding(TAB, "agent-1", ACP_SESSION, "/tmp");
+    actions.setAcpModes(TAB, "ask", [
+      { id: "ask", name: "ASK" },
+      { id: "code", name: "CODE" },
+    ]);
+    return () => useChatStore.getState().sessions[TAB];
+  }
+
+  it("takes a mode the agent added, and switched to, from its mode select", () => {
+    const session = advertisedSession();
+    useChatStore
+      .getState()
+      .actions.applyAgentDelta(
+        configOptionsDelta([modeOption("architect", ["ask", "code", "architect"])]),
+      );
+    expect(session().acpAvailableModes?.map((m) => m.id)).toEqual(["ask", "code", "architect"]);
+    expect(session().acpCurrentMode).toBe("architect");
+  });
+
+  it("a withdrawn current mode leaves the pill on one the agent still offers", () => {
+    const session = advertisedSession();
+    useChatStore.setState((s) => ({
+      sessions: { ...s.sessions, [TAB]: { ...s.sessions[TAB], acpCurrentMode: "code" } },
+    }));
+    useChatStore
+      .getState()
+      .actions.applyAgentDelta(configOptionsDelta([modeOption("", ["ask", "plan"])]));
+    expect(session().acpAvailableModes?.map((m) => m.id)).toEqual(["ask", "plan"]);
+    expect(session().acpCurrentMode).toBe("ask");
+  });
+
+  it("leaves the list alone when the delta carries no mode select", () => {
+    const session = advertisedSession();
+    useChatStore.getState().actions.applyAgentDelta(configOptionsDelta([modelOption("opus")]));
+    expect(session().acpAvailableModes?.map((m) => m.id)).toEqual(["ask", "code"]);
+    expect(session().acpCurrentMode).toBe("ask");
+  });
+});

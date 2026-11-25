@@ -311,6 +311,21 @@ export async function configureAgent(
   }
 }
 
+/** Restart a running agent so it picks up settings saved since it started
+ *  (`restartToApply` on its catalog entry). */
+export async function restartAgentToApply(item: { id: string; name: string }): Promise<boolean> {
+  try {
+    await agentConfig.restartToApply(item.id);
+    toast.success(`Restarted ${item.name}.`);
+    return true;
+  } catch (e) {
+    toast.error(`Couldn't restart ${item.name}: ${String(e)}`);
+    return false;
+  } finally {
+    await hydrateAgentRegistry();
+  }
+}
+
 /** Split an arguments field the way a shell would split simple input:
  *  whitespace separates, and single or double quotes keep a space inside one
  *  argument. No escapes or expansion: this is a list, not a script. */

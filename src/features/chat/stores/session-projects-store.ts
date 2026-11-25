@@ -4,7 +4,7 @@
 // column); this is a read-through copy keyed by live ACP session id, so a
 // composer chip can show and flip its project's access without each chip
 // asking the backend. Two writers, both answers from Rust: the composer's
-// history read (`use-live-elsewhere-feed.ts`, refreshed on
+// history read (`use-session-projects-feed.ts`, refreshed on
 // `atlas:threads-changed`, so an agent's granted access request lands too),
 // and the answer to an attach or access change, applied at once.
 

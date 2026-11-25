@@ -57,7 +57,9 @@ export function GithubPanel() {
       return;
     }
     try {
-      setRepos(await listClonedRepos(projectPath));
+      const current = await listClonedRepos(projectPath);
+      setRepos(current);
+      setCloned(new Set(current.map((repo) => repo.display_name)));
     } catch {
       setRepos([]);
     }

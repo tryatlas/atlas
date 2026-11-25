@@ -53,8 +53,9 @@ interface SessionLifecycleState {
     markUnread: (threadId: string) => Promise<boolean>;
     /** Rename; an empty title clears the rename. */
     rename: (threadId: string, title: string) => Promise<boolean>;
-    /** The chat tab running `sessionId` was opened or focused. Debounced. */
-    noteViewed: (sessionId: string) => void;
+    /** The chat tab running `sessionId` was opened or focused. Debounced.
+     *  `agentId` is the tab's agent, when it knows it (#86). */
+    noteViewed: (sessionId: string, agentId?: string) => void;
     /** Drop a pending "viewed" — the tab lost focus before it counted. */
     cancelViewed: (sessionId: string) => void;
   };
@@ -112,7 +113,7 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>()(
             await renameThread(threadId, title);
             return true;
           }),
-        noteViewed: (sessionId) => {
+        noteViewed: (sessionId, agentId) => {
           const previous = viewedTimers.get(sessionId);
           if (previous !== undefined) clearTimeout(previous);
           viewedTimers.set(
@@ -120,7 +121,7 @@ export const useSessionLifecycleStore = create<SessionLifecycleState>()(
             setTimeout(() => {
               viewedTimers.delete(sessionId);
               // Quiet on failure: a missed "viewed" leaves a dot, not a loss.
-              markSessionViewed(sessionId).catch((err) =>
+              markSessionViewed(sessionId, agentId).catch((err) =>
                 console.warn("Couldn't mark the session viewed:", err),
               );
             }, VIEWED_DEBOUNCE_MS),

@@ -1,3 +1,6 @@
+import { useKeybindingsStore } from "@/features/keybindings/stores/keybindings-store";
+import { evaluateWhen } from "@/features/keybindings/lib/when";
+import { liveWhenContext } from "@/features/keybindings/lib/when-context";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { runAction } from "@/features/keybindings/lib/action-registry";
 import { isActionId } from "@/features/keybindings/lib/actions";
@@ -22,7 +25,11 @@ const COMMANDS: Record<MenuCommandId, () => void> = {
  * its chord would, or a menu-only command. Returns whether anything ran.
  */
 export function runMenuItem(id: string): boolean {
-  if (isActionId(id)) return runAction(id).ok;
+  if (isActionId(id)) {
+    const binding = useKeybindingsStore.getState().resolved.byAction.get(id)?.[0];
+    if (binding?.whenAst && !evaluateWhen(binding.whenAst, liveWhenContext())) return false;
+    return runAction(id).ok;
+  }
   const command = COMMANDS[id as MenuCommandId];
   if (!command) return false;
   command();

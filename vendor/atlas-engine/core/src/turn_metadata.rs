@@ -460,7 +460,7 @@ impl TurnMetadataState {
         let latest_git_commit_hash = head_commit_hash.map(|sha| sha.0);
 
         WorkspaceGitMetadata {
-            associated_remote_urls,
+            associated_remote_urls: associated_remote_urls.map(without_credentials),
             latest_git_commit_hash,
             has_changes,
         }
@@ -477,7 +477,7 @@ async fn memory_workspaces(cwd: &AbsolutePathBuf) -> BTreeMap<String, TurnMetada
         get_has_changes_in_repo(cwd, &repo_root),
     );
     let workspace_git_metadata = WorkspaceGitMetadata {
-        associated_remote_urls,
+        associated_remote_urls: associated_remote_urls.map(without_credentials),
         latest_git_commit_hash: head_commit_hash.map(|sha| sha.0),
         has_changes,
     };
@@ -489,6 +489,55 @@ async fn memory_workspaces(cwd: &AbsolutePathBuf) -> BTreeMap<String, TurnMetada
         );
     }
     workspaces
+}
+
+/// Atlas: a git remote URL can carry a credential (`https://user:token@host/…`,
+/// the form a CI checkout or a pasted clone URL leaves behind). Turn metadata
+/// travels to the model provider and to local MCP servers, and a token is
+/// never part of what either needs, so the userinfo is removed from every
+/// remote before it is recorded. An scp-style `git@host:path` remote has no
+/// URL userinfo to remove and is kept as it is.
+fn without_credentials(urls: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    urls.into_iter()
+        .map(|(name, remote)| (name, remote_without_credentials(&remote)))
+        .collect()
+}
+
+pub(crate) fn remote_without_credentials(remote: &str) -> String {
+    let Ok(mut url) = url::Url::parse(remote) else {
+        return remote.to_string();
+    };
+    if url.username().is_empty() && url.password().is_none() {
+        return remote.to_string();
+    }
+    // Both fail only for URLs that cannot carry userinfo, which this one
+    // demonstrably does.
+    let _ = url.set_password(None);
+    let _ = url.set_username("");
+    url.to_string()
+}
+
+/// Atlas: whether an MCP server may receive the turn metadata (the absolute
+/// repository path, its remotes, the HEAD commit, the session and thread ids)
+/// in a tool call's `_meta`. Only a server on this machine may: a stdio child,
+/// or an HTTP server on a loopback address, which is how Atlas's own servers
+/// run. A remote server, or one whose origin is unknown, gets none of it.
+pub(crate) fn mcp_server_origin_is_local(origin: Option<&str>) -> bool {
+    let Some(origin) = origin else {
+        return false;
+    };
+    if origin == "stdio" {
+        return true;
+    }
+    let Ok(url) = url::Url::parse(origin) else {
+        return false;
+    };
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 #[cfg(test)]

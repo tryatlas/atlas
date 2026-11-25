@@ -14,8 +14,7 @@ import type { SessionKey } from "@/types/agents";
  * through the agent. {@link syncProjectThreads} asks the agents for the open
  * project's sessions, and also arms a Rust watcher on that project's Claude
  * transcript directory (`session_watcher.rs`) that syncs new sessions and
- * bumps active ones. While any session is live elsewhere, a 30s ticker there
- * re-announces the change event when the clock alone changes `liveElsewhere`.
+ * bumps active ones.
  */
 
 /** Fired whenever a thread row is added, changed or removed. */
@@ -73,8 +72,9 @@ export interface ThreadRow {
   woke: boolean;
   projectName: string;
   folderPaths: string[];
-  /** Another process (typically `claude` in a terminal) wrote this session
-   *  within the last ~90s and Atlas is not hosting it. Decided in Rust. */
+  /** @deprecated Always `false`. Liveness is ACP state only (decided
+   *  2026-11-25): nothing sets it and nothing should read it. Kept because the
+   *  Rust `ThreadRow` still sends it (`wire-shape-contract.test.ts`). */
   liveElsewhere: boolean;
   /** A hold keeps this session running in Atlas (Universal RC) and a turn is
    *  in flight — working even with no tab open on it. Decided in Rust. */
@@ -297,9 +297,13 @@ export function renameThread(threadId: string, title: string): Promise<void> {
  * The chat tab running `sessionId` was opened or focused. Keyed by the live
  * session, which is what a tab knows. Debounced by the caller
  * (`useMarkActiveSessionViewed`); resolves whether a row was marked.
+ *
+ * `agentId` is the tab's agent (`acpAgentId`) when it knows it: two agents
+ * can share a session id (#86), and by the bare id such a session marks
+ * nothing.
  */
-export function markSessionViewed(sessionId: string): Promise<boolean> {
-  return invoke<boolean>("threads_mark_viewed", { sessionId });
+export function markSessionViewed(sessionId: string, agentId?: string): Promise<boolean> {
+  return invoke<boolean>("threads_mark_viewed", { sessionId, agentId: agentId ?? null });
 }
 
 /** Make a session read as unread again. Rejects for one with no finished turn. */

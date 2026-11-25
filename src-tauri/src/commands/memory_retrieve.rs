@@ -83,7 +83,9 @@ async fn retrieve_engine(
     let Some(provider) = registry.provider(app).await else {
         return Vec::new();
     };
-    let engine = registry.engine_for(project_path);
+    let Ok(engine) = registry.inner().engine_for_async(project_path).await else {
+        return Vec::new();
+    };
     // try_read, never read().await: the indexer holds the WRITE lock for the
     // whole of a re-embed pass, and a big working-tree churn keeps it busy for
     // minutes. Queueing a tool call behind indexing turned "agent is thinking"
@@ -127,7 +129,9 @@ const EVICT_LOCK_TIMEOUT_SECS: u64 = 2;
 /// Returns whether the document was actually removed.
 pub async fn evict_doc(app: &AppHandle, project_path: &str, doc_id: &str) -> bool {
     let registry = app.state::<Arc<MemoryRegistry>>();
-    let engine = registry.engine_for(project_path);
+    let Ok(engine) = registry.inner().engine_for_async(project_path).await else {
+        return false;
+    };
     let Ok(mut guard) =
         tokio::time::timeout(Duration::from_secs(EVICT_LOCK_TIMEOUT_SECS), engine.write()).await
     else {

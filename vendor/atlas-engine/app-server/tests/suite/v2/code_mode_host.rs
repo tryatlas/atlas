@@ -26,11 +26,13 @@ const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 60);
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 10);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs the standalone atlas-engine-code-mode-host binary, which Atlas does not build: the engine runs in-process (ADR-0004)"]
 async fn app_server_shares_flag_selected_code_mode_host_across_threads() -> Result<()> {
     assert_shared_remote_code_mode_host("ws://127.0.0.1:0").await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs the standalone atlas-engine-code-mode-host binary, which Atlas does not build: the engine runs in-process (ADR-0004)"]
 async fn app_server_shares_flag_selected_grpc_code_mode_host_across_threads() -> Result<()> {
     assert_shared_remote_code_mode_host("grpc://127.0.0.1:0").await
 }

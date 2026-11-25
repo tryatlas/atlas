@@ -52,6 +52,35 @@ pub fn replace_file(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> io::Resu
     replace(path.as_ref(), bytes.as_ref(), None, Flush::ToDisk)
 }
 
+/// Preserve a user-managed symlink while atomically replacing its target.
+/// Dangling links and cycles are errors, never a reason to replace the link.
+/// Callers accepting untrusted paths must enforce their own root boundary.
+pub fn replace_file_follow_symlink(
+    path: impl AsRef<Path>,
+    bytes: impl AsRef<[u8]>,
+) -> io::Result<()> {
+    let path = symlink_destination(path.as_ref())?;
+    replace_file(path, bytes)
+}
+
+pub fn replace_file_follow_symlink_with_mode(
+    path: impl AsRef<Path>,
+    bytes: impl AsRef<[u8]>,
+    mode: u32,
+) -> io::Result<()> {
+    let path = symlink_destination(path.as_ref())?;
+    replace_file_with_mode(path, bytes, mode)
+}
+
+fn symlink_destination(path: &Path) -> io::Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => path.canonicalize(),
+        Ok(_) => Ok(path.to_path_buf()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Replace the contents of `path` with `bytes` atomically, without waiting for
 /// the disk: for a cache whose content can be fetched or rebuilt again, and
 /// for nothing else.

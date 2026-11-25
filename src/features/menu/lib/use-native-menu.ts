@@ -1,6 +1,5 @@
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { isMac } from "@/lib/platform";
 import { useKeybindingsStore } from "@/features/keybindings/stores/keybindings-store";
 import { toMenuAccelerator } from "@/features/keybindings/lib/native-accelerator";
 import { setMenuAccelerators } from "./menu-api";
@@ -16,7 +15,6 @@ const ACTION_IDS = menuActionIds();
  */
 export function useNativeMenu(): void {
   useEffect(() => {
-    if (!isMac) return;
     const unlisten = listen<string>(MENU_EVENT, (event) => {
       if (!runMenuItem(event.payload)) console.warn("menu item did nothing:", event.payload);
     });
@@ -41,7 +39,7 @@ export function useNativeMenu(): void {
 
   useEffect(() => {
     // Before load the bindings are not the user's yet; don't flap the menu.
-    if (!isMac || !loaded) return;
+    if (!loaded) return;
     setMenuAccelerators(JSON.parse(accelerators) as Record<string, string | null>).catch((e) =>
       console.warn("could not update the menu's shortcuts:", e),
     );

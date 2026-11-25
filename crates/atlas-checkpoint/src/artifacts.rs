@@ -32,6 +32,15 @@ pub enum AtlasArtifact {
 }
 
 impl AtlasArtifact {
+    pub(crate) fn sync_revision(&self) -> i64 {
+        match self {
+            Self::AgentSession(a) => a.base.sync_revision,
+            Self::AgentMessage(a) => a.base.sync_revision,
+            Self::ToolCall(a) => a.base.sync_revision,
+            Self::Checkpoint(a) => a.base.sync_revision,
+        }
+    }
+
     /// The local row this came from, so the drain can mark exactly what the
     /// server acknowledged rather than assuming a whole batch succeeded.
     pub fn row_id(&self) -> &str {
@@ -82,6 +91,9 @@ impl AtlasArtifact {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactBase {
+    /// Local version captured with the payload. Never part of the wire contract.
+    #[serde(skip)]
+    pub(crate) sync_revision: i64,
     /// Local row id. Echoed back in a per-artifact result so the drain knows
     /// precisely which rows were accepted.
     pub row_id: String,

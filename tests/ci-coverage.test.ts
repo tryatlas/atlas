@@ -217,6 +217,18 @@ describe("CI's Rust jobs", () => {
       .join("\n");
     const script = readFileSync(path.join(REPO_ROOT, "scripts", "test-rust.sh"), "utf8");
     expect(packages(job)).toContain("atlas-engine-api");
+    expect(packages(job)).toEqual(
+      expect.arrayContaining([
+        "atlas-engine-app-server",
+        "atlas-engine-backend-client",
+        "atlas-engine-core",
+        "atlas-engine-exec-server",
+        "atlas-engine-hooks",
+        "atlas-engine-linux-sandbox",
+        "atlas-engine-rmcp-client",
+        "atlas-engine-skills-extension",
+      ]),
+    );
     expect(packages(script)).toEqual(packages(job));
   });
 

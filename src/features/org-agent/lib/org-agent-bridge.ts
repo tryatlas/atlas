@@ -23,10 +23,15 @@ const FOCUS_REFRESH_MS = 60_000;
 export function startOrgAgentBridge(): () => void {
   let disposed = false;
   let unlisten: (() => void) | null = null;
+  let receivedConnection = false;
   const actions = () => useOrgAgentStore.getState().actions;
 
   void orgAgent
-    .listen((envelope) => actions().onEnvelope(envelope))
+    .listen((envelope) => {
+      if (disposed) return;
+      if (envelope.ev.kind === "connection") receivedConnection = true;
+      actions().onEnvelope(envelope);
+    })
     .then((stop) => {
       if (disposed) stop();
       else unlisten = stop;
@@ -36,7 +41,7 @@ export function startOrgAgentBridge(): () => void {
   void orgAgent
     .status()
     .then((s) => {
-      if (!disposed) actions().adopt(s.orgId, s.state);
+      if (!disposed && !receivedConnection) actions().adopt(s.orgId, s.state);
     })
     .catch(() => {});
 

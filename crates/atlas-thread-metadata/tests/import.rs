@@ -239,6 +239,33 @@ fn an_imported_row_keeps_the_time_the_agent_reported() {
 }
 
 #[test]
+fn a_row_without_a_usable_time_sorts_as_unknown_age_not_now() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ThreadMetadataStore::open(dir.path().join("threads.db")).unwrap();
+    let cutoff = Utc::now() - chrono::Duration::hours(1);
+
+    let rows = importable_threads(
+        vec![AgentSessionInfo {
+            updated_at: None,
+            ..session("undated", &["/tmp/atlas"])
+        }],
+        &"some-agent".into(),
+        &store.known_session_ids(),
+        Some(cutoff),
+    );
+
+    assert_eq!(
+        rows[0].updated_at,
+        chrono::DateTime::<Utc>::UNIX_EPOCH,
+        "a session whose age is unknown must not claim it was active just now"
+    );
+    assert!(
+        rows[0].settled_at.is_some(),
+        "and so does not land in the active list past a recency cutoff"
+    );
+}
+
+#[test]
 fn a_backfill_runs_once_per_agent() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("threads.db");

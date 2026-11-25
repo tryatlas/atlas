@@ -20,10 +20,13 @@
 //                checks the login. Atlas no longer runs these headlessly
 //                first: piped stdio cannot answer a login that asks a
 //                question, so that path could only ever hang (#24).
-//   `env_var`  → a read-only checklist of variables the user must export. There
-//                is deliberately NO key input: for ACP agents, credentials live
-//                in the system environment (the plan's BYOK-maps-to-env
-//                contract), and Atlas holds no agent tokens.
+//   `env_var`  → a checklist of the variables the method reads, ticked only
+//                for ones that reach the agent's process, with a field for
+//                each that doesn't. Typed values are saved for the agent as
+//                sensitive variables (keychain, ADR-0023) and the agent
+//                restarts with them (`agents_set_auth_env`): authenticating
+//                the process already running never gave it the variable
+//                (audit #61).
 
 import { resolveAgentSignIn } from "@/features/notifications/lib/agent-notifier";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -48,6 +51,8 @@ import { copyText } from "@/lib/clipboard";
 import { pluginIdForAgent } from "@/types/agent";
 import { useCenterPanelCenterX } from "@/features/layout/lib/use-center-panel-x";
 import { agentMeta, catalogEntry } from "@/features/agents/lib/agent-meta";
+import { agentConfig } from "@/features/agents/lib/agent-config-api";
+import { cancelAuthentication } from "@/features/agents/lib/agent-auth-api";
 import { logEvent } from "@/features/log/lib/log";
 import {
   closeCommandTerminal,
@@ -84,6 +89,8 @@ function AgentOAuthModal({
   onClose: () => void;
 }) {
   const label = agentMeta(request.agentType).label;
+  const labelRef = useRef(label);
+  labelRef.current = label;
   const [phase, setPhase] = useState<SignInPhase>({ kind: "loading" });
   const [agentId, setAgentId] = useState<string | null>(null);
   const [env, setEnv] = useState<AuthEnvStatus[]>([]);
@@ -132,17 +139,17 @@ function AgentOAuthModal({
     (method: AuthMethodWire) => {
       const command = manualCommandFor(method);
       if (!command) return;
-      const terminal = openCommandTerminal(command, `Sign in — ${label}`);
+      const terminal = openCommandTerminal(command, `Sign in — ${labelRef.current}`);
       setPhase({ kind: "terminal", method, command, terminal });
       logEvent({
         source: "atlas",
         kind: "agent-auth",
-        summary: `${label} sign-in handed to a terminal (${method.id})`,
+        summary: `${labelRef.current} sign-in handed to a terminal (${method.id})`,
         status: "success",
         payload: { agent: request.agentType, method: method.id },
       });
     },
-    [label, request.agentType],
+    [request.agentType],
   );
 
   /** A method Atlas should run in a terminal rather than headlessly: it has a
@@ -235,7 +242,8 @@ function AgentOAuthModal({
     }
     // A CLI login goes straight to a terminal — see `handOffToTerminal`. Only
     // methods with nothing to type into (ACP's own `authenticate`, or an
-    // `env_var` checklist the user has already satisfied) run headlessly here.
+    // `env_var` checklist whose every variable already reaches the agent) run
+    // headlessly here.
     if (runsInTerminal(method)) {
       handOffToTerminal(method);
       return;
@@ -284,6 +292,47 @@ function AgentOAuthModal({
       });
     } finally {
       unlisten?.();
+    }
+  };
+
+  /** Continue on an `env_var` checklist. Nothing typed means every variable
+   *  already reaches the agent, and the method runs as any other. Typed values
+   *  are saved for the agent and it restarts with them; the `authenticate`
+   *  after is the same best-effort courtesy as after a CLI login, and the
+   *  rebind `finish` triggers is what checks it. */
+  const continueEnv = async (method: AuthMethodWire, values: { name: string; value: string }[]) => {
+    if (!agentId) return;
+    if (values.length === 0) {
+      void run(method);
+      return;
+    }
+    const attempt = ++attemptRef.current;
+    setPhase({
+      kind: "running",
+      label: `Restarting ${label} with its new settings…`,
+      docked: false,
+    });
+    try {
+      await agentConfig.setAuthEnv(pluginIdForAgent(request.agentType), values);
+      await authenticateAfterCliLogin(agentId, method.id, label);
+      logEvent({
+        source: "atlas",
+        kind: "agent-auth",
+        summary: `${label} variables saved (${method.id})`,
+        status: "success",
+        payload: { agent: request.agentType, method: method.id },
+      });
+      if (!current(attempt)) resolveAgentSignIn(request.agentType);
+      else finish(false);
+    } catch (err) {
+      if (current(attempt)) setPhase({ kind: "error", message: errInfo(err).message });
+      logEvent({
+        source: "atlas",
+        kind: "agent-auth",
+        summary: `${label} variables could not be saved (${method.id})`,
+        status: "failure",
+        payload: { agent: request.agentType, method: method.id, error: errInfo(err).message },
+      });
     }
   };
 
@@ -338,10 +387,15 @@ function AgentOAuthModal({
 
   const dismiss = () => {
     // A dismissal abandons the flow in the UI: whatever is still running finds
-    // its attempt stale, and the success frame's close timer cannot fire. A
-    // headless run is not stopped (there is no command to stop one); if it
-    // lands later it only closes the sign-in notification.
+    // its attempt stale, and the success frame's close timer cannot fire.
     attemptRef.current += 1;
+    // And on the agent: `authenticate` has no deadline (#67), so a sign-in
+    // the user walked away from stays open there until it is cancelled, and
+    // the next attempt would start a second flow beside it. A no-op when
+    // nothing is in flight.
+    if (phase.kind === "running" && agentId) {
+      void cancelAuthentication(agentId).catch(() => {});
+    }
     if (closeTimerRef.current !== null) {
       window.clearTimeout(closeTimerRef.current);
       closeTimerRef.current = null;
@@ -403,8 +457,8 @@ function AgentOAuthModal({
       onBackToMethods={() => {
         if (phase.kind === "env") setPhase({ kind: "choose", methods: phase.methods });
       }}
-      onContinueEnv={() => {
-        if (phase.kind === "env") void run(phase.method);
+      onContinueEnv={(values) => {
+        if (phase.kind === "env") void continueEnv(phase.method, values);
       }}
       onRetry={() => {
         // A clean start: the old run is stale, and its tail and URL go too.

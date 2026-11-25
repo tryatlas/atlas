@@ -123,11 +123,12 @@ pub fn canonical_name(
     // AND COMMITTED a file was classified as a read and never sampled for
     // writes. The argument shape outranks the title because it cannot be
     // prose.
-    if arguments
-        .get("command")
-        .and_then(serde_json::Value::as_str)
-        .is_some()
-    {
+    if arguments.get("command").is_some_and(|command| {
+        command.is_string()
+            || command.as_array().is_some_and(|args| {
+                !args.is_empty() && args.iter().all(serde_json::Value::is_string)
+            })
+    }) {
         return ToolName::Bash;
     }
 

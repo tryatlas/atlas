@@ -18,7 +18,7 @@ import { agents } from "./agents-api";
 async function holdSession(tabId: string, held: boolean): Promise<void> {
   const session = useChatStore.getState().sessions[tabId];
   if (!session?.acpSessionId) throw new Error(`tab ${tabId} has no live session`);
-  await agents.setHold(session.acpSessionId, held);
+  await agents.setHold(session.acpSessionId, held, session.acpAgentId);
 }
 
 export function installDevSessionHold(): void {

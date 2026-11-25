@@ -37,7 +37,7 @@ interface ModelPricingState {
   actions: {
     setOverrides: (overrides: ModelPriceOverrides) => void;
     load: () => Promise<void>;
-    refresh: () => Promise<void>;
+    refresh: () => Promise<boolean>;
   };
 }
 
@@ -80,8 +80,9 @@ const base = create<ModelPricingState>((set, get) => ({
           prices: applyPriceOverrides(prices, get().overrides),
           loaded: true,
         });
+        return true;
       } catch {
-        // best-effort — keep whatever's cached
+        return false;
       } finally {
         set({ loading: false });
       }

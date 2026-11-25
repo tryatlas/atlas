@@ -101,23 +101,25 @@ fn gateway_settings(home: &std::path::Path, server: &MockServer) -> EngineSettin
 fn event_sink() -> (ThreadEventSink, std::sync::mpsc::Receiver<AcpThreadEvent>) {
     let (tx, events) = std::sync::mpsc::channel();
     let tx = Arc::new(std::sync::Mutex::new(tx));
-    let sink: ThreadEventSink = Arc::new(move |_id: &acp::SessionId| {
-        let (thread_tx, mut thread_rx) = tokio::sync::mpsc::unbounded_channel();
-        let out = tx.clone();
-        tokio::spawn(async move {
-            while let Some(event) = thread_rx.recv().await {
-                if out
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .send(event)
-                    .is_err()
-                {
-                    return;
+    let sink: ThreadEventSink = Arc::new(
+        move |_agent: &atlas_acp_thread::AgentId, _id: &acp::SessionId| {
+            let (thread_tx, mut thread_rx) = tokio::sync::mpsc::unbounded_channel();
+            let out = tx.clone();
+            tokio::spawn(async move {
+                while let Some(event) = thread_rx.recv().await {
+                    if out
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .send(event)
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
-            }
-        });
-        thread_tx
-    });
+            });
+            thread_tx
+        },
+    );
     (sink, events)
 }
 
@@ -1630,6 +1632,11 @@ async fn undo_rewinds_the_engine_and_trims_the_transcript_to_match() {
         .await
         .expect("the first turn should complete");
 
+    push_user(&thread, "local-status", "/status");
+    h.connection
+        .prompt(acp::PromptRequest::new(session_id.clone(), text("/status")))
+        .await
+        .expect("local status");
     push_user(&thread, "u2", "/undo");
     let response = h
         .connection
@@ -1653,6 +1660,35 @@ async fn undo_rewinds_the_engine_and_trims_the_transcript_to_match() {
         all.contains("Rewound"),
         "the user must be told what happened: {all}",
     );
+}
+
+#[tokio::test]
+async fn retry_returns_the_model_prompt_after_a_local_slash_exchange() {
+    let h = harness(vec![(None, sse_ok(answer("first answer")))]).await;
+    let session_id = h.open_thread().await;
+    let thread = h.threads.lock().unwrap().last().cloned().unwrap();
+    push_user(&thread, "real", "retry this question");
+    h.connection
+        .prompt(acp::PromptRequest::new(
+            session_id.clone(),
+            text("retry this question"),
+        ))
+        .await
+        .unwrap();
+    push_user(&thread, "local", "/status");
+    h.connection
+        .prompt(acp::PromptRequest::new(session_id.clone(), text("/status")))
+        .await
+        .unwrap();
+    let prompt = h
+        .connection
+        .rewind(&session_id)
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(prompt.as_deref(), Some("retry this question"));
+    assert!(thread.lock().unwrap().entries().is_empty());
 }
 
 #[tokio::test]
@@ -2214,4 +2250,66 @@ async fn the_memory_servers_tools_reach_the_gateway_and_a_call_runs() {
         vec!["mcp__atlas_memory__memory_search".to_string()]
     );
     assert!(h.assistant_text().contains("grounded answer"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reopened_fork_can_offer_and_call_its_host_mcp_tools() {
+    let (url, calls) = memory_server::start().await;
+    let offering = Arc::new(memory_server::OfferingMemory {
+        url,
+        asked: std::sync::Mutex::new(Vec::new()),
+        settled: Arc::default(),
+    });
+    let h = harness_full(
+        vec![
+            (Some(1), sse_ok(answer("original answer"))),
+            (
+                Some(1),
+                sse_ok(tool_call(
+                    "mcp__atlas_memory__memory_search",
+                    r#"{"query":"fork memory"}"#,
+                )),
+            ),
+            (None, sse_ok(answer("fork answer"))),
+        ],
+        Arc::new(StaticToken),
+        Some(offering.clone()),
+    )
+    .await;
+    let original = h.open_thread().await;
+    h.connection
+        .prompt(acp::PromptRequest::new(original.clone(), text("hello")))
+        .await
+        .unwrap();
+    let forked = h.connection.fork(&original).unwrap().run().await.unwrap();
+    let reopened = h
+        .connection
+        .clone()
+        .resume_session(forked.clone(), vec![h._home.path().to_path_buf()], None)
+        .await
+        .unwrap();
+    assert_eq!(reopened.lock().unwrap().session_id(), &forked);
+    h.connection
+        .prompt(acp::PromptRequest::new(forked.clone(), text("use memory")))
+        .await
+        .unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert_eq!(calls.lock().unwrap()[0].1["query"], "fork memory");
+    assert!(
+        offering
+            .settled
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|id| id.as_deref() == Some(forked.to_string().as_str()))
+            .count()
+            >= 2,
+        "fork creation and ordinary reopen each settle their host offer"
+    );
+    let body = h.last_request_body().await;
+    assert!(body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["function"]["name"] == "mcp__atlas_memory__memory_search"));
 }

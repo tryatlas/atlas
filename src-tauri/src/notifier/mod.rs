@@ -218,6 +218,19 @@ impl Notifier {
 }
 
 fn emit_response(app: &AppHandle, response: &NotificationResponse) {
+    #[cfg(windows)]
+    {
+        use tauri::Manager;
+        let app = app.clone();
+        let handle = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Some(window) = handle.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        });
+    }
     if let Err(error) = app.emit(RESPONSE_EVENT, response) {
         tracing::warn!("failed to emit notification response: {error}");
     }

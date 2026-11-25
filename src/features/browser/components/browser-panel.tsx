@@ -7,9 +7,9 @@ import {
   browserEmbedReload,
   browserOpenWindow,
   fetchReadable,
-  saveKnowledgeNote,
   type ReadableContent,
 } from "../lib/browser-api";
+import { savePageToKnowledge } from "../lib/save-to-knowledge";
 import { normalizeUrl, toNavUrl } from "../lib/browser-url";
 import type { BrowserMode } from "../lib/browser-types";
 import { useLiveEmbed } from "../lib/use-live-embed";
@@ -43,6 +43,15 @@ export function BrowserPanel({ tabId, initialUrl, groupId }: BrowserPanelProps) 
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<ReadableContent[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
+  const historyIndexRef = useRef(historyIndex);
+  historyIndexRef.current = historyIndex;
+  const readerRequest = useRef(0);
+  useEffect(
+    () => () => {
+      readerRequest.current += 1;
+    },
+    [],
+  );
   const [searchQuery, setSearchQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -60,26 +69,28 @@ export function BrowserPanel({ tabId, initialUrl, groupId }: BrowserPanelProps) 
   } = useLiveEmbed({ embedId, mode, initialUrl, groupId, tabId, setInputUrl });
 
   // ── Reader: sanitized fetch ─────────────────────────────────────────────
-  const fetchPage = useCallback(
-    async (url: string) => {
-      url = normalizeUrl(url);
-      setInputUrl(url);
-      setLoading(true);
-      setError(null);
-      try {
-        const result = await fetchReadable(url);
-        setPage(result);
-        setInputUrl(result.url);
-        setHistory((h) => [...h.slice(0, historyIndex + 1), result]);
-        setHistoryIndex((i) => i + 1);
-      } catch (e) {
-        setError(String(e));
-        setPage(null);
-      }
-      setLoading(false);
-    },
-    [historyIndex],
-  );
+  const fetchPage = useCallback(async (url: string) => {
+    const request = ++readerRequest.current;
+    const from = historyIndexRef.current;
+    url = normalizeUrl(url);
+    setInputUrl(url);
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await fetchReadable(url);
+      if (request !== readerRequest.current) return;
+      setPage(result);
+      setInputUrl(result.url);
+      setHistory((h) => [...h.slice(0, from + 1), result]);
+      historyIndexRef.current = from + 1;
+      setHistoryIndex(from + 1);
+    } catch (e) {
+      if (request !== readerRequest.current) return;
+      setError(String(e));
+      setPage(null);
+    }
+    setLoading(false);
+  }, []);
 
   // ── Unified navigation (dispatches by mode) ─────────────────────────────
   const navigate = useCallback(
@@ -105,6 +116,8 @@ export function BrowserPanel({ tabId, initialUrl, groupId }: BrowserPanelProps) 
   }, [tabId, navigate]);
 
   const goBack = () => {
+    readerRequest.current += 1;
+    setLoading(false);
     if (mode === "live") {
       browserEmbedBack(embedId).catch(() => {});
     } else if (historyIndex > 0) {
@@ -116,6 +129,8 @@ export function BrowserPanel({ tabId, initialUrl, groupId }: BrowserPanelProps) 
   };
 
   const goForward = () => {
+    readerRequest.current += 1;
+    setLoading(false);
     if (mode === "live") {
       browserEmbedForward(embedId).catch(() => {});
     } else if (historyIndex < history.length - 1) {
@@ -196,15 +211,7 @@ export function BrowserPanel({ tabId, initialUrl, groupId }: BrowserPanelProps) 
   const saveToKnowledge = async () => {
     if (!page || !currentProject) return;
     const textContent = contentRef.current?.innerText || "";
-    try {
-      await saveKnowledgeNote(
-        currentProject.path,
-        `web-${Date.now()}`,
-        `# ${page.title}\n\nSource: ${page.url}\n\n${textContent.slice(0, 50000)}`,
-      );
-      const { useKnowledgeStore } = await import("@/features/knowledge/stores/knowledge-store");
-      useKnowledgeStore.getState().actions.loadEntries(currentProject.path);
-    } catch {}
+    await savePageToKnowledge(currentProject.path, page, textContent);
   };
 
   const copySelection = () => {

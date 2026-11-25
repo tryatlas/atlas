@@ -25,7 +25,7 @@ use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::conn::{classify_handshake, ticket_request, ExitReason};
+use crate::conn::{ticket_request, ExitReason};
 use crate::{spaces_socket_url, CommsError, TokenSource};
 
 /// Backoff for the Spaces socket — the web client's numbers (500ms · 2^n,
@@ -181,8 +181,21 @@ impl SpacesManager {
         self.send(conv_id, SpaceOutbound::Control(frame));
     }
 
-    pub fn send_binary(&self, conv_id: &str, bytes: Vec<u8>) {
-        self.send(conv_id, SpaceOutbound::Binary(bytes));
+    pub fn send_binary(&self, conv_id: &str, bytes: Vec<u8>) -> crate::Result<()> {
+        let slot = self
+            .inner
+            .spaces
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .cloned()
+            .ok_or_else(|| crate::CommsError::Transport("Space is not connected".into()))?;
+        let outbound = slot.outbound.lock().unwrap();
+        let tx = outbound
+            .as_ref()
+            .ok_or_else(|| crate::CommsError::Transport("Space is not connected".into()))?;
+        tx.try_send(SpaceOutbound::Binary(bytes))
+            .map_err(|e| crate::CommsError::Transport(format!("Space update was not queued: {e}")))
     }
 
     fn send(&self, conv_id: &str, out: SpaceOutbound) {
@@ -278,10 +291,9 @@ impl SpacesManager {
             }
         };
 
-        let (stream, _response) = match tokio_tungstenite::connect_async(request).await {
+        let (stream, _response) = match crate::conn::connect(request).await {
             Ok(ok) => ok,
-            Err(err) => {
-                let reason = classify_handshake(&err);
+            Err(reason) => {
                 // The classification, never the error — a tungstenite HTTP
                 // error can carry the request, and the request the ticket.
                 tracing::warn!(target: "atlas_comms::spaces", "handshake failed: {reason:?}");
@@ -301,10 +313,24 @@ impl SpacesManager {
         let (mut write, mut read) = stream.split();
         let b64 = base64::engine::general_purpose::STANDARD;
 
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(20),
+        );
+        let mut last_received = tokio::time::Instant::now();
         let exit = loop {
             tokio::select! {
+                _ = tokio::time::sleep_until(last_received + std::time::Duration::from_secs(60)) => {
+                    break ExitReason::Transport("socket stopped responding".into());
+                }
+                _ = heartbeat.tick() => {
+                    if let Err(error) = crate::conn::send_frame(&mut write, WsMessage::Ping(Vec::new().into())).await {
+                        break ExitReason::Transport(error);
+                    }
+                }
                 incoming = read.next() => match incoming {
                     Some(Ok(WsMessage::Text(text))) => {
+                        last_received = tokio::time::Instant::now();
                         // Verbatim to the renderer; the contract is decoded
                         // there. An undecodable frame is its problem to drop.
                         let _ = self.inner.events.send(SpaceEnvelope {
@@ -314,6 +340,7 @@ impl SpacesManager {
                         });
                     }
                     Some(Ok(WsMessage::Binary(bytes))) => {
+                        last_received = tokio::time::Instant::now();
                         // The hot path: update batches and awareness fanouts.
                         let _ = self.inner.events.send(SpaceEnvelope {
                             org: slot.org_id.clone(),
@@ -328,26 +355,26 @@ impl SpacesManager {
                             .is_some_and(|f| u16::from(f.code) == 1008);
                         break if revoked { ExitReason::Evicted } else { ExitReason::Closed };
                     }
-                    Some(Ok(_)) => {} // ping/pong
+                    Some(Ok(_)) => { last_received = tokio::time::Instant::now(); } // ping/pong
                     Some(Err(e)) => break ExitReason::Transport(e.to_string()),
                     None => break ExitReason::Closed,
                 },
 
                 to_send = outbound.recv() => match to_send {
                     Some(SpaceOutbound::Control(text)) => {
-                        if let Err(e) = write.send(WsMessage::Text(text.into())).await {
-                            break ExitReason::Transport(e.to_string());
+                        if let Err(e) = crate::conn::send_frame(&mut write, WsMessage::Text(text.into())).await {
+                            break ExitReason::Transport(e);
                         }
                     }
                     Some(SpaceOutbound::Binary(bytes)) => {
-                        if let Err(e) = write.send(WsMessage::Binary(bytes.into())).await {
-                            break ExitReason::Transport(e.to_string());
+                        if let Err(e) = crate::conn::send_frame(&mut write, WsMessage::Binary(bytes.into())).await {
+                            break ExitReason::Transport(e);
                         }
                     }
                     // Sender dropped: teardown or a deliberate cycle. Close
                     // politely so presence clears on the next fanout tick.
                     None => {
-                        let _ = write.send(WsMessage::Close(None)).await;
+                        let _ = crate::conn::send_frame(&mut write, WsMessage::Close(None)).await;
                         break ExitReason::Closed;
                     }
                 },
@@ -424,13 +451,13 @@ impl SpacesManager {
         loop {
             let token = self.inner.tokens.mint().await?;
             let request = ticket_request(spaces_socket_url(org_id, conv_id), &token)?;
-            match tokio_tungstenite::connect_async(request).await {
+            match crate::conn::connect(request).await {
                 Ok((stream, _response)) => {
                     let (write, read) = stream.split();
                     return await_page_created(write, read, page.frame(), PAGE_CREATE_TIMEOUT)
                         .await;
                 }
-                Err(err) => match classify_handshake(&err) {
+                Err(reason) => match reason {
                     // Never the error itself: it can carry the request, and
                     // the request the ticket.
                     ExitReason::Unauthorized if !reminted => reminted = true,

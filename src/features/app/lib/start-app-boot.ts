@@ -19,6 +19,10 @@ import { emitWindowEvent } from "@/lib/window-events";
 import { setAppStateWritable, useAppStore, type AppStateWire } from "../stores/app-store";
 import { runBootSequence } from "./boot-sequence";
 
+// StrictMode can cancel the first effect after Rust consumed its single-shot
+// launch path. Both boot attempts must share that same read.
+let initialCliPath: Promise<string | null> | undefined;
+
 /** Dispatch `atlas:app-ready` once: the inline script in `index.html`
  *  listens for it and removes the boot skeleton. */
 function signalReady(): void {
@@ -31,7 +35,7 @@ function signalReady(): void {
 export function startAppBoot(): () => void {
   return runBootSequence({
     // Rust stashes the path single-shot, so a window reload won't re-trigger.
-    takeCliPath: () => invoke<string | null>("cli_take_initial_project_path"),
+    takeCliPath: () => (initialCliPath ??= invoke<string | null>("cli_take_initial_project_path")),
     loadState: () => invoke<AppStateWire>("bootstrap_app_state"),
     wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     // Marks the welcome → project layout swap as non-urgent, so React can
@@ -68,6 +72,7 @@ export function startAppBoot(): () => void {
       );
     },
     openCliProject: async (path) => {
+      initialCliPath = Promise.resolve(null);
       logEvent({
         source: "atlas",
         kind: "cli-launch-open-project",

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { realpathSync } from "node:fs";
 /**
  * Brings the theme engine's data in from `@tryatlas/design` and generates the
  * files only desktop needs from it.
@@ -678,7 +679,10 @@ function check() {
   process.exitCode = 1;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (
+  process.argv[1] &&
+  realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1])
+) {
   try {
     if (process.argv.includes("--check")) check();
     else write();

@@ -15,7 +15,6 @@ use atlas_engine_skills::system_cache_root_dir;
 use atlas_engine_utils_absolute_path::AbsolutePathBuf;
 use atlas_engine_utils_path_uri::PathUri;
 use atlas_engine_utils_plugins::PluginSkillRoot;
-use dirs::home_dir;
 use futures::StreamExt;
 use toml::Value as TomlValue;
 
@@ -29,16 +28,15 @@ pub(crate) async fn resolve_skill_roots(
     repository_file_system: Option<Arc<dyn ExecutorFileSystem>>,
     config_layer_stack: &ConfigLayerStack,
     cwd: &AbsolutePathBuf,
+    home_dir: Option<&AbsolutePathBuf>,
     plugin_skill_roots: Vec<PluginSkillRoot>,
     extra_skill_roots: Vec<AbsolutePathBuf>,
 ) -> Vec<HostSkillRoot> {
-    let home_dir =
-        home_dir().and_then(|path| AbsolutePathBuf::from_absolute_path_checked(path).ok());
     resolve_skill_roots_with_home_dir(
         repository_file_system,
         config_layer_stack,
         cwd,
-        home_dir.as_ref(),
+        home_dir,
         plugin_skill_roots,
         extra_skill_roots,
     )
@@ -168,7 +166,16 @@ async fn repo_agents_skill_roots(
                 Arc::clone(&repository_file_system),
             )),
             Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            // Keep prospective roots: the watcher subscribes to their nearest
+            // existing ancestor so creating the first project skill invalidates
+            // the cwd cache. The loader already treats an absent root as empty.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                roots.push(HostSkillRoot::host(
+                    agents_skills,
+                    SkillScope::Repo,
+                    Arc::clone(&repository_file_system),
+                ))
+            }
             Err(error) => {
                 tracing::warn!(
                     "failed to stat repo skills root {}: {error:#}",

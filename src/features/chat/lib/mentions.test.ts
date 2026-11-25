@@ -148,6 +148,7 @@ beforeEach(() => {
           cloudPending: false,
           cloudFailed: null,
         };
+      case "list_knowledge":
       case "mention_search":
         return [];
       default:

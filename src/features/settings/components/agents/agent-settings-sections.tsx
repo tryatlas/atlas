@@ -80,7 +80,10 @@ function ModelPricingRow() {
   }, [load]);
   const count = Object.keys(prices).filter((key) => key.includes("/")).length;
   const update = async () => {
-    await refresh();
+    if (!(await refresh())) {
+      toast.error("Could not update model pricing. Cached prices are still available.");
+      return;
+    }
     const n = Object.keys(useModelPricingStore.getState().prices).filter((key) =>
       key.includes("/"),
     ).length;

@@ -583,13 +583,13 @@ enabled = true
     Ok(())
 }
 
-#[cfg_attr(windows, ignore = "plugin metrics fixture is Unix-only")]
+#[ignore = "asserts on the upstream analytics uploader, which Atlas removed (tests/engine-no-phone-home.test.ts)"]
 #[tokio::test]
 async fn classic_plugin_script_emits_measurement_analytics() -> Result<()> {
     assert_plugin_measurement_analytics(PluginMetricsRuntime::Classic).await
 }
 
-#[cfg_attr(windows, ignore = "plugin metrics fixture is Unix-only")]
+#[ignore = "asserts on the upstream analytics uploader, which Atlas removed (tests/engine-no-phone-home.test.ts)"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_plugin_script_emits_measurement_analytics() -> Result<()> {
     assert_plugin_measurement_analytics(PluginMetricsRuntime::Unified {
@@ -599,7 +599,7 @@ async fn unified_plugin_script_emits_measurement_analytics() -> Result<()> {
     .await
 }
 
-#[cfg_attr(windows, ignore = "plugin metrics fixture is Unix-only")]
+#[ignore = "asserts on the upstream analytics uploader, which Atlas removed (tests/engine-no-phone-home.test.ts)"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_unified_plugin_script_emits_measurement_analytics() -> Result<()> {
     assert_plugin_measurement_analytics(PluginMetricsRuntime::Unified {
@@ -609,7 +609,7 @@ async fn remote_unified_plugin_script_emits_measurement_analytics() -> Result<()
     .await
 }
 
-#[cfg_attr(windows, ignore = "plugin metrics fixture is Unix-only")]
+#[ignore = "asserts on the upstream analytics uploader, which Atlas removed (tests/engine-no-phone-home.test.ts)"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_background_plugin_script_emits_measurements_after_turn_completion() -> Result<()> {
     assert_plugin_measurement_analytics(PluginMetricsRuntime::Unified {
@@ -619,7 +619,7 @@ async fn unified_background_plugin_script_emits_measurements_after_turn_completi
     .await
 }
 
-#[cfg_attr(windows, ignore = "plugin metrics fixture is Unix-only")]
+#[ignore = "asserts on the upstream analytics uploader, which Atlas removed (tests/engine-no-phone-home.test.ts)"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_unified_background_plugin_script_emits_measurements_after_turn_completion()
 -> Result<()> {

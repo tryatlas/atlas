@@ -294,6 +294,7 @@ const THREAD_COMMENT: &str = r#"fragment ThreadComment on PullRequestReviewComme
   }
   body
   createdAt
+  publishedAt
   lastEditedAt
   url
   viewerCanUpdate
@@ -655,7 +656,7 @@ const PULL_REQUEST_ROW: &str = r#"fragment PullRequestRow on PullRequest {
     nodes {
       requestedReviewer {
         ... on User { login }
-        ... on Team { slug }
+        ... on Team { slug organization { login } }
       }
     }
   }

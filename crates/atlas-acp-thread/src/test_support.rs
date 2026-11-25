@@ -40,13 +40,15 @@ use tokio::sync::{oneshot, watch, Notify};
 
 use crate::{
     event_channel, AcpThread, AcpThreadEvent, AcpThreadHandle, AgentConnection, AgentId,
-    AgentModelCatalogue, AgentModelSelector, AgentSessionEffort, AgentSessionFork,
-    AgentSessionList, AgentSessionListRequest, AgentSessionListResponse, EventSink, EventStream,
+    AgentModelCatalogue, AgentModelSelector, AgentSessionConfigOptions, AgentSessionEffort,
+    AgentSessionFork, AgentSessionList, AgentSessionListRequest, AgentSessionListResponse,
+    EventSink, EventStream,
 };
 
-/// Where a session's thread reports, by session id: the shape of the sink a
-/// host hands a connection at connect.
-pub type FakeThreadEvents = Arc<dyn Fn(&acp::SessionId) -> EventSink<AcpThreadEvent> + Send + Sync>;
+/// Where a session's thread reports, by its agent and session id: the shape
+/// of the sink a host hands a connection at connect.
+pub type FakeThreadEvents =
+    Arc<dyn Fn(&AgentId, &acp::SessionId) -> EventSink<AcpThreadEvent> + Send + Sync>;
 
 /// Runs against a thread the fake has just loaded, before the load answers.
 type LoadHook = Arc<dyn Fn(&AcpThreadHandle) + Send + Sync>;
@@ -109,6 +111,7 @@ struct Script {
     forgotten: Option<String>,
     on_load: Option<LoadHook>,
     hold_opens: bool,
+    hold_authenticate: bool,
     turn: Turn,
     fork: Option<String>,
     effort: bool,
@@ -116,6 +119,7 @@ struct Script {
     session_delete: bool,
     model_selector: Option<Arc<dyn AgentModelSelector>>,
     model_catalogue: Option<Arc<dyn AgentModelCatalogue>>,
+    config_options: Option<Arc<dyn AgentSessionConfigOptions>>,
 }
 
 struct Shared {
@@ -130,6 +134,8 @@ struct Shared {
     release: Notify,
     release_open: Notify,
     closes: AtomicBool,
+    /// Bumped by `cancel_authentication`; a held `authenticate` ends on it.
+    auth_cancel: watch::Sender<u64>,
     thread_events: Mutex<Option<FakeThreadEvents>>,
     /// The streams of sessions opened with no sink of the host's, kept so the
     /// thread's sends land somewhere and a test can read them.
@@ -226,6 +232,13 @@ impl FakeConnectionBuilder {
         self
     }
 
+    /// Every `authenticate` stays in flight until `cancel_authentication`,
+    /// and then fails: a sign-in the user has not finished.
+    pub fn hold_authenticate(mut self) -> Self {
+        self.script.hold_authenticate = true;
+        self
+    }
+
     /// Every turn runs until [`FakeHandle::release_prompt`] or a cancel.
     pub fn hold_prompts(mut self) -> Self {
         self.script.turn = Turn::Held;
@@ -280,6 +293,12 @@ impl FakeConnectionBuilder {
         self
     }
 
+    /// Every session's config options are these.
+    pub fn config_options(mut self, options: Arc<dyn AgentSessionConfigOptions>) -> Self {
+        self.script.config_options = Some(options);
+        self
+    }
+
     pub fn build(self) -> (Arc<FakeConnection>, FakeHandle) {
         let handle = self.handle();
         (handle.connection(), handle)
@@ -298,6 +317,7 @@ impl FakeConnectionBuilder {
                 release: Notify::new(),
                 release_open: Notify::new(),
                 closes: AtomicBool::new(self.closes),
+                auth_cancel: watch::channel(0).0,
                 thread_events: Mutex::default(),
                 streams: Mutex::default(),
                 threads: Mutex::default(),
@@ -489,12 +509,14 @@ impl FakeConnection {
                 forgotten: None,
                 on_load: None,
                 hold_opens: false,
+                hold_authenticate: false,
                 turn: Turn::Ends,
                 fork: None,
                 effort: false,
                 session_list: false,
                 session_delete: false,
                 model_selector: None,
+                config_options: None,
                 model_catalogue: None,
             },
             closes: false,
@@ -509,7 +531,7 @@ impl FakeConnection {
         work_dirs: Vec<PathBuf>,
     ) -> AcpThreadHandle {
         let sink = match lock(&self.shared.thread_events).clone() {
-            Some(events) => events(&session_id),
+            Some(events) => events(&self.agent_id(), &session_id),
             None => {
                 let (sink, stream) = event_channel();
                 lock(&self.shared.streams).insert(session_id.clone(), stream);
@@ -630,10 +652,11 @@ impl AgentConnection for FakeConnection {
         self: Arc<Self>,
         session_id: acp::SessionId,
     ) -> BoxFuture<'static, Result<()>> {
-        if self.supports_close_session() {
-            self.shared
-                .record(FakeCall::CloseSession(session_id.to_string()));
+        if !self.supports_close_session() {
+            return async { Err(anyhow!("Closing sessions is not supported")) }.boxed();
         }
+        self.shared
+            .record(FakeCall::CloseSession(session_id.to_string()));
         async { Ok(()) }.boxed()
     }
 
@@ -660,7 +683,22 @@ impl AgentConnection for FakeConnection {
     }
 
     fn authenticate(&self, _method: acp::AuthMethodId) -> BoxFuture<'static, Result<()>> {
-        async { Ok(()) }.boxed()
+        if !self.shared.script.hold_authenticate {
+            return async { Ok(()) }.boxed();
+        }
+        let mut cancelled = self.shared.auth_cancel.subscribe();
+        cancelled.mark_unchanged();
+        async move {
+            let _ = cancelled.changed().await;
+            Err(anyhow!("the sign-in was cancelled"))
+        }
+        .boxed()
+    }
+
+    fn cancel_authentication(&self) {
+        self.shared
+            .auth_cancel
+            .send_modify(|generation| *generation += 1);
     }
 
     fn prompt(
@@ -699,6 +737,13 @@ impl AgentConnection for FakeConnection {
 
     fn model_selector(&self, _session_id: &acp::SessionId) -> Option<Arc<dyn AgentModelSelector>> {
         self.shared.script.model_selector.clone()
+    }
+
+    fn session_config_options(
+        &self,
+        _session_id: &acp::SessionId,
+    ) -> Option<Arc<dyn AgentSessionConfigOptions>> {
+        self.shared.script.config_options.clone()
     }
 
     fn session_list(&self) -> Option<Arc<dyn AgentSessionList>> {

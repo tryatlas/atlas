@@ -54,6 +54,10 @@ pub mod server;
 pub mod session;
 pub mod session_list;
 pub mod session_mcp;
+#[cfg(feature = "test-support")]
+pub mod test_support;
+#[cfg(windows)]
+mod windows_job;
 
 pub use connection::{
     client_capabilities_for_agent, map_acp_error, AcpConnection, AcpConnectionDefaults,
@@ -67,9 +71,8 @@ pub use debug_log::{
 pub use handlers::ClientContext;
 pub use host_env::sanitize_host_env;
 pub use server::{
-    atlas_only_memory, env_quirks, env_quirks_from, load_proxy_env, memory_quirks,
-    set_atlas_only_memory, AgentServer, AgentServerDelegate, ConnectOptions, CustomAgentServer,
-    ExternalAgentServer,
+    atlas_only_memory, load_proxy_env, set_atlas_only_memory, AgentServer, AgentServerDelegate,
+    ConnectOptions, CustomAgentServer, ExternalAgentServer,
 };
 pub use session::{
     AcpSession, CancelProbe, CancelSignal, CancelWaiter, ConfigOptions, SessionDirectories,

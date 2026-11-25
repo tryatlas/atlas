@@ -114,14 +114,16 @@ export function capturePromote(args: {
   slug: string;
   name: string | null;
   visibility: Visibility;
+  gitUrl: string;
 }): Promise<unknown> {
-  const { projectPath, orgId, slug, name, visibility } = args;
+  const { projectPath, orgId, slug, name, visibility, gitUrl } = args;
   return invoke("capture_promote", {
     projectPath,
     orgId,
     slug,
     name,
     visibility,
+    gitUrl,
   });
 }
 

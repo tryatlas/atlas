@@ -148,6 +148,7 @@ fn a_live_update_keeps_the_attachments() {
             "/work/app",
         )])),
         remote_connection: None,
+        activity: true,
     });
     assert_eq!(store.attached_projects(id).len(), 1);
 }

@@ -430,6 +430,33 @@ pub async fn install_archive_with_limits(
     kind: &RegistryArchiveKind,
     limits: InstallLimits,
 ) -> Result<()> {
+    install_archive_reporting(
+        http,
+        url,
+        digest,
+        destination_dir,
+        kind,
+        limits,
+        &|_received| {},
+    )
+    .await
+}
+
+/// [`install_archive_with_limits`], telling `progress` how many bytes have
+/// arrived after every chunk.
+///
+/// A large agent on a slow link downloads for minutes. A caller that shows
+/// only "Installing…" for all of it looks exactly like one that hung, and the
+/// bind deadline that watches the status text took it for one (audit #63).
+pub async fn install_archive_reporting(
+    http: &dyn HttpClient,
+    url: &str,
+    digest: Option<&str>,
+    destination_dir: &Path,
+    kind: &RegistryArchiveKind,
+    limits: InstallLimits,
+    progress: &(dyn Fn(u64) + Send + Sync),
+) -> Result<()> {
     let parent = destination_dir
         .parent()
         .context("destination path has no parent")?;
@@ -446,7 +473,8 @@ pub async fn install_archive_with_limits(
     let extracted = staging.path().join("extracted");
     tokio::fs::create_dir_all(&extracted).await?;
 
-    let actual_digest = download_to_file(http, url, &payload, limits.max_download_bytes).await?;
+    let actual_digest =
+        download_to_file(http, url, &payload, limits.max_download_bytes, progress).await?;
     if let Some(expected) = digest {
         anyhow::ensure!(
             actual_digest.eq_ignore_ascii_case(expected),
@@ -495,6 +523,7 @@ async fn download_to_file(
     url: &str,
     destination: &Path,
     max_bytes: u64,
+    progress: &(dyn Fn(u64) + Send + Sync),
 ) -> Result<String> {
     let response = http
         .get(url)
@@ -524,6 +553,7 @@ async fn download_to_file(
         file.write_all(&chunk)
             .await
             .with_context(|| format!("writing {destination:?}"))?;
+        progress(received);
     }
     file.flush().await?;
 

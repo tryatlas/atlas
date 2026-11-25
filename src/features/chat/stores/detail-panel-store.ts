@@ -51,10 +51,7 @@ const DEFAULT_WIDTH = 460;
 function sameTarget(a: PanelTarget, b: PanelTarget): boolean {
   if (!a || !b) return false;
   if (a.kind !== b.kind) return false;
-  if ((a.kind === "tool" || a.kind === "output") && (b.kind === "tool" || b.kind === "output")) {
-    return a.toolCallId === b.toolCallId;
-  }
-  return false;
+  return a.toolCallId === b.toolCallId;
 }
 
 export const useDetailPanelStore = create<DetailPanelState>()((set) => ({

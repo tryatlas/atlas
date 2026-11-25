@@ -63,7 +63,12 @@ fn walk_knowledge(dir: &Path, root: &Path, entries: &mut Vec<KnowledgeEntry>) {
 
         // Use relative path (without .md) as the ID so nested notes work
         let rel = path.strip_prefix(root).unwrap_or(&path);
-        let id = rel.with_extension("").to_string_lossy().to_string();
+        let id = rel
+            .with_extension("")
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
 
         let filename = path
             .file_stem()

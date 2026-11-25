@@ -44,23 +44,33 @@ fn native_prefs_path(config_dir: &Path) -> PathBuf {
     config_dir.join("native-agent.json")
 }
 
-/// A missing or unreadable file is the defaults: nothing renamed or hidden.
-pub fn load_native_prefs(config_dir: &Path) -> NativeAgentPrefs {
+fn read_native_prefs(config_dir: &Path) -> std::io::Result<NativeAgentPrefs> {
     let path = native_prefs_path(config_dir);
     match std::fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
-            tracing::warn!(
-                target: "atlas::agents",
-                path = %path.display(),
-                "native agent settings are unreadable ({e}); using the defaults"
-            );
-            NativeAgentPrefs::default()
+        Ok(raw) => serde_json::from_str(&raw).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "repair {} before changing Atlas Agent settings: {e}",
+                    path.display()
+                ),
+            )
         }),
-        Err(_) => NativeAgentPrefs::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(e) => Err(e),
     }
 }
 
+/// Catalog rendering can use defaults; writes always use the strict reader.
+pub fn load_native_prefs(config_dir: &Path) -> NativeAgentPrefs {
+    read_native_prefs(config_dir).unwrap_or_else(|e| {
+        tracing::warn!(target: "atlas::agents", "native agent settings are unavailable: {e}");
+        Default::default()
+    })
+}
+
 fn save_native_prefs(config_dir: &Path, prefs: &NativeAgentPrefs) -> std::io::Result<()> {
+    read_native_prefs(config_dir)?;
     let json = serde_json::to_string_pretty(prefs)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     atlas_fs::replace_file(native_prefs_path(config_dir), json)
@@ -302,21 +312,30 @@ pub async fn agents_configure(
     app: AppHandle,
 ) -> Result<AgentCatalogEntry, String> {
     let host = host.inner().clone();
+    // Keep read, disk publication, store publication and keychain effects in
+    // one transaction shared with install/uninstall and the boot loader.
+    let _write = super::registry::settings_write().await;
     if agent_id == ATLAS_AGENT_ID {
         let config_dir = host.config_dir().to_path_buf();
-        let mut prefs = load_native_prefs(&config_dir);
-        apply_to_native(&mut prefs, patch)?;
-        tauri::async_runtime::spawn_blocking(move || save_native_prefs(&config_dir, &prefs))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| format!("writing Atlas Agent's settings: {e}"))?;
+        tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+            let mut prefs = read_native_prefs(&config_dir).map_err(|e| e.to_string())?;
+            apply_to_native(&mut prefs, patch)?;
+            save_native_prefs(&config_dir, &prefs).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("writing Atlas Agent's settings: {e}"))?;
     } else {
-        let mut settings = host.store().settings();
+        let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+        let mut settings = super::registry::installed_settings(&data_dir).await?;
         let entry = settings
             .0
             .get_mut(&agent_id)
             .ok_or_else(|| format!("{agent_id} is not installed"))?;
         let turning_off = patch.enabled == Some(false);
+        // How it launches is read once, at spawn: a running agent keeps the
+        // old command, arguments and environment until it restarts.
+        let relaunches = patch.launch.is_some();
         let keychain = apply_to_entry(entry, patch)?;
         // New values before the map that names them: a name the map lists
         // with no stored value would launch the agent without it. Deletes
@@ -332,10 +351,6 @@ pub async fn agents_configure(
         })
         .await
         .map_err(|e| e.to_string())??;
-        let data_dir = app
-            .path()
-            .app_data_dir()
-            .unwrap_or_else(|_| std::env::temp_dir());
         super::registry::persist(&host, &data_dir, settings).await?;
         let agent = agent_id.clone();
         let delete = keychain.delete;
@@ -351,10 +366,231 @@ pub async fn agents_configure(
         // Off means not running, not just not started next time.
         if turning_off {
             host.turn_off(&agent_id).map_err(|e| e.to_string())?;
+        } else if relaunches {
+            mark_stale(&host, &agent_id);
         }
     }
     catalog::emit_catalog_changed(&app, "settings");
     catalog::entry_for(&host, &agent_id).ok_or_else(|| format!("{agent_id} is not in the catalog"))
+}
+
+// ── Restart to apply (audit #65) ────────────────────────────────────────────
+//
+// An agent reads its command, arguments and environment once, when it
+// starts. A change in Settings → Agents, or a provider key edited in the
+// shell profile, reached the next start and not the agent already running —
+// and nothing said so, or offered to restart a healthy agent.
+
+/// The connection each agent had when a change to how it launches was saved,
+/// held weakly: the agent is "running the old settings" exactly while that
+/// same connection is still the one it has. A restart, a crash and respawn,
+/// or a kill all replace or drop it, and the mark lapses by itself without
+/// any of those paths having to clear it.
+#[derive(Default)]
+struct StaleLaunches(
+    parking_lot::Mutex<HashMap<String, std::sync::Weak<dyn atlas_acp_thread::AgentConnection>>>,
+);
+
+impl StaleLaunches {
+    fn mark(&self, plugin_id: &str, running: &Arc<dyn atlas_acp_thread::AgentConnection>) {
+        self.0
+            .lock()
+            .insert(plugin_id.to_string(), Arc::downgrade(running));
+    }
+
+    fn is_stale(
+        &self,
+        plugin_id: &str,
+        running: Option<&Arc<dyn atlas_acp_thread::AgentConnection>>,
+    ) -> bool {
+        let mut marks = self.0.lock();
+        let Some(marked) = marks.get(plugin_id) else {
+            return false;
+        };
+        match (running, marked.upgrade()) {
+            (Some(running), Some(marked)) if Arc::ptr_eq(running, &marked) => true,
+            _ => {
+                marks.remove(plugin_id);
+                false
+            }
+        }
+    }
+
+    fn forget(&self, plugin_id: &str) {
+        self.0.lock().remove(plugin_id);
+    }
+}
+
+fn stale_launches() -> &'static StaleLaunches {
+    static STALE: std::sync::LazyLock<StaleLaunches> = std::sync::LazyLock::new(Default::default);
+    &STALE
+}
+
+fn running_connection(
+    host: &AgentHost,
+    plugin_id: &str,
+) -> Option<Arc<dyn atlas_acp_thread::AgentConnection>> {
+    if plugin_id == ATLAS_AGENT_ID {
+        return None;
+    }
+    host.manager()
+        .connected(&atlas_agent_manager::Agent::Custom {
+            id: atlas_acp_thread::AgentId::new(plugin_id),
+        })
+}
+
+/// Note that `plugin_id`'s running process predates a change to how it
+/// launches. Nothing to note when it is not running: its next start reads
+/// the change.
+pub(crate) fn mark_stale(host: &AgentHost, plugin_id: &str) {
+    if let Some(running) = running_connection(host, plugin_id) {
+        stale_launches().mark(plugin_id, &running);
+    }
+}
+
+/// [`mark_stale`] for every running external agent — a provider key changed,
+/// and every agent is handed the keys when it starts.
+pub(crate) fn mark_all_stale(host: &AgentHost) {
+    for (agent, running) in host.manager().connections() {
+        if let atlas_agent_manager::Agent::Custom { id } = agent {
+            stale_launches().mark(id.as_str(), &running);
+        }
+    }
+}
+
+/// Whether `plugin_id` is running with settings older than what is saved:
+/// the catalog's `restartToApply`, which Settings → Agents offers a restart
+/// for.
+pub(crate) fn restart_to_apply(host: &AgentHost, plugin_id: &str) -> bool {
+    stale_launches().is_stale(plugin_id, running_connection(host, plugin_id).as_ref())
+}
+
+/// Stop `plugin_id` and start it again, so it runs what is saved now. Open
+/// chats are told, and reconnect on their next message; a running turn
+/// blocks it, as it blocks a model refresh, rather than being cut off.
+async fn restart_agent(host: &Arc<AgentHost>, plugin_id: &str) -> Result<(), String> {
+    if host.agent_turn_running(plugin_id) {
+        return Err(format!(
+            "{} is replying. Stop the reply or let it finish, then restart.",
+            host.display_name(plugin_id)
+        ));
+    }
+    host.kill_plugin(plugin_id).map_err(|e| e.to_string())?;
+    stale_launches().forget(plugin_id);
+    host.spawn(plugin_id).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// "Restart to apply" in Settings → Agents.
+#[tauri::command]
+pub async fn agents_restart_to_apply(
+    agent_id: String,
+    host: State<'_, Arc<AgentHost>>,
+    app: AppHandle,
+) -> Result<(), String> {
+    if agent_id == ATLAS_AGENT_ID {
+        return Err("Atlas Agent runs inside Atlas; there is nothing to restart".into());
+    }
+    let host = host.inner().clone();
+    let restarted = restart_agent(&host, &agent_id).await;
+    catalog::emit_catalog_changed(&app, "restart");
+    restarted
+}
+
+// ── Sign-in variables (audit #61) ───────────────────────────────────────────
+
+/// One variable an `env_var` sign-in method asked for, as the user typed it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthEnvValue {
+    pub name: String,
+    pub value: String,
+}
+
+/// Add `values` to an entry as sensitive variables, keeping every other
+/// variable as it is; one of the same name is replaced. Pure, like
+/// [`apply_to_entry`], whose rules it goes through.
+pub fn with_sensitive_variables(
+    entry: &mut atlas_agent_store::AgentServerSettings,
+    values: Vec<AuthEnvValue>,
+) -> Result<KeychainWrites, String> {
+    let mut variables: Vec<AgentVariable> = AgentLaunch::of(entry)
+        .variables
+        .into_iter()
+        .filter(|kept| !values.iter().any(|new| new.name.trim() == kept.name))
+        .collect();
+    for AuthEnvValue { name, value } in values {
+        if value.trim().is_empty() {
+            return Err(format!("{} needs a value", name.trim()));
+        }
+        variables.push(AgentVariable {
+            name,
+            value: Some(value.trim().to_string()),
+            sensitive: true,
+        });
+    }
+    apply_to_entry(
+        entry,
+        AgentConfigPatch {
+            launch: Some(LaunchPatch {
+                variables: Some(variables),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+}
+
+/// Save the variables an `env_var` sign-in method asked for, and restart the
+/// agent so it has them.
+///
+/// The sign-in dialog used to show a checklist and then call `authenticate`
+/// on the process already running — which was started without the variable
+/// and never got it (audit #61). The values go where any sensitive agent
+/// variable goes (the keychain, ADR-0023); the installed map keeps only their
+/// names, and the agent is restarted so its next start carries them. A turn
+/// running on it holds the restart back: the variables are saved, and the
+/// catalog offers "Restart to apply" once the turn ends.
+#[tauri::command]
+pub async fn agents_set_auth_env(
+    agent_id: String,
+    values: Vec<AuthEnvValue>,
+    host: State<'_, Arc<AgentHost>>,
+    app: AppHandle,
+) -> Result<(), String> {
+    if agent_id == ATLAS_AGENT_ID {
+        return Err("Atlas Agent signs in with your Atlas account".into());
+    }
+    if values.is_empty() {
+        return Ok(());
+    }
+    let host = host.inner().clone();
+    {
+        let _write = super::registry::settings_write().await;
+        let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+        let mut settings = super::registry::installed_settings(&data_dir).await?;
+        let entry = settings
+            .0
+            .get_mut(&agent_id)
+            .ok_or_else(|| format!("{agent_id} is not installed"))?;
+        let keychain = with_sensitive_variables(entry, values)?;
+        // Values before the map that names them, as in `agents_configure`.
+        let agent = agent_id.clone();
+        tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+            for (name, value) in &keychain.set {
+                super::agent_secrets::write(&agent, name, value)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        super::registry::persist(&host, &data_dir, settings).await?;
+    }
+    mark_stale(&host, &agent_id);
+    if running_connection(&host, &agent_id).is_some() && !host.agent_turn_running(&agent_id) {
+        restart_agent(&host, &agent_id).await?;
+    }
+    catalog::emit_catalog_changed(&app, "sign-in");
+    Ok(())
 }
 
 /// `~/…` against the home directory; anything else as given.
@@ -640,6 +876,94 @@ mod tests {
         };
         save_native_prefs(&dir, &prefs).unwrap();
         assert_eq!(load_native_prefs(&dir), prefs);
+        std::fs::write(native_prefs_path(&dir), "{broken").unwrap();
+        assert!(save_native_prefs(&dir, &prefs).is_err());
+        assert_eq!(
+            std::fs::read_to_string(native_prefs_path(&dir)).unwrap(),
+            "{broken"
+        );
+        std::fs::write(native_prefs_path(&dir), "{}").unwrap();
+        save_native_prefs(&dir, &prefs).unwrap();
+        assert_eq!(read_native_prefs(&dir).unwrap(), prefs);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit #61: the value an `env_var` sign-in method asked for is saved
+    /// for the agent as a sensitive variable — the keychain gets the value,
+    /// the map only the name — and every variable already set stays.
+    #[test]
+    fn a_sign_in_variable_is_saved_as_a_sensitive_one_beside_the_rest() {
+        let mut entry = AgentServerSettings::registry();
+        apply_to_entry(
+            &mut entry,
+            patch(serde_json::json!({ "launch": { "variables": [
+                { "name": "REGION", "value": "eu" },
+                { "name": "OLD_TOKEN", "value": "kept", "sensitive": true },
+                { "name": "GEMINI_API_KEY", "value": "plain" },
+            ] } })),
+        )
+        .unwrap();
+
+        let writes = with_sensitive_variables(
+            &mut entry,
+            vec![AuthEnvValue {
+                name: "GEMINI_API_KEY".into(),
+                value: " k3y ".into(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            writes.set,
+            [("GEMINI_API_KEY".to_string(), "k3y".to_string())]
+        );
+        assert!(writes.delete.is_empty(), "the other secret is kept");
+        assert_eq!(entry.secret_env(), ["GEMINI_API_KEY", "OLD_TOKEN"]);
+        assert_eq!(entry.env().get("REGION").map(String::as_str), Some("eu"));
+        assert!(
+            !entry.env().contains_key("GEMINI_API_KEY"),
+            "the plain copy is replaced, not left beside it"
+        );
+
+        let blank = with_sensitive_variables(
+            &mut entry,
+            vec![AuthEnvValue {
+                name: "OTHER".into(),
+                value: "  ".into(),
+            }],
+        );
+        assert!(blank.is_err());
+    }
+
+    /// Audit #65: a launch change is "waiting for a restart" exactly while
+    /// the connection that was running when it was saved is still the one
+    /// running. A restart replaces it, and the mark lapses by itself.
+    #[test]
+    fn a_launch_change_is_stale_only_while_the_same_process_runs() {
+        use atlas_acp_thread::test_support::FakeConnection;
+        use atlas_acp_thread::AgentConnection;
+
+        let stale = StaleLaunches::default();
+        let (first, _) = FakeConnection::builder().agent("a").build();
+        let first: Arc<dyn AgentConnection> = first;
+        assert!(!stale.is_stale("a", Some(&first)), "nothing changed yet");
+
+        stale.mark("a", &first);
+        assert!(stale.is_stale("a", Some(&first)));
+        assert!(!stale.is_stale("b", Some(&first)), "per agent");
+
+        let (second, _) = FakeConnection::builder().agent("a").build();
+        let second: Arc<dyn AgentConnection> = second;
+        assert!(!stale.is_stale("a", Some(&second)), "restarted: applied");
+        assert!(
+            !stale.is_stale("a", Some(&first)),
+            "and the mark is gone for good"
+        );
+
+        stale.mark("a", &second);
+        assert!(
+            !stale.is_stale("a", None),
+            "stopped: the next start applies it"
+        );
     }
 }

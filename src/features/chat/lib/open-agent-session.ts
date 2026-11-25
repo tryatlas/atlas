@@ -6,18 +6,15 @@ import { useAppStore } from "@/features/app/stores/app-store";
 import { useProjectStore } from "@/features/projects/stores/project-store";
 import { ensureAgent, getAgentSync } from "./agents-api";
 import { errInfo } from "./agent-signin";
-import {
-  isBusyAgentStatus,
-  pluginIdForAgent,
-  type AgentType,
-  type SwitchableAgent,
-} from "@/types/agent";
+import { canReuseTab, findSessionHolder, showTab } from "./session-tab-reuse";
+import { pluginIdForAgent, type AgentType, type SwitchableAgent } from "@/types/agent";
 import { bumpLoadToken, invalidateLoad, isLoadStale } from "./load-tokens";
 import { snapshotLive } from "./snapshot-message";
 import { clearKeepingUnsent } from "./unsent-text";
 import { ResumeError, resumeSessionFast } from "./resume-session";
 import { applyModeOnResume, holdUnrestoredMode } from "./resume-mode";
 import { emitWindowEvent } from "@/lib/window-events";
+import { offerSignInOnRefusal } from "./sign-in-on-refusal";
 
 /** Active project root, preferring the legacy `currentProject` but falling back
  *  to the active project path (mirrors the sidebar's `cwd` resolution). */
@@ -51,6 +48,12 @@ interface OpenOpts {
    *  `loadSession` fail and silently fall back to a blank session — the same
    *  bug the sidebar fixed. Defaults to Claude for legacy callers. */
   agentType?: AgentType;
+  /** Always a new tab, never the active one: a branch, whose source is the
+   *  active tab and has to stay as it is. */
+  newTab?: boolean;
+  /** This open is the retry after a sign-in it offered: a second auth
+   *  refusal is reported, not offered again. */
+  signInAttempted?: boolean;
 }
 
 function freshTabId(): string {
@@ -59,16 +62,19 @@ function freshTabId(): string {
 
 /**
  * Open the agent chat focused on a specific ACP session, reloading its
- * transcript from disk. Assumes the target project is already active (the
- * caller switches projects first). Mirrors `openThread`'s load flow
- * (`open-thread.ts`: focus-if-open, reuse-idle-tab-else-new) so it can be
- * invoked from anywhere.
+ * transcript from disk. A tab that already holds the session is shown in its
+ * own project; otherwise the session opens in the active project (the caller
+ * switches projects first). Mirrors `openThread`'s load flow (`open-thread.ts`:
+ * focus-if-open, reuse-a-reusable-tab-else-new) so it can be invoked from
+ * anywhere.
  */
 export async function openAgentSession({
   acpSessionId,
   title,
   cwd,
   agentType,
+  newTab,
+  signInAttempted,
 }: OpenOpts): Promise<void> {
   const chat = useChatStore.getState();
   const layout = useLayoutStore.getState();
@@ -84,32 +90,25 @@ export async function openAgentSession({
     hydrateSessionSnapshot,
   } = chat.actions;
 
-  // 1. Already open in a LIVE tab → focus it (covers re-clicks + running chats).
-  //    Closing a chat tab leaves its chat-store session behind (orphan), so we
-  //    must skip sessions whose tab no longer exists — otherwise `setActiveTab`
-  //    can't find the dead tab and bounces to tab[0], "jumping" to an unrelated
-  //    chat instead of loading the clicked session.
-  //    A tab saved with this session and not shown since (`pendingRestore`)
-  //    counts too: loading it into a second tab left two holders, and the
-  //    saved one took the session back the first time it was shown.
-  if (acpSessionId) {
-    const openTabIds = new Set(layout.tabs.map((t) => t.id));
-    for (const [tid, s] of Object.entries(chat.sessions)) {
-      const holds = s.acpSessionId === acpSessionId || s.pendingRestore === acpSessionId;
-      if (holds && openTabIds.has(tid)) {
-        setActiveTab(tid);
-        return;
-      }
-    }
+  // 1. Already open in a LIVE tab, in any project → show it (covers re-clicks
+  //    + running chats). Closing a chat tab leaves its chat-store session
+  //    behind (orphan), so only a tab that still exists counts — otherwise
+  //    `setActiveTab` can't find the dead tab and bounces to tab[0]. A tab saved
+  //    with this session and not shown since (`pendingRestore`) counts too:
+  //    loading it into a second tab left two holders, and the saved one took
+  //    the session back the first time it was shown.
+  const holder = findSessionHolder(acpSessionId);
+  if (holder) {
+    await showTab(holder);
+    return;
   }
 
-  // 2. Pick a target chat tab: reuse the active chat tab only if its session is
-  //    idle (load in place — the "open in the agent chat tab" behaviour);
-  //    otherwise open a FRESH tab so we never overwrite a running/other session.
+  // 2. Pick a target chat tab: reuse the active chat tab only when nothing in
+  //    it would be lost (`canReuseTab`: not mid-turn, nothing queued, held or
+  //    drafted), and never for a branch; otherwise a FRESH tab.
   const activeId = layout.activeTabId;
-  const activeTab = activeId ? layout.tabs.find((t) => t.id === activeId) : undefined;
   const activeSession = activeId ? chat.sessions[activeId] : undefined;
-  const reuse = activeTab?.type === "chat" && (!activeSession || activeSession.status === "idle");
+  const reuse = !newTab && canReuseTab(activeId);
   const targetTabId = reuse && activeId ? activeId : freshTabId();
 
   if (targetTabId !== activeId) {
@@ -212,6 +211,23 @@ export async function openAgentSession({
     // goes to a session the agent does not have. Same rollback as a history
     // open (`loadThreadIntoTab`), keeping what the user sent meanwhile.
     const kept = clearKeepingUnsent(targetTabId);
+    // Refused for want of a sign-in (ACP audit finding 64): the dialog, as a
+    // new session's bind offers, and the open again once it lands.
+    const offered = offerSignInOnRefusal(
+      useChatStore.getState().sessions[targetTabId]?.agentType ?? agentType,
+      err,
+      () =>
+        void openAgentSession({
+          acpSessionId,
+          title,
+          cwd,
+          agentType,
+          newTab,
+          signInAttempted: true,
+        }),
+      signInAttempted,
+    );
+    if (offered) return;
     toast.error(
       `Couldn't open session: ${message}` + (kept ? " What you sent is back in the composer." : ""),
     );
@@ -261,7 +277,7 @@ export function openNewAgentChat(agent?: SwitchableAgent): string {
     ? layout.tabs.find((t) => t.id === layout.activeTabId && t.type === "chat")
     : undefined;
   const existing = activeChatTab ?? layout.tabs.find((t) => t.type === "chat");
-  if (existing && !isBusyAgentStatus(chat.sessions[existing.id]?.status)) {
+  if (existing && canReuseTab(existing.id)) {
     setActiveTab(existing.id);
     // Cancel any in-flight history load targeting this tab BEFORE clearing, so a
     // resolving `loadSession → replaceMessages` chain can't repaint the freshly
@@ -277,7 +293,8 @@ export function openNewAgentChat(agent?: SwitchableAgent): string {
     return existing.id;
   }
 
-  // No chat tab open, or the current chat is mid-turn → fresh tab.
+  // No chat tab open, or the current chat is mid-turn or holds something the
+  // user sent or wrote → fresh tab.
   return openAgentChatInNewTab(agent);
 }
 

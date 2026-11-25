@@ -30,6 +30,7 @@ const plainCrate: PlacedJob = { id: "crates", os: "linux", flags: {} };
 const appLinux: PlacedJob = { id: "app-linux", os: "linux" };
 const appWindows: PlacedJob = { id: "app-windows", os: "windows" };
 const appMac: PlacedJob = { id: "app", os: "macos" };
+const engine: PlacedJob = { id: "engine-dialect", os: "linux" };
 
 describe("linuxMode", () => {
   it("defaults to native", () => {
@@ -59,6 +60,7 @@ describe("linuxMode", () => {
 describe("placement on a Mac", () => {
   it("native: every Linux job runs here, the OS-bound ones are skipped", () => {
     expect(placement(sandboxCrate, "macos", "native")).toBe("native");
+    expect(placement(engine, "macos", "native")).toBe("native");
     expect(placement(plainCrate, "macos", "native")).toBe("native");
     expect(placement(appLinux, "macos", "native")).toBe("skip");
     expect(placement(appWindows, "macos", "native")).toBe("skip");
@@ -67,6 +69,7 @@ describe("placement on a Mac", () => {
 
   it("needed: only the jobs Linux alone can judge go to the container", () => {
     expect(placement(sandboxCrate, "macos", "needed")).toBe("container");
+    expect(placement(engine, "macos", "needed")).toBe("container");
     expect(placement(appLinux, "macos", "needed")).toBe("container");
     expect(placement(plainCrate, "macos", "needed")).toBe("native");
     expect(placement(appMac, "macos", "needed")).toBe("native");
@@ -82,6 +85,7 @@ describe("placement on a Mac", () => {
 describe("placement on Linux", () => {
   it("runs Linux jobs here unless every one is asked for in the container", () => {
     expect(placement(sandboxCrate, "linux", "needed")).toBe("native");
+    expect(placement(engine, "linux", "needed")).toBe("native");
     expect(placement(appLinux, "linux", "native")).toBe("native");
     expect(placement(plainCrate, "linux", "all")).toBe("container");
     expect(placement(appMac, "linux", "native")).toBe("skip");

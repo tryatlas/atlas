@@ -38,6 +38,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -282,7 +283,10 @@ function check() {
   process.exitCode = 1;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (
+  process.argv[1] &&
+  realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1])
+) {
   try {
     if (process.argv.includes("--check")) check();
     else render();

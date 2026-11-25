@@ -1,3 +1,5 @@
+import { isComposingKey, isTypingElement } from "@/lib/keyboard-event";
+import { deepActiveElement } from "@/lib/deep-active-element";
 // Stepper card for agent questions (AskUserQuestion et al).
 //
 // One question per step — radio options (or checkboxes for multiSelect), a
@@ -42,6 +44,7 @@ export function ApprovalCardView({
   onSubmit,
   onSkip,
   skipLabel = "Skip",
+  canHandleKey,
 }: {
   questions: QuestionSpec[];
   queueNote?: string | null;
@@ -51,9 +54,11 @@ export function ApprovalCardView({
    *  way to say "no answer" on its wire. */
   onSkip?: () => void;
   skipLabel?: string;
+  canHandleKey?: () => boolean;
 }) {
   const [step, setStep] = useState(0);
   const [answers, setAnswers] = useState<Answer[]>(() => questions.map(() => EMPTY));
+  const rootRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const advanceTimer = useRef<number | null>(null);
 
@@ -127,9 +132,21 @@ export function ApprovalCardView({
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       // A chord being recorded in Settings → Keybindings is not an answer.
-      if (isRecordingShortcut()) return;
+      if (isRecordingShortcut() || isComposingKey(e) || e.defaultPrevented) return;
+      const root = rootRef.current;
+      if (
+        !root ||
+        root.closest('[inert],[hidden],[aria-hidden="true"]') ||
+        (canHandleKey && !canHandleKey())
+      )
+        return;
+      const focused = deepActiveElement();
+      if (isTypingElement(focused) && !root.contains(focused)) {
+        const composer = focused?.closest(".atlas-composer");
+        if (!composer || !root.closest("[data-chat-composer-stack]")?.contains(composer)) return;
+      }
       if (e.metaKey || e.ctrlKey || e.altKey) return;
-      const active = document.activeElement;
+      const active = focused;
       const inText = active === inputRef.current;
       const options = Array.from(
         optionsRef.current?.querySelectorAll<HTMLButtonElement>("[data-option]") ?? [],
@@ -138,7 +155,7 @@ export function ApprovalCardView({
       if (e.key === "Enter") {
         // A focused option takes its own Enter (a press); the card takes the rest.
         if (onOption >= 0) return;
-        if (inText || isAnswered(answer)) {
+        if (isAnswered(answer)) {
           e.preventDefault();
           goNext();
         }
@@ -186,7 +203,7 @@ export function ApprovalCardView({
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
     // oxlint-disable-next-line react-hooks/exhaustive-deps
-  }, [answer, q, step, goNext, goBack]);
+  }, [answer, q, step, goNext, goBack, canHandleKey]);
 
   return (
     <div
@@ -207,6 +224,7 @@ export function ApprovalCardView({
       // own appearance. The hand-written black shadow it replaces was tuned
       // for one dark theme and painted a grey smear under the card on light
       // ones, and a heavier one than any menu on dark.
+      ref={rootRef}
       data-approval-card
       data-testid="approval-card"
       className="mx-auto w-full max-w-[650px] overflow-hidden rounded-xl border border-border bg-popover shadow-md"

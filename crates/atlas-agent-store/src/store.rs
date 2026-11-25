@@ -139,14 +139,17 @@ impl AgentServerStore {
             return;
         }
 
-        if settings.has_registry_agents() {
-            if let Some(registry) = &self.registry {
-                registry.refresh_if_stale().await;
-            }
-        }
-
+        let refresh = settings.has_registry_agents();
         self.state.lock().unwrap().settings = settings;
         self.reregister();
+        if refresh {
+            if let Some(registry) = &self.registry {
+                registry.refresh_if_stale().await;
+                // Read the current settings again, so a later call wins even
+                // when this request finished after it.
+                self.reregister();
+            }
+        }
     }
 
     pub fn settings(&self) -> AllAgentServersSettings {

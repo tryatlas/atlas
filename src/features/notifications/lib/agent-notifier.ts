@@ -36,6 +36,8 @@ import {
   questionDedupeKey,
   retryDedupeKey,
   toAgentErrorKind,
+  isNewBind,
+  turnNonce,
   type AgentCtx,
   type AgentNotifyEvent,
 } from "./agent-notifier-rules";
@@ -140,7 +142,21 @@ function signInRequired(agentType: string): AgentNotifyEvent {
 }
 
 let counter = 0;
-const nonceFor = (turnSeq?: number) => turnSeq || `n${++counter}`;
+const nonceFor = (sessionId?: string, turnSeq?: number) =>
+  sessionId && turnSeq ? turnNonce(bindEpochs.get(sessionId) ?? 0, turnSeq) : `n${++counter}`;
+
+/** Binds seen per agent session, for `turnNonce`. Counted off the chat store,
+ *  where every bind lands (`isNewBind`); read here, never written there. */
+const bindEpochs = new Map<string, number>();
+useChatStore.subscribe((state, prev) => {
+  if (state.sessions === prev.sessions) return;
+  for (const [tabId, session] of Object.entries(state.sessions)) {
+    const before = prev.sessions[tabId];
+    if (session === before || !isNewBind(before, session)) continue;
+    const sid = session.acpSessionId!;
+    bindEpochs.set(sid, (bindEpochs.get(sid) ?? 0) + 1);
+  }
+});
 
 function toNotifyEvent(env: AgentDelta, session: ChatSession): AgentNotifyEvent | null {
   switch (env.kind) {
@@ -202,7 +218,7 @@ function toNotifyEvent(env: AgentDelta, session: ChatSession): AgentNotifyEvent 
       return {
         type: "turn_finished",
         stopReason: env.stop_reason,
-        nonce: nonceFor(env.turn_seq),
+        nonce: nonceFor(env.session_id, env.turn_seq),
         durationMs: stats.durationMs,
         summary: stats.summary,
         filesEdited: stats.filesEdited,
@@ -221,7 +237,7 @@ function toNotifyEvent(env: AgentDelta, session: ChatSession): AgentNotifyEvent 
         type: "turn_failed",
         error: env.error,
         errorKind: toAgentErrorKind(env.error_kind),
-        nonce: nonceFor(env.turn_seq),
+        nonce: nonceFor(env.session_id, env.turn_seq),
       };
     case "agent_disconnected":
       return {

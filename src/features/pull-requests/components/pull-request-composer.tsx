@@ -1,3 +1,5 @@
+import { shortcutLabel } from "@/features/keybindings/lib/combo";
+import { isComposingKey } from "@/lib/keyboard-event";
 // The floating composer at the tab's bottom right: a comment (optionally
 // closing or reopening with it), or a review with a verdict. Drafts live
 // here, not in the popover, so closing it keeps what was typed.
@@ -78,8 +80,9 @@ const VERDICTS: readonly {
 
 function isSubmitChord(event: React.KeyboardEvent): boolean {
   return (
-    !event.nativeEvent.isComposing &&
+    !isComposingKey(event) &&
     event.key === "Enter" &&
+    !isComposingKey(event) &&
     (event.metaKey || event.ctrlKey) &&
     !event.shiftKey &&
     !event.altKey
@@ -450,7 +453,9 @@ export function PullRequestComposer({
             </div>
           </div>
         ) : null}
-        <p className={cn("mt-2 text-2xs text-muted-foreground")}>⌘↵ to send</p>
+        <p className={cn("mt-2 text-2xs text-muted-foreground")}>
+          {shortcutLabel("cmd+enter")} to send
+        </p>
       </PopoverContent>
     </Popover>
   );

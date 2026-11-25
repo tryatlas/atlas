@@ -16,9 +16,11 @@ vi.mock("@tauri-apps/api/core", () => import("@/test/tauri-core"));
 vi.mock("@tauri-apps/api/event", () => import("@/test/tauri-event"));
 
 import type { SessionKey } from "@/types/agents";
+import type { RebindOutcome } from "./agent-rebind";
 import { useChatStore } from "../stores/chat-store";
 import type { SendState } from "./send-gate";
 import { createSessionSend, type AgentsPort, type SessionSend } from "./session-send";
+import type { WirePrompt } from "./wire-prompt";
 
 const TAB = "tab-1";
 const KEY: SessionKey = { agent_id: "agent-1", session_id: "sess-1" };
@@ -85,8 +87,8 @@ function fakeAgents() {
     },
     kill: async (...args) => call("kill", args),
     killPlugin: async (...args) => call("killPlugin", args),
-    queueAdd: async (key, text, prompt) => {
-      await call("queueAdd", [key, text, prompt]);
+    queueAdd: async (key, text, prompt, ...rest) => {
+      await call("queueAdd", [key, text, prompt, ...rest]);
       if (fake.holdAdds) await new Promise<void>((r) => fake.holdAdds?.push(r));
       const id = `q-${++ids}`;
       fake.queue.push({ id, text, session: key.session_id });
@@ -112,14 +114,21 @@ function fakeAgents() {
       fake.drainHead();
       return null;
     },
+    queueResume: async (...args) => {
+      await call("queueResume", args);
+      fake.drainHead();
+      return null;
+    },
   };
   return { fake, port };
 }
 
 let fake: ReturnType<typeof fakeAgents>["fake"];
 let send: SessionSend;
-let ambient: Pick<SendState, "heldElsewhere" | "grantHold" | "remoteDriving">;
-let rebind: ReturnType<typeof vi.fn<(tabId: string) => Promise<boolean>>>;
+let ambient: Pick<SendState, "grantHold" | "remoteDriving">;
+let rebind: ReturnType<typeof vi.fn<(tabId: string) => Promise<RebindOutcome>>>;
+/** What composing a prompt does; a test that holds it replaces it. */
+let compose: (content: string) => Promise<WirePrompt>;
 let forgetAgent: ReturnType<typeof vi.fn<(pluginId: string) => void>>;
 let kickBind: ReturnType<typeof vi.fn<() => void>>;
 let drain: ReturnType<SessionSend["watch"]>;
@@ -128,7 +137,6 @@ let drain: ReturnType<SessionSend["watch"]>;
 const tick = (watch = drain) =>
   watch.tick({
     session: session(),
-    heldElsewhere: ambient.heldElsewhere,
     grantHold: ambient.grantHold,
   });
 /** A store change the panel would re-render for, then its tick. */
@@ -157,8 +165,9 @@ beforeEach(() => {
   store().actions.createSession(TAB, "claude-code");
   const made = fakeAgents();
   fake = made.fake;
-  ambient = { heldElsewhere: false, grantHold: false, remoteDriving: false };
-  rebind = vi.fn(async () => true);
+  ambient = { grantHold: false, remoteDriving: false };
+  rebind = vi.fn(async (): Promise<RebindOutcome> => ({ ok: true }));
+  compose = async (content) => ({ prompt: content, resourceLinks: [], pastedTexts: [] });
   forgetAgent = vi.fn();
   kickBind = vi.fn();
   send = createSessionSend({
@@ -167,11 +176,7 @@ beforeEach(() => {
     ambient: () => ambient,
     rebind,
     forgetAgent,
-    wirePrompt: async (_session, content) => ({
-      prompt: content,
-      resourceLinks: [],
-      pastedTexts: [],
-    }),
+    wirePrompt: (_session, content) => compose(content),
     queuedPrompt: (queued) => queued,
   });
   drain = send.watch(TAB, { kickBind });
@@ -385,6 +390,33 @@ describe("Stop while the session is still starting", () => {
     expect(strip()).toEqual(["second"]);
   });
 
+  it("Stop during a restart lets the held message go: nothing is sent when the agent comes back", async () => {
+    bindTab();
+    tick();
+    await settle();
+    fake.log.length = 0;
+    setSession({ disconnected: true });
+    let finish!: () => void;
+    rebind.mockImplementation(
+      () =>
+        new Promise<RebindOutcome>((resolve) => {
+          finish = () => {
+            store().actions.setDisconnected(TAB, false);
+            resolve({ ok: true });
+          };
+        }),
+    );
+    const sending = send.send(TAB, text("hello"));
+    await settle();
+    send.stop(TAB);
+    finish();
+    await sending;
+    await settle();
+    expect(fake.calls("send")).toEqual([]);
+    expect(userBubbles()).toHaveLength(1);
+    expect(session().pendingSend).toBeUndefined();
+  });
+
   it("does nothing on a session with nothing sent and nothing bound", () => {
     send.stop(TAB);
     expect(fake.log).toEqual([]);
@@ -416,52 +448,6 @@ describe("the gates", () => {
     expect(fake.paused).toBe(false);
     expect(fake.started).toEqual(["go"]);
     expect(fake.calls("send")).toEqual([]);
-  });
-
-  it("live elsewhere: the send queues and nothing forks the session until the hold lifts (ADR-0001)", async () => {
-    ambient.heldElsewhere = true;
-    tick();
-    await send.send(TAB, text("status?"));
-    await settle();
-    expect(strip()).toEqual(["status?"]);
-    expect(fake.paused).toBe(true);
-    // A turn ending meanwhile drains nothing.
-    await change(() => fake.turnEnds());
-    expect(fake.started).toEqual([]);
-
-    ambient.heldElsewhere = false;
-    await change(() => {});
-    expect(fake.started).toEqual(["status?"]);
-  });
-
-  it("live elsewhere: a held first message stays held, with its one bubble, until the hold lifts", async () => {
-    setSession({ resumePending: true });
-    tick();
-    await send.send(TAB, text("first"), { kickBind });
-    // The resume lands on a session another process is writing.
-    ambient.heldElsewhere = true;
-    await change(() => setSession({ resumePending: false }));
-    expect(fake.started).toEqual([]);
-    expect(session().pendingSend?.content).toBe("first");
-    expect(userBubbles()).toHaveLength(1);
-
-    // "Send anyway", or the other process going quiet.
-    ambient.heldElsewhere = false;
-    await change(() => {});
-    expect(fake.started).toEqual(["first"]);
-    expect(session().pendingSend).toBeUndefined();
-    expect(userBubbles()).toHaveLength(1);
-  });
-
-  it("live elsewhere: a held message released into a live session goes back on hold, idle", async () => {
-    ambient.heldElsewhere = true;
-    await send.send(TAB, text("first"), { recorded: true, clientMessageId: "bubble-1" });
-    expect(session().pendingSend).toMatchObject({ content: "first", clientMessageId: "bubble-1" });
-    // Not "Starting…": nothing is starting until the user says so.
-    expect(session().status).toBe("idle");
-    // Already recorded when it was first held: no bubble is drawn for it.
-    expect(userBubbles()).toHaveLength(0);
-    expect(fake.log).toEqual([]);
   });
 
   it("no AI grant: an idle send queues, a mid-turn one goes, and the queue waits out the turn's end", async () => {
@@ -546,25 +532,131 @@ describe("the agent process gone", () => {
   it("the next send restarts it, then sends", async () => {
     rebind.mockImplementation(async () => {
       store().actions.setDisconnected(TAB, false);
-      return true;
+      return { ok: true };
     });
     await send.send(TAB, text("hello"));
     expect(rebind).toHaveBeenCalledTimes(1);
     expect(fake.started).toEqual(["hello"]);
+    expect(userBubbles()).toHaveLength(1);
+    expect(fake.calls("send")[0][5]).toBe(userBubbles()[0].clientMessageId);
   });
 
-  it("a restart that fails says so and sends nothing; nothing restarts by itself", async () => {
-    rebind.mockResolvedValue(false);
-    await send.send(TAB, text("hello"));
-    expect(session().messages.map((m) => m.content)).toEqual([
-      "The agent could not be restarted. Check its runtime (Node/npx) and try again.",
-    ]);
+  // ACP audit finding 79: the bubble used to appear only after the respawn, seconds later.
+  it("the message shows at once, as starting, while the agent restarts", async () => {
+    let finish!: () => void;
+    rebind.mockImplementation(
+      () =>
+        new Promise<RebindOutcome>((resolve) => {
+          finish = () => {
+            store().actions.setDisconnected(TAB, false);
+            resolve({ ok: true });
+          };
+        }),
+    );
+    const sending = send.send(TAB, text("hello"));
+    await settle();
+    expect(userBubbles().map((m) => m.content)).toEqual(["hello"]);
+    expect(session().pendingSend?.content).toBe("hello");
+    expect(session().status).toBe("running");
+    expect(fake.started).toEqual([]);
+
+    finish();
+    await sending;
+    expect(fake.started).toEqual(["hello"]);
+    expect(session().pendingSend).toBeUndefined();
+    expect(userBubbles()).toHaveLength(1);
+  });
+
+  // ACP audit finding 79: a second send used to start a second restart and race the first.
+  it("a send during the restart queues behind the first instead of racing it", async () => {
+    let finish!: () => void;
+    rebind.mockImplementation(
+      () =>
+        new Promise<RebindOutcome>((resolve) => {
+          finish = () => {
+            store().actions.setDisconnected(TAB, false);
+            resolve({ ok: true });
+          };
+        }),
+    );
+    const first = send.send(TAB, text("first"));
+    await settle();
+    const second = send.send(TAB, text("second"));
+    await settle();
+    expect(rebind).toHaveBeenCalledTimes(1);
+    expect(strip()).toEqual(["second"]);
+
+    finish();
+    await Promise.all([first, second]);
+    await settle();
+    expect(fake.calls("send")).toHaveLength(1);
+    expect(fake.started).toEqual(["first"]);
+    expect(fake.queue.map((q) => q.text)).toEqual(["second"]);
+    expect(userBubbles().map((m) => m.content)).toEqual(["first"]);
+    fake.turnEnds();
+    expect(fake.started).toEqual(["first", "second"]);
+  });
+
+  // ACP audit finding 62 (whole-app D8): the message was lost and the cause went to the console.
+  it("a restart that fails keeps the message, says the real cause, and nothing restarts by itself", async () => {
+    rebind.mockResolvedValue({ ok: false, error: "codex-acp exited with code 127" });
+    const image = { mimeType: "image/png", dataBase64: "AAAA" };
+    await send.send(TAB, { content: "hello", mentions: [], attachments: [image] });
+    const notice = session().messages.find((m) => m.role === "assistant")?.content ?? "";
+    expect(notice).toContain("codex-acp exited with code 127");
+    expect(notice).not.toMatch(/node|npx/i);
+    expect(userBubbles().map((m) => m.content)).toEqual(["hello"]);
+    expect(session().pendingSend).toMatchObject({
+      content: "hello",
+      attachments: [image],
+      clientMessageId: userBubbles()[0].clientMessageId,
+    });
+    expect(session().status).toBe("idle");
     expect(fake.log).toEqual([]);
 
-    // A drain tick with nothing queued does not restart the agent either.
+    // A drain tick does not restart the agent.
     await change(() => setSession({ status: "running" }));
     await change(() => setSession({ status: "idle" }));
     expect(rebind).toHaveBeenCalledTimes(1);
+  });
+
+  it("a restart let go (the tab moved on) says nothing and keeps the message", async () => {
+    rebind.mockResolvedValue({ ok: false, error: null });
+    await send.send(TAB, text("hello"));
+    expect(session().messages.map((m) => m.role)).toEqual(["user"]);
+    expect(session().pendingSend?.content).toBe("hello");
+  });
+
+  it("the message kept through a failed restart goes, once, when the Restart banner brings the agent back", async () => {
+    rebind.mockResolvedValue({ ok: false, error: "spawn failed" });
+    const image = { mimeType: "image/png", dataBase64: "AAAA" };
+    await send.send(TAB, { content: "hello", mentions: [], attachments: [image] });
+    tick();
+
+    // The banner's restart: the session is back, idle.
+    await change(() => store().actions.setDisconnected(TAB, false));
+    expect(fake.calls("send")).toHaveLength(1);
+    expect(fake.calls("send")[0][2]).toEqual([image]);
+    expect(fake.calls("send")[0][5]).toBe(userBubbles()[0].clientMessageId);
+    expect(userBubbles()).toHaveLength(1);
+    expect(session().pendingSend).toBeUndefined();
+    tick();
+    await settle();
+    expect(fake.calls("send")).toHaveLength(1);
+  });
+
+  it("a send after a failed restart restarts for the kept message first, then queues behind it", async () => {
+    rebind.mockResolvedValueOnce({ ok: false, error: "spawn failed" });
+    await send.send(TAB, text("first"));
+    rebind.mockImplementation(async () => {
+      store().actions.setDisconnected(TAB, false);
+      return { ok: true };
+    });
+    await send.send(TAB, text("second"));
+    await settle();
+    expect(fake.started).toEqual(["first"]);
+    expect(fake.queue.map((q) => q.text)).toEqual(["second"]);
+    expect(userBubbles().map((m) => m.content)).toEqual(["first"]);
   });
 });
 
@@ -599,7 +691,7 @@ describe("what the queue survives, and what drops it", () => {
     rebind.mockImplementation(async () => {
       store().actions.setAcpBinding(TAB, "agent-2", "sess-2", "/tmp");
       store().actions.setDisconnected(TAB, false);
-      return true;
+      return { ok: true };
     });
 
     await change(() => setSession({ status: "idle" }));
@@ -622,6 +714,60 @@ describe("what the queue survives, and what drops it", () => {
     expect(fake.queue.map((q) => q.text)).toEqual(["kept"]);
   });
 
+  it("a queued message goes as a direct send would: composed, with its images (ACP audit finding 80)", async () => {
+    setSession({ status: "running" });
+    fake.turnRunning = true;
+    tick();
+    compose = async (content) => ({
+      prompt: `${content} [composed]`,
+      resourceLinks: [{ uri: "file:///tmp/a.ts", name: "a.ts" }],
+      pastedTexts: [{ id: "p1", text: "pasted" }],
+    });
+    const image = { mimeType: "image/png", dataBase64: "iVBO" };
+    send.enqueue(TAB, "look at @a.ts", [], [image]);
+    await settle();
+
+    expect(fake.calls("queueAdd")).toEqual([
+      [
+        KEY,
+        "look at @a.ts",
+        "look at @a.ts [composed]",
+        [image],
+        [{ uri: "file:///tmp/a.ts", name: "a.ts" }],
+        [{ id: "p1", text: "pasted" }],
+      ],
+    ]);
+  });
+
+  it("a long prompt the delta cut still reaches a new session whole (ACP audit finding 78)", async () => {
+    setSession({ status: "running" });
+    fake.turnRunning = true;
+    tick();
+    const long = "x".repeat(5000);
+    send.enqueue(TAB, long, []);
+    await settle();
+    // Rust's `queue_changed` carries only the head of it.
+    store().actions.applyAgentDelta({
+      kind: "queue_changed",
+      agent_id: KEY.agent_id,
+      session_id: KEY.session_id,
+      seq: 0,
+      queue: [{ id: "q-1", text: long.slice(0, 2048), origin: { kind: "local" }, truncated: true }],
+    });
+    expect(strip()).toEqual([long]);
+
+    // The agent dies; the restart lands on a different session.
+    setSession({ disconnected: true });
+    rebind.mockImplementation(async () => {
+      store().actions.setAcpBinding(TAB, "agent-2", "sess-2", "/tmp");
+      store().actions.setDisconnected(TAB, false);
+      return { ok: true };
+    });
+    await change(() => setSession({ status: "idle" }));
+    await settle();
+    expect(fake.queue.filter((q) => q.session === "sess-2").map((q) => q.text)).toEqual([long]);
+  });
+
   it("removing a chip takes it out of Rust's queue too", async () => {
     send.enqueue(TAB, "one", []);
     send.enqueue(TAB, "two", []);
@@ -630,6 +776,36 @@ describe("what the queue survives, and what drops it", () => {
     await settle();
     expect(strip()).toEqual(["two"]);
     expect(fake.queue.map((q) => q.text)).toEqual(["two"]);
+  });
+
+  // ACP audit finding 77: a failed turn halts the queue; Resume lifts it.
+  it("Resume lifts a failed turn's halt and runs the head", async () => {
+    setSession({ status: "running" });
+    fake.turnRunning = true;
+    send.enqueue(TAB, "next", []);
+    await settle();
+    // The turn failed; the controller halted the queue instead of draining.
+    fake.turnRunning = false;
+    setSession({ status: "error", queueHalted: true });
+    expect(fake.started).toEqual([]);
+
+    await send.resumeQueue(TAB);
+    expect(fake.calls("queueResume")).toEqual([[KEY]]);
+    expect(fake.started).toEqual(["next"]);
+    expect(store().sessions[TAB].queueHalted).toBeUndefined();
+  });
+
+  it("a refused Resume leaves the notice to try again", async () => {
+    setSession({ status: "running" });
+    fake.turnRunning = true;
+    send.enqueue(TAB, "next", []);
+    await settle();
+    fake.turnRunning = false;
+    setSession({ status: "error", queueHalted: true });
+    fake.failNext.queueResume = new Error("unknown session");
+
+    await send.resumeQueue(TAB);
+    expect(store().sessions[TAB].queueHalted).toBe(true);
   });
 
   it("is dropped by Stop, by an agent switch taking it, and with the session", async () => {
@@ -642,6 +818,53 @@ describe("what the queue survives, and what drops it", () => {
     store().actions.enqueueMessage(TAB, "b", []);
     store().actions.clearSession(TAB);
     expect(strip()).toEqual([]);
+  });
+});
+
+// ACP audit finding 84
+describe("Stop while the prompt is being composed", () => {
+  let release!: () => void;
+  beforeEach(() => {
+    bindTab();
+    compose = (content) =>
+      new Promise((resolve) => {
+        release = () => resolve({ prompt: content, resourceLinks: [], pastedTexts: [] });
+      });
+  });
+
+  it("aborts the send: nothing reaches the agent, and nothing is cancelled on the wire", async () => {
+    const sending = send.send(TAB, text("hello"));
+    await settle();
+    expect(session().status).toBe("running");
+
+    send.stop(TAB);
+    expect(session().status).toBe("idle");
+    expect(session().stopping).toBeFalsy();
+    release();
+    await sending;
+    expect(fake.calls("send")).toEqual([]);
+    expect(fake.calls("cancel")).toEqual([]);
+    expect(userBubbles()).toHaveLength(1);
+  });
+
+  it("mid-turn, a Stop also stops the turn that was running", async () => {
+    store().actions.updateSessionStatus(TAB, "running");
+    const sending = send.send(TAB, text("an answer"));
+    await settle();
+    send.stop(TAB);
+    release();
+    await sending;
+    expect(fake.calls("send")).toEqual([]);
+    expect(fake.calls("cancel")).toHaveLength(1);
+    expect(session().stopping).toBe(true);
+  });
+
+  it("a send composed without a Stop goes as before", async () => {
+    const sending = send.send(TAB, text("hello"));
+    await settle();
+    release();
+    await sending;
+    expect(fake.started).toEqual(["hello"]);
   });
 });
 
@@ -667,7 +890,7 @@ describe("the instance owns its state", () => {
       ambient: () => ambient,
       rebind,
       forgetAgent,
-      wirePrompt: async (_s, content) => ({ prompt: content, resourceLinks: [], pastedTexts: [] }),
+      wirePrompt: (_s, content) => compose(content),
       queuedPrompt: (queued) => queued,
     });
     send.setHold(TAB, "switch", true);

@@ -37,10 +37,10 @@ export function hostOs(platform = process.platform) {
   return { darwin: "macos", win32: "windows" }[platform] ?? platform;
 }
 
-/** Linux jobs no other OS can stand in for: the crates whose suites run the
- *  engine's sandbox, and the app's Linux compile. */
+/** Linux jobs no other OS can stand in for: the crates and engine regression
+ *  suites that run the sandbox, and the app's Linux compile. */
 export function needsLinux(job) {
-  return Boolean(job.flags?.sandbox) || job.id === "app-linux";
+  return Boolean(job.flags?.sandbox) || job.id === "engine-dialect" || job.id === "app-linux";
 }
 
 /**

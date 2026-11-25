@@ -86,10 +86,9 @@ pub async fn run(
 ) -> Result<()> {
     let request = ticket_request(url, &token)?;
 
-    let (stream, _response) = match tokio_tungstenite::connect_async(request).await {
+    let (stream, _response) = match connect(request).await {
         Ok(ok) => ok,
-        Err(err) => {
-            let reason = classify_handshake(&err);
+        Err(reason) => {
             // Deliberately logs the *classification*, never the error's own
             // Display — a tungstenite HTTP error can carry the request back.
             tracing::warn!(target: "atlas_comms::conn", "handshake failed: {reason:?}");
@@ -109,10 +108,24 @@ pub async fn run(
         return Ok(());
     }
 
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(20),
+        std::time::Duration::from_secs(20),
+    );
+    let mut last_received = tokio::time::Instant::now();
     let exit = loop {
         tokio::select! {
+                _ = tokio::time::sleep_until(last_received + std::time::Duration::from_secs(60)) => {
+                    break ExitReason::Transport("socket stopped responding".into());
+                }
+                _ = heartbeat.tick() => {
+                    if let Err(error) = crate::conn::send_frame(&mut write, WsMessage::Ping(Vec::new().into())).await {
+                        break ExitReason::Transport(error);
+                    }
+                }
             incoming = read.next() => match incoming {
                 Some(Ok(WsMessage::Text(text))) => {
+                        last_received = tokio::time::Instant::now();
                     match serde_json::from_str::<ServerFrame>(&text) {
                         Ok(frame) => {
                             let evicted = matches!(frame, ServerFrame::MemberEvicted { .. });
@@ -140,7 +153,7 @@ pub async fn run(
                         .is_some_and(|f| u16::from(f.code) == 1008);
                     break if evicted { ExitReason::Evicted } else { ExitReason::Closed };
                 }
-                Some(Ok(_)) => {} // ping/pong/binary — nothing here sends binary
+                Some(Ok(_)) => { last_received = tokio::time::Instant::now(); } // ping/pong/binary — nothing here sends binary
                 Some(Err(e)) => break ExitReason::Transport(e.to_string()),
                 None => break ExitReason::Closed,
             },
@@ -154,14 +167,14 @@ pub async fn run(
                             continue;
                         }
                     };
-                    if let Err(e) = write.send(WsMessage::Text(text.into())).await {
-                        break ExitReason::Transport(e.to_string());
+                    if let Err(e) = crate::conn::send_frame(&mut write, WsMessage::Text(text.into())).await {
+                        break ExitReason::Transport(e);
                     }
                 }
                 // The manager dropped the sender: this target is being torn
                 // down. Close politely so the server drops presence promptly.
                 None => {
-                    let _ = write.send(WsMessage::Close(None)).await;
+                    let _ = crate::conn::send_frame(&mut write, WsMessage::Close(None)).await;
                     break ExitReason::Closed;
                 }
             },
@@ -178,7 +191,36 @@ pub async fn run(
 /// The three that matter are distinguishable only by status: `401` is worth one
 /// re-mint, `403` is worth nothing at all, and everything else is worth a
 /// backoff.
-pub(crate) fn classify_handshake(err: &tokio_tungstenite::tungstenite::Error) -> ExitReason {
+/// How long a WebSocket dial (TCP, TLS and the HTTP upgrade together) may
+/// take. `connect_async` has no deadline of its own, so a peer that accepts the
+/// connection and never answers the upgrade used to park the reconnect loop
+/// forever, the UI stuck on "connecting".
+pub(crate) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+pub(crate) type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type WsResponse = tokio_tungstenite::tungstenite::handshake::client::Response;
+
+/// Dial `request` within [`HANDSHAKE_TIMEOUT`]; a failure comes back already
+/// classified (never as the error itself, which can carry the ticket).
+pub(crate) async fn connect(
+    request: tokio_tungstenite::tungstenite::handshake::client::Request,
+) -> std::result::Result<(WsStream, WsResponse), ExitReason> {
+    connect_within(request, HANDSHAKE_TIMEOUT).await
+}
+
+async fn connect_within(
+    request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    deadline: std::time::Duration,
+) -> std::result::Result<(WsStream, WsResponse), ExitReason> {
+    match tokio::time::timeout(deadline, tokio_tungstenite::connect_async(request)).await {
+        Ok(Ok(ok)) => Ok(ok),
+        Ok(Err(err)) => Err(classify_handshake(&err)),
+        Err(_) => Err(ExitReason::Transport("handshake timed out".into())),
+    }
+}
+
+fn classify_handshake(err: &tokio_tungstenite::tungstenite::Error) -> ExitReason {
     use tokio_tungstenite::tungstenite::Error;
     match err {
         Error::Http(response) => match response.status().as_u16() {
@@ -192,5 +234,47 @@ pub(crate) fn classify_handshake(err: &tokio_tungstenite::tungstenite::Error) ->
         Error::Tls(_) => ExitReason::Transport("tls".into()),
         Error::Protocol(p) => ExitReason::Transport(format!("protocol: {p}")),
         _ => ExitReason::Transport("connect failed".into()),
+    }
+}
+
+/// A stalled peer must not trap the select loop inside a write forever.
+pub(crate) async fn send_frame<W>(
+    write: &mut W,
+    frame: WsMessage,
+) -> std::result::Result<(), String>
+where
+    W: futures_util::Sink<WsMessage> + Unpin,
+    W::Error: std::fmt::Display,
+{
+    tokio::time::timeout(std::time::Duration::from_secs(10), write.send(frame))
+        .await
+        .map_err(|_| "socket write timed out".to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// N6: a peer that accepts the TCP connection and never answers the
+    /// upgrade must not hold the dial forever.
+    #[tokio::test]
+    async fn a_silent_peer_times_the_handshake_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _held = tokio::spawn(async move {
+            let mut kept = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                kept.push(socket); // accepted, never answered
+            }
+        });
+        let request = ticket_request(format!("ws://{addr}/socket"), "t").unwrap();
+        let started = std::time::Instant::now();
+        let result = connect_within(request, std::time::Duration::from_millis(200)).await;
+        assert!(matches!(
+            result,
+            Err(ExitReason::Transport(ref why)) if why == "handshake timed out"
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 }

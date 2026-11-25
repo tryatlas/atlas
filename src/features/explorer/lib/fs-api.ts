@@ -75,6 +75,13 @@ export function addToGitignore(projectPath: string, pattern: string): Promise<vo
   return invoke("fs_add_to_gitignore", { projectPath, pattern });
 }
 
+/** One exact project-relative entry; gitignore patterns are not file paths. */
+export function literalGitignorePattern(path: string): string {
+  if (/[\r\n]/.test(path))
+    throw new Error("A path containing a line break cannot be added to .gitignore.");
+  return `/${path.replace(/^\/+/, "").replace(/[\\*?[\]#! ]/g, "\\$&")}`;
+}
+
 /** Re-point the mention picker's recent-files entry after a rename or move. */
 export function renameRecentFile(
   oldPath: string,

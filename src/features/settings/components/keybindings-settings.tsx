@@ -1,3 +1,4 @@
+import { isWindows } from "@/lib/platform";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, FileJson, Keyboard, Plus, Search, X } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -46,7 +47,9 @@ import { Button, Icon, IconButton, KbdKeys, Segmented, Hint } from "@tryatlas/de
 export function KeybindingsSettings() {
   const resolved = useKeybindingsStore((s) => s.resolved);
   const fileWarnings = useKeybindingsStore((s) => s.warnings);
-  const { removeBinding } = useKeybindingsStore((s) => s.actions);
+  const writable = useKeybindingsStore((s) => s.writable);
+  const saveError = useKeybindingsStore((s) => s.saveError);
+  const { removeBinding, load, retrySave } = useKeybindingsStore((s) => s.actions);
   const [query, setQuery] = useState("");
   const [pressing, setPressing] = useState(false);
   const [pressed, setPressed] = useState<Combo | null>(null);
@@ -101,7 +104,7 @@ export function KeybindingsSettings() {
   // Only keys pressed on the list itself: a row's buttons and its portaled
   // context menu bubble here too, and act on their own row, not the selection.
   const onListKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (recording || e.target !== e.currentTarget) return;
+    if (!writable || recording || e.target !== e.currentTarget) return;
     const idx = selectedId ? flat.findIndex((r) => r.id === selectedId) : -1;
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
@@ -139,132 +142,160 @@ export function KeybindingsSettings() {
       title="Keybindings"
       description="A shortcut for every command. Click one and press the keys you want."
     >
-      <SettingsSection title="Keymap" action={<ProfileControls />}>
-        <SettingsGroup>
-          <SettingsRow
-            anchor="keymap"
-            title="Start from"
-            description="Use another editor's shortcuts underneath your own changes."
-            control={<KeymapSelect />}
-          />
-        </SettingsGroup>
-      </SettingsSection>
-
-      <div className="flex flex-col gap-3">
-        <div
-          ref={toolbarRef}
-          className="sticky top-0 z-10 -mx-1 flex scroll-mt-4 flex-wrap items-center gap-2 bg-background px-1 py-2"
-        >
-          <SearchField
-            query={query}
-            onQuery={setQuery}
-            pressing={pressing}
-            onPressing={(on) => {
-              setPressing(on);
-              setPressed(null);
-            }}
-            pressed={pressed}
-            onPressed={setPressed}
-          />
-          {(changedCount > 0 || clashCount > 0) && (
-            <Segmented
-              size="sm"
-              aria-label="Show"
-              value={filter}
-              onValueChange={setFilter}
-              options={[
-                { value: "all", label: "All" },
-                ...(changedCount
-                  ? [{ value: "changed" as const, label: `Changed ${changedCount}` }]
-                  : []),
-                ...(clashCount
-                  ? [{ value: "clashes" as const, label: `Clashes ${clashCount}` }]
-                  : []),
-              ]}
-            />
-          )}
-          <Button variant="outline" disabled={adding} onClick={() => setAdding(true)}>
-            <Icon icon={Plus} size="xs" />
-            Add keybinding
-          </Button>
-          <Hint label="Open keybindings.json">
-            <IconButton
-              icon={FileJson}
-              variant="outline"
-              size="md"
-              label="Open keybindings.json"
-              onClick={() => void openKeybindingsFile()}
-            />
-          </Hint>
-        </div>
-
-        {warnings.length > 0 && (
-          <div className="flex items-start gap-2 rounded-lg border border-warning/40 bg-warning-muted px-3 py-2 text-xs text-secondary-foreground">
-            <Icon icon={AlertTriangle} size="xs" className="mt-0.5 text-warning" />
-            <div className="flex flex-col gap-0.5">
-              {warnings.map((w) => (
-                <p key={w}>{w}</p>
-              ))}
-            </div>
-          </div>
+      {isWindows &&
+        resolved.list.some(
+          ({ combo }) => combo.alt && (combo.ctrl || combo.meta) && /^Key[A-Z]$/.test(combo.code),
+        ) && (
+          <p className="text-sm text-muted-foreground">
+            Ctrl+Alt letter shortcuts can overlap AltGr on your keyboard layout. Atlas keeps AltGr
+            characters available; record an alternative chord for any affected command.
+          </p>
         )}
-
-        <div
-          ref={listRef}
-          tabIndex={0}
-          role="group"
-          aria-label="Keybindings"
-          onKeyDown={onListKeyDown}
-          className="group/list flex flex-col gap-8 outline-none"
-        >
-          {adding && (
-            <SettingsGroup>
-              <NewKeybindingRow
-                onDone={(saved) => {
-                  setAdding(false);
-                  if (!saved) return;
-                  // Show where it landed.
-                  setFilter("all");
-                  setQuery("");
-                  setPressing(false);
-                  setSelectedId(saved);
-                }}
-              />
-            </SettingsGroup>
-          )}
-          {groups.length === 0 && (
-            <SettingsGroup>
-              <SettingsNote>{emptyHint}</SettingsNote>
-            </SettingsGroup>
-          )}
-          {groups.map((g) => (
-            <SettingsSection key={g.title} title={g.title}>
-              <SettingsGroup>
-                {g.rows.map((row) => (
-                  <KeybindingRow
-                    key={row.id}
-                    row={row}
-                    conflicts={conflicts}
-                    selected={row.id === selectedId}
-                    recording={recording?.id === row.id ? recording.which : null}
-                    onSelect={() => setSelectedId(row.id)}
-                    onRecord={(which) => {
-                      setSelectedId(row.id);
-                      setRecording(which === null ? null : { id: row.id, which });
-                      // Back to the list, so ↑↓ keep working after a save.
-                      if (which === null) listRef.current?.focus({ preventScroll: true });
-                    }}
-                    onShowSame={showSame}
-                  />
-                ))}
-              </SettingsGroup>
-            </SettingsSection>
-          ))}
-          {!query && !pressing && filter === "all" && resolved.unknownActionIds.length > 0 && (
-            <UnknownCommands ids={resolved.unknownActionIds} />
-          )}
+      {!writable && (
+        <div role="alert" className="flex flex-col gap-2 text-sm">
+          <p>Keybindings are read-only. Repair the file, then reload to edit your profiles.</p>
+          <div className="flex gap-2">
+            <Button variant="outline" onClick={() => void openKeybindingsFile()}>
+              Open keybindings.json
+            </Button>
+            <Button onClick={() => void load()}>Retry load</Button>
+          </div>
         </div>
-      </div>
+      )}
+      {saveError && (
+        <div role="alert" className="flex flex-col gap-2 text-sm">
+          <p>Your shortcut edits are still pending: {saveError}</p>
+          <Button onClick={() => void retrySave().catch(() => {})}>Retry save</Button>
+        </div>
+      )}
+      <fieldset disabled={!writable} className="min-w-0 border-0 p-0">
+        <SettingsSection title="Keymap" action={<ProfileControls />}>
+          <SettingsGroup>
+            <SettingsRow
+              anchor="keymap"
+              title="Start from"
+              description="Use another editor's shortcuts underneath your own changes."
+              control={<KeymapSelect />}
+            />
+          </SettingsGroup>
+        </SettingsSection>
+
+        <div className="flex flex-col gap-3">
+          <div
+            ref={toolbarRef}
+            className="sticky top-0 z-10 -mx-1 flex scroll-mt-4 flex-wrap items-center gap-2 bg-background px-1 py-2"
+          >
+            <SearchField
+              query={query}
+              onQuery={setQuery}
+              pressing={pressing}
+              onPressing={(on) => {
+                setPressing(on);
+                setPressed(null);
+              }}
+              pressed={pressed}
+              onPressed={setPressed}
+            />
+            {(changedCount > 0 || clashCount > 0) && (
+              <Segmented
+                size="sm"
+                aria-label="Show"
+                value={filter}
+                onValueChange={setFilter}
+                options={[
+                  { value: "all", label: "All" },
+                  ...(changedCount
+                    ? [{ value: "changed" as const, label: `Changed ${changedCount}` }]
+                    : []),
+                  ...(clashCount
+                    ? [{ value: "clashes" as const, label: `Clashes ${clashCount}` }]
+                    : []),
+                ]}
+              />
+            )}
+            <Button variant="outline" disabled={adding} onClick={() => setAdding(true)}>
+              <Icon icon={Plus} size="xs" />
+              Add keybinding
+            </Button>
+            <Hint label="Open keybindings.json">
+              <IconButton
+                icon={FileJson}
+                variant="outline"
+                size="md"
+                label="Open keybindings.json"
+                onClick={() => void openKeybindingsFile()}
+              />
+            </Hint>
+          </div>
+
+          {warnings.length > 0 && (
+            <div className="flex items-start gap-2 rounded-lg border border-warning/40 bg-warning-muted px-3 py-2 text-xs text-secondary-foreground">
+              <Icon icon={AlertTriangle} size="xs" className="mt-0.5 text-warning" />
+              <div className="flex flex-col gap-0.5">
+                {warnings.map((w) => (
+                  <p key={w}>{w}</p>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div
+            ref={listRef}
+            tabIndex={0}
+            role="group"
+            aria-label="Keybindings"
+            onKeyDown={onListKeyDown}
+            className="group/list flex flex-col gap-8 outline-none"
+          >
+            {adding && (
+              <SettingsGroup>
+                <NewKeybindingRow
+                  onDone={(saved) => {
+                    setAdding(false);
+                    if (!saved) return;
+                    // Show where it landed.
+                    setFilter("all");
+                    setQuery("");
+                    setPressing(false);
+                    setSelectedId(saved);
+                  }}
+                />
+              </SettingsGroup>
+            )}
+            {groups.length === 0 && (
+              <SettingsGroup>
+                <SettingsNote>{emptyHint}</SettingsNote>
+              </SettingsGroup>
+            )}
+            {groups.map((g) => (
+              <SettingsSection key={g.title} title={g.title}>
+                <SettingsGroup>
+                  {g.rows.map((row) => (
+                    <KeybindingRow
+                      key={row.id}
+                      row={row}
+                      conflicts={conflicts}
+                      selected={row.id === selectedId}
+                      recording={recording?.id === row.id ? recording.which : null}
+                      onSelect={() => setSelectedId(row.id)}
+                      onRecord={(which) => {
+                        setSelectedId(row.id);
+                        setRecording(which === null ? null : { id: row.id, which });
+                        // Back to the list, so ↑↓ keep working after a save.
+                        if (which === null) listRef.current?.focus({ preventScroll: true });
+                      }}
+                      onShowSame={showSame}
+                    />
+                  ))}
+                </SettingsGroup>
+              </SettingsSection>
+            ))}
+            {!query && !pressing && filter === "all" && resolved.unknownActionIds.length > 0 && (
+              <UnknownCommands ids={resolved.unknownActionIds} />
+            )}
+          </div>
+        </div>
+      </fieldset>
     </SettingsPage>
   );
 }

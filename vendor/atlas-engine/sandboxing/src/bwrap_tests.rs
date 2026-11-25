@@ -1,3 +1,4 @@
+// Modified by Atlas from upstream OpenAI Codex (Apache-2.0). See CONTEXT.md.
 use super::*;
 use pretty_assertions::assert_eq;
 use std::path::Path;
@@ -127,7 +128,7 @@ fn finds_first_executable_bwrap_in_joined_search_path() {
     let search_path = std::env::join_paths([first_dir, second_dir]).expect("join search path");
 
     assert_eq!(
-        find_system_bwrap_in_search_paths(std::env::split_paths(&search_path), &cwd),
+        find_system_bwrap_in_search_paths(std::env::split_paths(&search_path), &cwd, None),
         Some(expected_bwrap)
     );
 }
@@ -144,7 +145,7 @@ fn skips_workspace_local_bwrap_in_joined_search_path() {
     let search_path = std::env::join_paths([cwd.clone(), trusted_dir]).expect("join search path");
 
     assert_eq!(
-        find_system_bwrap_in_search_paths(std::env::split_paths(&search_path), &cwd),
+        find_system_bwrap_in_search_paths(std::env::split_paths(&search_path), &cwd, None),
         Some(expected_bwrap)
     );
 }
@@ -158,8 +159,36 @@ fn root_cwd_does_not_hide_system_bwrap_candidates() {
     let search_path = std::env::join_paths([bin_dir]).expect("join search path");
 
     assert_eq!(
-        find_system_bwrap_in_search_paths(std::env::split_paths(&search_path), Path::new("/")),
+        find_system_bwrap_in_search_paths(
+            std::env::split_paths(&search_path),
+            Path::new("/"),
+            None
+        ),
         Some(expected_bwrap)
+    );
+}
+
+#[test]
+fn appimage_bundle_does_not_shadow_the_system_bwrap() {
+    let temp = tempdir().unwrap();
+    let bundle = temp.path().join("appdir");
+    let bundled_bin = bundle.join("usr/bin");
+    let system_bin = temp.path().join("system/bin");
+    std::fs::create_dir_all(&bundled_bin).unwrap();
+    std::fs::create_dir_all(&system_bin).unwrap();
+    write_named_fake_bwrap_in(&bundled_bin);
+    let expected = write_named_fake_bwrap_in(&system_bin);
+    assert_eq!(
+        find_system_bwrap_in_search_paths(
+            [bundled_bin.clone(), system_bin],
+            Path::new("/"),
+            Some(&bundle)
+        ),
+        Some(expected)
+    );
+    assert_eq!(
+        find_system_bwrap_in_search_paths([bundled_bin], Path::new("/"), Some(&bundle)),
+        None
     );
 }
 

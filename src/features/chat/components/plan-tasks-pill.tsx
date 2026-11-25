@@ -11,9 +11,12 @@ import { PlanTasksListView, PlanTasksTriggerView } from "./views/plan-tasks-pill
  * beui-style "Implementation plan" list: circled-check + strikethrough for
  * done, a spinning arc for the in-progress step, a faint circle for pending.
  *
- * Same live-only semantics as the dock it replaces: `livePlan` resets on every
- * (re)bind, and the pill hides the moment the turn is no longer active — a
- * finished plan lives on in the thread, never as stale composer chrome.
+ * The plan is the agent's and stands until the agent replaces or clears it:
+ * a turn ending does not hide it, so a plan the agent is working through
+ * across several prompts stays in reach between them (ACP audit finding 102). It hides
+ * when there is none, and once every step is done and the session is idle —
+ * a finished plan lives on in the thread, not as composer chrome. `livePlan`
+ * resets on every (re)bind.
  *
  * Same interaction grammar as the composer's other menus: height-morph panel
  * (ResizeObserver → height tween), Esc/outside closes, and it participates in
@@ -27,11 +30,10 @@ export const PlanTasksPill = memo(function PlanTasksPill({ tabId }: { tabId: str
     measureKey: plan?.length,
   });
 
-  // Live-only, mirroring the dock this replaces (see module docs).
   if (!plan || plan.length === 0) return null;
-  if (!isBusyAgentStatus(status ?? "idle")) return null;
-
   const completed = plan.filter((s) => s.status === "completed").length;
+  // See the module docs: only a finished plan on an idle session is hidden.
+  if (completed === plan.length && !isBusyAgentStatus(status ?? "idle")) return null;
 
   return (
     <div ref={ref} className="relative">

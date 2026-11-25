@@ -1154,7 +1154,9 @@ impl RecordStore {
     }
 
     /// Entries of `kind` changed after `since` by any session but
-    /// `exclude_session`, oldest first by `(updated_at, id)`, at most `limit`.
+    /// `exclude_session`, oldest first by `(updated_at, id)`. Includes all
+    /// rows tied at the limit's final timestamp so a timestamp cursor cannot
+    /// skip the remainder of a bulk update.
     /// What a changes call pages through. The session is whoever made the
     /// latest change (`changed_by`), not the entry's last content writer: an
     /// archive, a verdict or a rewind by another session reaches the writer,
@@ -1166,13 +1168,25 @@ impl RecordStore {
         exclude_session: &str,
         limit: usize,
     ) -> Result<Vec<Entry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT * FROM entries WHERE kind = ?1 AND updated_at > ?2 AND changed_by <> ?3 \
-             ORDER BY updated_at ASC, id ASC LIMIT ?4",
+            "WITH selected AS (SELECT updated_at FROM entries \
+             WHERE kind = ?1 AND updated_at > ?2 AND changed_by <> ?3 \
+             ORDER BY updated_at ASC, id ASC LIMIT ?4) \
+             SELECT * FROM entries WHERE kind = ?1 AND updated_at > ?2 AND changed_by <> ?3 \
+             AND updated_at <= (SELECT MAX(updated_at) FROM selected) \
+             ORDER BY updated_at ASC, id ASC",
         )?;
         let rows = stmt.query_map(
-            params![kind.as_str(), since, exclude_session, limit as i64],
+            params![
+                kind.as_str(),
+                since,
+                exclude_session,
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
             entry_from_row,
         )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1191,12 +1205,28 @@ impl RecordStore {
     /// Entries whose content or key contains `query` (case-insensitive),
     /// optionally restricted to `kinds`, most recently written first.
     pub fn query(&self, query: &str, kinds: &[EntryKind], limit: usize) -> Result<Vec<Entry>> {
+        self.query_filtered(query, kinds, limit, true)
+    }
+
+    fn query_filtered(
+        &self,
+        query: &str,
+        kinds: &[EntryKind],
+        limit: usize,
+        include_archived: bool,
+    ) -> Result<Vec<Entry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let q = query.trim().to_lowercase();
         let conn = self.conn();
         let mut stmt = conn.prepare("SELECT * FROM entries ORDER BY updated_at DESC, id DESC")?;
         let mut out = Vec::new();
         for row in stmt.query_map([], entry_from_row)? {
             let e = row?;
+            if !include_archived && e.state == State::Archived {
+                continue;
+            }
             if !kinds.is_empty() && !kinds.contains(&e.kind) {
                 continue;
             }
@@ -1723,7 +1753,7 @@ impl RecordStore {
         now: i64,
     ) -> Result<Vec<SearchHit>> {
         if query.trim().is_empty() {
-            let out = self.query("", kinds, limit)?;
+            let out = self.query_filtered("", kinds, limit, false)?;
             self.mark_used(&out, now)?;
             return Ok(out
                 .into_iter()
@@ -4468,6 +4498,31 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Credentials in the shapes agent transcripts carry them (ATL-1013). Each
+    /// leaked through `redact` until the credential layer learned the shape.
+    #[test]
+    fn redact_scrubs_credentials_as_transcripts_carry_them() {
+        for (input, secret) in [
+            (
+                "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJl",
+                "eyJhbGciOiJIUzI1NiJ9",
+            ),
+            ("password: hunter2hunter2", "hunter2hunter2"),
+            (
+                "database:\n  user: app\n  password: hunter2hunter2\n",
+                "hunter2hunter2",
+            ),
+            (
+                r#"{"user": "app", "password": "hunter2hunter2"}"#,
+                "hunter2hunter2",
+            ),
+        ] {
+            let out = redact(input);
+            assert!(!out.contains(secret), "leaked {secret:?}: {out}");
+            assert!(out.contains(atlas_redact::PLACEHOLDER), "{out}");
+        }
+    }
+
     #[test]
     fn a_secret_in_any_write_lands_redacted() {
         let root = temp_root("redact");
@@ -5895,6 +5950,7 @@ pub(crate) mod tests {
         let root = temp_root("evidence");
         let store = open_scope(&root).unwrap();
         let c1 = Citation {
+            worktree_root: None,
             path: "src/a.rs".into(),
             start_line: 1,
             end_line: 2,
@@ -5902,6 +5958,7 @@ pub(crate) mod tests {
             hash: "h1".into(),
         };
         let c2 = Citation {
+            worktree_root: None,
             path: "src/b.rs".into(),
             start_line: 3,
             end_line: 3,
@@ -6021,6 +6078,62 @@ pub(crate) mod tests {
             store.get(cand.id, now + 2).unwrap().unwrap().state,
             State::Archived
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_empty_search_never_uses_archived_entries() {
+        let root = temp_root("blank-search-archive");
+        let store = open_scope(&root).unwrap();
+        let old = store
+            .remember(
+                tool_write(EntryKind::Fact, "archived", "obsolete fact", 1),
+                1,
+            )
+            .unwrap()
+            .entry;
+        store
+            .feedback(old.id, Verdict::Wrong, "obsolete", "agent", "other", 2)
+            .unwrap();
+        let before = store.peek(old.id).unwrap().unwrap();
+        assert!(store.search("  ", &[], 20, 100).unwrap().is_empty());
+        let after = store.peek(old.id).unwrap().unwrap();
+        assert_eq!(after.last_used_at, before.last_used_at);
+        assert_eq!(after.state, State::Archived);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn changes_include_every_row_at_the_page_boundary_timestamp() {
+        let root = temp_root("change-ties");
+        let store = open_scope(&root).unwrap();
+        for n in 0..24 {
+            store
+                .upsert(tool_write(
+                    EntryKind::Fact,
+                    &format!("key-{n}"),
+                    &format!("bulk fact {n}"),
+                    10,
+                ))
+                .unwrap();
+        }
+        store
+            .upsert(tool_write(EntryKind::Fact, "later", "later fact", 11))
+            .unwrap();
+        let page = store
+            .changed_since(EntryKind::Fact, 0, "reader", 11)
+            .unwrap();
+        assert_eq!(page.len(), 24, "all ties must survive the timestamp cursor");
+        assert!(page.iter().all(|entry| entry.updated_at == 10));
+        let next = store
+            .changed_since(EntryKind::Fact, 10, "reader", 11)
+            .unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].key, "later");
+        assert!(store
+            .changed_since(EntryKind::Fact, 0, "reader", 0)
+            .unwrap()
+            .is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6550,6 +6663,7 @@ pub(crate) mod tests {
             .unwrap()
             .entry;
         let c = Citation {
+            worktree_root: None,
             path: "src/ttl.rs".into(),
             start_line: 1,
             end_line: 1,

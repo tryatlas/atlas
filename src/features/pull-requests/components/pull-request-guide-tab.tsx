@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 // The Guide tab: an agent-written tour of the pull request in numbered stops,
 // read in order with J and K.
 //
@@ -246,7 +247,7 @@ function GuideTour({
   useEffect(() => {
     if (!active) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented || event.isComposing) return;
+      if (event.defaultPrevented || isComposingKey(event)) return;
       if (event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
       if (event.key !== "j" && event.key !== "k") return;
       const target = event.target as HTMLElement | null;

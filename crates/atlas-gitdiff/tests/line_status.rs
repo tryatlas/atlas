@@ -42,11 +42,17 @@ fn a_removal_marks_the_line_that_follows_it() {
 }
 
 #[test]
-fn a_removal_with_no_line_after_it_in_the_diff_marks_nothing() {
-    // `-U0` prints no context, so a pure removal has no following line here,
-    // and neither has one at the end of the file.
-    assert_eq!(status("@@ -2,2 +1,0 @@\n-gone\n-too\n"), (NONE, NONE, NONE));
-    assert_eq!(status("@@ -1,2 +1 @@\n keep\n-last\n"), (NONE, NONE, NONE));
+fn a_removal_without_following_context_keeps_its_new_file_boundary() {
+    // Preserve the position after line one, including at EOF. The editor can
+    // anchor that boundary to its last line instead of losing the removal.
+    assert_eq!(
+        status("@@ -2,2 +1,0 @@\n-gone\n-too\n"),
+        (NONE, NONE, vec![2])
+    );
+    assert_eq!(
+        status("@@ -1,2 +1 @@\n keep\n-last\n"),
+        (NONE, NONE, vec![2])
+    );
 }
 
 #[test]

@@ -21,6 +21,7 @@ pub struct RawLine {
 #[derive(Debug, Clone)]
 pub struct Hunk {
     pub new_start: u32,
+    pub new_count: u32,
     pub lines: Vec<RawLine>,
 }
 
@@ -93,6 +94,7 @@ pub fn parse_unified(diff: &str) -> ParsedDiff {
             left = (count(3).unwrap_or(0), count(5).unwrap_or(0));
             cur = Some(Hunk {
                 new_start,
+                new_count: left.1,
                 lines: Vec::new(),
             });
             continue;

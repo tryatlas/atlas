@@ -156,7 +156,9 @@ describe("resume-mode coverage", () => {
     // queue into `handleSend`; without a per-tab guard each caller respawns
     // the agent and rebinds, and the loser can leave the tab on a session the
     // mode was never applied to.
-    const guard = bracketBody(read(REBIND), /\bfunction rebindDisconnectedSession\b/, {
+    // `rebindDisconnectedSession` answers through `restartDisconnectedSession`
+    // (which also says why a restart failed), so the guard lives there.
+    const guard = bracketBody(read(REBIND), /\bfunction restartDisconnectedSession\b/, {
       lang: "ts",
       where: REBIND,
     });

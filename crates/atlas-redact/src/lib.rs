@@ -240,6 +240,8 @@ pub(crate) fn redact_link(input: &str) -> Redacted {
     let mut regions = uri::detect_userinfo_passwords(input);
     regions.extend(dsn::detect_password_values(input));
     regions.extend(provider::detect(input));
+    regions.extend(vendor::detect(input));
+    regions.extend(credential::detect(input));
 
     let (text, replaced) = region::apply(input, regions, PLACEHOLDER);
     let mut counts = RedactionCounts::default();

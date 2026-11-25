@@ -9,8 +9,8 @@
 //! * **Display order is preserved separately.** The user's ordering is theirs;
 //!   it round-trips through the database in the `*_order` columns.
 //!
-//! There is no Windows UNC/verbatim-prefix normalisation. Paths are stored as given, minus a trailing
-//! separator, which is identity on the platforms Atlas ships.
+//! Windows verbatim prefixes are normalized to their ordinary drive or UNC
+//! spelling. Trailing separators are ignored without turning UNC paths relative.
 
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -274,6 +274,9 @@ fn normalize(path: &Path) -> PathBuf {
 /// other spelling of the path carries. No-op elsewhere.
 fn strip_verbatim(path: PathBuf) -> PathBuf {
     if cfg!(windows) {
+        if let Some(rest) = path.to_string_lossy().strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
         if let Some(rest) = path.to_string_lossy().strip_prefix(r"\\?\") {
             return PathBuf::from(rest);
         }

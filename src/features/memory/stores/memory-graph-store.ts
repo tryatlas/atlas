@@ -45,6 +45,8 @@ interface MemoryGraphState {
 // Module-level listener handles so an in-flight download survives the Memory
 // tab unmounting (it isn't a persistent tab).
 let unlistens: UnlistenFn[] = [];
+let graphGeneration = 0;
+let queryGeneration = 0;
 const clearListeners = () => {
   unlistens.forEach((u) => u());
   unlistens = [];
@@ -64,12 +66,15 @@ export const useMemoryGraphStore = create<MemoryGraphState>()((set, get) => ({
   selectedId: null,
   actions: {
     init: async (projectPath) => {
+      const generation = ++graphGeneration;
+      queryGeneration++;
       const prev = get().projectPath;
       set({ projectPath });
       // Project changed → drop the cached graph so we don't show a stale one.
       if (prev !== null && prev !== projectPath) {
         set({
           graph: null,
+          querying: false,
           docCount: 0,
           query: "",
           results: [],
@@ -85,12 +90,14 @@ export const useMemoryGraphStore = create<MemoryGraphState>()((set, get) => ({
       set({ phase: "checking", error: null });
       try {
         const status = await memoryGraph.embedStatus();
+        if (generation !== graphGeneration || get().projectPath !== projectPath) return;
         if (status.downloaded) {
           await get().actions.buildIndex(projectPath);
         } else {
           set({ phase: "not-downloaded" });
         }
       } catch (e) {
+        if (generation !== graphGeneration || get().projectPath !== projectPath) return;
         set({ phase: "error", error: String(e) });
       }
     },
@@ -124,15 +131,19 @@ export const useMemoryGraphStore = create<MemoryGraphState>()((set, get) => ({
     },
 
     buildIndex: async (projectPath) => {
+      if (get().projectPath !== projectPath) return;
+      const generation = ++graphGeneration;
       set({ phase: "indexing", error: null });
       try {
         const g = await memoryGraph.buildIndex(projectPath);
+        if (generation !== graphGeneration || get().projectPath !== projectPath) return;
         set({
           phase: "graph-ready",
           graph: { nodes: g.nodes, edges: g.edges },
           docCount: g.doc_count,
         });
       } catch (e) {
+        if (generation !== graphGeneration || get().projectPath !== projectPath) return;
         const msg = String(e);
         if (msg.includes("model-not-downloaded")) {
           set({ phase: "not-downloaded" });
@@ -143,6 +154,8 @@ export const useMemoryGraphStore = create<MemoryGraphState>()((set, get) => ({
     },
 
     runQuery: async (projectPath, q) => {
+      if (get().projectPath !== projectPath) return;
+      const generation = ++queryGeneration;
       const query = q.trim();
       if (!query) {
         set({ results: [], matchedIds: new Set(), querying: false });
@@ -151,18 +164,23 @@ export const useMemoryGraphStore = create<MemoryGraphState>()((set, get) => ({
       set({ querying: true });
       try {
         const hits = await memoryGraph.query(projectPath, query, 12);
+        if (generation !== queryGeneration || get().projectPath !== projectPath) return;
         set({
           results: hits,
           matchedIds: new Set(hits.map((h) => h.id)),
           querying: false,
         });
       } catch {
+        if (generation !== queryGeneration || get().projectPath !== projectPath) return;
         set({ querying: false });
       }
     },
 
     setQuery: (q) => set({ query: q }),
-    clearQuery: () => set({ query: "", results: [], matchedIds: new Set(), selectedId: null }),
+    clearQuery: () => {
+      queryGeneration++;
+      set({ query: "", querying: false, results: [], matchedIds: new Set(), selectedId: null });
+    },
     select: (id) => set({ selectedId: id }),
   },
 }));

@@ -519,7 +519,8 @@ fn check_entries(sources: &Sources, cwd: &str, entries: &[Entry]) -> Checked {
         let results: Vec<(Validity, Citation)> = match &sources.check {
             Some(check) => check(root.as_path(), cites.as_slice()),
             None => {
-                let r = atlas_memory::citation::FileResolver::new(&root);
+                let r =
+                    atlas_memory::citation::FileResolver::with_worktrees(&root, store.scope_dirs());
                 cites.iter().map(|c| default_cache().check(c, &r)).collect()
             }
         };
@@ -1303,5 +1304,6 @@ impl ServerHandler for MemoryTools {
 pub fn tenant(tools: MemoryTools) -> Tenant {
     let gate = tools.gate.clone();
     Tenant::new(MEMORY_SERVER_NAME, MCP_PATH, tools)
+        .advertising(crate::commands::tool_servers::tool_names(&tools_list()))
         .gated_by(gate, "shared memory is off for this project")
 }

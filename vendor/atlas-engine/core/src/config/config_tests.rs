@@ -3694,6 +3694,50 @@ async fn permissions_profiles_allow_unknown_special_paths_with_nested_entries()
 }
 
 #[tokio::test]
+async fn permissions_profiles_allow_unknown_special_paths_with_glob_entries() -> std::io::Result<()>
+{
+    let config = load_workspace_permission_profile(PermissionProfileToml {
+        description: None,
+        extends: None,
+        workspace_roots: None,
+        filesystem: Some(FilesystemPermissionsToml {
+            glob_scan_max_depth: None,
+            entries: BTreeMap::from([(
+                ":future_special_path".into(),
+                FilesystemPermissionToml::Scoped(BTreeMap::from([
+                    ("**/*.secret".into(), FileSystemAccessMode::Deny),
+                    ("docs/*/index".into(), FileSystemAccessMode::Read),
+                ])),
+            )]),
+        }),
+        network: None,
+    })
+    .await?;
+    let policy = config.permissions.file_system_sandbox_policy();
+    assert_eq!(policy.entries.len(), 2);
+    for (subpath, access) in [
+        ("**/*.secret", FileSystemAccessMode::Deny),
+        ("docs/*/index", FileSystemAccessMode::Read),
+    ] {
+        assert!(policy.entries.iter().any(|entry| entry.access == access
+            && entry.path
+                == FileSystemPath::Special {
+                    value: FileSystemSpecialPath::unknown(
+                        ":future_special_path",
+                        Some(subpath.into())
+                    ),
+                }));
+        assert!(
+            config
+                .startup_warnings
+                .iter()
+                .any(|warning| warning.contains(subpath) && warning.contains("will be ignored"))
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn permissions_profiles_allow_missing_filesystem_with_warning() -> std::io::Result<()> {
     let config = load_workspace_permission_profile(PermissionProfileToml {
         description: None,
@@ -5725,10 +5769,7 @@ async fn config_resolves_explicit_keyring_auth_store_mode() -> std::io::Result<(
 
     assert_eq!(
         config.cli_auth_credentials_store_mode,
-        resolve_cli_auth_credentials_store_mode(
-            AuthCredentialsStoreMode::Keyring,
-            env!("CARGO_PKG_VERSION"),
-        ),
+        AuthCredentialsStoreMode::Keyring,
     );
 
     Ok(())
@@ -5748,64 +5789,10 @@ async fn config_resolves_default_oauth_store_mode() -> std::io::Result<()> {
 
     assert_eq!(
         config.mcp_oauth_credentials_store_mode,
-        resolve_mcp_oauth_credentials_store_mode(
-            OAuthCredentialsStoreMode::Auto,
-            env!("CARGO_PKG_VERSION"),
-        ),
+        OAuthCredentialsStoreMode::Auto,
     );
 
     Ok(())
-}
-
-#[test]
-fn local_dev_builds_force_file_cli_auth_store_modes() {
-    assert_eq!(
-        resolve_cli_auth_credentials_store_mode(
-            AuthCredentialsStoreMode::Keyring,
-            LOCAL_DEV_BUILD_VERSION,
-        ),
-        AuthCredentialsStoreMode::File,
-    );
-    assert_eq!(
-        resolve_cli_auth_credentials_store_mode(
-            AuthCredentialsStoreMode::Auto,
-            LOCAL_DEV_BUILD_VERSION,
-        ),
-        AuthCredentialsStoreMode::File,
-    );
-    assert_eq!(
-        resolve_cli_auth_credentials_store_mode(
-            AuthCredentialsStoreMode::Ephemeral,
-            LOCAL_DEV_BUILD_VERSION,
-        ),
-        AuthCredentialsStoreMode::Ephemeral,
-    );
-    assert_eq!(
-        resolve_cli_auth_credentials_store_mode(AuthCredentialsStoreMode::Keyring, "1.2.3"),
-        AuthCredentialsStoreMode::Keyring,
-    );
-}
-
-#[test]
-fn local_dev_builds_force_file_mcp_oauth_store_modes() {
-    assert_eq!(
-        resolve_mcp_oauth_credentials_store_mode(
-            OAuthCredentialsStoreMode::Keyring,
-            LOCAL_DEV_BUILD_VERSION,
-        ),
-        OAuthCredentialsStoreMode::File,
-    );
-    assert_eq!(
-        resolve_mcp_oauth_credentials_store_mode(
-            OAuthCredentialsStoreMode::Auto,
-            LOCAL_DEV_BUILD_VERSION,
-        ),
-        OAuthCredentialsStoreMode::File,
-    );
-    assert_eq!(
-        resolve_mcp_oauth_credentials_store_mode(OAuthCredentialsStoreMode::Keyring, "1.2.3"),
-        OAuthCredentialsStoreMode::Keyring,
-    );
 }
 
 #[tokio::test]
@@ -6205,10 +6192,7 @@ async fn managed_config_overrides_oauth_store_mode() -> anyhow::Result<()> {
     .await?;
     assert_eq!(
         final_config.mcp_oauth_credentials_store_mode,
-        resolve_mcp_oauth_credentials_store_mode(
-            OAuthCredentialsStoreMode::Keyring,
-            env!("CARGO_PKG_VERSION"),
-        ),
+        OAuthCredentialsStoreMode::Keyring,
     );
 
     Ok(())

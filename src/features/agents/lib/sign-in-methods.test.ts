@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { AuthEnvStatus, AuthMethodWire } from "@/features/chat/lib/agents-api";
 
 import {
+  enteredEnvValues,
   envStatusLabel,
   isDocked,
   manualCommandFor,
@@ -99,6 +100,15 @@ describe("methodBlockedReason", () => {
     ).toBeNull();
   });
 
+  /// Audit #61: a variable that doesn't reach the agent can be typed in the
+  /// dialog, and a typed value is what unblocks Continue.
+  it("allows it once the missing var has a value typed for it", () => {
+    const m = method({ id: "k", kind: "env_var" });
+    const env = [envStatus({ methodId: "k", name: "GEMINI_API_KEY" })];
+    expect(methodBlockedReason(m, env, { GEMINI_API_KEY: "   " })).toContain("GEMINI_API_KEY");
+    expect(methodBlockedReason(m, env, { GEMINI_API_KEY: "k3y" })).toBeNull();
+  });
+
   it("blocks a terminal method with no runnable command", () => {
     expect(methodBlockedReason(method({ kind: "terminal" }), [])).toContain("could not find");
   });
@@ -183,5 +193,29 @@ describe("envStatusLabel", () => {
   it("tells an optional variable from a missing one", () => {
     expect(envStatusLabel(envStatus({ satisfied: false, optional: true }))).toBe("optional");
     expect(envStatusLabel(envStatus({ satisfied: false, optional: false }))).toBe("not set");
+  });
+});
+
+describe("enteredEnvValues", () => {
+  /// Audit #61: what Continue saves for the agent — only this method's
+  /// variables, only the ones typed, trimmed.
+  it("collects this method's typed values", () => {
+    const m = method({ id: "k", kind: "env_var" });
+    const env = [
+      envStatus({ methodId: "k", name: "API_KEY" }),
+      envStatus({ methodId: "k", name: "REGION", optional: true }),
+      envStatus({ methodId: "other", name: "OTHER_KEY" }),
+    ];
+    expect(enteredEnvValues(m, env, { API_KEY: " k3y ", REGION: "", OTHER_KEY: "x" })).toEqual([
+      { name: "API_KEY", value: "k3y" },
+    ]);
+  });
+});
+
+describe("envStatusLabel for an agent setting", () => {
+  it("names a variable set in the agent's own settings", () => {
+    expect(envStatusLabel(envStatus({ satisfied: true, source: "agent-settings" }))).toBe(
+      "set for this agent",
+    );
   });
 });

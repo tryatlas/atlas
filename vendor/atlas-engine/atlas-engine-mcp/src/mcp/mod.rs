@@ -518,10 +518,15 @@ fn normalize_atlas_apps_base_url(base_url: &str) -> String {
 
 fn atlas_apps_mcp_url_for_base_url(base_url: &str) -> String {
     let base_url = normalize_atlas_apps_base_url(base_url);
-    let base_url = if base_url.contains("/backend-api") || base_url.contains("/api/atlas-agent") {
+    // The hosted service's URL is a wire contract, independent of Atlas branding.
+    // Preserve an explicitly configured Atlas proxy prefix as well.
+    let base_url = if base_url.contains("/backend-api")
+        || base_url.contains("/api/codex")
+        || base_url.contains("/api/atlas-agent")
+    {
         base_url
     } else {
-        format!("{base_url}/api/atlas-agent")
+        format!("{base_url}/api/codex")
     };
     format!("{base_url}/ps/mcp")
 }

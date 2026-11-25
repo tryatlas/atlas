@@ -12,6 +12,7 @@
 // panel. Hovering it lists them all, stacks indented under their base.
 // ⌘-click (Ctrl elsewhere) opens the pull request on GitHub instead.
 
+import { isMac } from "@/lib/platform";
 import { useState, type ComponentProps, type MouseEvent, type ReactNode } from "react";
 import { Layers } from "lucide-react";
 
@@ -128,7 +129,7 @@ export function SessionPullRequestBadge({
         openOnHover
         delay={250}
         closeDelay={120}
-        aria-label={`${label}. ${several ? "Open the session's pull requests" : "Open it"}; ⌘-click opens on GitHub`}
+        aria-label={`${label}. ${several ? "Open the session's pull requests" : "Open it"}; ${isMac ? "⌘" : "Ctrl"}-click opens on GitHub`}
         onPointerDown={stop}
         onClick={onClick}
         render={<BadgeButton className={tone} />}
@@ -175,7 +176,7 @@ function PullRequestMiniList({
             <button
               type="button"
               aria-label={`${linkLabel(link)} — open`}
-              title={`${link.url}\n${LINK_SOURCE_LABEL[link.source]} · ⌘-click opens on GitHub`}
+              title={`${link.url}\n${LINK_SOURCE_LABEL[link.source]} · ${isMac ? "⌘" : "Ctrl"}-click opens on GitHub`}
               onClick={(event) => onOpen(link, wantsHost(event))}
               className="flex w-full min-w-0 cursor-pointer items-center gap-2 rounded-sm px-1.5 py-1 text-left text-xs hover:bg-element-hover focus-visible:bg-element-hover focus-visible:outline-none"
             >

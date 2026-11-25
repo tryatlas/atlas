@@ -26,6 +26,17 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tempfile::TempDir;
 
+// Use the fixture as the user home as well as engine home. Production resolves
+// ~/.agents/skills, but a test must not import the developer's installed skills.
+fn isolated_skills_service(
+    atlas_agent_home: AbsolutePathBuf,
+    bundled_skills_enabled: bool,
+) -> HostSkillsService {
+    let mut service = HostSkillsService::new(atlas_agent_home.clone(), bundled_skills_enabled);
+    service.home_dir = Some(atlas_agent_home);
+    service
+}
+
 #[derive(Default)]
 struct TestPluginSkillSnapshotCache {
     snapshots: Mutex<HashMap<PluginSkillRoot, LoadedSkillRoot>>,
@@ -182,11 +193,30 @@ async fn skills_for_config_with_stack(
 }
 
 #[tokio::test]
+async fn watchable_roots_include_the_first_project_skills_directory_before_creation() {
+    let engine_home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    fs::create_dir(cwd.path().join(".git")).unwrap();
+    let service = isolated_skills_service(engine_home.path().abs(), false);
+    let input =
+        HostSkillsLoadInput::new(cwd.path().abs(), Vec::new(), config_stack(&engine_home, ""));
+    let root = cwd.path().join(".agents/skills").abs();
+    assert!(!root.exists());
+    let roots = service
+        .watchable_skill_root_paths(&input, Arc::clone(&LOCAL_FS))
+        .await;
+    assert!(
+        roots.contains(&root),
+        "missing project skill roots need ancestor watches: {roots:?}"
+    );
+}
+
+#[tokio::test]
 async fn skills_for_config_reuses_cache_for_same_effective_config() {
     let atlas_agent_home = tempfile::tempdir().expect("tempdir");
     let cwd = tempfile::tempdir().expect("tempdir");
     let config_layer_stack = config_stack(&atlas_agent_home, "");
-    let skills_service = HostSkillsService::new(
+    let skills_service = isolated_skills_service(
         atlas_agent_home.path().abs(),
         /*bundled_skills_enabled*/ true,
     );
@@ -227,7 +257,7 @@ async fn watchable_skill_root_paths_exclude_plugin_and_system_roots() {
         vec![plugin_skill_root.clone()],
         config_layer_stack,
     );
-    let skills_service = HostSkillsService::new(
+    let skills_service = isolated_skills_service(
         atlas_agent_home.path().abs(),
         /*bundled_skills_enabled*/ true,
     );
@@ -267,7 +297,7 @@ async fn snapshot_for_config_merges_extension_host_and_legacy_plugin_roots() {
         vec![plugin_skill_root],
         config_layer_stack,
     );
-    let skills_service = HostSkillsService::new(
+    let skills_service = isolated_skills_service(
         atlas_agent_home.path().abs(),
         /*bundled_skills_enabled*/ false,
     );
@@ -311,7 +341,7 @@ async fn snapshot_for_config_preserves_host_precedence_for_symlinked_plugin_root
     )
     .expect("symlink user skills root to plugin skills root");
     let config_layer_stack = config_stack(&atlas_agent_home, "[skills.bundled]\nenabled = false\n");
-    let skills_service = HostSkillsService::new(
+    let skills_service = isolated_skills_service(
         atlas_agent_home.path().abs(),
         /*bundled_skills_enabled*/ false,
     );
@@ -354,7 +384,7 @@ async fn skills_list_snapshots_share_host_roots_only_within_one_request() {
         &atlas_agent_home,
         &name_toggle_config("first-skill", /*enabled*/ false),
     );
-    let skills_service = HostSkillsService::new(
+    let skills_service = isolated_skills_service(
         atlas_agent_home.path().abs(),
         /*bundled_skills_enabled*/ true,
     );
@@ -424,7 +454,7 @@ async fn skills_for_config_refreshes_cache_when_remote_plugin_id_changes() {
     let config_layer_stack = config_stack(&atlas_agent_home, "");
     let mut plugin_skill_root =
         plugin_skill_root_for_skill_path(&skill_path, "sample@test", "sample");
-    let skills_service = HostSkillsService::new(
+    let skills_service = isolated_skills_service(
         atlas_agent_home.path().abs(),
         /*bundled_skills_enabled*/ true,
     );
@@ -497,7 +527,7 @@ async fn set_extra_roots_replaces_runtime_roots_and_clears_cache() {
     let cwd = tempfile::tempdir().expect("tempdir");
     let extra_root = tempfile::tempdir().expect("tempdir");
     let config_layer_stack = config_stack(&atlas_agent_home, "");
-    let skills_service = HostSkillsService::new(
+    let skills_service = isolated_skills_service(
         atlas_agent_home.path().abs(),
         /*bundled_skills_enabled*/ true,
     );
@@ -571,7 +601,7 @@ async fn set_extra_roots_applies_to_config_loads_and_empty_clears() {
     let cwd = tempfile::tempdir().expect("tempdir");
     let extra_root = tempfile::tempdir().expect("tempdir");
     let config_layer_stack = config_stack(&atlas_agent_home, "");
-    let skills_service = HostSkillsService::new(
+    let skills_service = isolated_skills_service(
         atlas_agent_home.path().abs(),
         /*bundled_skills_enabled*/ true,
     );
@@ -633,7 +663,7 @@ async fn skills_for_config_disables_plugin_skills_by_name() {
     );
     let plugin_skill_root =
         plugin_skill_root_for_skill_path(&skill_path, "test-plugin@test", "sample");
-    let skills_service = HostSkillsService::new(
+    let skills_service = isolated_skills_service(
         atlas_agent_home.path().abs(),
         /*bundled_skills_enabled*/ true,
     );
@@ -700,7 +730,7 @@ async fn skills_for_cwd_loads_repo_and_user_roots_with_local_fs() {
     .expect("valid config layer stack");
     let skills_input =
         HostSkillsLoadInput::new(cwd.path().abs(), Vec::new(), config_layer_stack.clone());
-    let skills_service = HostSkillsService::new(
+    let skills_service = isolated_skills_service(
         atlas_agent_home.path().abs(),
         /*bundled_skills_enabled*/ true,
     );
@@ -772,7 +802,7 @@ async fn skills_for_cwd_without_fs_skips_repo_roots() {
     .expect("valid config layer stack");
     let skills_input =
         HostSkillsLoadInput::new(cwd.path().abs(), Vec::new(), config_layer_stack.clone());
-    let skills_service = HostSkillsService::new(
+    let skills_service = isolated_skills_service(
         atlas_agent_home.path().abs(),
         /*bundled_skills_enabled*/ true,
     );
@@ -809,7 +839,7 @@ async fn skills_for_config_excludes_bundled_skills_when_disabled_in_config() {
     )
     .expect("write bundled skill");
     let config_layer_stack = config_stack(&atlas_agent_home, "[skills.bundled]\nenabled = false\n");
-    let skills_service = HostSkillsService::new(
+    let skills_service = isolated_skills_service(
         atlas_agent_home.path().abs(),
         /*bundled_skills_enabled*/ false,
     );
@@ -835,7 +865,7 @@ async fn skills_for_cwd_uses_cached_result_until_force_reload() {
     let atlas_agent_home = tempfile::tempdir().expect("tempdir");
     let cwd = tempfile::tempdir().expect("tempdir");
     let config_layer_stack = config_stack(&atlas_agent_home, "");
-    let skills_service = HostSkillsService::new(
+    let skills_service = isolated_skills_service(
         atlas_agent_home.path().abs(),
         /*bundled_skills_enabled*/ true,
     );
@@ -920,7 +950,7 @@ async fn skills_for_config_ignores_cwd_cache_when_session_flags_reenable_skill()
         &disabled_skill_config,
         &enabled_skill_config,
     );
-    let skills_service = HostSkillsService::new(
+    let skills_service = isolated_skills_service(
         atlas_agent_home.path().abs(),
         /*bundled_skills_enabled*/ true,
     );

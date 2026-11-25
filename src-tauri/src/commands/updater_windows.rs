@@ -213,12 +213,12 @@ pub(super) async fn update_check_now(app: AppHandle) -> Result<UpdateStatus, Str
     emit_checking(&app, true);
     let cfg = fetch_remote(&app).await;
     emit_checking(&app, false);
-    let available = cfg
-        .as_ref()
-        .map(|c| is_newer(&c.version, CURRENT_VERSION))
-        .unwrap_or(false);
-    let version = cfg.as_ref().map(|c| c.version.clone());
-    if let Some(cfg) = cfg.filter(|_| available) {
+    let cfg = cfg.ok_or_else(|| {
+        "Could not retrieve update information. Try again in a moment.".to_string()
+    })?;
+    let available = is_newer(&cfg.version, CURRENT_VERSION);
+    let version = Some(cfg.version.clone());
+    if available {
         maybe_start_update(&app, cfg).await;
     }
     Ok(UpdateStatus {

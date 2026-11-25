@@ -29,9 +29,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { tauri } from "@/test/tauri-fake";
 import { useAiGrantStore } from "../stores/ai-grant-store";
 import { useChatStore } from "../stores/chat-store";
-import { useLiveElsewhereStore } from "../stores/live-elsewhere-store";
 import { pluginIdForAgent } from "@/types/agent";
 import { resetAgent } from "../lib/agents-api";
+import { restartFailedNotice } from "../lib/agent-rebind";
 import { ChatPanel } from "./chat-panel";
 import { emitWindowEvent } from "@/lib/window-events";
 
@@ -102,7 +102,6 @@ beforeEach(() => {
     activeSessionId: null,
   });
   store().actions.createSession(TAB, "claude-code");
-  useLiveElsewhereStore.setState({ live: {}, overridden: {} });
   useAiGrantStore.setState({ entitlement: null });
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
@@ -188,7 +187,7 @@ describe("a bind that fails", () => {
   // queue and dropped the status to idle, the drain read that edge as a turn
   // ending and sent the message back into the unbound tab, which re-held it
   // and kicked the bind again: 491 connect attempts in a minute.
-  it("does not re-enter: the message is parked once and nothing connects again", async () => {
+  it("does not re-enter: the message stays held and nothing connects again", async () => {
     tauri.handleRaw({
       agents_spawn: () => {
         throw new Error("engine start refused");
@@ -199,10 +198,11 @@ describe("a bind that fails", () => {
     chatSend("hello");
     await waitFor(() => expect(session().pendingSend?.content).toBe("hello"));
 
-    // The first failure is retried once, quietly; the second parks the message.
-    await waitFor(() => expect(queue()).toEqual(["hello"]), { timeout: 4000 });
-    expect(session().pendingSend).toBeUndefined();
-    expect(session().status).toBe("idle");
+    // The first failure is retried once, quietly; the second leaves the
+    // message held, idle, as its one bubble: the next bind that lands sends it
+    // with its images, which the queue it used to be parked in dropped.
+    await waitFor(() => expect(session().status).toBe("idle"), { timeout: 4000 });
+    expect(session().pendingSend?.content).toBe("hello");
     const connects = count("agents_spawn");
 
     await settle(300);
@@ -210,7 +210,7 @@ describe("a bind that fails", () => {
     expect(connects).toBeLessThanOrEqual(3);
     expect(count("agents_send")).toBe(0);
     expect(userBubbles()).toHaveLength(1);
-    expect(queue()).toEqual(["hello"]);
+    expect(queue()).toEqual([]);
   });
 });
 
@@ -367,27 +367,20 @@ describe("the gates a send from outside the composer meets", () => {
     });
   });
 
-  it("live elsewhere: a held first message stays held, recorded once, until Send anyway", async () => {
+  it("a held first message goes out once the resume lands, recorded once", async () => {
     useChatStore.setState((s) => {
       s.sessions[TAB].resumePending = true;
     });
     mount();
     chatSend("first");
     await waitFor(() => expect(session().pendingSend?.content).toBe("first"));
+    expect(count("agents_send")).toBe(0);
 
-    // The resume lands on a session another process is writing.
     act(() => {
-      useLiveElsewhereStore.getState().actions.setLive([SESSION]);
       useChatStore.setState((s) => {
         s.sessions[TAB].resumePending = false;
       });
     });
-    await settle();
-    expect(count("agents_send")).toBe(0);
-    expect(session().pendingSend?.content).toBe("first");
-    expect(userBubbles()).toHaveLength(1);
-
-    act(() => useLiveElsewhereStore.getState().actions.sendAnyway(SESSION));
     await waitFor(() => expect(sentTexts()).toEqual(["first"]));
     expect(userBubbles()).toHaveLength(1);
   });
@@ -461,11 +454,15 @@ describe("what the queue survives", () => {
     });
     mount();
     chatSend("hello");
+    // The message stays, as the user's bubble and held for the next restart,
+    // and the chat says why in the backend's words, not a guess at the cause.
     await waitFor(() =>
       expect(session().messages.map((m) => m.content)).toEqual([
-        "The agent could not be restarted. Check its runtime (Node/npx) and try again.",
+        "hello",
+        restartFailedNotice("no runtime"),
       ]),
     );
+    expect(session().pendingSend?.content).toBe("hello");
     expect(count("agents_send")).toBe(0);
   });
 

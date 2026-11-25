@@ -16,6 +16,7 @@
  * parsed, we keep the JSON so the next visit doesn't pay parse cost.
  */
 import type { JSONContent } from "@tiptap/core";
+import { isDocumentDirty } from "./document-saves";
 
 const cache = new Map<string, JSONContent>();
 
@@ -33,4 +34,9 @@ export function dropCachedDoc(id: string): void {
 
 export function clearDocCache(): void {
   cache.clear();
+}
+
+/** Release stale parsed views on project changes while retaining failed saves. */
+export function clearCleanDocCache(): void {
+  for (const id of cache.keys()) if (!isDocumentDirty(id)) cache.delete(id);
 }

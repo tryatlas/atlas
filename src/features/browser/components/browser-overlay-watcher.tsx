@@ -24,7 +24,7 @@ const TOOLTIP_SELECTOR =
   '[role="tooltip"], [data-slot="tooltip-content"], [data-slot="tooltip-arrow"]';
 
 const OVERLAY_SELECTOR =
-  '[role="dialog"], [role="menu"], [role="listbox"], [data-hint-overlay], [data-browser-suppress], [data-overlay], [data-modal], [data-open][data-side]';
+  '[role="dialog"], [role="menu"], [data-hint-overlay], [data-browser-suppress], [data-overlay], [data-modal], [data-open][data-side]';
 
 export function BrowserOverlayWatcher() {
   const embedCount = useBrowserOverlayStore((s) => s.embedCount);
@@ -39,7 +39,10 @@ export function BrowserOverlayWatcher() {
       const overlays = document.querySelectorAll(OVERLAY_SELECTOR);
       setOverlayOpen(
         Array.from(overlays).some(
-          (el) => !el.closest(TOOLTIP_SELECTOR) && !el.querySelector(TOOLTIP_SELECTOR),
+          (el) =>
+            !el.closest('[hidden], [inert], [aria-hidden="true"]') &&
+            !el.closest(TOOLTIP_SELECTOR) &&
+            !el.querySelector(TOOLTIP_SELECTOR),
         ),
       );
     };

@@ -203,6 +203,44 @@ fn lockfile_bump_to_safe_version_has_no_findings_and_lists_floor() {
 }
 
 #[test]
+fn shipping_after_a_dependency_fix_retires_the_old_blocker() {
+    use atlas_security::view::{ship_overview, ShipScan};
+    let (_dir, db) = foo_db();
+    let vulnerable = run(&lock_bump_repo("1.0.0", "1.3.0"), Some(&db), soon());
+    let fixed = run(&lock_bump_repo("1.3.0", "1.4.2"), Some(&db), soon());
+    let scans = [
+        ShipScan {
+            commit_sha: "vulnerable".to_string(),
+            result: vulnerable,
+        },
+        ShipScan {
+            commit_sha: "fixed".to_string(),
+            result: fixed,
+        },
+    ];
+    let head = cargo_lock("1.4.2");
+    let overview = ship_overview(
+        "main",
+        &scans,
+        &|path| (path == "Cargo.lock").then(|| head.clone()),
+        &std::collections::HashSet::new(),
+    );
+    assert!(!overview.blocking);
+    assert!(overview.open.is_empty());
+    assert_eq!(overview.fixed.len(), 1);
+
+    let still_vulnerable = cargo_lock("1.3.0");
+    let overview = ship_overview(
+        "main",
+        &scans,
+        &|path| (path == "Cargo.lock").then(|| still_vulnerable.clone()),
+        &std::collections::HashSet::new(),
+    );
+    assert!(overview.blocking);
+    assert_eq!(overview.open.len(), 1);
+}
+
+#[test]
 fn lockfile_bump_without_db_reports_deps_not_run() {
     let res = run(&lock_bump_repo("1.0.0", "1.3.0"), None, soon());
     assert!(

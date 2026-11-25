@@ -211,7 +211,7 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
         let shutdown_notify = shutdown_notify.clone();
         let server = server;
         tokio::spawn(async move {
-            let mut callback_result = LoginCallbackResult::default();
+            let mut callback_result = None;
             let result = loop {
                 tokio::select! {
                     _ = shutdown_notify.notified() => {
@@ -240,7 +240,7 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
                                 None
                             }
                             HandledRequest::RedirectWithHeader { header, result } => {
-                                callback_result = result;
+                                callback_result = Some(result);
                                 let redirect = Response::empty(302).with_header(header);
                                 let _ = tokio::task::spawn_blocking(move || req.respond(redirect)).await;
                                 None
@@ -250,6 +250,14 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
                                 body,
                                 result,
                             } => {
+                                // A success page is only a continuation of an
+                                // accepted OAuth callback, never proof of login.
+                                if result.is_ok() && callback_result.is_none() {
+                                    let _ = tokio::task::spawn_blocking(move || req.respond(
+                                        Response::from_string("Sign-in has not completed").with_status_code(400),
+                                    )).await;
+                                    continue;
+                                }
                                 let _ = tokio::task::spawn_blocking(move || {
                                     send_response_with_disconnect(
                                         req,
@@ -259,7 +267,7 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
                                     )
                                 })
                                 .await;
-                                Some(result.map(|()| callback_result))
+                                Some(result.and_then(|()| callback_result.ok_or_else(|| io::Error::other("Sign-in has not completed"))))
                             }
                             HandledRequest::RedirectAndExit { header, result } => {
                                 match tokio::task::spawn_blocking(move || {
@@ -995,9 +1003,10 @@ fn is_missing_atlas_engine_entitlement_error(
 ) -> bool {
     error_code == "access_denied"
         && error_description.is_some_and(|description| {
-            description
-                .to_ascii_lowercase()
-                .contains("missing_atlas_engine_entitlement")
+            let description = description.to_ascii_lowercase();
+            // OAuth error identifiers belong to the issuer, not to UI branding.
+            description.contains("missing_codex_entitlement")
+                || description.contains("missing_atlas_engine_entitlement")
         })
 }
 
@@ -1304,21 +1313,26 @@ mod tests {
 
     #[test]
     fn render_login_error_page_uses_entitlement_copy() {
-        let error_description = Some("missing_atlas_engine_entitlement");
-        assert!(is_missing_atlas_engine_entitlement_error(
-            "access_denied",
-            error_description
-        ));
+        for description in [
+            "missing_codex_entitlement",
+            "missing_atlas_engine_entitlement",
+        ] {
+            let error_description = Some(description);
+            assert!(is_missing_atlas_engine_entitlement_error(
+                "access_denied",
+                error_description
+            ));
 
-        let body = String::from_utf8(render_login_error_page(
-            "access denied",
-            Some("access_denied"),
-            error_description,
-        ))
-        .expect("login error page should be utf-8");
+            let body = String::from_utf8(render_login_error_page(
+                "access denied",
+                Some("access_denied"),
+                error_description,
+            ))
+            .expect("login error page should be utf-8");
 
-        assert!(body.contains("You do not have access to Atlas Agent"));
-        assert!(body.contains("Contact your workspace administrator"));
-        assert!(!body.contains("missing_atlas_engine_entitlement"));
+            assert!(body.contains("You do not have access to Atlas Agent"));
+            assert!(body.contains("Contact your workspace administrator"));
+            assert!(!body.contains(description));
+        }
     }
 }

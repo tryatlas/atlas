@@ -342,6 +342,9 @@ if [ "${VERIFY_INSTALL:-0}" = "1" ]; then
     fi
     if [ -n "$RPM" ]; then
       install_check "fedora:latest" "$RPM" "dnf install -y -q" "dnf remove -y -q tryatlas"
+      install_check "rockylinux:10" "$RPM" \
+        "dnf install -y -q dnf-plugins-core epel-release >/dev/null && dnf config-manager --set-enabled crb && dnf install -y -q" \
+        "dnf remove -y -q tryatlas"
     fi
     if [ -n "$ARCHPKG" ] && [ "$EXPECT_ARCH" = "x86_64" ]; then
       # Arch Linux ARM has no official image; the x86-64 package is the one

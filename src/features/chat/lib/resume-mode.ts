@@ -32,6 +32,7 @@ import {
 } from "@/types/agent";
 import { sessionConfiguration, useChatStore } from "../stores/chat-store";
 import { loadLastModePref, saveLastModePref } from "./last-mode-pref";
+import { onClaudeModeList } from "./session-configuration";
 
 export { resolveEffectiveMode } from "./session-configuration";
 
@@ -47,7 +48,8 @@ export { resolveEffectiveMode } from "./session-configuration";
  */
 function requestedMode(tabId: string): { isClaude: boolean; requested: string | undefined } {
   const session = useChatStore.getState().sessions[tabId];
-  const isClaude = session?.agentType === "claude-code";
+  // Which record holds the pick is the session's own, not its agent's id.
+  const isClaude = onClaudeModeList(session);
   if (!session) return { isClaude, requested: undefined };
   if (session.unrestoredModeId) return { isClaude, requested: session.unrestoredModeId };
   const pref = session.agentType ? loadLastModePref(session.agentType) : null;
@@ -114,6 +116,7 @@ export async function applyModeOnResume(
   tabId: string,
   key: SessionKey,
   snapshot: SessionSnapshot,
+  stillCurrent: () => boolean = () => true,
 ): Promise<void> {
   const { isClaude, requested } = requestedMode(tabId);
   // The same call a new session makes (`session-bind.ts`), so a mode means
@@ -124,6 +127,7 @@ export async function applyModeOnResume(
     snapshot,
   );
 
+  if (!stillCurrent()) return;
   forgetStalePref(
     useChatStore.getState().sessions[tabId]?.agentType,
     requested,

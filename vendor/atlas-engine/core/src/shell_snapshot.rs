@@ -40,6 +40,9 @@ struct ShellSnapshotConfig {
 
 pub(crate) struct ShellSnapshotFile {
     path: AbsolutePathBuf,
+    // A live session may have no rollout yet. The lease protects its snapshot
+    // across cleanup by other sessions and other engine processes.
+    _lease: std::fs::File,
 }
 
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -168,6 +171,19 @@ impl ShellSnapshot {
             temp_path.display()
         );
 
+        let lease = match fs::File::open(&temp_path).await {
+            Ok(file) => file.into_std().await,
+            Err(error) => {
+                tracing::warn!("Failed to open shell snapshot lease: {error}");
+                remove_snapshot_file(&temp_path).await;
+                return Err("write_failed");
+            }
+        };
+        if let Err(error) = lease.try_lock_shared() {
+            tracing::warn!("Failed to lease shell snapshot: {error}");
+            remove_snapshot_file(&temp_path).await;
+            return Err("write_failed");
+        }
         if let Err(err) = validate_snapshot(shell, &temp_path, session_cwd).await {
             tracing::error!("Shell snapshot validation failed: {err:?}");
             remove_snapshot_file(&temp_path).await;
@@ -180,7 +196,10 @@ impl ShellSnapshot {
             return Err("write_failed");
         }
 
-        Ok(ShellSnapshotFile { path })
+        Ok(ShellSnapshotFile {
+            path,
+            _lease: lease,
+        })
     }
 }
 
@@ -292,6 +311,9 @@ async fn run_script_with_timeout(
     // Handler is kept as guard to control the drop. The `mut` pattern is required because .args()
     // returns a ref of handler.
     let mut handler = Command::new(&args[0]);
+    handler
+        .env_clear()
+        .envs(atlas_engine_protocol::shell_environment::host_environment());
     atlas_engine_protocol::shell_environment::scrub_non_inheritable_env_vars(handler.as_std_mut());
     handler.args(&args[1..]);
     handler.stdin(Stdio::null());
@@ -512,9 +534,8 @@ $envVars | ForEach-Object {
 "##
 }
 
-/// Removes shell snapshots that either lack a matching session rollout file or
-/// whose rollouts have not been updated within the retention window.
-/// The active session id is exempt from cleanup.
+/// Removes unleased snapshots whose rollout or orphan file is past retention.
+/// Live session leases and the active session id are exempt from cleanup.
 pub async fn cleanup_stale_snapshots(
     atlas_agent_home: &AbsolutePathBuf,
     active_session_id: ThreadId,
@@ -548,10 +569,34 @@ pub async fn cleanup_stale_snapshots(
             continue;
         }
 
+        let lease = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .await
+        {
+            Ok(file) => file.into_std().await,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if lease.try_lock().is_err() {
+            continue;
+        }
+
         let rollout_path =
             find_thread_path_by_id_str(atlas_agent_home, session_id, state_db.as_deref()).await?;
         let Some(rollout_path) = rollout_path else {
-            remove_snapshot_file(&path).await;
+            // Covers the short write-to-lease gap and sessions that never sent
+            // a message. Only abandoned, old files are eligible for removal.
+            if lease
+                .metadata()?
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= SNAPSHOT_RETENTION)
+            {
+                remove_snapshot_file(&path).await;
+            }
             continue;
         };
 

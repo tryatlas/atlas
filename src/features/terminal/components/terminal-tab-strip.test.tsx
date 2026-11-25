@@ -61,7 +61,7 @@ describe("TerminalTabStrip", () => {
     expect(event.defaultPrevented).toBe(true);
   });
 
-  it("closes tab on middle-click (auxclick with button 1)", () => {
+  it.each(["auxclick", "click"])("closes once on middle-click followed by %s", (clickEvent) => {
     useTerminalStore.setState((s) => {
       s.tabs["tab1"] = {
         root: { id: "p1", type: "pane", terminals: ["t1", "t2"], activeTerminalId: "t1" },
@@ -86,7 +86,8 @@ describe("TerminalTabStrip", () => {
     expect(tabs.length).toBe(2);
 
     fireEvent.mouseDown(tabs[0], { button: 1 });
-    fireEvent(tabs[0], new MouseEvent("auxclick", { button: 1, bubbles: true }));
+    fireEvent.mouseUp(tabs[0], { button: 1 });
+    fireEvent(tabs[0], new MouseEvent(clickEvent, { button: 1, bubbles: true }));
 
     const tabState = useTerminalStore.getState().tabs["tab1"];
     expect((tabState.root as PaneNode).terminals).toEqual(["t2"]);
@@ -113,6 +114,7 @@ describe("TerminalTabStrip", () => {
 
     const tab = getByRole("tab");
     fireEvent.mouseDown(tab, { button: 1 });
+    fireEvent.mouseUp(tab, { button: 1 });
     fireEvent(tab, new MouseEvent("auxclick", { button: 1, bubbles: true }));
 
     const tabState = useTerminalStore.getState().tabs["tab1"];

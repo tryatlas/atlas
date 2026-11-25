@@ -42,6 +42,27 @@ fn assistant_output_text(text: &str) -> ResponseItem {
 
 #[test]
 fn post_sampling_token_estimate_is_disabled_by_always_on_sinks() {
+    const CHILD_ENV: &str = "ATLAS_TEST_POST_SAMPLING_FILTER_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        // Other tests install global tracing subscribers. The interest cache includes
+        // those subscribers even while this test uses a thread-local default.
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "session::turn::tests::post_sampling_token_estimate_is_disabled_by_always_on_sinks",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("run the filter check in an isolated process");
+        assert!(
+            output.status.success(),
+            "filter check failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let feedback = atlas_engine_feedback::AtlasEngineFeedback::new();
     let subscriber = tracing_subscriber::registry()
         .with(feedback.logger_layer())

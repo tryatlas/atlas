@@ -65,8 +65,8 @@ use uuid::Uuid;
 /// Bridge the stack's deltas to the Tauri host's outbound concerns.
 ///
 /// The sink body is an ordered [`OutboundPipeline`] of small, independently
-/// testable middleware (window broadcast → analytics → capture → transcript →
-/// memory ingest) rather than one monolithic `emit`. An in-process consumer
+/// testable middleware (window broadcast → analytics → transcript → memory
+/// ingest, then capture) rather than one monolithic `emit`. An in-process consumer
 /// is a tap on the last stage, not a subscription beside the pipeline.
 pub struct TauriDeltaSink {
     inner: Arc<SinkInner>,
@@ -74,6 +74,7 @@ pub struct TauriDeltaSink {
 
 struct SinkInner {
     pipeline: OutboundPipeline<SessionDeltaEnvelope>,
+    capture: super::capture::CaptureMiddleware,
     /// Names the turns a sleep of the computer interrupted. Read on every
     /// delta, BEFORE it travels, so the notice reaches every stage ahead of
     /// the failure it explains; and on a tick, for a turn that wakes silent.
@@ -89,11 +90,18 @@ struct SinkInner {
 
 impl SinkInner {
     fn run(&self, envelope: &SessionDeltaEnvelope) {
-        let _order = self.delivery.lock();
-        for notice in self.sleep.observe(envelope) {
-            self.pipeline.run(&notice);
+        {
+            let _order = self.delivery.lock();
+            for notice in self.sleep.observe(envelope) {
+                self.pipeline.run(&notice);
+            }
+            self.pipeline.run(envelope);
         }
-        self.pipeline.run(envelope);
+        // The projector holds this session's emit order and drains on the
+        // blocking pool. Snapshot files here, before returning that event, so
+        // a long import cannot cause later human edits to be attributed to it.
+        // No other session or sleep notice waits for these filesystem probes.
+        self.capture.on_event(envelope);
     }
 }
 
@@ -104,14 +112,6 @@ impl TauriDeltaSink {
             .with(Arc::new(BroadcastMiddleware::new(app.clone())))
             .with(Arc::new(AnalyticsMiddleware { app: app.clone() }))
             .with(Arc::new(KeepAwakeMiddleware { app: app.clone() }))
-            // Session capture is a stage here rather than a subscriber to a
-            // broadcast because a broadcast drops events for a lagging
-            // subscriber, and a dropped event is a turn missing from the
-            // permanent record. This stage only
-            // enqueues; all disk work happens on the capture worker thread.
-            .with(Arc::new(super::capture::CaptureMiddleware {
-                app: app.clone(),
-            }))
             // Atlas-owned transcripts for agents that keep none — what makes
             // an opencode / gemini session still exist in the sidebar after
             // the live session goes away. Always on and agent-agnostic,
@@ -128,6 +128,9 @@ impl TauriDeltaSink {
             }));
         let inner = Arc::new(SinkInner {
             pipeline,
+            // Lossless final stage, outside the app-wide sleep ordering lock.
+            // Its event-time snapshots precede enqueueing durable work.
+            capture: super::capture::CaptureMiddleware { app },
             sleep,
             delivery: parking_lot::Mutex::new(()),
         });
@@ -526,17 +529,13 @@ impl TranscriptMiddleware {
         let state = self
             .app
             .state::<Arc<super::agent_transcript::TranscriptState>>();
-        let Some(snapshot) = state.snapshot(session_id) else {
+        if !state.is_recording(session_id) {
             return;
-        };
-        // Disk write off the emit thread — same discipline as memory ingest.
-        let app = self.app.clone();
+        }
+        let state = state.inner().clone();
+        let session_id = session_id.to_owned();
         tauri::async_runtime::spawn_blocking(move || {
-            let dir = app
-                .path()
-                .app_config_dir()
-                .unwrap_or_else(|_| std::env::temp_dir());
-            if let Err(e) = super::agent_transcript::save(&dir, &snapshot) {
+            if let Err(e) = state.save_latest(&session_id) {
                 tracing::warn!(target: "atlas::agent_transcript", "save failed: {e}");
             }
         });
@@ -688,6 +687,17 @@ impl OutboundMiddleware<SessionDeltaEnvelope> for MemoryIngestMiddleware {
             }
         }
 
+        if matches!(envelope.delta, SessionDelta::AgentDisconnected { .. }) {
+            if let Some(meta) = meta.clone() {
+                let store = store.inner().clone();
+                let session_id = session_id.clone();
+                // Behind every earlier ingest job; a rebind's newer routing
+                // token is retained if it arrived while the queue drained.
+                self.queue
+                    .push(move || store.unregister_session(&session_id, &meta));
+            }
+        }
+
         if is_turn_finished {
             // Site B — the extractor's turn-finished pass, for every agent
             // (`super::memory_extract`). The conversation is read now, off the
@@ -806,14 +816,9 @@ fn auto_settle_tick(app: &AppHandle, host: &Arc<AgentHost>) {
     if days == 0 {
         return;
     }
-    // Each candidate is judged by its own project's transcripts, read now:
-    // the session watcher only covers the project the sidebar has open.
     let keep_pull_requests = crate::state::atlas_config::read(app).auto_settle_keep_pull_requests;
-    match host.auto_settle_idle_keeping(
-        chrono::Duration::days(i64::from(days)),
-        &super::session_watcher::activity_in,
-        keep_pull_requests,
-    ) {
+    match host.auto_settle_idle_keeping(chrono::Duration::days(i64::from(days)), keep_pull_requests)
+    {
         Ok(0) => {}
         Ok(settled) => {
             tracing::debug!(settled, days, "auto-settled idle sessions");
@@ -947,6 +952,7 @@ enum LifecycleWrite {
     },
     Ended {
         session_id: String,
+        agent: String,
     },
 }
 
@@ -975,9 +981,9 @@ impl SharingGatedLifecycle {
                                 memory.session_started(&session_id, &agent, &cwd);
                             }
                         }
-                        LifecycleWrite::Ended { session_id } => {
+                        LifecycleWrite::Ended { session_id, agent } => {
                             // Its bridge's token file, dead with its token.
-                            token_files.session_ended(&session_id);
+                            token_files.session_ended(&agent, &session_id);
                             // The end-of-session extraction, queued behind the
                             // session's last turn-finished pass.
                             if let Some(ended) = memory.session_ended(&session_id) {
@@ -1041,8 +1047,12 @@ impl super::agent_host::SessionLifecycle for SharingGatedLifecycle {
         });
     }
 
-    fn session_ended(&self, session_id: &str) {
-        super::agent_host::SessionLifecycle::session_ended(&**self.server.tokens(), session_id);
+    fn session_ended(&self, session_id: &str, agent: &str) {
+        super::agent_host::SessionLifecycle::session_ended(
+            &**self.server.tokens(),
+            session_id,
+            agent,
+        );
         if let Some(keep_awake) = &self.keep_awake {
             keep_awake.session_ended(session_id);
         }
@@ -1052,6 +1062,7 @@ impl super::agent_host::SessionLifecycle for SharingGatedLifecycle {
         self.clocks.forget(session_id);
         self.queue(LifecycleWrite::Ended {
             session_id: session_id.to_string(),
+            agent: agent.to_string(),
         });
     }
 }
@@ -1111,11 +1122,14 @@ pub fn install_manager(app: &AppHandle) {
         AgentHost::new(sink, config_dir, store.clone(), registry.clone())
     };
     app.manage(host.clone());
+    let capture_app = app.clone();
+    host.observe_session_end(Arc::new(move |session_id| {
+        capture_app
+            .state::<super::capture::CaptureState>()
+            .session_ended(session_id);
+    }));
     host.set_prompt_hooks(Arc::new(AppPromptHooks { app: app.clone() }));
-    app.manage(super::session_watcher::SessionWatcher::new(
-        host.clone(),
-        app.clone(),
-    ));
+    app.manage(super::session_watcher::SessionWatcher::new(host.clone()));
     super::session_pull_requests::sweep_leftover_checkouts_later(host.clone(), data_dir.clone());
     // Pull request watches wake their sessions' agents, window hidden or not.
     super::pull_request_watch::start(app.clone(), host.clone());
@@ -1491,7 +1505,7 @@ pub fn install_manager(app: &AppHandle) {
 
     // Auto-settle: once a minute, sessions idle for `autoSettleAfterDays`
     // move to the sidebar's Settled shelf (0 turns it off). The host skips the
-    // busy and the live-elsewhere ones, the store the pinned, the snoozed and
+    // busy ones, the store the pinned, the snoozed and
     // the ones the user un-settled since their last activity; a settle announces
     // itself through the forwarder above. The setting is read every pass, so
     // a change takes effect within the minute. Each tick's work reads the
@@ -1574,7 +1588,6 @@ pub fn install_manager(app: &AppHandle) {
         let app = app.clone();
         let host = host;
         tauri::async_runtime::spawn(async move {
-            let installed = super::agent_host::load_installed(&data_dir);
             // Not fatal — an unreadable cache means "empty until the first
             // refresh", which the refresh below fixes. Logged rather than
             // discarded because the symptom it produces is "Registry
@@ -1585,7 +1598,21 @@ pub fn install_manager(app: &AppHandle) {
                     "could not load the cached agent registry",
                 );
             }
-            store.set_settings(installed).await;
+            {
+                let _write = super::registry::settings_write().await;
+                match super::registry::installed_settings(&data_dir).await {
+                    Ok(installed) => {
+                        let installed = super::registry::seed_installed_launch_defaults(
+                            &data_dir,
+                            installed,
+                            super::registry::seed_conditions(&app),
+                        )
+                        .await;
+                        store.set_settings(installed).await;
+                    }
+                    Err(error) => tracing::warn!(%error, "installed agents need repair"),
+                }
+            }
             emit_catalog_changed(&app, "settings");
 
             // Once the installed map is live, pull each installed agent's own
@@ -1786,6 +1813,18 @@ pub async fn agents_authenticate(
 ) -> Result<(), String> {
     host.authenticate(agent_id, method_id)
         .await
+        .map_err(|e| e.to_string())
+}
+
+/// End an `authenticate` in flight for this agent: the user dismissed the
+/// sign-in dialog. `agents_authenticate` then rejects. A no-op when nothing is
+/// in flight.
+#[tauri::command]
+pub fn agents_cancel_authentication(
+    agent_id: AgentId,
+    host: State<'_, Arc<AgentHost>>,
+) -> Result<(), String> {
+    host.cancel_authentication(agent_id)
         .map_err(|e| e.to_string())
 }
 
@@ -2012,12 +2051,8 @@ pub async fn threads_resume(
 pub async fn threads_delete(
     thread_id: String,
     host: State<'_, Arc<AgentHost>>,
-    watcher: State<'_, Arc<super::session_watcher::SessionWatcher>>,
 ) -> Result<(), CmdError> {
-    // The watcher's file times decide "live elsewhere", which refuses the
-    // delete — the same input the sidebar's dot reads.
-    let modified = watcher.last_modified();
-    host.delete_thread(parse_thread_id(&thread_id)?, &modified)
+    host.delete_thread(parse_thread_id(&thread_id)?)
         .await
         .map_err(CmdError::from)
 }
@@ -2032,11 +2067,9 @@ pub async fn threads_delete(
 pub async fn threads_projects(
     cwd: Option<String>,
     host: State<'_, Arc<AgentHost>>,
-    watcher: State<'_, Arc<super::session_watcher::SessionWatcher>>,
 ) -> Result<Vec<super::agent_host::ThreadProjectWire>, CmdError> {
     let host = host.inner().clone();
-    let modified = watcher.last_modified();
-    tauri::async_runtime::spawn_blocking(move || host.thread_projects(cwd.as_deref(), &modified))
+    tauri::async_runtime::spawn_blocking(move || host.thread_projects(cwd.as_deref()))
         .await
         .map_err(|e| CmdError::new(e.to_string(), ErrorClass::Fatal))?
         .map_err(CmdError::from)
@@ -2047,22 +2080,17 @@ pub async fn threads_projects(
 #[tauri::command(async)]
 pub async fn threads_history(
     host: State<'_, Arc<AgentHost>>,
-    watcher: State<'_, Arc<super::session_watcher::SessionWatcher>>,
 ) -> Result<Vec<super::agent_host::ThreadRow>, CmdError> {
     let host = host.inner().clone();
-    let modified = watcher.last_modified();
-    tauri::async_runtime::spawn_blocking(move || host.thread_history(&modified))
+    tauri::async_runtime::spawn_blocking(move || host.thread_history())
         .await
         .map_err(|e| CmdError::new(e.to_string(), ErrorClass::Fatal))?
         .map_err(CmdError::from)
 }
 
 /// Move a session to the sidebar's Settled shelf. Refused while a turn is
-/// running there, in Atlas or in another process, or just after a send.
+/// running there or just after a send.
 /// Answers whether it moved: `false` for one already settled or gone.
-///
-/// Liveness elsewhere is read from the row's own project's transcripts, which
-/// is file I/O, so the check runs off the async workers.
 #[tauri::command]
 pub async fn threads_settle(
     thread_id: String,
@@ -2070,12 +2098,10 @@ pub async fn threads_settle(
 ) -> Result<bool, CmdError> {
     let thread_id = parse_thread_id(&thread_id)?;
     let host = host.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        host.settle_thread(thread_id, &super::session_watcher::activity_in)
-    })
-    .await
-    .map_err(|e| CmdError::new(e.to_string(), ErrorClass::Fatal))?
-    .map_err(CmdError::from)
+    tauri::async_runtime::spawn_blocking(move || host.settle_thread(thread_id))
+        .await
+        .map_err(|e| CmdError::new(e.to_string(), ErrorClass::Fatal))?
+        .map_err(CmdError::from)
 }
 
 /// Take a session back off the Settled shelf. Answers whether it was on it.
@@ -2174,9 +2200,10 @@ pub fn threads_unsnooze(
 #[tauri::command(async)]
 pub fn threads_mark_viewed(
     session_id: String,
+    agent_id: Option<AgentId>,
     host: State<'_, Arc<AgentHost>>,
 ) -> Result<bool, CmdError> {
-    host.mark_session_viewed(&session_id)
+    host.mark_session_viewed(&session_id, agent_id)
         .map_err(CmdError::from)
 }
 
@@ -2249,7 +2276,7 @@ fn canonical_project_dir(raw: &str) -> String {
     // `dunce`, not `std::fs`: on Windows std returns the verbatim `\\?\C:\…`
     // form, which slugs to `----C--…` — a `~/.claude/projects` folder Claude
     // Code never writes (it slugs its plain `getcwd`, `C--…`). The watcher then
-    // waited forever for that folder, so live-elsewhere detection and the
+    // waited forever for that folder, so the session watcher and the
     // `session/list` filter both silently never matched on Windows.
     if let Ok(canonical) = dunce::canonicalize(trimmed) {
         return canonical.to_string_lossy().into_owned();
@@ -2331,6 +2358,7 @@ pub async fn agents_send(
         pastes: pasted_texts.unwrap_or_default(),
         client_message_id,
         from_atlas: false,
+        restart_continuations: 0,
     };
     host.inner()
         .submit(&key, prompt, Origin::Local, SubmitPolicy::Now)
@@ -2381,8 +2409,8 @@ pub(crate) trait PromptBooks {
         model: Option<&str>,
         text: &str,
     );
-    /// The user interacted with the session (`interacted_at`).
-    fn interaction(&self, session_id: &str);
+    /// The user interacted with `plugin_id`'s session (`interacted_at`).
+    fn interaction(&self, session_id: &str, plugin_id: &str);
     /// Atlas's own transcript of the session.
     fn transcript(&self, session_id: &str, cwd: &str, plugin_id: &str, text: &str);
     /// Whether memory sharing is on for `cwd`.
@@ -2426,7 +2454,7 @@ pub(crate) fn record_prompt(
     // thread's own events cannot supply — a queued message never reaches the
     // agent. A wake is not the user.
     if origin == PromptOrigin::User {
-        books.interaction(session_id);
+        books.interaction(session_id, meta.plugin_id);
     }
 
     // Atlas's own transcript, for every agent. Recorded here for the same
@@ -2467,9 +2495,13 @@ impl PromptBooks for AppBooks<'_> {
             .note_prompt(session_id, cwd, plugin_id, model, text);
     }
 
-    fn interaction(&self, session_id: &str) {
+    fn interaction(&self, session_id: &str, plugin_id: &str) {
         if let Some(history) = self.host.history() {
-            history.note_interaction(&acp::SessionId::new(session_id), chrono::Utc::now());
+            history.note_interaction(
+                &plugin_id.into(),
+                &acp::SessionId::new(session_id),
+                chrono::Utc::now(),
+            );
         }
     }
 
@@ -2507,6 +2539,7 @@ pub(crate) fn send_prompt(
     key: &SessionKey,
     outgoing: OutgoingPrompt,
     origin: PromptOrigin,
+    restart_continuations: u32,
 ) -> Result<(), String> {
     let OutgoingPrompt {
         text,
@@ -2520,6 +2553,7 @@ pub(crate) fn send_prompt(
         resource_links: links,
         pastes,
         from_atlas: origin == PromptOrigin::Atlas,
+        restart_continuations,
         ..Prompt::default()
     };
     host.submit(key, prompt, Origin::Local, SubmitPolicy::Now)
@@ -2656,15 +2690,26 @@ pub fn agents_cancel(
 /// Park a prompt behind the running turn. `text` is what the strip shows;
 /// `prompt` is what the agent will be sent (the window may append hidden
 /// directives), defaulting to `text`. Returns the queued item's id.
+///
+/// A queued prompt is the same prompt a direct send would have been: its
+/// images, its `@`-mentioned files and its pastes ride with it, in the same
+/// fields `agents_send` takes (audit #80). Before, the queue took a string,
+/// and every one of them was dropped on the way into it.
 #[tauri::command]
 pub fn agents_queue_add(
     key: SessionKey,
     text: String,
     prompt: Option<String>,
+    attachments: Option<Vec<ImageAttachment>>,
+    resource_links: Option<Vec<ResourceLinkSpec>>,
+    pasted_texts: Option<Vec<PastedText>>,
     host: State<'_, Arc<AgentHost>>,
 ) -> Result<String, String> {
     let item = Prompt {
         display: Some(text.clone()),
+        images: attachments.unwrap_or_default(),
+        resource_links: resource_links.unwrap_or_default(),
+        pastes: pasted_texts.unwrap_or_default(),
         ..Prompt::text(prompt.unwrap_or(text))
     };
     host.enqueue(&key, item, Origin::Local)
@@ -2688,7 +2733,7 @@ pub fn agents_queue_clear(key: SessionKey, host: State<'_, Arc<AgentHost>>) -> R
 }
 
 /// Close or open the queue's drain gate — the window's send gates (a resume
-/// loading, a session live elsewhere, no AI grant, a pending agent switch).
+/// loading, a mode it could not restore, no AI grant, a pending agent switch).
 #[tauri::command]
 pub fn agents_queue_pause(
     key: SessionKey,
@@ -2707,6 +2752,18 @@ pub fn agents_queue_drain(
     host: State<'_, Arc<AgentHost>>,
 ) -> Result<Option<u64>, String> {
     host.inner().drain_queue(&key).map_err(|e| e.to_string())
+}
+
+/// Lift the halt a failed turn put on the queue and start its head if the
+/// session is idle — the window's "resume queue" (audit #77).
+#[tauri::command]
+pub fn agents_queue_resume(
+    key: SessionKey,
+    host: State<'_, Arc<AgentHost>>,
+) -> Result<Option<u64>, String> {
+    host.inner()
+        .resume_queue(&key, Origin::Local)
+        .map_err(|e| e.to_string())
 }
 
 /// Run one queued prompt next, interrupting the running turn.
@@ -2730,6 +2787,7 @@ pub fn agents_queue_send_now(
 pub async fn agents_set_hold(
     session_id: String,
     held: bool,
+    agent_id: Option<AgentId>,
     host: State<'_, Arc<AgentHost>>,
 ) -> Result<(), String> {
     if !cfg!(debug_assertions) {
@@ -2737,10 +2795,10 @@ pub async fn agents_set_hold(
     }
     const DEV_HOLDER: &str = "dev";
     if held {
-        host.hold_session(&session_id, DEV_HOLDER)
+        host.hold_session_in(agent_id, &session_id, DEV_HOLDER)
             .map_err(|e| e.to_string())
     } else {
-        host.release_session(&session_id, DEV_HOLDER)
+        host.release_session_in(agent_id, &session_id, DEV_HOLDER)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2754,13 +2812,13 @@ pub async fn agents_drop_session(
     agent_id: AgentId,
     session_id: String,
 ) -> Result<(), String> {
-    let _ = agent_id;
     // Release the per-turn accumulator with the session, so a tab closed
     // mid-turn doesn't hold one for the life of the process.
     app.state::<Arc<AnalyticsState>>()
         .forget_session(&session_id);
     let host = app.state::<Arc<AgentHost>>().inner().clone();
-    host.drop_session(&session_id)
+    // By agent as well as id: two agents can share a session id (#86).
+    host.drop_session_in(Some(agent_id), &session_id)
         .await
         .map_err(|e| e.to_string())
 }
@@ -2892,12 +2950,31 @@ pub async fn agents_auth_env_status(
     // One shell probe for anything the standard sweep never looks at, so an
     // agent asking for an unusual variable still reports honestly.
     let names: Vec<String> = wanted.iter().map(|(_, n, _, _)| n.clone()).collect();
-    super::byok::ensure_vars_probed(&names);
+    tokio::task::spawn_blocking(move || super::byok::ensure_vars_probed(&names))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // What the agent's own settings set: those reach its process whatever
+    // the shell says (audit #61).
+    let set_for_agent: std::collections::HashSet<String> = host
+        .plugin_id_for_agent(agent_id)
+        .and_then(|plugin| host.store().settings().0.get(&plugin).cloned())
+        .map(|entry| {
+            entry
+                .env()
+                .keys()
+                .cloned()
+                .chain(entry.secret_env().iter().cloned())
+                .collect()
+        })
+        .unwrap_or_default();
 
     Ok(wanted
         .into_iter()
         .map(|(method_id, name, label, optional)| {
-            let source = super::byok::env_var_source(&name);
+            // Satisfied means delivered: a variable Atlas can see but never
+            // passes to the agent is not set as far as the agent knows.
+            let source = super::byok::delivered_source(&name, set_for_agent.contains(&name));
             AuthEnvStatus {
                 method_id,
                 name,
@@ -3602,7 +3679,7 @@ mod prompt_books_tests {
                 model.unwrap_or("-")
             ));
         }
-        fn interaction(&self, session_id: &str) {
+        fn interaction(&self, session_id: &str, _plugin_id: &str) {
             self.writes
                 .borrow_mut()
                 .push(format!("interaction {session_id}"));

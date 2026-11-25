@@ -255,6 +255,10 @@ pub fn classify(status: StatusCode, body: &str, retry_after_header: Option<&str>
             }
         }
 
+        // Infrastructure failures can occur before the gateway produces its
+        // typed envelope. Keep the explicit gateway statuses above authoritative.
+        (408 | 500 | 504..=599, _) => Disposition::RetryCautiously { message },
+
         // Everything else the gateway defines is terminal: 400 (bad request),
         // 403 (no grant / wrong org / model not allowed), 404, 405, 413, 501.
         //
@@ -530,6 +534,22 @@ mod tests {
         let d = classify_code(502, "provider_error");
         assert!(matches!(d, Disposition::RetryCautiously { .. }));
         assert!(d.is_retryable());
+    }
+
+    #[test]
+    fn transient_infrastructure_statuses_allow_bounded_retry_without_a_gateway_body() {
+        for status in [408, 500, 504, 520, 521, 522, 524] {
+            let disposition = classify(
+                StatusCode::from_u16(status).unwrap(),
+                "<html>temporary outage</html>",
+                None,
+            );
+            assert!(
+                matches!(disposition, Disposition::RetryCautiously { .. }),
+                "{status}: {disposition:?}"
+            );
+        }
+        assert!(!classify_code(501, "not_implemented").is_retryable());
     }
 
     #[test]

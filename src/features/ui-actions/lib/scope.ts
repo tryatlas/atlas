@@ -10,6 +10,8 @@ import { projectIdForTab } from "@/features/chat/lib/tab-project";
 import { useAppStore } from "@/features/app/stores/app-store";
 import { invoke } from "@tauri-apps/api/core";
 import { refuse } from "./args";
+import { isUnderRoot } from "@/lib/file-links";
+import { canonicalFilePath } from "@/lib/open-file";
 
 /** The tab `tabId` in the active project's view, or a refusal saying why not. */
 export function tabInScope(tabId: string): Tab {
@@ -46,9 +48,9 @@ export async function resolvePath(path: string, cwd: string): Promise<string> {
   if (/^[\\/]{2}/.test(path)) {
     return refuse(`${path} is a network path; UI actions open files on this machine only`);
   }
-  if (path.startsWith("/")) return path;
+  if (path.startsWith("/") || /^[a-z]:[\\/]/i.test(path)) return canonicalFilePath(path);
   const project = activeProject().path;
-  const cwdInProject = cwd !== project && cwd.startsWith(`${project}/`);
+  const cwdInProject = cwd !== project && isUnderRoot(cwd, project);
   if (cwdInProject) {
     const underCwd = join(cwd, path);
     const exists = await invoke("file_mtime_ms", { path: underCwd }).then(

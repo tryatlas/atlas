@@ -21,6 +21,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use atlas_artifacts::{
@@ -52,6 +53,8 @@ pub struct ArtifactsCloudState {
     /// renderer's effect keys on auth, Organisation and the set of project
     /// paths, none of which move when a Project is connected or promoted.
     pub targets: std::sync::Mutex<(Option<String>, Vec<String>)>,
+    target_revision: AtomicU64,
+    target_apply: std::sync::Mutex<()>,
 }
 
 impl ArtifactsCloudState {
@@ -122,6 +125,8 @@ pub fn install(app: &AppHandle) {
         client,
         org: std::sync::Mutex::new(None),
         targets: std::sync::Mutex::new((None, Vec::new())),
+        target_revision: AtomicU64::new(0),
+        target_apply: std::sync::Mutex::new(()),
     });
 
     // Forward the crate's broadcast onto the one window channel.
@@ -240,11 +245,16 @@ async fn refresh_board(app: &AppHandle) {
     };
     let Some(org_id) = state.org_id() else { return };
 
+    let revision = state.board.begin_refresh();
     match state.client.board(&org_id, None).await {
         Ok(page) => {
-            state
-                .board
-                .replace(&org_id, page.sessions, page.workspaces, page.notes);
+            state.board.replace_after(
+                &org_id,
+                revision,
+                page.sessions,
+                page.workspaces,
+                page.notes,
+            );
         }
         Err(e) => {
             tracing::debug!(target: "atlas_artifacts", "board refresh failed: {e}");
@@ -277,10 +287,11 @@ pub async fn artifacts_cloud_retarget(
     let Some(state) = app.try_state::<ArtifactsCloudState>() else {
         return Err("artifacts cloud is not ready".into());
     };
+    let revision = state.target_revision.fetch_add(1, Ordering::SeqCst) + 1;
     if let Ok(mut targets) = state.targets.lock() {
         *targets = (org_id.clone(), project_paths.clone());
     }
-    apply_targets(&app, org_id, project_paths).await
+    apply_targets(&app, org_id, project_paths, revision).await
 }
 
 /// Re-run targeting after a binding changed on this side.
@@ -296,6 +307,7 @@ pub fn resync_targets(app: &AppHandle, touched: Option<&str>) {
     let Some(state) = app.try_state::<ArtifactsCloudState>() else {
         return;
     };
+    let revision = state.target_revision.fetch_add(1, Ordering::SeqCst) + 1;
     let (org_id, mut project_paths) = state.targets.lock().map(|t| t.clone()).unwrap_or_default();
     if let Some(path) = touched {
         if !project_paths.iter().any(|p| p == path) {
@@ -309,7 +321,7 @@ pub fn resync_targets(app: &AppHandle, touched: Option<&str>) {
     );
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = apply_targets(&app, org_id, project_paths).await {
+        if let Err(e) = apply_targets(&app, org_id, project_paths, revision).await {
             tracing::warn!(target: "atlas_artifacts", "resync targets failed: {e}");
         }
     });
@@ -321,39 +333,36 @@ async fn apply_targets(
     app: &AppHandle,
     org_id: Option<String>,
     project_paths: Vec<String>,
+    revision: u64,
 ) -> Result<(), String> {
     let Some(state) = app.try_state::<ArtifactsCloudState>() else {
         return Err("artifacts cloud is not ready".into());
     };
-
-    let changed = {
-        let Ok(mut current) = state.org.lock() else {
-            return Err("artifacts cloud state is poisoned".into());
-        };
-        let changed = *current != org_id;
-        current.clone_from(&org_id);
-        changed
-    };
-
-    let Some(org_id) = org_id else {
-        state.manager.shutdown();
-        return Ok(());
-    };
-    if changed {
-        state.board.clear();
-    }
-
-    let project_ids = {
-        let org_id = org_id.clone();
+    let project_ids = if let Some(org_id) = org_id.clone() {
         tauri::async_runtime::spawn_blocking(move || connected_projects(&project_paths, &org_id))
             .await
             .map_err(|e| e.to_string())?
+    } else {
+        Vec::new()
     };
-    state.manager.retarget(&org_id, project_ids);
-
-    // Paint from the network once immediately rather than waiting a whole tick
-    // — a switch that shows an empty remote half for fifteen seconds reads as
-    // "this Organisation has no work".
+    {
+        let _apply = state.target_apply.lock().map_err(|e| e.to_string())?;
+        if state.target_revision.load(Ordering::SeqCst) != revision {
+            return Ok(());
+        }
+        let mut current = state.org.lock().map_err(|e| e.to_string())?;
+        if *current != org_id {
+            state.board.clear();
+        }
+        current.clone_from(&org_id);
+        match org_id {
+            Some(ref org_id) => state.manager.retarget(org_id, project_ids),
+            None => {
+                state.manager.shutdown();
+                return Ok(());
+            }
+        }
+    }
     refresh_board(app).await;
     Ok(())
 }

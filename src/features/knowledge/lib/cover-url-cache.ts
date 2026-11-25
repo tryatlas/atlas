@@ -1,3 +1,4 @@
+import { useSyncExternalStore } from "react";
 /**
  * KB cover-image data URLs, keyed `projectPath|coverRef`.
  *
@@ -13,6 +14,15 @@
  */
 const cache = new Map<string, string>();
 const CAP = 32;
+const revisions = new Map<string, number>();
+const listeners = new Set<() => void>();
+const subscribe = (listener: () => void) => {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+};
+export function useCoverRevision(key: string | null): number {
+  return useSyncExternalStore(subscribe, () => (key ? (revisions.get(key) ?? 0) : 0));
+}
 
 export const coverCacheKey = (projectPath: string, cover: string): string =>
   `${projectPath}|${cover}`;
@@ -31,5 +41,8 @@ export function putCachedCoverUrl(key: string, url: string): void {
 }
 
 export function evictCoverUrl(projectPath: string, cover: string): void {
-  cache.delete(coverCacheKey(projectPath, cover));
+  const key = coverCacheKey(projectPath, cover);
+  cache.delete(key);
+  revisions.set(key, (revisions.get(key) ?? 0) + 1);
+  for (const listener of listeners) listener();
 }

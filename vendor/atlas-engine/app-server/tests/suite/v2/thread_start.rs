@@ -95,6 +95,7 @@ async fn start_thread_with_model(
 }
 
 #[tokio::test]
+#[ignore = "Amazon Bedrock is removed in Atlas: atlas-engine-model-provider builds without its aws feature (see model-provider/Cargo.toml)"]
 async fn thread_start_provider_model_fallback_applies_to_configured_model() -> Result<()> {
     let atlas_agent_home = TempDir::new()?;
     std::fs::write(
@@ -226,6 +227,7 @@ async fn thread_start_does_not_repeat_initialize_exec_policy_warning() -> Result
 }
 
 #[tokio::test]
+#[ignore = "Amazon Bedrock is removed in Atlas: atlas-engine-model-provider builds without its aws feature (see model-provider/Cargo.toml)"]
 async fn thread_start_provider_model_fallback_uses_bedrock_static_catalog() -> Result<()> {
     let atlas_agent_home = TempDir::new()?;
     std::fs::write(
@@ -269,6 +271,7 @@ async fn thread_start_provider_model_fallback_uses_bedrock_static_catalog() -> R
 }
 
 #[tokio::test]
+#[ignore = "Amazon Bedrock is removed in Atlas: atlas-engine-model-provider builds without its aws feature (see model-provider/Cargo.toml)"]
 async fn thread_start_bedrock_runtime_prefers_global_cross_region_models() -> Result<()> {
     let atlas_agent_home = TempDir::new()?;
     std::fs::write(
@@ -884,6 +887,7 @@ fn normalize_path_for_comparison(path: impl AsRef<Path>) -> PathBuf {
 }
 
 #[tokio::test]
+#[ignore = "asserts on the upstream analytics uploader, which Atlas removed (tests/engine-no-phone-home.test.ts)"]
 async fn thread_start_tracks_thread_initialized_analytics() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 

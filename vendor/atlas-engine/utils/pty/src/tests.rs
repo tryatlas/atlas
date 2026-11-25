@@ -54,6 +54,26 @@ fn shell_command(program: &str) -> (String, Vec<String>) {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn pty_preserves_signal_exit_status_without_inherited_fds() -> anyhow::Result<()> {
+    let args = vec!["-c".to_string(), "kill -TERM $$".to_string()];
+    let spawned = spawn_pty_process(
+        "/bin/sh",
+        &args,
+        Path::new("."),
+        &HashMap::new(),
+        &None,
+        TerminalSize::default(),
+        &[],
+    )
+    .await?;
+    let (_session, output, exit) = combine_spawned_output(spawned);
+    let (_, code) = collect_output_until_exit(output, exit, 5_000).await;
+    assert_eq!(code, 128 + libc::SIGTERM);
+    Ok(())
+}
+
 fn echo_sleep_command(marker: &str) -> String {
     if cfg!(windows) {
         format!("echo {marker} & ping -n 2 127.0.0.1 > NUL")

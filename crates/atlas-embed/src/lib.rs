@@ -403,7 +403,12 @@ impl Embedder {
                 self.dim,
             )
         }))
-        .unwrap_or_else(|_| Err(anyhow!("embedding kernel panicked on {}", self.backend())))
+        .unwrap_or_else(|_| {
+            Err(anyhow!(
+                "embedding kernel panicked on {}",
+                if core.on_gpu { "gpu" } else { "cpu" }
+            ))
+        })
     }
 
     /// Replace the core with a CPU build and persist the incompatibility

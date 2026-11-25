@@ -18,7 +18,9 @@
 //!     deltas back. Per the "Rust owns business logic" rule.
 //!
 //! All browser surfaces share one on-disk data directory so a login in one
-//! persists across windows and app restarts.
+//! persists across windows and app restarts. macOS 14+ uses a dedicated
+//! WKWebsiteDataStore; older macOS uses isolated ephemeral stores because
+//! WebKit provides no persistent isolated-store API there.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -32,6 +34,20 @@ use tauri::{
     Emitter, LogicalPosition, LogicalSize, Manager, Position, Rect, Size, WebviewUrl,
     WebviewWindowBuilder,
 };
+
+// One stable, dedicated WKWebsiteDataStore, shared only by browser surfaces.
+const BROWSER_DATA_STORE: [u8; 16] = *b"atlas-browser-v1";
+
+fn browser_needs_ephemeral_store() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        !objc2::available!(macos = 14.0)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
 
 /// Monotonic counter so each browser *window* gets a unique, capability-matching
 /// label (`atlas-browser-N`). The `atlas-*` pattern is whitelisted in
@@ -211,6 +227,9 @@ pub fn browser_open_window(app: tauri::AppHandle, url: String) -> Result<String,
         .inner_size(1100.0, 800.0)
         .min_inner_size(480.0, 360.0)
         .data_directory(profile)
+        .disable_drag_drop_handler()
+        .data_store_identifier(BROWSER_DATA_STORE)
+        .incognito(browser_needs_ephemeral_store())
         .center()
         .focused(true)
         .build()
@@ -269,6 +288,9 @@ pub fn browser_embed_create(
     // below to match the "initially hidden" contract callers rely on.
     let builder = tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed))
         .data_directory(profile)
+        .disable_drag_drop_handler()
+        .data_store_identifier(BROWSER_DATA_STORE)
+        .incognito(browser_needs_ephemeral_store())
         .on_page_load(move |webview, payload| {
             let url = payload.url().to_string();
             match payload.event() {

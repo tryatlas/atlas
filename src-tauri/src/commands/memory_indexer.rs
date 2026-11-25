@@ -271,6 +271,18 @@ impl MemoryRegistry {
         inserted
     }
 
+    /// Opening can migrate SQLite, heal vectors and walk watcher roots.
+    pub async fn engine_for_async(
+        self: &Arc<Self>,
+        cwd: &str,
+    ) -> Result<Arc<RwLock<MemoryEngine>>, String> {
+        let registry = self.clone();
+        let cwd = cwd.to_owned();
+        tokio::task::spawn_blocking(move || registry.engine_for(&cwd))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// Enqueue a job (non-blocking). A full queue keeps the job for retry
     /// (extraction jobs are dropped with a warning) rather than stalling the
     /// caller — the IPC thread must never block on indexing. `Err` only when
@@ -669,7 +681,7 @@ async fn health_one(app: &AppHandle, registry: &MemoryRegistry, cwd: &str) -> Re
         // Unused candidates, and unused memories whose cited code changed,
         // leave for the archive. Citations are checked against the file on
         // disk; a symbol that only moved no longer holds on its own.
-        let resolver = atlas_memory::citation::FileResolver::new(store.root());
+        let resolver = atlas_memory::citation::FileResolver::with_worktrees(store.root(), store.scope_dirs());
         let archived = store.expire(now, &resolver).unwrap_or_else(|e| {
             tracing::warn!(target: "atlas::memory_indexer", "memory expiry failed: {e:#}");
             0
@@ -1029,8 +1041,12 @@ pub(crate) async fn indexed_vectors(
     cwd: &str,
     docs: &[MemoryDoc],
 ) -> std::collections::HashMap<String, Vec<f32>> {
-    let engine = registry.engine_for(cwd);
-    let guard = engine.read().await;
+    let Some(engine) = registry.open_engine(cwd) else {
+        return Default::default();
+    };
+    let Ok(guard) = engine.try_read() else {
+        return Default::default();
+    };
     if !guard.index_params_match(provider) {
         return std::collections::HashMap::new();
     }
@@ -1135,7 +1151,7 @@ pub async fn force_reindex(
     let cwd = cwd.trim_end_matches('/').to_string();
     // Opening also enqueues an initial IndexCorpus on first open; the explicit
     // enqueue below covers the already-open case.
-    let _ = registry.engine_for(&cwd);
+    let _ = registry.inner().engine_for_async(&cwd).await?;
     registry.enqueue(Job::IndexCorpus { cwd })
 }
 

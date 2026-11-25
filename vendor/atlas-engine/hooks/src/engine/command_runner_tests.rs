@@ -116,6 +116,29 @@ async fn fast_exiting_hook_preserves_stdout_when_stdin_is_not_consumed() {
 
 const ASYNC_HOOK_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(unix)]
+#[tokio::test]
+async fn timeout_includes_writing_to_a_hook_that_never_reads_stdin() {
+    let temp = tempdir().expect("create temp dir");
+    let mut handler = write_handler(&temp, "import time\ntime.sleep(60)\n");
+    handler.timeout_sec = 1;
+    let ConfiguredHandlerKind::Command { command, env, .. } = &handler.kind;
+    let (runtime, _) = runtime();
+    let input = "x".repeat(1024 * 1024);
+    let result = timeout(
+        Duration::from_secs(5),
+        run_command(&runtime, &handler, command, env, &input, temp.path()),
+    )
+    .await
+    .expect("the hook timeout must cover a blocked stdin writer");
+    assert!(
+        result.error.is_some(),
+        "a timed out hook must report failure"
+    );
+    assert_ne!(result.exit_code, Some(0));
+    runtime.shutdown().await;
+}
+
 fn runtime() -> (CommandHookRuntime, Receiver<HookCompletedEvent>) {
     let thread_id = ThreadId::new();
     let (result_sender, result_receiver) = async_channel::unbounded();

@@ -107,12 +107,19 @@ impl AgentSessionList for AcpSessionList {
         }
         let connection = self.connection.clone();
         let session_id = session_id.clone();
+        let agent = self.agent.clone();
+        let debug_log = self.debug_log.clone();
         async move {
-            connection
-                .send_request(acp::DeleteSessionRequest::new(session_id))
-                .block_task()
-                .await
-                .map_err(map_acp_error)?;
+            // Bounded like `session/list` (#13): an agent that never answers
+            // must not hold whoever deleted the row.
+            with_request_deadline(&agent, "session/delete", &debug_log, async {
+                connection
+                    .send_request(acp::DeleteSessionRequest::new(session_id))
+                    .block_task()
+                    .await
+                    .map_err(map_acp_error)
+            })
+            .await?;
             Ok(())
         }
         .boxed()

@@ -362,12 +362,22 @@ describe("settleMode: a session that has just been opened", () => {
     expect(refusals).toEqual([]);
   });
 
-  it("keeps a pick on trust when the agent advertises no modes at all", async () => {
+  // #36: pushing it was refused, and a resume then held every send over a
+  // mode the session could never be put in.
+  it("pushes nothing to a session that advertises no modes, and holds nothing back", async () => {
     expect(await configuration.settleMode(KEY, "read-only", reported(null, []))).toEqual({
-      effective: "read-only",
+      effective: null,
       honoured: true,
     });
-    expect(pushes).toEqual([{ cmd: "setMode", value: "read-only" }]);
+    expect(pushes).toEqual([]);
+  });
+
+  it("asks nothing of a session with no modes when nothing was picked", async () => {
+    expect(await configuration.settleMode(KEY, undefined, reported(null, []))).toEqual({
+      effective: null,
+      honoured: false,
+    });
+    expect(pushes).toEqual([]);
   });
 });
 
@@ -504,7 +514,7 @@ describe("what a knob decides", () => {
     await configuration.pick(TAB, KNOBS.acpMode, "auto");
     expect(session()).toMatchObject({ acpModeExplicit: true, unrestoredModeId: undefined });
 
-    open("claude-code", { unrestoredModeId: "plan" });
+    open("claude-code", { claudePermissionMode: "default", unrestoredModeId: "plan" });
     await configuration.pick(TAB, KNOBS.claudeMode, "plan");
     expect(session()).toMatchObject({
       claudePermissionMode: "plan",
@@ -513,8 +523,49 @@ describe("what a knob decides", () => {
     });
   });
 
+  // #56: the hold was released when the pick was SHOWN, and a refusal only
+  // put the pill back, so a refused pick let sends through in the agent's own
+  // mode, the one the hold was there to stop.
+  it("a refused mode pick keeps a held resume held", async () => {
+    answer = async () => {
+      throw "busy";
+    };
+    open("codex", {
+      acpCurrentMode: "auto",
+      acpAvailableModes: [
+        { id: "auto", name: "Auto" },
+        { id: "read-only", name: "Read only" },
+      ],
+      unrestoredModeId: "read-only",
+    });
+    expect(await configuration.pick(TAB, KNOBS.acpMode, "read-only")).toBe("refused");
+    expect(session()).toMatchObject({ acpCurrentMode: "auto", unrestoredModeId: "read-only" });
+
+    open("claude-code", { claudePermissionMode: "default", unrestoredModeId: "plan" });
+    expect(await configuration.pick(TAB, KNOBS.claudeMode, "plan")).toBe("refused");
+    expect(session()).toMatchObject({ claudePermissionMode: "default", unrestoredModeId: "plan" });
+  });
+
+  it("a held resume is released while the pick is out only once the agent takes it", async () => {
+    const out = held();
+    answer = () => out.promise;
+    open("codex", { acpCurrentMode: "auto", unrestoredModeId: "read-only" });
+
+    const outcome = configuration.pick(TAB, KNOBS.acpMode, "read-only");
+    expect(session().unrestoredModeId).toBe("read-only");
+    out.resolve();
+    await outcome;
+    expect(session().unrestoredModeId).toBeUndefined();
+  });
+
+  it("a mode picked before the bind releases a held resume: the bind applies it", async () => {
+    open("codex", { unrestoredModeId: "read-only" }, false);
+    expect(await configuration.pick(TAB, KNOBS.acpMode, "read-only")).toBe("kept-for-bind");
+    expect(session().unrestoredModeId).toBeUndefined();
+  });
+
   it("picking Claude's `default` forgets the remembered mode rather than storing it", async () => {
-    open("claude-code");
+    open("claude-code", { claudePermissionMode: "default" });
     await configuration.pick(TAB, KNOBS.claudeMode, "bypassPermissions");
     expect(prefs.modes).toEqual({ "claude-code": "bypassPermissions" });
 

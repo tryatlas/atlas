@@ -172,6 +172,12 @@ impl CommsManager {
         self.inner.connection.lock().unwrap().clone()
     }
 
+    /// Access profile-local persistence under its lock. Call from a blocking
+    /// worker for writes; a failed disk open remains visible via is_durable().
+    pub fn with_store<T>(&self, f: impl FnOnce(&CommsStore) -> T) -> T {
+        f(&self.inner.store.lock().unwrap())
+    }
+
     pub fn with_state<T>(&self, f: impl FnOnce(&ChatState) -> T) -> T {
         f(&self.inner.state.lock().unwrap())
     }
@@ -550,14 +556,53 @@ impl CommsManager {
         let journaled = crate::wire::is_journaled(&frame);
         let seq = crate::wire::frame_seq(&frame);
 
-        let deltas = {
+        let (deltas, delete_after_ack) = {
             let mut state = self.inner.state.lock().unwrap();
             let mut pending = self.inner.pending.lock().unwrap();
             if !self.live(session.generation) {
                 return;
             }
-            apply_frame(&mut state, frame, &mut pending, now)
+            let acknowledgement = match &frame {
+                ServerFrame::Ack {
+                    client_msg_id, id, ..
+                } => Some((client_msg_id, id)),
+                ServerFrame::MessageNew(message) => message
+                    .client_msg_id
+                    .as_ref()
+                    .map(|client| (client, &message.id)),
+                _ => None,
+            };
+            let delete_after_ack = acknowledgement.and_then(|(client_msg_id, id)| {
+                let optimistic = optimistic_id(client_msg_id);
+                state
+                    .messages
+                    .values()
+                    .flatten()
+                    .any(|row| row.message.id == optimistic && row.deleted)
+                    .then(|| id.clone())
+            });
+            let deltas = apply_frame(&mut state, frame, &mut pending, now);
+            for delta in &deltas {
+                if let StateDelta::MemberChanged {
+                    conv_id,
+                    user_id,
+                    change,
+                } = delta
+                {
+                    if *change != MemberChange::Joined && state.me.as_ref() == Some(user_id) {
+                        self.inner.hydrated.lock().unwrap().remove(conv_id);
+                        pending.retain(|_, send| &send.conv_id != conv_id);
+                    }
+                }
+            }
+            (deltas, delete_after_ack)
         };
+
+        if let Some(message_id) = delete_after_ack {
+            // This send may have reached the server just before local cancel.
+            // The acknowledgement supplies its real id; never resend its body.
+            let _ = out_tx.send(ClientFrame::Delete { message_id });
+        }
 
         // Only a journaled frame may move the watermark. Advancing from an
         // ephemeral one would skip real history on the next resume.
@@ -676,7 +721,7 @@ impl CommsManager {
         let windows: Vec<String> = self.inner.windows.lock().unwrap().iter().cloned().collect();
         for conv_id in windows {
             if let Ok(page) = self.inner.rest.messages(org_id, &conv_id, None, 50).await {
-                let rows = page
+                let mut rows = page
                     .messages
                     .into_iter()
                     .map(LocalMessage::settled)
@@ -686,13 +731,34 @@ impl CommsManager {
                     if !self.live(generation) {
                         return;
                     }
+                    // The REST page cannot acknowledge this client's still
+                    // pending optimistic rows. Keep them until ack or failure.
+                    if let Some(old) = state.messages.get(&conv_id) {
+                        for row in old {
+                            if row.status != SendStatus::Settled
+                                && !rows.iter().any(|new| new.message.id == row.message.id)
+                            {
+                                rows.push(row.clone());
+                            }
+                        }
+                    }
+                    let page_ids: std::collections::HashSet<_> = rows
+                        .iter()
+                        .filter(|row| row.status == SendStatus::Settled)
+                        .map(|row| row.message.id.clone())
+                        .collect();
+                    for id in page_ids {
+                        state.reactions.remove(&id);
+                    }
                     state.messages.insert(conv_id.clone(), rows);
                     for row in page.reactions {
-                        state
-                            .reactions
-                            .entry(row.message_id.clone())
-                            .or_default()
-                            .push(row);
+                        let bucket = state.reactions.entry(row.message_id.clone()).or_default();
+                        if !bucket
+                            .iter()
+                            .any(|old| old.emoji == row.emoji && old.user_id == row.user_id)
+                        {
+                            bucket.push(row);
+                        }
                     }
                 }
                 self.mark_hydrated(session, &conv_id);
@@ -869,7 +935,9 @@ impl CommsManager {
         Ok(client_msg_id)
     }
 
-    // Edit, delete, react and pin are all OPTIMISTIC: the local state mutates
+    // Edits and reactions update locally; settled deletes and pins wait for
+    // their authoritative server frame so a refusal cannot erase local state.
+    // Optimistic sends can be cancelled before they have a server id.
     // and the granular event goes out synchronously in the command path, and
     // only then is the frame written. The server's echo re-applies the same
     // fact, which the reducer already treats as a no-op (reactions dedupe on
@@ -908,43 +976,39 @@ impl CommsManager {
     }
 
     pub fn delete(&self, message_id: &str) {
-        let (updated, unpinned) = {
+        // An unsent optimistic row is a local cancellation. Retire its retry
+        // record atomically with the tombstone so reconnect cannot send it.
+        let local = {
             let mut state = self.inner.state.lock().unwrap();
-            let mut found = None;
-            for (conv_id, list) in state.messages.iter_mut() {
-                if let Some(row) = list.iter_mut().find(|m| m.message.id == message_id) {
+            let mut pending = self.inner.pending.lock().unwrap();
+            let mut changed = None;
+            for (conv_id, rows) in &mut state.messages {
+                if let Some(row) = rows
+                    .iter_mut()
+                    .find(|row| row.message.id == message_id && row.status != SendStatus::Settled)
+                {
+                    pending.retain(|id, _| optimistic_id(id) != message_id);
                     row.deleted = true;
                     row.message.body.clear();
                     row.message.attachments.clear();
                     row.message.code_refs.clear();
                     row.message.artifact_refs.clear();
-                    found = Some((conv_id.clone(), row.clone()));
+                    changed = Some((conv_id.clone(), row.clone()));
                     break;
                 }
             }
-            // A deleted message takes its pin with it, exactly as the server's
-            // own `pin.removed` will confirm.
-            let unpinned = found.as_ref().and_then(|(conv_id, _)| {
-                let rail = state.pins.get_mut(conv_id)?;
-                let before = rail.len();
-                rail.retain(|m| m != message_id);
-                (rail.len() != before).then(|| (conv_id.clone(), rail.clone()))
-            });
-            (found, unpinned)
+            changed
         };
-        if let Some((conv_id, row)) = updated {
+        if let Some((conv_id, row)) = local {
             self.emit(CommsEvent::MessageUpdated {
                 conv_id,
                 replaced_id: None,
                 message: to_wire(&row),
             });
+            return;
         }
-        if let Some((conv_id, rail)) = unpinned {
-            self.emit(CommsEvent::PinsChanged {
-                conv_id,
-                pinned_message_ids: rail,
-            });
-        }
+        // Server-confirmed rows change only on the journaled deletion. A
+        // refusal must leave the last authoritative body and pins intact.
         self.write(ClientFrame::Delete {
             message_id: message_id.to_string(),
         });
@@ -1003,37 +1067,6 @@ impl CommsManager {
     }
 
     pub fn pin(&self, message_id: &str, on: bool) {
-        let rail = {
-            let mut state = self.inner.state.lock().unwrap();
-            // The rail is per conversation; find which one holds the message.
-            let conv_id = state
-                .messages
-                .iter()
-                .find(|(_, list)| list.iter().any(|m| m.message.id == message_id))
-                .map(|(conv_id, _)| conv_id.clone());
-            conv_id.and_then(|conv_id| {
-                let rail = state.pins.entry(conv_id.clone()).or_default();
-                let changed = if on {
-                    if rail.contains(&message_id.to_string()) {
-                        false
-                    } else {
-                        rail.insert(0, message_id.to_string());
-                        true
-                    }
-                } else {
-                    let before = rail.len();
-                    rail.retain(|m| m != message_id);
-                    rail.len() != before
-                };
-                changed.then(|| (conv_id, rail.clone()))
-            })
-        };
-        if let Some((conv_id, rail)) = rail {
-            self.emit(CommsEvent::PinsChanged {
-                conv_id,
-                pinned_message_ids: rail,
-            });
-        }
         self.write(ClientFrame::Pin {
             message_id: message_id.to_string(),
             on,
@@ -1113,12 +1146,14 @@ impl CommsManager {
     pub fn expire_stale_sends(&self) {
         let now = now_ms();
         let stale: Vec<PendingSend> = {
-            let pending = self.inner.pending.lock().unwrap();
-            pending
+            let mut pending = self.inner.pending.lock().unwrap();
+            let stale = pending
                 .values()
                 .filter(|p| now - p.sent_at > SEND_TIMEOUT_MS)
                 .cloned()
-                .collect()
+                .collect();
+            pending.retain(|_, p| now - p.sent_at <= SEND_TIMEOUT_MS);
+            stale
         };
         for sent in stale {
             let optimistic = optimistic_id(&sent.client_msg_id);
@@ -2506,7 +2541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_tombstones_optimistically_and_clears_the_pin() {
+    async fn delete_and_pin_wait_for_confirmation_before_changing_settled_rows() {
         let store = CommsStore::open_in_memory().expect("store");
         let mgr = CommsManager::new(store, std::sync::Arc::new(NoToken));
         mgr.set_target(Some(OrgTarget {
@@ -2539,7 +2574,26 @@ mod tests {
             state.pins.insert("c1".into(), vec!["m1".into()]);
         });
 
+        mgr.pin("m1", false);
         mgr.delete("m1");
+        mgr.with_state(|state| {
+            assert!(!state.messages("c1")[0].deleted);
+            assert_eq!(state.messages("c1")[0].message.body, "regrettable");
+            assert_eq!(state.pins["c1"], vec!["m1"]);
+        });
+        let session = mgr.session().unwrap();
+        let (out, _incoming) = mpsc::unbounded_channel();
+        mgr.handle_frame(
+            &session,
+            ServerFrame::MessageDeleted {
+                seq: 2,
+                conv_id: "c1".into(),
+                id: "m1".into(),
+                deleted_at: now_ms(),
+            },
+            &out,
+        )
+        .await;
         mgr.with_state(|s| {
             let row = &s.messages("c1")[0];
             assert!(row.deleted);
@@ -2547,6 +2601,96 @@ mod tests {
             // A rail must never point at something that is gone.
             assert!(s.pins.get("c1").is_none_or(Vec::is_empty));
         });
+    }
+
+    #[tokio::test]
+    async fn expired_sends_are_not_retried_but_a_late_ack_still_reconciles() {
+        let mgr = fresh();
+        mgr.set_target(target("org_a"));
+        let client = mgr
+            .send("c1", "late".into(), None, Vec::new(), Vec::new())
+            .unwrap();
+        mgr.inner
+            .pending
+            .lock()
+            .unwrap()
+            .get_mut(&client)
+            .unwrap()
+            .sent_at = now_ms() - SEND_TIMEOUT_MS - 1;
+        mgr.expire_stale_sends();
+        assert!(mgr.inner.pending.lock().unwrap().is_empty());
+        assert_eq!(
+            mgr.with_state(|s| s.messages("c1")[0].status),
+            SendStatus::Failed
+        );
+        let (out, _incoming) = mpsc::unbounded_channel();
+        mgr.handle_frame(
+            &mgr.session().unwrap(),
+            ServerFrame::Ack {
+                client_msg_id: client,
+                id: "real".into(),
+                seq: 1,
+            },
+            &out,
+        )
+        .await;
+        mgr.with_state(|s| {
+            assert_eq!(s.messages("c1").len(), 1);
+            assert_eq!(s.messages("c1")[0].status, SendStatus::Settled);
+            assert_eq!(s.messages("c1")[0].message.id, "real");
+        });
+    }
+
+    #[tokio::test]
+    async fn deleting_an_unacknowledged_send_never_retries_it_and_deletes_a_late_acceptance() {
+        let mgr = fresh();
+        mgr.set_target(target("org_a"));
+        let client = mgr
+            .send("c1", "cancel this".into(), None, Vec::new(), Vec::new())
+            .unwrap();
+        mgr.delete(&optimistic_id(&client));
+        assert!(mgr.inner.pending.lock().unwrap().is_empty());
+        let (out, mut incoming) = mpsc::unbounded_channel();
+        mgr.handle_frame(
+            &mgr.session().unwrap(),
+            ServerFrame::Ack {
+                client_msg_id: client,
+                id: "accepted".into(),
+                seq: 1,
+            },
+            &out,
+        )
+        .await;
+        assert!(
+            matches!(incoming.try_recv().unwrap(), ClientFrame::Delete { message_id } if message_id == "accepted")
+        );
+        mgr.with_state(|s| {
+            assert!(s.messages("c1")[0].deleted);
+            assert!(s.messages("c1")[0].message.body.is_empty());
+        });
+    }
+
+    #[tokio::test]
+    async fn leaving_during_quiet_replay_retires_history_hydration() {
+        let mgr = fresh();
+        mgr.set_target(target("org_a"));
+        let session = mgr.session().unwrap();
+        mgr.test_mutate_state(|state| state.me = Some("me".into()));
+        mgr.mark_hydrated(&session, "c1");
+        assert!(mgr.is_hydrated("c1"));
+        mgr.begin_quiet(session.generation);
+        let (out, _incoming) = mpsc::unbounded_channel();
+        mgr.handle_frame(
+            &session,
+            ServerFrame::MemberLeft {
+                seq: 2,
+                conv_id: "c1".into(),
+                user_id: "me".into(),
+            },
+            &out,
+        )
+        .await;
+        assert!(!mgr.is_hydrated("c1"));
     }
 
     #[test]

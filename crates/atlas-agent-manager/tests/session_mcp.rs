@@ -10,7 +10,7 @@ mod support;
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1 as acp;
-use atlas_agent_servers::{SessionMcpOffer, SessionMcpRequest, SessionMcpServers};
+use atlas_agent_servers::{AskFirst, SessionMcpOffer, SessionMcpRequest, SessionMcpServers};
 use serde_json::json;
 
 use support::custom;
@@ -45,7 +45,15 @@ impl SessionMcpServers for TokenOffering {
                 .unwrap()
                 .push((token, session.map(std::string::ToString::to_string)));
         })
+        .asking_first(memory_tools())
     }
+}
+
+/// The one tool the offered server advertises: only it is pre-approved, never
+/// the whole server (`mcp__atlas_memory`), which a user's own server of the
+/// same name would inherit.
+fn memory_tools() -> AskFirst {
+    AskFirst::none().advertising("atlas_memory", &["memory_search"])
 }
 
 fn http_capable(extra: serde_json::Value) -> serde_json::Value {
@@ -85,7 +93,7 @@ async fn an_agent_advertising_http_mcp_gets_the_server_with_its_token_on_session
     assert_eq!(requests[0].1["mcpServers"], the_memory_entry("token-1"));
     assert_eq!(
         requests[0].1["_meta"]["claudeCode"]["options"]["allowedTools"],
-        json!(["mcp__atlas_memory"]),
+        json!(["mcp__atlas_memory__memory_search"]),
         "the offered server rides pre-approved for the Claude Code adapter",
     );
 
@@ -171,7 +179,7 @@ impl SessionMcpServers for BridgeOffering {
                 "/private/atlas/mcp-bridge/l/t.token".into(),
             ]),
         );
-        SessionMcpOffer::new(vec![server], |_| {})
+        SessionMcpOffer::new(vec![server], |_| {}).asking_first(memory_tools())
     }
 }
 
@@ -203,7 +211,7 @@ async fn a_bridged_server_reaches_an_agent_without_http_mcp_pre_approved() {
     );
     assert_eq!(
         requests[0].1["_meta"]["claudeCode"]["options"]["allowedTools"],
-        json!(["mcp__atlas_memory"]),
+        json!(["mcp__atlas_memory__memory_search"]),
     );
 
     manager.shutdown();
@@ -236,7 +244,7 @@ async fn a_loaded_session_gets_the_server_and_its_token_is_bound_to_that_session
     assert_eq!(requests[0].1["mcpServers"], the_memory_entry("token-1"));
     assert_eq!(
         requests[0].1["_meta"]["claudeCode"]["options"]["allowedTools"],
-        json!(["mcp__atlas_memory"]),
+        json!(["mcp__atlas_memory__memory_search"]),
         "the offered server rides pre-approved for the Claude Code adapter",
     );
     assert_eq!(
@@ -278,7 +286,7 @@ async fn a_resumed_session_gets_the_server() {
     assert_eq!(requests[0].1["mcpServers"], the_memory_entry("token-1"));
     assert_eq!(
         requests[0].1["_meta"]["claudeCode"]["options"]["allowedTools"],
-        json!(["mcp__atlas_memory"]),
+        json!(["mcp__atlas_memory__memory_search"]),
         "the offered server rides pre-approved for the Claude Code adapter",
     );
     assert_eq!(

@@ -186,6 +186,7 @@ impl Repo {
         self.path.join(".git").join(name).exists()
     }
 
+    #[cfg(unix)]
     fn hook(&self, name: &str, body: &str) {
         let hooks = self.path.join(".git").join("hooks");
         std::fs::create_dir_all(&hooks).unwrap();
@@ -1383,6 +1384,37 @@ fn show_reads_one_commit_and_its_diff() {
 // ── index, working tree, stash ────────────────────────────────────────────
 
 #[test]
+fn selected_filenames_are_literal_for_every_worktree_mutation() {
+    let dir = scratch();
+    let repo = Repo::init(dir.path());
+    repo.write("[id].txt", "original\n");
+    repo.write("i.txt", "original\n");
+    repo.git(&["add", "--all"]);
+    repo.git(&["commit", "-qm", "initial files"]);
+    repo.write("[id].txt", "selected change\n");
+    repo.write("i.txt", "other change\n");
+
+    repo.ops().stage(&files(&["[id].txt"])).unwrap();
+    assert_eq!(repo.staged(), "[id].txt");
+    repo.ops().stage(&files(&["i.txt"])).unwrap();
+    repo.ops().unstage(&files(&["[id].txt"])).unwrap();
+    assert_eq!(repo.staged(), "i.txt");
+
+    repo.ops().discard(&files(&["[id].txt"])).unwrap();
+    assert_eq!(repo.read("[id].txt"), "original\n");
+    assert_eq!(repo.read("i.txt"), "other change\n");
+    assert_eq!(repo.staged(), "i.txt");
+
+    repo.write("[xy].txt", "selected addition\n");
+    repo.write("x.txt", "other addition\n");
+    repo.git(&["add", "--all"]);
+    repo.ops().delete_added(&files(&["[xy].txt"])).unwrap();
+    assert!(!repo.exists("[xy].txt"));
+    assert_eq!(repo.read("x.txt"), "other addition\n");
+    assert_eq!(repo.staged(), "i.txt\nx.txt");
+}
+
+#[test]
 fn stage_and_unstage_move_files_in_and_out_of_the_index() {
     let dir = scratch();
     let (repo, _, _) = two_commits(dir.path());
@@ -1857,4 +1889,81 @@ fn a_hunk_of_a_crlf_file_is_found_and_stages() {
     apply.run().unwrap_or_else(|e| panic!("{}", e.raw_stderr));
     assert_eq!(repo.staged(), "crlf.txt");
     assert_eq!(repo.unstaged(), "", "the whole change is staged");
+}
+
+#[test]
+fn partial_changes_preserve_unselected_lines_and_eof_boundaries() {
+    use atlas_git::patch;
+    for (before, after, selected, reverse, expected) in [
+        ("a\nb\nc\n", "a\nB\nC\n", vec![3], true, "a\nC\n"),
+        ("old tail", "new tail", vec![1], false, "old tail\nnew tail"),
+        ("old tail", "new tail", vec![0], true, "old tail\nnew tail"),
+    ] {
+        let dir = scratch();
+        let repo = Repo::init(dir.path());
+        repo.commit("f.txt", before, "initial");
+        repo.write("f.txt", after);
+        let diff = repo.git(&["diff", "--", "f.txt"]);
+        let parsed = patch::parse_file_diff(&diff).unwrap();
+        let patch = if reverse {
+            patch::reverse_line_selection_patch(&parsed, 0, Some(&selected))
+        } else {
+            patch::line_selection_patch(&parsed, 0, Some(&selected))
+        }
+        .unwrap();
+        let args = if reverse {
+            vec!["apply", "--reverse", "-"]
+        } else {
+            vec!["apply", "--cached", "-"]
+        };
+        GitCommand::new(&repo.path, &args)
+            .stdin(patch.as_bytes().to_vec())
+            .run()
+            .unwrap_or_else(|e| panic!("{}\n{}", e.raw_stderr, patch));
+        let actual = if reverse {
+            repo.read("f.txt")
+        } else {
+            repo.git(&["show", ":f.txt"])
+        };
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn deleting_added_folders_keeps_their_symlink_targets() {
+    let dir = scratch();
+    let repo = Repo::init(dir.path());
+    repo.commit("kept.txt", "kept\n", "initial");
+    std::fs::create_dir_all(repo.path.join("new/nested")).unwrap();
+    repo.write("new/nested/f.txt", "new\n");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("../kept.txt", repo.path.join("new/link")).unwrap();
+        std::os::unix::fs::symlink("absent", repo.path.join("dangling")).unwrap();
+        repo.ops().delete_added(&files(&["dangling"])).unwrap();
+        assert!(std::fs::symlink_metadata(repo.path.join("dangling")).is_err());
+    }
+    repo.ops().delete_added(&files(&["new/"])).unwrap();
+    assert!(!repo.exists("new"));
+    assert_eq!(repo.read("kept.txt"), "kept\n");
+}
+
+#[test]
+fn a_resolved_rebase_continues_without_an_interactive_editor() {
+    let dir = scratch();
+    let repo = Repo::init(dir.path());
+    repo.commit("a.txt", "base\n", "initial");
+    repo.git(&["checkout", "-qb", "feature"]);
+    repo.commit("a.txt", "feature\n", "feature edit");
+    repo.git(&["checkout", "-q", "main"]);
+    repo.commit("a.txt", "main\n", "main edit");
+    repo.git(&["checkout", "-q", "feature"]);
+    assert!(repo.ops().rebase("main", None).is_err());
+    repo.write("a.txt", "resolved\n");
+    repo.ops().stage(&files(&["a.txt"])).unwrap();
+    repo.ops()
+        .control(InProgressKind::Rebase, OpAction::Continue)
+        .unwrap();
+    assert!(!repo.ops().in_progress().unwrap().rebase);
+    assert_eq!(repo.read("a.txt"), "resolved\n");
 }

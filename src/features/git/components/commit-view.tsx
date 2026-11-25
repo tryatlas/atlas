@@ -1,4 +1,5 @@
 import { useTipOnMount } from "@/features/tips/lib/use-tip-on-mount";
+import { confirm } from "@/lib/confirm";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -646,7 +647,28 @@ function CommitActions({ repoPath, sha }: { repoPath: string; sha: string }) {
           <Undo2 size={12} />
         </button>
       </HintItem>
-      <ResetMenu busy={busy} onReset={(mode) => run(() => actions.reset(sha, mode))} />
+      <ResetMenu
+        busy={busy}
+        onReset={(mode) =>
+          run(async () => {
+            if (
+              mode === "hard" &&
+              !(await confirm({
+                title: "Discard changes and reset?",
+                body: "A hard reset replaces staged and working-tree changes with this commit. Unsaved changes to tracked files will be lost.",
+                confirmLabel: "Hard reset",
+                destructive: true,
+              }))
+            )
+              return;
+            if (useGitStore.getState().repoPath !== repoPath)
+              throw new Error(
+                "The active repository changed. Select this commit again before resetting.",
+              );
+            await actions.reset(sha, mode);
+          })
+        }
+      />
       <Popover.Root
         open={tagging}
         onOpenChange={(open) => {

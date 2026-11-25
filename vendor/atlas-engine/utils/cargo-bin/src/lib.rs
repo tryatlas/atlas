@@ -36,7 +36,6 @@ pub enum CargoBinError {
 /// In `cargo test`, `CARGO_BIN_EXE_*` env vars are absolute.
 /// In `bazel test`, `CARGO_BIN_EXE_*` env vars are rlocationpaths, intended to be consumed by `rlocation`.
 /// This helper allows callers to transparently support both.
-#[allow(deprecated)]
 pub fn cargo_bin(name: &str) -> Result<PathBuf, CargoBinError> {
     let env_keys = cargo_bin_env_keys(name);
     for key in &env_keys {
@@ -44,28 +43,23 @@ pub fn cargo_bin(name: &str) -> Result<PathBuf, CargoBinError> {
             return resolve_bin_from_env(key, value);
         }
     }
-    match assert_cmd::Command::cargo_bin(name) {
-        Ok(cmd) => {
-            let mut path = PathBuf::from(cmd.get_program());
-            if !path.is_absolute() {
-                path = std::env::current_dir()
-                    .map_err(|source| CargoBinError::CurrentDir { source })?
-                    .join(path);
-            }
-            if path.exists() {
-                Ok(path)
-            } else {
-                Err(CargoBinError::ResolvedPathDoesNotExist {
-                    key: "assert_cmd::Command::cargo_bin".to_owned(),
-                    path,
-                })
-            }
-        }
-        Err(err) => Err(CargoBinError::NotFound {
+    // assert_cmd 2.2 panics when neither Cargo's env var nor a sibling binary
+    // exists. Callers use this fallible lookup to probe optional test helpers.
+    let mut path =
+        std::env::current_exe().map_err(|source| CargoBinError::CurrentExe { source })?;
+    path.pop();
+    if path.ends_with("deps") {
+        path.pop();
+    }
+    path.push(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(CargoBinError::NotFound {
             name: name.to_owned(),
             env_keys,
-            fallback: format!("assert_cmd fallback failed: {err}"),
-        }),
+            fallback: format!("sibling binary does not exist: {}", path.display()),
+        })
     }
 }
 
@@ -229,4 +223,15 @@ fn normalize_runfile_path(path: &Path) -> PathBuf {
             acc.push(component.as_os_str());
             acc
         })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn missing_optional_binary_returns_an_error_without_panicking() {
+        assert!(matches!(
+            super::cargo_bin("atlas-test-nonexistent-optional-binary-20261124"),
+            Err(super::CargoBinError::NotFound { .. })
+        ));
+    }
 }

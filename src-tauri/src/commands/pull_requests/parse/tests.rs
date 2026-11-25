@@ -645,6 +645,7 @@ fn a_dismissed_review_with_only_a_marker_reads_its_dismissal() {
         body: "<!-- marker -->".into(),
         created_at: "2026-10-01T00:00:00Z".into(),
         edited_at: None,
+        published_at: None,
         url: None,
         path: None,
         review_state: Some("DISMISSED".into()),

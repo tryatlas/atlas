@@ -179,16 +179,18 @@ pub async fn terminal_resize(
 
 #[tauri::command]
 pub async fn terminal_close(state: State<'_, TerminalState>, id: String) -> Result<(), String> {
-    {
-        let mut manager = state.manager.lock().await;
-        manager.close(&id);
-    }
+    let session = state.manager.lock().await.take_session(&id);
     // Force-open the credit window so an emit task parked waiting for acks can
     // run to its exit path (its send fails once the channel is gone).
     if let Some(w) = state.acks.lock().get(&id).cloned() {
         w.in_flight.store(0, Ordering::Release);
         w.notify.notify_one();
     }
+    // Closing a ConPTY can wait for its reader. Never hold the shared manager
+    // mutex or an async runtime worker while it drains.
+    tokio::task::spawn_blocking(move || drop(session))
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -202,13 +204,14 @@ pub async fn terminal_resolve_path(
     state: State<'_, TerminalState>,
     id: String,
     raw: String,
+    cwd: Option<String>,
 ) -> Result<Option<String>, String> {
-    let pid = {
+    let (pid, hint) = {
         let manager = state.manager.lock().await;
-        manager.pid(&id)
+        (manager.pid(&id), manager.cwd_hint(&id))
     };
     tokio::task::spawn_blocking(move || {
-        let base = pid.and_then(atlas_terminal::cwd_of_pid);
+        let base = pid.and_then(atlas_terminal::cwd_of_pid).or(cwd).or(hint);
         resolve_path_with_base(base.as_deref(), &raw)
     })
     .await
@@ -242,7 +245,7 @@ fn resolve_path_with_base(base: Option<&str>, raw: &str) -> Option<String> {
         dirs::home_dir()?
     } else if let Some(rest) = s.strip_prefix("~/") {
         dirs::home_dir()?.join(rest)
-    } else if s.starts_with('/') {
+    } else if PathBuf::from(&s).is_absolute() {
         PathBuf::from(&s)
     } else {
         // Relative — resolve against the provided base directory.

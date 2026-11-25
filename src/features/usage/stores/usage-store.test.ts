@@ -44,6 +44,8 @@ beforeEach(() => {
   tauri.invoke.mockReset();
   tauri.invoke.mockResolvedValue(DASH);
   mocks.projects = [{ path: "/w/a" }, { path: "/w/b" }];
+  mocks.org.activeOrganisationId = "org-a";
+  for (const listener of mocks.orgListeners) listener(mocks.org);
   reset();
 });
 
@@ -52,6 +54,43 @@ afterEach(() => {
 });
 
 describe("refresh", () => {
+  it("discards an outgoing org response even when its projects are identical", async () => {
+    let finishOld!: (value: unknown) => void;
+    const old = new Promise((resolve) => {
+      finishOld = resolve;
+    });
+    mocks.org.activeOrganisationId = "org-a";
+    tauri.invoke.mockReturnValueOnce(old);
+    const first = useUsageStore.getState().actions.refresh();
+    mocks.org.activeOrganisationId = "org-b";
+    for (const listener of mocks.orgListeners) listener(mocks.org);
+    const current = { ...DASH, sessionsTotal: 8 };
+    tauri.invoke.mockResolvedValueOnce(current);
+    await useUsageStore.getState().actions.refresh();
+    finishOld({ ...DASH, sessionsTotal: 99 });
+    await first;
+    expect(useUsageStore.getState().data).toBe(current);
+    expect(useUsageStore.getState().loading).toBe(false);
+  });
+
+  it("starts a new project-set read while the old read is still pending", async () => {
+    let finishOld!: (value: unknown) => void;
+    tauri.invoke.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishOld = resolve;
+      }),
+    );
+    const first = useUsageStore.getState().actions.refresh();
+    mocks.projects = [{ path: "/other-project" }];
+    const current = { ...DASH, sessionsTotal: 3 };
+    tauri.invoke.mockResolvedValueOnce(current);
+    await useUsageStore.getState().actions.refresh();
+    finishOld({ ...DASH, sessionsTotal: 10 });
+    await first;
+    expect(useUsageStore.getState().data).toBe(current);
+    expect(tauri.invoke).toHaveBeenCalledTimes(2);
+  });
+
   it("invokes usage_dashboard with the active org's project paths", async () => {
     await useUsageStore.getState().actions.refresh();
     expect(tauri.invoke).toHaveBeenCalledTimes(1);

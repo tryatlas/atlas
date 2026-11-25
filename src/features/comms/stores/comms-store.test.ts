@@ -7,6 +7,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const snapshot = vi.fn();
 const send = vi.fn();
+const edit = vi.fn();
+const deleteMessage = vi.fn();
+const conversationSnapshot = vi.fn();
 const openConversation = vi.fn<(...args: unknown[]) => Promise<unknown>>(
   () => new Promise(() => {}),
 );
@@ -17,7 +20,9 @@ vi.mock("../lib/comms-api", () => ({
     snapshot: (...args: unknown[]) => snapshot(...args),
     send: (...args: unknown[]) => send(...args),
     openConversation: (...args: unknown[]) => openConversation(...args),
-    conversationSnapshot: vi.fn(),
+    conversationSnapshot: (...args: unknown[]) => conversationSnapshot(...args),
+    edit: (...args: unknown[]) => edit(...args),
+    delete: (...args: unknown[]) => deleteMessage(...args),
     closeConversation: vi.fn(() => Promise.resolve()),
     typing: vi.fn(() => Promise.resolve()),
   },
@@ -75,6 +80,9 @@ beforeEach(() => {
   commsActions().reset();
   snapshot.mockReset();
   send.mockReset();
+  edit.mockReset().mockResolvedValue(undefined);
+  deleteMessage.mockReset().mockResolvedValue(undefined);
+  conversationSnapshot.mockReset();
   openConversation.mockReset();
   openConversation.mockImplementation(() => new Promise(() => {}));
   toastError.mockReset();
@@ -222,4 +230,93 @@ describe("send", () => {
     expect(composer?.replyTo).toBe("m9");
     expect(toastError).toHaveBeenCalledWith("Nope.");
   });
+});
+
+it("does not re-arm an outgoing conversation's retry after the org reset", async () => {
+  let reject!: (error: Error) => void;
+  openConversation.mockReturnValue(
+    new Promise((_resolve, fail) => {
+      reject = fail;
+    }),
+  );
+  commsActions().openConversation("old");
+  commsActions().beginSwitch("org_b");
+  reject(new Error("old request refused"));
+  await flush();
+  expect(pendingConvRetriesForTests()).toBe(0);
+  expect(useCommsStore.getState().loading.old).toBeUndefined();
+});
+
+it("stops a hydrate's per-conversation loop when the org changes", async () => {
+  let resolve!: (value: unknown) => void;
+  snapshot.mockResolvedValue(snapshotFor("org_a", ["old-1", "old-2"]));
+  conversationSnapshot.mockReturnValue(
+    new Promise((done) => {
+      resolve = done;
+    }),
+  );
+  useCommsStore.setState({
+    tabs: [
+      { id: "t1", convId: "old-1" },
+      { id: "t2", convId: "old-2" },
+    ],
+    hydrated: { "old-1": true },
+  });
+  const run = commsActions().hydrate();
+  await flush();
+  commsActions().beginSwitch("org_b");
+  resolve({ messages: [], reactions: [], pinned_message_ids: [] });
+  await run;
+  expect(openConversation).not.toHaveBeenCalledWith("old-2");
+  expect(useCommsStore.getState().messages).toEqual({});
+});
+
+it("cancel and successful edit restore the draft and its staged files", async () => {
+  const previous = {
+    draft: "unfinished reply",
+    replyTo: "parent",
+    editing: null,
+    attachments: [
+      {
+        uploadId: "upload",
+        fileId: "file",
+        filename: "notes.txt",
+        state: "complete" as const,
+        totalBytes: 4,
+        sentBytes: 4,
+      },
+    ],
+  };
+  const message = { id: "mine", author_id: "me", body: "old message", deleted: false } as never;
+  useCommsStore.setState({ me: "me", composers: { c1: previous }, messages: { c1: [message] } });
+  commsActions().beginEdit("c1", "mine");
+  commsActions().cancelComposerIntent("c1");
+  expect(useCommsStore.getState().composers.c1).toEqual(previous);
+  commsActions().beginEdit("c1", "mine");
+  commsActions().setDraft("c1", "revised");
+  commsActions().commitEdit("c1");
+  await flush();
+  expect(edit).toHaveBeenCalledWith("mine", "revised");
+  expect(useCommsStore.getState().composers.c1).toEqual(previous);
+});
+
+it("keeps reconnecting edits for retry and refuses deletion of another author's message", async () => {
+  useCommsStore.setState({
+    me: "me",
+    messages: {
+      c1: [
+        { id: "other", author_id: "someone", deleted: false },
+        { id: "mine", author_id: "me", body: "original", deleted: false },
+      ] as never,
+    },
+    connection: { state: "backoff", orgId: "org_a", epoch: 1, reason: null },
+  });
+  commsActions().deleteMessage("c1", "other");
+  expect(deleteMessage).not.toHaveBeenCalled();
+  commsActions().beginEdit("c1", "mine");
+  commsActions().setDraft("c1", "retained edit");
+  commsActions().commitEdit("c1");
+  expect(edit).not.toHaveBeenCalled();
+  expect(useCommsStore.getState().composers.c1.draft).toBe("retained edit");
+  expect(toastError).toHaveBeenCalled();
 });

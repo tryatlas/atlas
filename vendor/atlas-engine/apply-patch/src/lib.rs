@@ -567,8 +567,10 @@ async fn apply_hunks_to_files(
                     sandbox,
                 )
                 .await?;
-                if let Some(dest) = move_path {
-                    let dest_uri = cwd.join(&dest.to_string_lossy())?;
+                if let Some(dest_uri) =
+                    resolve_move_destination(&path_uri, move_path.as_ref(), cwd, fs, sandbox)
+                        .await?
+                {
                     let overwritten_move_content =
                         read_optional_file_text_for_delta(&dest_uri, fs, sandbox, &mut delta.exact)
                             .await;
@@ -661,6 +663,35 @@ async fn apply_hunks_to_files(
         modified,
         deleted,
     })
+}
+
+// Resolve against the executor's filesystem, including remote executors. A
+// rename onto the source itself is an update, otherwise removing the source
+// after writing the destination would delete the newly written file.
+async fn resolve_move_destination(
+    source: &PathUri,
+    destination: Option<&PathBuf>,
+    cwd: &PathUri,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> std::result::Result<Option<PathUri>, ApplyPatchError> {
+    let Some(destination) = destination else {
+        return Ok(None);
+    };
+    let destination = cwd.join(&destination.to_string_lossy())?;
+    if source == &destination {
+        return Ok(None);
+    }
+    match fs.canonicalize(&destination, sandbox).await {
+        Ok(canonical_destination) => {
+            if fs.canonicalize(source, sandbox).await? == canonical_destination {
+                return Ok(None);
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(Some(destination))
 }
 
 async fn ensure_not_directory(

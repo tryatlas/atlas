@@ -181,6 +181,46 @@ pub fn strip_unsupported(content: Vec<ContentBlock>, image_supported: bool) -> V
     kept
 }
 
+/// [`strip_unsupported`], for every capability an agent advertises in
+/// `promptCapabilities`, not only images.
+///
+/// - `Image` and `Audio` go when the agent did not advertise them.
+/// - An embedded resource (`embeddedContext`) is turned into its text when the
+///   agent cannot take one, so a pasted or attached file still reaches it; a
+///   binary resource, which has no text, goes.
+///
+/// Called on every send (`AgentManager::send`), so a block the composer did
+/// not degrade never reaches an agent that cannot take it (audit #23).
+#[must_use]
+pub fn strip_unsupported_for(
+    content: Vec<ContentBlock>,
+    capabilities: &agent_client_protocol::schema::v1::PromptCapabilities,
+) -> Vec<ContentBlock> {
+    let before = content.len();
+    let kept: Vec<ContentBlock> = strip_unsupported(content, capabilities.image)
+        .into_iter()
+        .filter_map(|block| match block {
+            ContentBlock::Audio(_) if !capabilities.audio => None,
+            ContentBlock::Resource(resource) if !capabilities.embedded_context => {
+                match resource.resource {
+                    EmbeddedResourceResource::TextResourceContents(text) => {
+                        Some(ContentBlock::Text(TextContent::new(text.text)))
+                    }
+                    _ => None,
+                }
+            }
+            block => Some(block),
+        })
+        .collect();
+    if kept.len() != before {
+        tracing::debug!(
+            count = before - kept.len(),
+            "dropping prompt blocks the agent did not advertise in promptCapabilities"
+        );
+    }
+    kept
+}
+
 /// Collapse content blocks back into a single string.
 ///
 /// Used by the native agent's backend, which takes text only. Text-bearing
@@ -398,5 +438,31 @@ mod tests {
             ContentBlock::ResourceLink(ResourceLink::new("src/main.rs", "file:///src/main.rs")),
         ];
         assert_eq!(flatten_text(&content), "explain\n\nfile:///src/main.rs");
+    }
+
+    /// Audit #23: the backstop honours every advertised prompt capability.
+    #[test]
+    fn strip_for_capabilities_drops_audio_and_unwraps_embedded_text() {
+        use agent_client_protocol::schema::v1::{AudioContent, PromptCapabilities};
+        let content = vec![
+            ContentBlock::Text(TextContent::new("hear this".to_string())),
+            ContentBlock::Audio(AudioContent::new("aGk=", "audio/wav")),
+            ContentBlock::Resource(EmbeddedResource::new(
+                EmbeddedResourceResource::TextResourceContents(TextResourceContents::new(
+                    "pasted",
+                    "atlas://paste/1",
+                )),
+            )),
+        ];
+
+        let kept = strip_unsupported_for(content.clone(), &PromptCapabilities::default());
+        assert_eq!(kept.len(), 2);
+        assert!(matches!(&kept[1], ContentBlock::Text(t) if t.text == "pasted"));
+
+        let all = PromptCapabilities::default()
+            .image(true)
+            .audio(true)
+            .embedded_context(true);
+        assert_eq!(strip_unsupported_for(content.clone(), &all), content);
     }
 }

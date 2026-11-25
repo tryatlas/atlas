@@ -465,6 +465,7 @@ async fn handle_approved_mcp_tool_call(
                         &server,
                         call_id,
                         Some(&metadata),
+                        prepared_call.server_origin(),
                     );
                     let request_meta = with_mcp_tool_call_thread_id_meta(
                         request_meta,
@@ -580,10 +581,10 @@ fn mcp_tool_call_span(
         turn.id = turn_context.sub_id.as_str(),
         server.address = Empty,
         server.port = Empty,
-        atlas_engine.mcp.target.id = Empty,
-        atlas_engine.mcp.server_user_flow.triggered = Empty,
+        atlas_agent.mcp.target.id = Empty,
+        atlas_agent.mcp.server_user_flow.triggered = Empty,
         error.type = Empty,
-        atlas_engine.mcp.error.code = Empty,
+        atlas_agent.mcp.error.code = Empty,
     );
     record_server_fields(&span, fields.server_origin);
     span
@@ -1183,6 +1184,7 @@ fn build_mcp_tool_call_request_meta(
     server: &str,
     call_id: &str,
     metadata: Option<&McpToolApprovalMetadata>,
+    server_origin: Option<&str>,
 ) -> Option<serde_json::Value> {
     let mut request_meta = serde_json::Map::new();
     request_meta.insert(
@@ -1190,12 +1192,16 @@ fn build_mcp_tool_call_request_meta(
         serde_json::Value::String(call_id.to_string()),
     );
 
-    if let Some(turn_metadata) = turn_context
-        .turn_metadata_state
-        .current_meta_value_for_mcp_request(McpTurnMetadataContext {
-            model: turn_context.model_info.slug.as_str(),
-            reasoning_effort: turn_context.effective_reasoning_effort(),
-        })
+    // Atlas: the turn metadata names the absolute repository path, its git
+    // remotes, the HEAD commit and the session ids. It goes only to a server
+    // on this machine (`mcp_server_origin_is_local`), never to a remote one.
+    if crate::turn_metadata::mcp_server_origin_is_local(server_origin)
+        && let Some(turn_metadata) = turn_context
+            .turn_metadata_state
+            .current_meta_value_for_mcp_request(McpTurnMetadataContext {
+                model: turn_context.model_info.slug.as_str(),
+                reasoning_effort: turn_context.effective_reasoning_effort(),
+            })
     {
         request_meta.insert(
             crate::X_ATLAS_AGENT_TURN_METADATA_HEADER.to_string(),

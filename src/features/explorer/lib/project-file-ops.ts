@@ -7,7 +7,10 @@
 import { toast } from "sonner";
 import { activeProjectId } from "@/features/projects/lib/active-project";
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
-import { openFile } from "@/lib/open-file";
+import { canonicalFilePath, openFile, openFileAs } from "@/lib/open-file";
+import { requestCloseTab } from "@/features/chat/lib/close-tab";
+import { fileDraftOf, releaseFileBuffer } from "@/features/editor/lib/dirty-close";
+import { useEditorStore } from "@/features/editor/stores/editor-store";
 import { fileTabPath } from "@/lib/tab-registry";
 import {
   copyPath,
@@ -20,14 +23,18 @@ import {
   renameRecentFile,
 } from "./fs-api";
 import type { ProjectTreeModel } from "./project-tree-model";
+import { basename } from "@/lib/paths";
+import { isUnderRoot, normalisePath } from "@/lib/file-links";
 
 const dirOf = (p: string) => p.slice(0, Math.max(0, p.lastIndexOf("/")));
-const baseOf = (p: string) => p.slice(p.lastIndexOf("/") + 1);
+const baseOf = basename;
 
 /** Absolute → root-relative, `""` for the root itself; null when outside. */
 export function relativeTo(root: string, abs: string): string | null {
-  if (abs === root) return "";
-  return abs.startsWith(`${root}/`) ? abs.slice(root.length + 1) : null;
+  const r = normalisePath(root);
+  const p = normalisePath(abs);
+  if (!p || !r || !isUnderRoot(p, r)) return null;
+  return p === r ? "" : p.slice(r.endsWith("/") ? r.length : r.length + 1);
 }
 
 export function absoluteOf(root: string, rel: string): string {
@@ -54,9 +61,7 @@ export function entryNameError(name: string): string | null {
  * the copy) and cannot be moved at all.
  */
 export function intoItselfError(src: string, destDir: string): string | null {
-  return destDir === src || destDir.startsWith(`${src}/`)
-    ? "Can't put a folder inside itself"
-    : null;
+  return isUnderRoot(destDir, src) ? "Can't put a folder inside itself" : null;
 }
 
 /**
@@ -86,12 +91,20 @@ async function destinationFor(src: string, destDir: string): Promise<string> {
   return `${destDir}/${freeName(baseOf(src), taken)}`;
 }
 
+interface OpenFileTab {
+  id: string;
+  type: string;
+  filePath: string;
+  dirty: boolean;
+  editing: boolean;
+}
+
 /** The open file tabs showing `path` or a file under it, with their paths. */
-function filesTabsAt(path: string): { id: string; filePath: string }[] {
+function filesTabsAt(path: string): OpenFileTab[] {
   return useLayoutStore.getState().tabs.flatMap((t) => {
     const filePath = fileTabPath(t);
     return filePath !== null && (filePath === path || filePath.startsWith(`${path}/`))
-      ? [{ id: t.id, filePath }]
+      ? [{ id: t.id, type: t.type, filePath, dirty: !!t.dirty, editing: t.data.editing === true }]
       : [];
   });
 }
@@ -222,8 +235,10 @@ export class ProjectFileOps {
       try {
         await deletePath(path);
         parents.add(dirOf(path));
-        const { closeTab } = useLayoutStore.getState().actions;
-        for (const tab of filesTabsAt(path)) closeTab(tab.id);
+        // Through the guarded close: a tab with unsaved edits asks (Save
+        // writes them back to the path), a clean one closes and frees its
+        // buffer.
+        for (const tab of filesTabsAt(path)) requestCloseTab(tab.id);
       } catch (e) {
         this.fail(e);
         break;
@@ -241,10 +256,23 @@ export class ProjectFileOps {
     void renameRecentFile(from, to, activeProjectId()).catch(() => {});
     const stale = filesTabsAt(from);
     if (stale.length === 0) return;
-    const { closeTab } = useLayoutStore.getState().actions;
+    const layout = useLayoutStore.getState().actions;
+    const editor = useEditorStore.getState().actions;
     for (const tab of stale) {
-      closeTab(tab.id);
-      void openFile(to + tab.filePath.slice(from.length));
+      const dest = to + tab.filePath.slice(from.length);
+      if (tab.type === "editor" && tab.dirty) {
+        // Unsaved edits move with the file: the buffer is re-keyed carrying
+        // the live text, and the new tab opens on it, still unsaved.
+        const draft = fileDraftOf(tab.id);
+        editor.moveBuffer(tab.filePath, canonicalFilePath(dest), draft);
+        layout.closeTab(tab.id);
+        const id = openFileAs(dest, "text", { edit: tab.editing });
+        useLayoutStore.getState().actions.setTabDirty(id, draft !== undefined);
+        continue;
+      }
+      layout.closeTab(tab.id);
+      releaseFileBuffer(tab.filePath, useLayoutStore.getState().tabs);
+      void openFile(dest);
     }
   }
 }

@@ -147,6 +147,8 @@ pub struct Tenant {
     audience: Audience,
     admit: Admit,
     outward: Option<Arc<dyn OutwardCalls>>,
+    /// The tools its server advertises ([`advertising`](Self::advertising)).
+    tools: Vec<String>,
     mount: Mount,
 }
 
@@ -165,6 +167,7 @@ impl Tenant {
             audience: Audience::Everyone,
             admit: Arc::new(|_, _| Ok(())),
             outward: None,
+            tools: Vec::new(),
             mount: Arc::new(move |sessions| {
                 let handler = handler.clone();
                 let service = StreamableHttpService::new(
@@ -212,6 +215,17 @@ impl Tenant {
         self
     }
 
+    /// Its server advertises exactly `tools` — taken from the server's own
+    /// `tools/list` answer ([`super::tool_names`]). Only these are
+    /// pre-approved for an agent that takes pre-approval by tool name
+    /// (`atlas_agent_servers::session_mcp::claude_code_meta`); a tenant that
+    /// declares none has none pre-approved.
+    #[must_use]
+    pub fn advertising(mut self, tools: Vec<String>) -> Self {
+        self.tools = tools;
+        self
+    }
+
     /// The name the server goes by in an agent's MCP configuration.
     pub fn name(&self) -> &'static str {
         self.name
@@ -236,8 +250,10 @@ impl Tenant {
         (self.mount)(sessions)
     }
 
-    /// Its ask-first tools, added to `ask_first` under its name.
+    /// Its advertised and ask-first tools, added to `ask_first` under its
+    /// name.
     pub(super) fn declare_ask_first(&self, ask_first: AskFirst) -> AskFirst {
+        let ask_first = ask_first.advertising(self.name, &self.tools);
         match &self.outward {
             Some(outward) => ask_first
                 .on(self.name, outward.ask_first())

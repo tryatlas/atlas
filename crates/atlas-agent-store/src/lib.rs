@@ -125,6 +125,7 @@
 pub mod archive;
 pub mod detection;
 pub mod http;
+pub mod launch_defaults;
 pub mod node;
 pub mod npm_tree;
 pub mod registry;
@@ -136,6 +137,7 @@ pub mod store;
 pub use archive::sanitize_path_component;
 pub use detection::{detect_on_path, DetectedAgent};
 pub use http::{HttpClient, HttpResponse, ReqwestClient};
+pub use launch_defaults::SeedConditions;
 pub use node::{npm_platform, NodeRuntime};
 pub use npm_tree::{install_state, platform_optionals, InstallState, NpmPlatform, OptionalEntry};
 pub use registry::{

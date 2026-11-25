@@ -218,11 +218,17 @@ describe("retrying the last turn", () => {
       "hello",
       [],
       expect.stringMatching(/^pending:/),
+      // No images: the prompt handed back is text.
+      undefined,
     );
     expect(queueAdd).toHaveBeenCalledWith(
       expect.objectContaining({ session_id: expect.any(String) }),
       "hello",
       "hello",
+      // Composed as a direct send is: no images, files or pastes here.
+      undefined,
+      [],
+      [],
     );
   });
 
@@ -244,12 +250,18 @@ describe("retrying the last turn", () => {
       "hello",
       [],
       expect.stringMatching(/^pending:/),
+      // No images: the prompt handed back is text.
+      undefined,
     );
     // Into the session the tab is on NOW: the hand-back is for the user.
     expect(queueAdd).toHaveBeenCalledWith(
       expect.objectContaining({ session_id: "a-different-session" }),
       "hello",
       "hello",
+      // Composed as a direct send is: no images, files or pastes here.
+      undefined,
+      [],
+      [],
     );
   });
 

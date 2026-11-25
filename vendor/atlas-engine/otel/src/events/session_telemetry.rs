@@ -1091,7 +1091,8 @@ impl SessionTelemetry {
             tool_name = %tool_name,
             duration_ms = %Duration::ZERO.as_millis(),
             success = %false,
-            output = %error,
+            output_length = error.len() as i64,
+            output_line_count = error.lines().count() as i64,
             mcp_server = "",
             mcp_server_origin = "",
         );
@@ -1104,7 +1105,6 @@ impl SessionTelemetry {
             output_length = error.len() as i64,
             output_line_count = error.lines().count() as i64,
             tool_origin = %"builtin",
-            error.message = %error,
         );
     }
 
@@ -1135,10 +1135,11 @@ impl SessionTelemetry {
             event.name = "atlas_agent.tool_result",
             tool_name = %tool_name,
             call_id = %call_id,
-            arguments = %arguments,
+            arguments_length = arguments.len() as i64,
             duration_ms = %duration.as_millis(),
             success = %success_str,
-            output = %output,
+            output_length = output.len() as i64,
+            output_line_count = output.lines().count() as i64,
             mcp_server = %mcp_server,
             mcp_server_origin = %mcp_server_origin,
         );

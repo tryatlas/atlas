@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Application } from "pixi.js";
-import { destroyPixiApp, livePixiAppCount, registerPixiApp } from "./pixi-app";
+import { destroyPixiApp, initPixiApp, livePixiAppCount, registerPixiApp } from "./pixi-app";
 
 /**
  * A stand-in for a pixi `Application` that records what `destroy` was handed.
@@ -79,4 +79,25 @@ describe("destroyPixiApp", () => {
     expect(calls).toHaveLength(0);
     expect(livePixiAppCount()).toBe(0);
   });
+});
+
+it("waits for a pending renderer before destruction and releases it once", async () => {
+  let resolve!: () => void;
+  const app = {
+    init: () =>
+      new Promise<void>((done) => {
+        resolve = done;
+      }),
+    destroy: vi.fn(),
+  } as unknown as Application;
+  registerPixiApp(app);
+  const init = initPixiApp(app, {});
+  destroyPixiApp(app);
+  expect(app.destroy).not.toHaveBeenCalled();
+  expect(livePixiAppCount()).toBe(1);
+  resolve();
+  await init;
+  destroyPixiApp(app);
+  expect(app.destroy).toHaveBeenCalledTimes(1);
+  expect(livePixiAppCount()).toBe(0);
 });

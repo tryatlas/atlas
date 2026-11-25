@@ -235,10 +235,6 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["html
 # the agent runtime moved to the separate `rig-agent` crate, which Atlas does not
 # use — modelchat / memory_summarize drive `Model::stream` directly.
 rig-core = { version = "0.45.0", features = ["reqwest"] }
-# Loads a `.env` (cwd) at startup so source / fork builds can point telemetry at
-# their own PostHog OSS project via `POSTHOG_KEY`/`POSTHOG_HOST` without a
-# rebuild. Tiny, zero transitive deps. See `crate::telemetry`.
-dotenvy = "0.15"
 # Semver comparison for the auto-updater's version gate (PostHog `version`
 # remote-config value vs the running `CARGO_PKG_VERSION`). See
 # `crate::commands::updater`.
@@ -258,6 +254,8 @@ unicode-normalization = "0.1"
 # `renameat2(RENAME_NOREPLACE)`) in `commands::fs`. The workspace's libc,
 # already linked through the engine.
 libc = { workspace = true }
+# Private, self-cleaning build directories for knowledge-server exports.
+tempfile = "3"
 
 [dev-dependencies]
 # The shared scripted `AgentConnection`; the feature is for tests only.
@@ -271,8 +269,6 @@ rmcp = { workspace = true, features = ["client", "transport-streamable-http-clie
 # (`src/command_seam/`). A feature of the dependency above, for tests only:
 # with resolver 2 it is not in the graph of a normal or release build.
 tauri = { version = "2", features = ["test"] }
-# Self-deleting temp dirs for the state/config tests.
-tempfile = "3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Read the Windows Installer's uninstall entry for Atlas: the auto-updater
@@ -289,6 +285,8 @@ windows = { version = "0.62", features = [
   # `GetLogicalDrives`/`GetDriveTypeW`: the drives the "Add project" folder
   # browser offers (`crate::commands::project_sources::project_locations`).
   "Win32_Storage_FileSystem",
+  "Win32_System_DataExchange",
+  "Win32_UI_Shell",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

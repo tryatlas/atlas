@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 import type { ReactNode } from "react";
 import { Hint } from "@tryatlas/design";
 
@@ -80,7 +81,7 @@ export function PageHeaderView({
             onChange={(e) => onTitleDraftChange(e.target.value)}
             onBlur={onTitleCommit}
             onKeyDown={(e) => {
-              if (e.key === "Enter") {
+              if (e.key === "Enter" && !isComposingKey(e)) {
                 e.preventDefault();
                 onTitleCommit();
                 (e.currentTarget as HTMLInputElement).blur();

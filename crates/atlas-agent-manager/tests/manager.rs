@@ -198,7 +198,7 @@ impl AgentServer for FakeServer {
 
 fn connect_options() -> ConnectOptions {
     let thread_events: ThreadEventSink =
-        Arc::new(|_session_id| atlas_acp_thread::event_channel().0);
+        Arc::new(|_agent, _session_id| atlas_acp_thread::event_channel().0);
     ConnectOptions {
         root_dir: None,
         defaults: AcpConnectionDefaults::default(),

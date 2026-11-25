@@ -92,6 +92,7 @@ jobs:
     # the same build and `Verify` again before anything is published.
     if: >-
       github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
       (github.head_ref != 'dev' && github.head_ref != 'main')
     strategy:
       fail-fast: false

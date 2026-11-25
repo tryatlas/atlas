@@ -4881,7 +4881,7 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
 }
 
 #[tokio::test]
-async fn emit_subagent_session_started_includes_fork_lineage_and_originator() {
+async fn subagent_session_start_does_not_upload_analytics_even_when_requested() {
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
@@ -4929,38 +4929,15 @@ async fn emit_subagent_session_started_includes_fork_lineage_and_originator() {
         },
     );
 
-    let event = timeout(Duration::from_secs(1), async {
-        'wait_for_event: loop {
-            if let Some(requests) = server.received_requests().await {
-                for request in requests {
-                    let payload: serde_json::Value =
-                        serde_json::from_slice(&request.body).expect("valid analytics payload");
-                    if let Some(event) = payload["events"].as_array().and_then(|events| {
-                        events
-                            .iter()
-                            .find(|event| event["event_type"] == "atlas_engine_thread_initialized")
-                    }) {
-                        break 'wait_for_event event.clone();
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("subagent initialization analytics should be emitted");
-
-    assert_eq!(
-        event["event_params"]["parent_thread_id"],
-        parent_thread_id.to_string()
-    );
-    assert_eq!(
-        event["event_params"]["forked_from_thread_id"],
-        forked_from_thread_id.to_string()
-    );
-    assert_eq!(
-        event["event_params"]["app_server_client"]["product_client_id"],
-        "test_originator"
+    // The Atlas port keeps local diagnostic events but removes the upstream uploader.
+    // Flushing proves this path completes without sending thread identity or lineage.
+    analytics_events_client.flush().await;
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("mock server records requests")
+            .is_empty()
     );
 }
 

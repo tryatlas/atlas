@@ -15,6 +15,114 @@ use atlas_checkpoint::{
 
 const WORKSPACE: &str = "ws-atlas";
 
+#[test]
+fn cloud_tool_titles_are_redacted_and_completion_is_queued_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = store_in(dir.path());
+    let session_id = started(&mut store);
+    for (status, title) in [
+        (ToolStatus::Running, "API_KEY=supersecretvalue123 run"),
+        (ToolStatus::Completed, "API_KEY=anothervalue456 finished"),
+    ] {
+        Capture::new(&mut store, ProjectMode::Cloud)
+            .record_tool_call(
+                &session_id,
+                ToolCallContent {
+                    turn_seq: 1,
+                    native_call_id: Some("tc-title"),
+                    tool_name: ToolName::Bash,
+                    title: Some(title),
+                    kind: Some("execute"),
+                    status,
+                    locations: &no_locations(),
+                    arguments: None,
+                    result: None,
+                },
+            )
+            .unwrap();
+        let batch = store
+            .pending_artifacts(WORKSPACE, "remote", "org", 100, 1_000_000)
+            .unwrap();
+        let call = batch
+            .iter()
+            .find(|a| matches!(a, atlas_checkpoint::artifacts::AtlasArtifact::ToolCall(_)))
+            .expect("each update is queued");
+        let json = serde_json::to_string(call).unwrap();
+        assert!(!json.contains("supersecretvalue123") && !json.contains("anothervalue456"));
+        assert!(json.contains("[REDACTED]"));
+        store.mark_sent(call).unwrap();
+    }
+    drop(store);
+    let store = store_in(dir.path());
+    let calls = store.tool_calls_for_session(&session_id).unwrap();
+    assert_eq!(
+        calls[0].title.as_deref(),
+        Some("API_KEY=[REDACTED] finished")
+    );
+}
+
+#[test]
+fn an_acknowledgement_cannot_hide_a_newer_tool_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = store_in(dir.path());
+    let session = started(&mut store);
+    let locations = no_locations();
+    let mut record = |status| {
+        Capture::new(&mut store, ProjectMode::Cloud)
+            .record_tool_call(
+                &session,
+                ToolCallContent {
+                    turn_seq: 1,
+                    native_call_id: Some("race"),
+                    tool_name: ToolName::Bash,
+                    title: Some("echo done"),
+                    kind: None,
+                    status,
+                    locations: &locations,
+                    arguments: None,
+                    result: None,
+                },
+            )
+            .unwrap()
+    };
+    record(ToolStatus::Running);
+    let before = store
+        .pending_artifacts(WORKSPACE, "remote", "org", 100, 1_000_000)
+        .unwrap();
+    let sent = before
+        .iter()
+        .find(|a| matches!(a, atlas_checkpoint::artifacts::AtlasArtifact::ToolCall(_)))
+        .unwrap();
+    Capture::new(&mut store, ProjectMode::Cloud)
+        .record_tool_call(
+            &session,
+            ToolCallContent {
+                turn_seq: 1,
+                native_call_id: Some("race"),
+                tool_name: ToolName::Bash,
+                title: None,
+                kind: None,
+                status: ToolStatus::Completed,
+                locations: &locations,
+                arguments: None,
+                result: Some(b"done"),
+            },
+        )
+        .unwrap();
+    store.mark_sent(sent).unwrap();
+    let after = store
+        .pending_artifacts(WORKSPACE, "remote", "org", 100, 1_000_000)
+        .unwrap();
+    let latest = after.iter().find(|a| a.row_id() == sent.row_id()).unwrap();
+    assert!(serde_json::to_string(latest).unwrap().contains("completed"));
+    store.mark_sent(latest).unwrap();
+    assert!(store
+        .pending_artifacts(WORKSPACE, "remote", "org", 100, 1_000_000)
+        .unwrap()
+        .iter()
+        .all(|a| a.row_id() != sent.row_id()));
+}
+
 fn store_in(dir: &std::path::Path) -> Store {
     Store::open(dir.join(".atlas")).expect("store opens")
 }

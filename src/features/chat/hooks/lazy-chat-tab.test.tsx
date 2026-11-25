@@ -198,21 +198,16 @@ describe("a new chat in a tab nobody is looking at", () => {
     expect(session().acpSessionId).toBeUndefined();
   });
 
-  it("starts its session when the tab is switched to, once", async () => {
+  it("switched to: connects its agent, and still starts no session", async () => {
     tabs(OTHER);
     mountPanel();
     await settle();
 
     await show(TAB);
     await settle();
-    expect(count("agents_new_session")).toBe(1);
-    expect(session().acpSessionId).toBe("sess-1");
-
-    // Away and back: bound, so nothing starts again.
-    await show(OTHER);
-    await show(TAB);
-    await settle();
-    expect(count("agents_new_session")).toBe(1);
+    expect(count("agents_spawn")).toBe(1);
+    expect(count("agents_new_session")).toBe(0);
+    expect(session().acpSessionId).toBeUndefined();
   });
 
   it("starts its session when sent to while hidden", async () => {
@@ -239,14 +234,7 @@ describe("a new chat in a tab nobody is looking at", () => {
     expect(session().acpSessionId).toBe("sess-1");
   });
 
-  it("still starts at once when it is the tab on screen", async () => {
-    tabs(TAB);
-    mountPanel();
-    await settle();
-    expect(count("agents_new_session")).toBe(1);
-  });
-
-  it("six tabs open, one showing: one session", async () => {
+  it("six tabs open, one showing: one agent connected, no session", async () => {
     const ids = ["a", "b", "c", "d", "e", "f"];
     useLayoutStore.setState({
       tabs: ids.map((id) => chatTab(id)),
@@ -259,8 +247,78 @@ describe("a new chat in a tab nobody is looking at", () => {
     for (const id of ids) mountPanel(id);
     await settle();
 
+    expect(count("agents_spawn")).toBe(1);
+    expect(count("agents_new_session")).toBe(0);
+  });
+});
+
+// The session is the user's, so only the user starts one. Showing a chat is
+// not that: a launch, a project switch and a tab switch all show one. An
+// agent that stores every session it is asked to open (opencode) listed each
+// of those as a session of its own, which the sidebar then imported as one
+// the user had started: an untitled "New session" per launch per project.
+// Showing a tab connects the agent, so the session that typing asks for
+// comes back in a fraction of a second, slash commands included.
+describe("a new chat on screen", () => {
+  beforeEach(() => store().actions.createSession(TAB, PLUGIN));
+
+  it("connects its agent and starts no session", async () => {
+    tabs(TAB);
+    mountPanel();
+    await settle();
+
+    expect(count("agents_spawn")).toBe(1);
+    expect(count("agents_new_session")).toBe(0);
+    expect(session().acpSessionId).toBeUndefined();
+  });
+
+  it("does not leave the mode picker loading while it waits", async () => {
+    tabs(TAB);
+    mountPanel();
+    await settle();
+    expect(session().acpModesPending).toBe(false);
+  });
+
+  it("starts nothing when its composer takes the focus", async () => {
+    tabs(TAB);
+    mountPanel();
+    await settle();
+
+    emitWindowEvent("atlas:chat-input-focused", { tabId: TAB });
+    await settle();
+    expect(count("agents_new_session")).toBe(0);
+  });
+
+  it("starts its session when the user starts writing, once", async () => {
+    tabs(TAB);
+    mountPanel();
+    await settle();
+
+    emitWindowEvent("atlas:chat-input-started", { tabId: TAB });
+    emitWindowEvent("atlas:chat-input-started", { tabId: TAB });
+    await settle();
     expect(count("agents_new_session")).toBe(1);
-    expect(session("c").acpSessionId).toBe("sess-1");
+    expect(session().acpSessionId).toBe("sess-1");
+  });
+
+  it("starts nothing for writing in another tab", async () => {
+    tabs(TAB);
+    mountPanel();
+    await settle();
+
+    emitWindowEvent("atlas:chat-input-started", { tabId: OTHER });
+    await settle();
+    expect(count("agents_new_session")).toBe(0);
+  });
+
+  it("starts its session when sent to", async () => {
+    tabs(TAB);
+    const control = mountPanel();
+    await settle();
+
+    act(() => control.result.current.current?.kick());
+    await settle();
+    expect(count("agents_new_session")).toBe(1);
   });
 });
 
@@ -387,6 +445,10 @@ describe("a tab saved with a conversation", () => {
 
     expect(count("threads_resume")).toBe(0);
     expect(session().pendingRestore).toBeUndefined();
+    // A new chat like any other: its session waits for the user.
+    expect(count("agents_new_session")).toBe(0);
+    act(() => emitWindowEvent("atlas:chat-input-started", { tabId: TAB }));
+    await settle();
     expect(count("agents_new_session")).toBe(1);
     expect(session().acpSessionId).toBe("sess-1");
   });
@@ -420,9 +482,12 @@ describe("a tab saved with a conversation", () => {
     mountPanel();
     await settle();
 
-    // "New chat" in the tab, then looking at it.
+    // "New chat" in the tab, then looking at it and writing in it.
     act(() => store().actions.clearSession(TAB));
     await show(TAB);
+    await settle();
+    expect(count("agents_new_session")).toBe(0);
+    act(() => emitWindowEvent("atlas:chat-input-started", { tabId: TAB }));
     await settle();
 
     expect(count("threads_resume")).toBe(0);
@@ -445,8 +510,10 @@ describe("a tab saved with a conversation", () => {
 
     act(() => void openNewAgentChat());
     await settle();
-
     expect(session().transcriptLoading).toBeFalsy();
+    act(() => emitWindowEvent("atlas:chat-input-started", { tabId: TAB }));
+    await settle();
+
     expect(session().acpSessionId).toBe("sess-1");
     act(() =>
       store().actions.applyAgentDelta({
@@ -533,6 +600,8 @@ describe("what a tab saves", () => {
     tabs(TAB);
     mountPanel();
     await settle();
+    act(() => emitWindowEvent("atlas:chat-input-started", { tabId: TAB }));
+    await settle();
 
     expect(session().acpSessionId).toBe("sess-1");
     expect(readChatTabSession(layout().tabs[0].data)).toBeNull();
@@ -541,6 +610,8 @@ describe("what a tab saves", () => {
   it("the session, once it has a conversation, and nothing again once it is cleared", async () => {
     tabs(TAB);
     mountPanel();
+    await settle();
+    act(() => emitWindowEvent("atlas:chat-input-started", { tabId: TAB }));
     await settle();
 
     act(() => store().actions.addMessage(TAB, "user", "hi"));

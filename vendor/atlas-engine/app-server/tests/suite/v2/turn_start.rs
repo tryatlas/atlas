@@ -652,9 +652,12 @@ async fn turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills(
     let warning: WarningNotification =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_notification("warning")).await??;
     assert_eq!(warning.thread_id.as_deref(), Some(thread.id.as_str()));
+    // Atlas: the two test skills plus the three model-visible bundled samples
+    // (plugin-creator, skill-creator, skill-installer; review-agent is not
+    // implicitly invocable). Upstream bundled a different sample set.
     assert_eq!(
         warning.message,
-        "Exceeded skills context budget. All skill descriptions were removed and 7 additional skills were not included in the model-visible skills list."
+        "Exceeded skills context budget. All skill descriptions were removed and 5 additional skills were not included in the model-visible skills list."
     );
 
     timeout(
@@ -907,6 +910,7 @@ async fn thread_start_omits_empty_instruction_overrides_from_model_request() -> 
 }
 
 #[tokio::test]
+#[ignore = "asserts on the upstream analytics uploader, which Atlas removed (tests/engine-no-phone-home.test.ts)"]
 async fn turn_start_tracks_thread_originator_in_analytics() -> Result<()> {
     let server = responses::start_mock_server().await;
     let response_mock = responses::mount_response_sequence(
@@ -1052,6 +1056,7 @@ async fn turn_start_tracks_thread_originator_in_analytics() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "asserts on the upstream analytics uploader, which Atlas removed (tests/engine-no-phone-home.test.ts)"]
 async fn code_mode_exec_emits_correlated_production_analytics() -> Result<()> {
     let server = responses::start_mock_server().await;
     let _responses = responses::mount_sse_sequence(
@@ -1111,6 +1116,7 @@ async fn code_mode_exec_emits_correlated_production_analytics() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "asserts on the upstream analytics uploader, which Atlas removed (tests/engine-no-phone-home.test.ts)"]
 async fn turn_profile_tracks_blocking_tool_and_follow_up_sampling() -> Result<()> {
     let responses = vec![
         create_request_user_input_sse_response("call1")?,

@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 import { useEffect, useRef, useState, type ReactElement } from "react";
 import { Hash } from "lucide-react";
 import { Button, Icon, Popover, PopoverContent, PopoverTrigger, Spinner } from "@tryatlas/design";
@@ -60,7 +61,7 @@ export function RenameChannelMenuView({
             onChange={(e) => setName(e.target.value)}
             onFocus={(e) => e.currentTarget.select()}
             onKeyDown={(e) => {
-              if (e.key === "Enter") {
+              if (e.key === "Enter" && !isComposingKey(e)) {
                 e.preventDefault();
                 save();
               }

@@ -1,8 +1,7 @@
 // What a sidebar row says about its session, decided once per row.
 //
 // The live half comes from the chat store (a tab running the session) and
-// from Rust (`liveElsewhere`: another process is writing it); the lifecycle
-// half — `unread`, `woke` — Rust decides and sends on the row. The order is
+// from Rust's ACP state (a hold keeping it working); the lifecycle half — `unread`, `woke` — Rust decides and sends on the row. The order is
 // the reference ladder: anything asking for the user beats work in flight,
 // work in flight beats a failure, and only a quiet session shows "Woke" or
 // "Done".
@@ -14,7 +13,6 @@ export type SessionRowStatus = "input" | "working" | "failed" | "ready";
 
 export function resolveSessionRowStatus(input: {
   live: SessionLiveStatus;
-  liveElsewhere: boolean;
   /** Atlas is watching one of its pull requests and will wake its agent:
    *  the session is still the agent's, not back in the user's inbox. */
   watching?: boolean;
@@ -23,7 +21,7 @@ export function resolveSessionRowStatus(input: {
   heldWorking?: boolean;
 }): SessionRowStatus {
   if (input.live === "waiting") return "input";
-  if (input.live === "running" || input.liveElsewhere || input.heldWorking || input.watching) {
+  if (input.live === "running" || input.heldWorking || input.watching) {
     return "working";
   }
   if (input.live === "error") return "failed";
@@ -73,7 +71,9 @@ export function sessionRowLabel(input: {
 export function compactAge(iso: string | null, now: number): string | null {
   if (!iso) return null;
   const at = Date.parse(iso);
-  if (Number.isNaN(at)) return null;
+  // The epoch is an unknown age (an imported row with no usable updatedAt),
+  // not "56y".
+  if (Number.isNaN(at) || at <= 0) return null;
   const s = Math.max(0, Math.floor((now - at) / 1000));
   if (s < 60) return "now";
   if (s < 3600) return `${Math.floor(s / 60)}m`;

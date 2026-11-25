@@ -18,7 +18,9 @@ import { PullRequestsPage } from "./pages/pull-requests-page";
 import { SettingsSidebar } from "./settings-sidebar";
 import { useSettingsNav, type SettingsSection } from "../stores/settings-nav-store";
 import { useSettingsStore } from "../stores/settings-store";
-import { DEFAULT_SETTINGS, type AppSettings } from "../lib/app-settings";
+import { DEFAULT_SETTINGS, SETTINGS_REGISTRY, type AppSettings } from "../lib/app-settings";
+import { useProjectSettingsStore } from "../stores/project-settings-store";
+import { useLoadProjectSettings } from "../lib/use-scoped-setting";
 import {
   changedOnPage,
   sectionEntry,
@@ -181,12 +183,34 @@ function Breadcrumbs({ section, onHome }: { section: SettingsSection; onHome: ()
  * which ones will change. Shown only while at least one differs.
  */
 function RestoreDefaults({ section }: { section: SettingsSection }) {
+  const selectedScope = useSettingsNav((s) => s.scope);
+  const scope = SETTINGS_REGISTRY.some((meta) => meta.page === section && meta.project)
+    ? selectedScope
+    : null;
+  useLoadProjectSettings(scope);
+  const overrides = useProjectSettingsStore((s) => (scope ? s.byPath[scope]?.values : undefined));
   const settings = useSettingsStore((s) => s.settings);
   const { updateSettings } = useSettingsStore((s) => s.actions);
   const [open, setOpen] = useState(false);
-  const changed = changedOnPage(section, settings);
+  const changed = scope
+    ? SETTINGS_REGISTRY.filter(
+        (meta) =>
+          meta.page === section &&
+          meta.status === "live" &&
+          meta.project &&
+          overrides &&
+          meta.key in overrides,
+      )
+    : changedOnPage(section, settings);
   if (changed.length === 0) return null;
   const restore = () => {
+    if (scope) {
+      void useProjectSettingsStore
+        .getState()
+        .actions.update(scope, Object.fromEntries(changed.map((meta) => [meta.key, null])));
+      setOpen(false);
+      return;
+    }
     const patch: Partial<AppSettings> = {};
     for (const meta of changed) {
       (patch as Record<string, unknown>)[meta.key] = DEFAULT_SETTINGS[meta.key];
@@ -203,11 +227,17 @@ function RestoreDefaults({ section }: { section: SettingsSection }) {
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="max-w-md">
           <DialogHeader>
-            <DialogTitle>Restore {sectionLabel(section)} defaults?</DialogTitle>
+            <DialogTitle>
+              {scope
+                ? `Use global ${sectionLabel(section)} settings?`
+                : `Restore ${sectionLabel(section)} defaults?`}
+            </DialogTitle>
             <DialogDescription>
-              {changed.length === 1
-                ? "This setting goes back to its default."
-                : `These ${changed.length} settings go back to their defaults.`}{" "}
+              {scope
+                ? "Remove this project's overrides and inherit the settings for all projects."
+                : changed.length === 1
+                  ? "This setting goes back to its default."
+                  : `These ${changed.length} settings go back to their defaults.`}{" "}
               Nothing on other pages changes.
             </DialogDescription>
           </DialogHeader>

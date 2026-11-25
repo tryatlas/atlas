@@ -48,7 +48,12 @@ fn read_meta(project_path: &str) -> BTreeMap<String, RepoMeta> {
         .unwrap_or_default()
 }
 
+static META_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn write_meta(project_path: &str, repo_name: &str, meta: &RepoMeta) -> Result<(), String> {
+    let _write = META_WRITE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut all = read_meta(project_path);
     all.insert(repo_name.to_string(), meta.clone());
     let json = serde_json::to_string_pretty(&all).map_err(|e| e.to_string())?;
@@ -56,6 +61,9 @@ fn write_meta(project_path: &str, repo_name: &str, meta: &RepoMeta) -> Result<()
 }
 
 fn forget_meta(project_path: &str, repo_name: &str) {
+    let _write = META_WRITE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut all = read_meta(project_path);
     if all.remove(repo_name).is_some() {
         if let Ok(json) = serde_json::to_string_pretty(&all) {
@@ -220,11 +228,6 @@ fn search_failure(
 
 #[tauri::command]
 pub async fn search_github(query: String) -> Result<Vec<GithubRepo>, String> {
-    let url = format!(
-        "https://api.github.com/search/repositories?q={}&sort=stars&order=desc&per_page=20",
-        urlencoded(&query)
-    );
-
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent("Atlas-IDE")
@@ -232,7 +235,13 @@ pub async fn search_github(query: String) -> Result<Vec<GithubRepo>, String> {
         .unwrap_or_default();
 
     let resp = client
-        .get(&url)
+        .get("https://api.github.com/search/repositories")
+        .query(&[
+            ("q", query.as_str()),
+            ("sort", "stars"),
+            ("order", "desc"),
+            ("per_page", "20"),
+        ])
         .send()
         .await
         .map_err(|e| format!("GitHub API request failed: {e}"))?;
@@ -648,13 +657,6 @@ pub async fn fetch_cloned_repo_meta(
         .await
         .map_err(|e| e.to_string())??;
     Ok(meta)
-}
-
-fn urlencoded(s: &str) -> String {
-    s.replace(' ', "+")
-        .replace('&', "%26")
-        .replace('=', "%3D")
-        .replace('?', "%3F")
 }
 
 #[cfg(test)]

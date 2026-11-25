@@ -1,4 +1,4 @@
-import type { Terminal, ILink, ILinkProvider } from "@xterm/xterm";
+import type { Terminal, IBufferLine, ILink, ILinkProvider } from "@xterm/xterm";
 import { invoke } from "@tauri-apps/api/core";
 import { openFileOrReveal } from "@/lib/open-file";
 import { splitLinks, normalizeUrl } from "./linkify-paths";
@@ -46,7 +46,24 @@ function installModListeners() {
   });
 }
 
-export function createPathLinkProvider(term: Terminal, terminalId: string): ILinkProvider {
+/** xterm columns count cells, while a JS string counts UTF-16 code units. */
+export function textOffsetToColumn(line: IBufferLine, offset: number): number {
+  let textOffset = 0;
+  for (let column = 0; column < line.length; column++) {
+    const cell = line.getCell(column);
+    if (!cell || cell.getWidth() === 0) continue;
+    if (textOffset >= offset) return column;
+    textOffset += (cell.getChars() || " ").length;
+    if (textOffset >= offset) return column + cell.getWidth();
+  }
+  return line.length;
+}
+
+export function createPathLinkProvider(
+  term: Terminal,
+  terminalId: string,
+  cwd?: () => string,
+): ILinkProvider {
   installModListeners();
   return {
     provideLinks(lineNo, callback) {
@@ -68,8 +85,8 @@ export function createPathLinkProvider(term: Terminal, terminalId: string): ILin
         links.push({
           text: raw,
           range: {
-            start: { x: startX + 1, y: lineNo },
-            end: { x: endX, y: lineNo },
+            start: { x: textOffsetToColumn(line, startX) + 1, y: lineNo },
+            end: { x: textOffsetToColumn(line, endX), y: lineNo },
           },
           decorations: decor(),
           activate: (event) => {
@@ -84,6 +101,7 @@ export function createPathLinkProvider(term: Terminal, terminalId: string): ILin
             void invoke<string | null>("terminal_resolve_path", {
               id: terminalId,
               raw,
+              cwd: cwd?.(),
             })
               .then((abs) => {
                 if (abs) void openFileOrReveal(abs);

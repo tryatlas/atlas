@@ -203,6 +203,19 @@ fn area_kind(path: &str) -> Option<&'static str> {
 /// needs the original text.
 fn still_present(f: &Finding, head: &str) -> bool {
     let path = f.refs.first().map(|r| r.path.as_str()).unwrap_or_default();
+    if f.source == Source::Dependency {
+        // Dependency fingerprints encode the resolved ecosystem/name/version,
+        // not the displayed lockfile line. Check that exact package identity
+        // against the current lockfile; unreadable formats remain unresolved.
+        return crate::deps::lockfiles::parse_lockfile(path, head.as_bytes()).is_none_or(
+            |packages| {
+                packages.iter().any(|pkg| {
+                    let key = format!("{}:{}@{}", pkg.eco.osv_name(), pkg.name, pkg.version);
+                    fingerprint(f.class, &f.rule_id, path, &key) == f.fingerprint
+                })
+            },
+        );
+    }
     head.lines().any(|line| {
         let text = if f.class == Class::Secret {
             atlas_redact::redact(line).text
@@ -233,14 +246,11 @@ pub fn ship_overview(
                 continue;
             }
             let path = f.refs.first().map(|r| r.path.clone()).unwrap_or_default();
-            // A dependency finding names a package, not a line: it stays open
-            // until a rescan says otherwise.
-            let present = f.source == Source::Dependency
-                || heads
-                    .entry(path.clone())
-                    .or_insert_with(|| head_file(&path))
-                    .as_deref()
-                    .is_some_and(|text| still_present(f, text));
+            let present = heads
+                .entry(path.clone())
+                .or_insert_with(|| head_file(&path))
+                .as_deref()
+                .is_some_and(|text| still_present(f, text));
             if present {
                 open.push(view_of(f, not_useful));
             } else {

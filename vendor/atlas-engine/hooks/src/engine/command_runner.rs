@@ -248,26 +248,27 @@ pub(crate) async fn run_command(
         job: process_tree_job,
     };
 
-    if let Some(mut stdin) = child.stdin.take()
-        && let Err(err) = stdin.write_all(input_json.as_bytes()).await
-        && err.kind() != ErrorKind::BrokenPipe
-    {
-        let _ = child.kill().await;
-        return finish_command_run(
-            started_at,
-            started,
-            CommandRunCompletion {
-                exit_code: None,
-                stdout: String::new(),
-                stderr: String::new(),
-                error: Some(format!("failed to write hook stdin: {err}")),
-                outcome: "stdin_error",
-            },
-        );
-    }
-
+    let stdin = child.stdin.take();
+    let write_stdin = async {
+        if let Some(mut stdin) = stdin
+            && let Err(err) = stdin.write_all(input_json.as_bytes()).await
+            && err.kind() != ErrorKind::BrokenPipe
+        {
+            return Err(std::io::Error::new(
+                err.kind(),
+                format!("failed to write hook stdin: {err}"),
+            ));
+        }
+        Ok(())
+    };
     let timeout_duration = Duration::from_secs(handler.timeout_sec);
-    match timeout(timeout_duration, child.wait_with_output()).await {
+    // Drain stdout/stderr while delivering stdin, and bound both by the same
+    // hook deadline. Cancellation drops the child and process-tree guard.
+    let completion = async {
+        let (_, output) = tokio::try_join!(write_stdin, child.wait_with_output())?;
+        Ok::<_, std::io::Error>(output)
+    };
+    match timeout(timeout_duration, completion).await {
         Ok(Ok(output)) => {
             // Successfully completed hooks may intentionally leave detached helpers running.
             #[cfg(windows)]
@@ -409,7 +410,10 @@ fn build_command(
         #[cfg(not(windows))]
         command.arg(command_line);
     }
-    command.envs(env);
+    command
+        .env_clear()
+        .envs(atlas_engine_protocol::shell_environment::host_environment())
+        .envs(env);
     scrub_non_inheritable_env_vars(command.as_std_mut());
     command
 }

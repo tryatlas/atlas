@@ -48,6 +48,7 @@ export function SurfaceLauncher({
       // Settings screen, which covers the workspace without being a dialog.
       if (document.querySelector("[role='dialog'], [role='menu']")) return;
       if (useSettingsNav.getState().open) return;
+      if (useLayoutStore.getState().destinationShown) return;
       if (e.key === "Escape" && closable) {
         e.preventDefault();
         useLayoutStore.getState().actions.closeGroup(groupId);

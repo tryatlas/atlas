@@ -253,9 +253,31 @@ pub fn import_all(
     source: &TranscriptSource,
     mode: ProjectMode,
 ) -> Result<ImportOutcome> {
+    import_all_filtered(
+        store,
+        workspace_id,
+        source,
+        mode,
+        &std::collections::HashSet::new(),
+    )
+}
+
+/// Skip transcript identities already owned by a live ACP session, including
+/// continuation aliases recorded by the app's metadata store.
+pub fn import_all_filtered(
+    store: &mut Store,
+    workspace_id: &str,
+    source: &TranscriptSource,
+    mode: ProjectMode,
+    excluded: &std::collections::HashSet<String>,
+) -> Result<ImportOutcome> {
     let mut outcome = ImportOutcome::default();
     for path in source.files() {
         outcome.files_seen += 1;
+        if session_id_of(&path).is_some_and(|id| excluded.contains(&id)) {
+            outcome.skipped_already_captured += 1;
+            continue;
+        }
         match import_file(store, workspace_id, &path, mode, &mut outcome) {
             Ok(()) => {}
             Err(err) if is_fatal(&err) => return Err(err),

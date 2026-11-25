@@ -29,7 +29,9 @@ same opt-out posture as VS Code and Zed, and it can be turned off at any time �
 change takes effect immediately, without a restart.
 
 With the toggle off, `capture()` returns before anything is queued. Nothing is
-buffered for later, and nothing is sent.
+buffered for later, and nothing is sent. Switching it off also discards whatever was
+captured earlier and still waiting in the send queue (the queue flushes every few
+seconds): only the `telemetry_opt_out` marker itself is sent.
 
 A second toggle, **"Link usage data to my account"**, controls only the account
 linkage below. Turning it off keeps you on the anonymous device identity even while
@@ -120,7 +122,7 @@ coarse geo-resolution. Atlas sends no other device, network, or locale informati
 | Event         | When                                                 | Properties                                                                                                      |
 | ------------- | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | `app_started` | Atlas launches                                       | `is_first_launch` (bool), `device_id_source` (`random` / `adopted`)                                             |
-| `rust_panic`  | A Rust panic, sent synchronously from the panic hook | `location` (Atlas's own `file:line`), `message` (redacted of path / URL / email tokens, truncated to 160 chars) |
+| `rust_panic`  | A Rust panic, queued without blocking the panic hook | `location` (Atlas's own `file:line`), `message` (redacted of path / URL / email tokens, truncated to 160 chars) |
 
 ### Account
 
@@ -141,10 +143,15 @@ relaunch. Switching directly from one account to another never carries
 
 ### Agents
 
-| Event                  | When                         | Properties                                             |
-| ---------------------- | ---------------------------- | ------------------------------------------------------ |
-| `agent_turn_started`   | A turn begins                | `agent_family`, `plugin_id`, `session_ref`, `turn_seq` |
-| `agent_turn_completed` | A turn ends, however it ends | see below                                              |
+| Event                   | When                                        | Properties                                                     |
+| ----------------------- | ------------------------------------------- | -------------------------------------------------------------- |
+| `agent_turn_started`    | A turn begins                               | `agent_family`, `plugin_id`, `session_ref`, `turn_seq`         |
+| `agent_turn_completed`  | A turn ends, however it ends                | see below                                                      |
+| `agent_start_timed_out` | An agent did not start within its timeout   | `agent_id`, `phase` (the start step that timed out), `after_s` |
+| `acp_agent_installed`   | An ACP agent is installed from the registry | `agent_id`; `from: detected` when adopting one already on disk |
+| `acp_agent_uninstalled` | An ACP agent is uninstalled                 | `agent_id`                                                     |
+
+`agent_id` is the registry's id for the agent (`claude-acp`, `codex`, …), never a path.
 
 `agent_family` is `acp` or `native`; `plugin_id` is the real agent (`claude-code-ts`,
 `codex`, `atlas-agent`). `session_ref` is a salted, non-reversible 16-character digest that
@@ -176,10 +183,23 @@ argument, no tool output, no project or repository, no diff.
 
 ### Other product events
 
-| Event                   | When                          | Properties                                           |
-| ----------------------- | ----------------------------- | ---------------------------------------------------- |
-| `model_chat_sent`       | A direct model chat completes | `provider`, `model`, `input_tokens`, `output_tokens` |
-| `code_review_completed` | An AI code review finishes    | `provider`, `model`                                  |
+| Event             | When                          | Properties                                           |
+| ----------------- | ----------------------------- | ---------------------------------------------------- |
+| `model_chat_sent` | A direct model chat completes | `provider`, `model`, `input_tokens`, `output_tokens` |
+
+### Skills
+
+| Event              | When                                          | Properties                                       |
+| ------------------ | --------------------------------------------- | ------------------------------------------------ |
+| `skill_enabled`    | A skill is switched on for an agent           | `agent`                                          |
+| `skill_disabled`   | A skill is switched off for an agent          | `agent`                                          |
+| `skill_deleted`    | A skill is deleted                            | `scope` (`global` / `project`)                   |
+| `pack_installed`   | A skills pack is installed                    | `source_kind` (`github`), `scope`, `skill_count` |
+| `skill_downloaded` | A single skill is installed from the registry | `source_kind` (`github`), `scope`                |
+
+None of these names the skill, the pack, or the repository it came from: a project
+skill's name is your own text, and a pack's `owner/repo` is a repository name. Not
+even a hash of the name is sent, since a hash of a short name can be guessed back.
 
 ### Onboarding
 
@@ -217,7 +237,8 @@ See [The two things that are not consent-gated](#the-two-things-that-are-not-con
 | `telemetry_opt_out` | The toggle is switched off | _none_     |
 
 `telemetry_opt_out` is sent while telemetry is still enabled, so nothing is
-transmitted after the moment you opted out.
+transmitted after the moment you opted out. Events captured before it and not yet
+sent are dropped, not flushed.
 
 ### Renderer crashes
 
@@ -225,13 +246,15 @@ transmitted after the moment you opted out.
 events, and session recording are all explicitly disabled — the renderer captures no
 usage events of any kind.
 
-| Event        | When                                                                            | Properties                                                                                                                                                |
-| ------------ | ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Event        | When                                                                            | Properties                                                                                                                                                                                                                                                                                                          |
+| ------------ | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `$exception` | A React render error, uncaught `window.onerror`, or unhandled promise rejection | The error message and stack, plus `type` (`react_error_boundary` / `react_render_boundary` / `uncaught_error` / `unhandled_rejection`), `source`, a truncated `component_stack`, and for `react_render_boundary` which part of the window failed (`boundary`: a fixed name such as `transcript-row`, never content) |
 
 A short list of known-benign, non-actionable errors is dropped before it reaches
 PostHog. Note that a JavaScript stack trace can contain bundled file names; it does not
 contain your files, your project path, or your content.
+The renderer scrubber removes Unix paths, Windows drive paths and UNC share paths
+from error messages and stacks before capture.
 
 ---
 
@@ -276,6 +299,14 @@ sends anything you did not type or attach.
 
 An inert build makes neither request.
 
+**Not telemetry, but it leaves your machine: commit avatars.** The git views show a
+commit author's GitHub avatar. For a repository with a GitHub remote, Atlas asks your
+own GitHub CLI (`gh`, signed in as you) which accounts the repository's authors are,
+then loads those images from `avatars.githubusercontent.com`, which sees your IP. No
+email or hash of one is sent anywhere else: an author GitHub doesn't know is shown as
+initials. (Through 0.5.x such an author's avatar was looked up on Gravatar, which
+received a hash of the author's email; that fallback is gone.)
+
 ---
 
 ## Deleting your data
@@ -292,10 +323,22 @@ locally, but does not remove what was already sent.
 The PostHog key and host resolve in this order, first match winning:
 
 1. `ATLAS_POSTHOG_KEY` / `POSTHOG_KEY` (+ `ATLAS_POSTHOG_HOST` / `POSTHOG_HOST`) from
-   the environment or a `.env` file
+   the explicit process environment
 2. `<app_config_dir>/telemetry.json` — `{ "key": "...", "host": "..." }`
 3. A compile-time key baked into official release builds
 4. Nothing — the client is permanently inert and makes no network calls
 
+The build and development wrapper reads the checkout’s `.env`. Installed Atlas
+reads the process environment and per-install configuration at runtime.
+
 Point rungs 1 or 2 at your own PostHog project to keep your organization's data in
 your own instance. Build from source without a key to have no telemetry path at all.
+
+Engine diagnostic events carry tool argument/output byte counts and line counts,
+without raw tool arguments, results, or failure text. Routine stream diagnostics
+use DEBUG/TRACE levels. Panic reports use the bounded background queue and may be
+lost if the process exits before it flushes; the panic hook performs no network I/O.
+The engine's MCP span fields use the same names when declared and recorded, so
+local diagnostics retain their bounded error codes and allowlisted result metadata.
+The removed upstream analytics uploader remains disabled, including for subagent
+session events that contain thread lineage.

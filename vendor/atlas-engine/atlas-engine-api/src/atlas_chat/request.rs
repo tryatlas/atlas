@@ -45,6 +45,8 @@ use std::collections::BTreeSet;
 
 use atlas_engine_protocol::models::AgentMessageInputContent;
 use atlas_engine_protocol::models::ContentItem;
+use atlas_engine_protocol::models::FunctionCallOutputBody;
+use atlas_engine_protocol::models::FunctionCallOutputContentItem;
 use atlas_engine_protocol::models::ResponseItem;
 use serde::Serialize;
 use serde_json::Value;
@@ -273,8 +275,57 @@ pub fn build_chat_request(input: ChatRequestInput<'_>) -> Result<BuiltChatReques
         });
     }
     let keep_images_from = first_turn_keeping_images(input.items);
+    let mut tool_images = Vec::new();
     for (index, item) in input.items.iter().enumerate() {
+        // All tool results must precede the next user message. Images use that
+        // message because the gateway's Responses adapter stringifies arrays
+        // in tool-role content instead of forwarding their image bytes.
+        if !matches!(
+            item,
+            ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. }
+        ) && !tool_images.is_empty()
+        {
+            messages.push(ChatMessage::User {
+                content: std::mem::take(&mut tool_images),
+            });
+        }
         push_item(&mut messages, item, index >= keep_images_from);
+        if let ResponseItem::FunctionCallOutput {
+            call_id, output, ..
+        }
+        | ResponseItem::CustomToolCallOutput {
+            call_id, output, ..
+        } = item
+            && let FunctionCallOutputBody::ContentItems(parts) = &output.body
+        {
+            let mut images: Vec<_> = parts
+                .iter()
+                .filter_map(|part| match part {
+                    FunctionCallOutputContentItem::InputImage { image_url, .. } => {
+                        Some(ContentPart::ImageUrl {
+                            image_url: ImageUrlPart {
+                                url: image_url.clone(),
+                            },
+                        })
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !images.is_empty() {
+                tool_images.push(ContentPart::Text {
+                    text: format!("Images returned by tool call {call_id}:"),
+                });
+                if index < keep_images_from {
+                    evict_images(&mut images);
+                }
+                tool_images.extend(images);
+            }
+        }
+    }
+    if !tool_images.is_empty() {
+        messages.push(ChatMessage::User {
+            content: tool_images,
+        });
     }
     let messages = merge_adjacent(messages);
 

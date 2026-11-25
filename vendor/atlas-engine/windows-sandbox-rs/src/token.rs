@@ -1,3 +1,4 @@
+// Modified by Atlas from upstream OpenAI Codex (Apache-2.0). See CONTEXT.md.
 use crate::winutil::to_wide;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -493,16 +494,26 @@ unsafe fn create_token_with_caps_from(
         return Err(anyhow!("CreateRestrictedToken failed: {}", GetLastError()));
     }
 
+    let new_token = unsafe {
+        <std::os::windows::io::OwnedHandle as std::os::windows::io::FromRawHandle>::from_raw_handle(
+            new_token as _,
+        )
+    };
+    use std::os::windows::io::{AsRawHandle, IntoRawHandle};
+
     // Additional restricting SIDs are identity markers, not capabilities. Deliberately exclude
     // them from the default DACL so possessing a route identity cannot grant object access.
     let mut dacl_sids: Vec<*mut c_void> = Vec::with_capacity(psid_capabilities.len() + 2);
     dacl_sids.push(psid_logon);
     dacl_sids.push(psid_everyone);
     dacl_sids.extend_from_slice(psid_capabilities);
-    set_default_dacl(new_token, &dacl_sids)?;
+    set_default_dacl(new_token.as_raw_handle() as HANDLE, &dacl_sids)?;
 
-    enable_single_privilege(new_token, "SeChangeNotifyPrivilege")?;
-    Ok(new_token)
+    enable_single_privilege(
+        new_token.as_raw_handle() as HANDLE,
+        "SeChangeNotifyPrivilege",
+    )?;
+    Ok(new_token.into_raw_handle() as HANDLE)
 }
 
 #[cfg(test)]

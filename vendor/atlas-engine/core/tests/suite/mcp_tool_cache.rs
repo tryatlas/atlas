@@ -264,7 +264,7 @@ async fn cached_http_mcp_starts_lazily_for_subagents(
     let responses_server = responses::start_mock_server().await;
     let (http_server, startup_control) =
         AppsTestServer::mount_with_startup_control(&responses_server).await?;
-    let server_url = format!("{}/api/atlas-agent/ps/mcp", http_server.chatgpt_base_url);
+    let server_url = format!("{}/api/codex/ps/mcp", http_server.chatgpt_base_url);
     let fixture = test_atlas_engine()
         .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
         .with_config(move |config| {

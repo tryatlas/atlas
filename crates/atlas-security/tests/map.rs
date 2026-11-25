@@ -157,7 +157,7 @@ fn files_beyond_max_files_are_skipped_but_floors_kept() {
     let skipped = map
         .files
         .iter()
-        .filter(|f| matches!(f.skip, Some(SkipReason::TooLarge { .. })))
+        .filter(|f| matches!(f.skip, Some(SkipReason::FileLimit)))
         .count();
     assert_eq!(skipped, 3);
     assert!(map.files[0].floor && map.files[0].skip.is_none());

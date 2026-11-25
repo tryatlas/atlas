@@ -219,10 +219,17 @@ export function SessionDetail({
               <ShareMorph
                 detail={detail}
                 projectId={remoteProjectId}
+                projectPath={projectPath}
+                entriesReady={!entriesPending && !entriesStreaming}
                 directory={comments?.directory ?? EMPTY_DIRECTORY}
                 inPill
               />
-              <ExportButton detail={detail} />
+              <ExportButton
+                detail={detail}
+                projectPath={projectPath}
+                remoteProjectId={remoteProjectId}
+                entriesReady={!entriesPending && !entriesStreaming}
+              />
               <FilterMenu
                 detail={detail}
                 filters={filters}

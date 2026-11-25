@@ -445,10 +445,7 @@ async fn root_reconciliation_reuses_pending_apps_startup() -> Result<()> {
     let mut extensions = ExtensionRegistryBuilder::new();
     extensions.mcp_server_contributor(Arc::new(AppsMcpServerContributor {
         id: "pending_apps_root_reconciliation_test",
-        url: format!(
-            "{}/api/atlas-agent/ps/mcp",
-            gated_apps_server.chatgpt_base_url
-        ),
+        url: format!("{}/api/codex/ps/mcp", gated_apps_server.chatgpt_base_url),
         root_resolved: Some(Arc::clone(&root_resolved)),
     }));
     let mut builder = search_capable_apps_builder(apps_server.chatgpt_base_url)
@@ -631,7 +628,7 @@ async fn elevated_apps_catalog_limit_requires_host_owned_registration() -> Resul
                 .collect::<Vec<_>>(),
         );
         Mock::given(method("POST"))
-            .and(path_regex("^/api/atlas-agent/ps/mcp/?$"))
+            .and(path_regex("^/api/codex/ps/mcp/?$"))
             .and(body_partial_json(json!({ "method": "tools/list" })))
             .respond_with(move |request: &Request| {
                 let body: Value = serde_json::from_slice(&request.body)
@@ -654,7 +651,7 @@ async fn elevated_apps_catalog_limit_requires_host_owned_registration() -> Resul
             let mut extensions = ExtensionRegistryBuilder::new();
             extensions.mcp_server_contributor(Arc::new(AppsMcpServerContributor {
                 id,
-                url: format!("{}/api/atlas-agent/ps/mcp", apps_server.chatgpt_base_url),
+                url: format!("{}/api/codex/ps/mcp", apps_server.chatgpt_base_url),
                 root_resolved: None,
             }));
             builder = builder.with_extensions(Arc::new(extensions.build()));
@@ -995,10 +992,7 @@ async fn apps_guidance_and_deferred_namespace_appear_after_recovery_within_a_tur
     let mut extensions = ExtensionRegistryBuilder::new();
     extensions.mcp_server_contributor(Arc::new(AppsMcpServerContributor {
         id: "deferred_apps_recovery_test",
-        url: format!(
-            "{}/api/atlas-agent/ps/mcp",
-            gated_apps_server.chatgpt_base_url
-        ),
+        url: format!("{}/api/codex/ps/mcp", gated_apps_server.chatgpt_base_url),
         root_resolved: None,
     }));
     let call_id = "pause-for-apps";

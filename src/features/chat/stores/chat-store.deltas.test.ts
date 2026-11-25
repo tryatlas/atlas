@@ -192,7 +192,10 @@ describe("applyAgentDelta: one delta kind at a time", () => {
     },
     {
       name: "tool_call_upserted: a new call opens a tool message and is tracked in flight",
-      deltas: () => [d("tool_call_upserted", { message_id: "t", tool_call: wireTool("tc1") })],
+      deltas: () => [
+        d("status", { status: "running", turn_seq: 1 }),
+        d("tool_call_upserted", { message_id: "t", tool_call: wireTool("tc1") }),
+      ],
       expect: () => {
         expect(last()).toMatchObject({ role: "assistant", mode: "tool" });
         expect(last().toolCalls.map((t) => t.id)).toEqual(["tc1"]);
@@ -213,6 +216,7 @@ describe("applyAgentDelta: one delta kind at a time", () => {
     {
       name: "tool_call_upserted: a known id is updated in place and leaves the in-flight set",
       deltas: () => [
+        d("status", { status: "running", turn_seq: 1 }),
         d("tool_call_upserted", { message_id: "t", tool_call: wireTool("tc1") }),
         d("tool_call_upserted", {
           message_id: "t",
@@ -402,12 +406,13 @@ describe("applyAgentDelta: one delta kind at a time", () => {
 });
 
 describe("applyAgentDelta: status transitions", () => {
-  it("running adopts the turn, clears the last turn's live plan and opens a scratch", () => {
+  it("running adopts the turn, keeps the agent's plan and opens a scratch", () => {
     boundTab();
     apply(d("plan_updated", { plan: [{ content: "old", status: "completed" }] }));
     apply(d("status", { status: "running", turn_seq: 1 }));
     expect(session()).toMatchObject({ status: "running", currentTurnSeq: 1 });
-    expect(session().livePlan).toBeUndefined();
+    // The plan stands until the agent replaces it (ACP audit finding 102).
+    expect(session().livePlan?.map((p) => p.description)).toEqual(["old"]);
     expect(session().turnScratch).toEqual({ seq: 1, tools: {} });
   });
 

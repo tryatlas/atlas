@@ -54,7 +54,8 @@ export const useSidebarStore = create<SidebarState>()(
         toggleScopeProjectId: (id) =>
           set((s) => ({ scopeProjectId: s.scopeProjectId === id ? null : id })),
         setSnoozedExpanded: (snoozedExpanded) => set({ snoozedExpanded }),
-        setSettledExpanded: (settledExpanded) => set({ settledExpanded }),
+        setSettledExpanded: (settledExpanded) =>
+          set({ settledExpanded, ...(!settledExpanded ? { settledSearch: "" } : {}) }),
         beginRename: (renamingThreadId) => set({ renamingThreadId }),
         endRename: () => set({ renamingThreadId: null }),
         setSearch: (search) => set({ search }),

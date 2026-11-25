@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 import { Node, mergeAttributes } from "@tiptap/core";
 import {
   NodeViewWrapper,
@@ -180,7 +181,7 @@ function ToggleView({ node, updateAttributes, editor, getPos }: NodeViewProps) {
               setEditingTitle(false);
             }}
             onKeyDown={(e) => {
-              if (e.key === "Enter") {
+              if (e.key === "Enter" && !isComposingKey(e)) {
                 updateAttributes({ title: draft.trim() || "Untitled" });
                 setEditingTitle(false);
               } else if (e.key === "Escape") {

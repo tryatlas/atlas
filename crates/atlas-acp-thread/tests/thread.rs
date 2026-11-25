@@ -259,18 +259,30 @@ async fn thoughts_concatenate_but_never_merge_into_the_message() {
 }
 
 // ----------------------------------------------------------------- tool calls
+/// Audit #22: some adapters only ever send `tool_call_update`. The call is
+/// built from the update rather than shown as a red "Tool call not found".
 #[tokio::test]
-async fn an_update_for_an_unknown_tool_call_becomes_a_failed_entry() {
+async fn an_update_for_an_unknown_tool_call_builds_the_call() {
     let (mut thread, _events, _conn) = new_thread();
 
-    thread
-        .update_tool_call(tool_call_update(
-            "ghost",
-            Some(acp::ToolCallStatus::Completed),
-        ))
-        .unwrap();
+    let mut update = tool_call_update("ghost", Some(acp::ToolCallStatus::Completed));
+    update.fields.title = Some("Read main.rs".into());
+    update.fields.kind = Some(acp::ToolKind::Read);
+    thread.update_tool_call(update).unwrap();
 
-    assert_eq!(status_of(&thread, "ghost"), "Failed");
+    let (_, call) = thread.tool_call(&acp::ToolCallId::new("ghost")).unwrap();
+    assert_eq!(call.status.to_string(), "Completed");
+    assert_eq!(call.label, "Read main.rs");
+    assert_eq!(call.kind, acp::ToolKind::Read);
+
+    // An update naming nothing but the id still makes a call, with the
+    // protocol's defaults.
+    thread
+        .update_tool_call(tool_call_update("bare", None))
+        .unwrap();
+    let (_, call) = thread.tool_call(&acp::ToolCallId::new("bare")).unwrap();
+    assert_eq!(call.status.to_string(), "Pending");
+    assert_eq!(call.label, "Tool call");
 }
 #[tokio::test]
 async fn requesting_permission_puts_an_existing_call_into_waiting() {
@@ -490,6 +502,81 @@ async fn a_completion_arriving_after_cancel_is_recorded() {
         .upsert_tool_call(tool_call("t1", "run", acp::ToolCallStatus::Completed))
         .unwrap();
     assert_eq!(status_of(&thread, "t1"), "Completed");
+}
+
+#[tokio::test]
+async fn a_late_permission_answer_cannot_reopen_a_completed_call() {
+    let (mut thread, _events, _conn) = new_thread();
+    thread
+        .upsert_tool_call(tool_call("t1", "run", acp::ToolCallStatus::Pending))
+        .unwrap();
+    let waiter = thread
+        .request_tool_call_authorization(
+            tool_call_update("t1", None),
+            PermissionOptions::Flat(Vec::new()),
+            AuthorizationKind::PermissionGrant,
+        )
+        .unwrap();
+    thread
+        .upsert_tool_call(tool_call("t1", "run", acp::ToolCallStatus::Completed))
+        .unwrap();
+    thread.authorize_tool_call(
+        acp::ToolCallId::new("t1"),
+        SelectedPermissionOutcome::new(
+            acp::PermissionOptionId::new("allow"),
+            acp::PermissionOptionKind::AllowOnce,
+        ),
+    );
+    assert_eq!(status_of(&thread, "t1"), "Completed");
+    assert!(matches!(waiter.await, RequestPermissionOutcome::Cancelled));
+}
+
+#[test]
+fn vendor_tool_names_survive_an_update_without_metadata() {
+    let (mut thread, _events, _conn) = new_thread();
+    thread
+        .upsert_tool_call(
+            serde_json::from_value(serde_json::json!({
+                "toolCallId": "bash-task", "title": "Task", "status": "in_progress",
+                "_meta": {"claudeCode": {"toolName": "Bash"}},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    thread
+        .update_tool_call(tool_call_update(
+            "bash-task",
+            Some(acp::ToolCallStatus::Completed),
+        ))
+        .unwrap();
+    let call = thread
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            AgentThreadEntry::ToolCall(call) => Some(call),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(call.tool_name.as_deref(), Some("Bash"));
+    assert!(call.launched_subagent.is_none());
+}
+
+#[test]
+fn a_diff_path_change_updates_the_file_even_when_text_is_identical() {
+    let mut content = ToolCallContent::from_acp(acp::ToolCallContent::Diff(
+        acp::Diff::new("/repo/old.rs", "after").old_text("before"),
+    ))
+    .unwrap()
+    .unwrap();
+    content
+        .update_from_acp(acp::ToolCallContent::Diff(
+            acp::Diff::new("/repo/new.rs", "after").old_text("before"),
+        ))
+        .unwrap();
+    let ToolCallContent::Diff(diff) = content else {
+        panic!("diff disappeared")
+    };
+    assert_eq!(diff.path, std::path::PathBuf::from("/repo/new.rs"));
 }
 
 // --------------------------------------------------------------------- cancel
@@ -1180,4 +1267,272 @@ async fn a_prompt_after_a_silent_turn_is_its_own_message() {
         user_messages(&thread),
         vec!["first prompt", "second prompt"]
     );
+}
+
+// ------------------------------------------------------ remediation batch B1
+
+fn image_block() -> acp::ContentBlock {
+    acp::ContentBlock::Image(acp::ImageContent::new("aGk=", "image/png"))
+}
+
+fn child_meta(parent: &str) -> acp::Meta {
+    serde_json::from_value(serde_json::json!({
+        "claudeCode": { "parentToolUseId": parent },
+    }))
+    .unwrap()
+}
+
+/// Audit #19: an image or audio reply has no text, and rendering nothing made
+/// it look like no reply at all.
+#[tokio::test]
+async fn non_text_agent_content_shows_a_labelled_placeholder() {
+    let (mut thread, _events, _conn) = new_thread();
+
+    thread
+        .handle_session_update(acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new(image_block()),
+        ))
+        .unwrap();
+    thread
+        .handle_session_update(acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new(text_block(" and ")),
+        ))
+        .unwrap();
+    thread
+        .handle_session_update(acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new(acp::ContentBlock::Audio(acp::AudioContent::new(
+                "aGk=",
+                "audio/wav",
+            ))),
+        ))
+        .unwrap();
+
+    assert_eq!(
+        assistant_chunk_texts(&thread),
+        vec![(
+            false,
+            format!("{IMAGE_PLACEHOLDER}\n and {AUDIO_PLACEHOLDER}")
+        )]
+    );
+}
+
+/// Audit #25: `title: null` is the agent clearing its title, which the schema
+/// tells apart from leaving it out.
+#[tokio::test]
+async fn a_null_title_clears_the_title() {
+    let (mut thread, mut events, _conn) = new_thread();
+
+    let mut named = acp::SessionInfoUpdate::new();
+    named.title = agent_client_protocol::schema::MaybeUndefined::Value("Fix the build".to_string());
+    thread
+        .handle_session_update(acp::SessionUpdate::SessionInfoUpdate(named))
+        .unwrap();
+    assert_eq!(thread.title().map(|t| &**t), Some("Fix the build"));
+    while events.try_recv().is_ok() {}
+
+    let mut cleared = acp::SessionInfoUpdate::new();
+    cleared.title = agent_client_protocol::schema::MaybeUndefined::Null;
+    thread
+        .handle_session_update(acp::SessionUpdate::SessionInfoUpdate(cleared))
+        .unwrap();
+    assert_eq!(thread.title(), None);
+    assert!(matches!(
+        events.try_recv(),
+        Ok(AcpThreadEvent::TitleUpdated)
+    ));
+
+    // Absent is "unchanged", not "cleared".
+    let mut named = acp::SessionInfoUpdate::new();
+    named.title = agent_client_protocol::schema::MaybeUndefined::Value("Again".to_string());
+    thread
+        .handle_session_update(acp::SessionUpdate::SessionInfoUpdate(named))
+        .unwrap();
+    thread
+        .handle_session_update(acp::SessionUpdate::SessionInfoUpdate(
+            acp::SessionInfoUpdate::new(),
+        ))
+        .unwrap();
+    assert_eq!(thread.title().map(|t| &**t), Some("Again"));
+}
+
+/// Audit #96: a subagent's narration arrives on the parent session with its
+/// launch in `_meta`. It is attributed to that launch and kept in an entry of
+/// its own, never merged into the parent's prose.
+#[tokio::test]
+async fn a_childs_narration_is_attributed_to_its_launch() {
+    let (mut thread, _events, _conn) = new_thread();
+
+    thread
+        .handle_session_update(agent_chunk("Let me delegate.", None))
+        .unwrap();
+    let mut child = acp::ContentChunk::new(text_block("Child: reading files"));
+    child.meta = Some(child_meta("toolu_1"));
+    thread
+        .handle_session_update(acp::SessionUpdate::AgentMessageChunk(child))
+        .unwrap();
+    thread
+        .handle_session_update(agent_chunk("Back in the parent.", None))
+        .unwrap();
+
+    let messages: Vec<_> = thread
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            AgentThreadEntry::AssistantMessage(message) => Some((
+                message.parent_tool_call_id.as_deref().map(str::to_string),
+                message.chunks[0].block().to_text().to_string(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        messages,
+        vec![
+            (None, "Let me delegate.".to_string()),
+            (
+                Some("toolu_1".to_string()),
+                "Child: reading files".to_string()
+            ),
+            (None, "Back in the parent.".to_string()),
+        ]
+    );
+}
+
+/// Audit #75: Stop is a state. The turn stays open, stopping, until the agent
+/// answers the prompt; only then does the thread go idle.
+#[tokio::test]
+async fn a_stop_keeps_the_turn_open_until_the_agent_answers() {
+    let (mut thread, _events, connection) = new_thread();
+
+    let turn = thread.begin_turn();
+    thread
+        .upsert_tool_call(tool_call("t1", "run", acp::ToolCallStatus::Pending))
+        .unwrap();
+    let waiter = thread
+        .request_tool_call_authorization(
+            tool_call_update("t1", None),
+            PermissionOptions::Flat(Vec::new()),
+            AuthorizationKind::PermissionGrant,
+        )
+        .unwrap();
+
+    assert_eq!(thread.request_stop(), Some(turn));
+    // What is ours resolves at once …
+    assert!(matches!(waiter.await, RequestPermissionOutcome::Cancelled));
+    assert_eq!(status_of(&thread, "t1"), "Canceled");
+    assert_eq!(connection.cancels(), 1);
+    // … but the turn is the agent's, and it has not said it stopped.
+    assert!(thread.is_generating());
+    assert!(thread.is_stopping());
+    assert_eq!(thread.watch_turn().borrow().running, Some(turn));
+
+    // A second Stop does not send a second cancel.
+    assert_eq!(thread.request_stop(), Some(turn));
+    assert_eq!(connection.cancels(), 1);
+
+    // The agent answers.
+    assert!(thread.end_turn_unless_superseded(turn, acp::StopReason::Cancelled));
+    assert!(!thread.is_generating());
+    assert!(!thread.is_stopping());
+    assert_eq!(thread.watch_turn().borrow().running, None);
+}
+
+/// A wedged agent that never answers is given up on: the turn closes as
+/// cancelled, and its late answer changes nothing.
+#[tokio::test]
+async fn an_expired_stop_closes_the_turn_as_cancelled() {
+    let (mut thread, mut events, _conn) = new_thread();
+
+    let turn = thread.begin_turn();
+    assert!(
+        !thread.expire_stop(turn),
+        "a turn not stopping is not expired"
+    );
+    thread.request_stop();
+    while events.try_recv().is_ok() {}
+
+    assert!(thread.expire_stop(turn));
+    assert!(!thread.is_generating());
+    assert_eq!(thread.watch_turn().borrow().expired, turn);
+    let mut stops = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let AcpThreadEvent::Stopped(reason, _) = event {
+            stops.push(reason);
+        }
+    }
+    assert_eq!(stops, vec![acp::StopReason::Cancelled]);
+
+    // The agent's late answer is a duplicate stop for a closed turn.
+    thread.end_turn_unless_superseded(turn, acp::StopReason::Cancelled);
+    assert!(events.try_recv().is_err(), "nothing is announced twice");
+}
+
+/// Audit #107: a call the agent never settled is cancelled when the turn
+/// ends, before the turn's end is announced. A detached child's calls are
+/// left alone: they keep arriving after the turn that launched it.
+#[tokio::test]
+async fn the_turn_end_settles_calls_the_agent_left_running() {
+    let (mut thread, mut events, _conn) = new_thread();
+
+    thread.begin_turn();
+    thread
+        .upsert_tool_call(tool_call("open", "run", acp::ToolCallStatus::InProgress))
+        .unwrap();
+    thread
+        .upsert_tool_call(tool_call("done", "read", acp::ToolCallStatus::Completed))
+        .unwrap();
+    let mut launch = tool_call("launch", "Agent", acp::ToolCallStatus::Completed);
+    launch.meta = Some(
+        serde_json::from_value(serde_json::json!({
+            "claudeCode": { "toolResponse": { "isAsync": true } },
+        }))
+        .unwrap(),
+    );
+    thread.upsert_tool_call(launch).unwrap();
+    let mut child = tool_call("child", "grep", acp::ToolCallStatus::InProgress);
+    child.meta = Some(child_meta("launch"));
+    thread.upsert_tool_call(child).unwrap();
+    while events.try_recv().is_ok() {}
+
+    thread.end_turn(acp::StopReason::EndTurn);
+
+    assert_eq!(status_of(&thread, "open"), "Canceled");
+    assert_eq!(status_of(&thread, "done"), "Completed");
+    assert_eq!(status_of(&thread, "child"), "In Progress");
+
+    let mut order = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            AcpThreadEvent::EntryUpdated(_) => order.push("updated"),
+            AcpThreadEvent::Stopped(..) => order.push("stopped"),
+            _ => {}
+        }
+    }
+    assert_eq!(order, vec!["updated", "stopped"]);
+}
+
+/// Audit #17: the host labels the next turn while this one may still be
+/// draining. A turn's stop carries the label it opened with.
+#[tokio::test]
+async fn a_stop_carries_the_label_its_turn_opened_with() {
+    let (mut thread, mut events, _conn) = new_thread();
+
+    thread.set_next_turn_seq(1);
+    let turn = thread.begin_turn();
+    assert_eq!(thread.turn_seq(), 1);
+    // The host dispatches the next prompt before this turn has reported.
+    thread.set_next_turn_seq(2);
+    thread.end_turn_unless_superseded(turn, acp::StopReason::EndTurn);
+
+    let mut labels = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let AcpThreadEvent::Stopped(_, record) = event {
+            labels.push(record.turn_seq);
+        }
+    }
+    assert_eq!(labels, vec![1]);
+    assert_eq!(thread.turn_seq(), 1, "no turn has opened under label 2 yet");
+
+    thread.begin_turn();
+    assert_eq!(thread.turn_seq(), 2);
 }

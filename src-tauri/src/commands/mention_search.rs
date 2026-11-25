@@ -245,7 +245,7 @@ pub async fn mention_search(
     // this cache the @-mention picker fired three `git` subprocesses
     // per keystroke and stuttered visibly on large repos.
     let cached_refs: Option<GitRefs> = match (&project_for_branch, want_branch) {
-        (Some(p), true) => git_watcher.get_or_compute_refs(p),
+        (Some(p), true) => git_watcher.get_or_compute_refs(p).await,
         _ => None,
     };
     let branch_fut = async move {

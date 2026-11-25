@@ -1,3 +1,4 @@
+import { preservesTextInput } from "@/lib/keyboard-event";
 import { useEffect, useRef } from "react";
 import { type Combo, matchesCombo, parseCombo } from "@/features/keybindings/lib/combo";
 import type { ActionId } from "@/features/keybindings/lib/actions";
@@ -25,6 +26,7 @@ export function useHotkeys(bindings: Array<{ combo: Combo | string; action: () =
 
   useEffect(() => {
     function handler(e: KeyboardEvent) {
+      if (e.defaultPrevented || preservesTextInput(e)) return;
       if (useKeybindingsStore.getState().recording) return;
       for (const { combo, action } of bindingsRef.current) {
         const parsed = typeof combo === "string" ? parseCombo(combo) : combo;
@@ -66,6 +68,7 @@ export function useActionHotkeys(handlers: Partial<Record<ActionId, () => void>>
 
   useEffect(() => {
     function handler(e: KeyboardEvent) {
+      if (e.defaultPrevented || preservesTextInput(e)) return;
       const state = useKeybindingsStore.getState();
       if (state.recording) return;
       let context: ReturnType<typeof liveWhenContext> | null = null;

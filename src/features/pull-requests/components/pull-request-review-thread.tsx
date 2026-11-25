@@ -1,3 +1,5 @@
+import { shortcutLabel } from "@/features/keybindings/lib/combo";
+import { isComposingKey } from "@/lib/keyboard-event";
 // What the Code tab draws under a line: a review thread (its comments, a
 // reply box, resolve / unresolve, reactions), a line comment waiting in the
 // review in progress, and the box a new line comment is written in.
@@ -41,8 +43,9 @@ const stop = (event: React.PointerEvent) => event.stopPropagation();
 
 function isSubmitChord(event: React.KeyboardEvent): boolean {
   return (
-    !event.nativeEvent.isComposing &&
+    !isComposingKey(event) &&
     event.key === "Enter" &&
+    !isComposingKey(event) &&
     (event.metaKey || event.ctrlKey) &&
     !event.shiftKey &&
     !event.altKey
@@ -393,7 +396,9 @@ export function DraftCommentCard({
       />
       <div className="mt-1.5 flex items-center gap-1">
         <span className="mr-auto text-2xs text-muted-foreground">
-          {canComment ? "⌘↵ adds to your review" : "⌘↵ asks an agent"}
+          {canComment
+            ? `${shortcutLabel("cmd+enter")} adds to your review`
+            : `${shortcutLabel("cmd+enter")} asks an agent`}
         </span>
         <Button size="xs" variant="ghost" onClick={onCancel}>
           Cancel

@@ -4,7 +4,9 @@
 use std::fs;
 use std::path::Path;
 
-use atlas_fs::{replace_file, replace_file_with_mode};
+use atlas_fs::replace_file;
+#[cfg(unix)]
+use atlas_fs::replace_file_with_mode;
 
 fn names_in(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
@@ -201,4 +203,21 @@ mod unix {
 
         assert_eq!(mode_of(&path), 0o666);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn opted_in_replacement_preserves_symlink_and_updates_its_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("actual.toml");
+    let link = dir.path().join("config.toml");
+    fs::write(&target, "before").unwrap();
+    std::os::unix::fs::symlink("actual.toml", &link).unwrap();
+    atlas_fs::replace_file_follow_symlink(&link, "after").unwrap();
+    assert_eq!(fs::read_link(&link).unwrap(), Path::new("actual.toml"));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "after");
+    fs::remove_file(&target).unwrap();
+    assert!(atlas_fs::replace_file_follow_symlink(&link, "lost").is_err());
+    assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+    assert!(!target.exists());
 }

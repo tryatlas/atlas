@@ -232,3 +232,42 @@ describe("no telemetry ingest marker anywhere in engine code", () => {
     expect(codeMatching(markers)).toEqual([]);
   });
 });
+
+/**
+ * The fifth path (whole-app review, 2026-11-24): the plugin manager warmed a
+ * "featured plugins" cache on every engine start with
+ * `GET {chatgpt_base_url}/plugins/featured`, and the engine's built-in
+ * `chatgpt_base_url` is chatgpt.com. Nothing about it was analytics, so the
+ * vendor-marker scan above could not see it. Two fences, either one enough:
+ * Atlas pins the engine's plugin system off, and the fetch itself refuses a
+ * ChatGPT host. Both are code an ordinary edit can undo.
+ */
+describe("the ChatGPT featured-plugins fetch is fenced", () => {
+  it("Atlas's engine config pins the plugin system off", () => {
+    const config = readFileSync(
+      path.join(REPO_ROOT, "crates", "atlas-native-agent", "src", "engine", "config.rs"),
+      "utf8",
+    );
+    expect(codeOnly("config.rs", config)).toMatch(
+      /\(\s*"features\.plugins"\.to_string\(\),\s*TomlValue::Boolean\(false\)\s*\)/,
+    );
+  });
+
+  it("the featured fetch refuses a ChatGPT host before building its URL", () => {
+    const file = path.join(VENDOR, "core-plugins", "src", "remote_legacy.rs");
+    const code = codeOnly(file, textOf(file));
+    const start = code.indexOf("pub async fn fetch_remote_featured_plugin_ids");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const body = code.slice(start, code.indexOf("\n}\n", start));
+    const guard = body.indexOf("is_allowed_chatgpt_host");
+    const request = body.indexOf("/plugins/featured");
+    expect(guard).toBeGreaterThanOrEqual(0);
+    expect(guard).toBeLessThan(request);
+  });
+
+  it("is the only shipping site that builds the featured URL", () => {
+    expect(codeMatching(/\/plugins\/featured/)).toEqual([
+      path.join("vendor", "atlas-engine", "core-plugins", "src", "remote_legacy.rs"),
+    ]);
+  });
+});

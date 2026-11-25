@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 import { cn } from "@/lib/utils";
 import {
   Globe,
@@ -95,7 +96,7 @@ export function BrowserAddressBar({
           value={inputUrl}
           onChange={(e) => onInputChange(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") onNavigate(inputUrl);
+            if (e.key === "Enter" && !isComposingKey(e)) onNavigate(inputUrl);
           }}
           className="flex-1 bg-transparent outline-none text-xs text-foreground font-mono placeholder:text-muted-foreground"
           placeholder="Search or enter URL"
@@ -179,7 +180,7 @@ export function BrowserFindBar({
         value={searchQuery}
         onChange={(e) => onSearchQueryChange(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Enter") onSearch();
+          if (e.key === "Enter" && !isComposingKey(e)) onSearch();
           if (e.key === "Escape") onClose();
         }}
         className="flex-1 bg-transparent outline-none text-xs text-foreground placeholder:text-muted-foreground"

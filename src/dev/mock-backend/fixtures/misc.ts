@@ -85,9 +85,7 @@ const THREADS: ThreadRow[] = [
     ...RESTING_LIFECYCLE,
     projectName: MOCK_PROJECT.name,
     folderPaths: [MOCK_PROJECT.path],
-    // Another process is writing this one: the live dot, and the composer's
-    // "Send anyway" hold when it is opened.
-    liveElsewhere: true,
+    liveElsewhere: false,
     // A sibling project attached read-only: the composer chip's access toggle
     // and the row's attached-projects data both have something to show.
     attachedProjects: [
@@ -592,7 +590,7 @@ export const miscHandlers: MockHandlers = {
   },
 
   // ── chat history ────────────────────────────────────────────────────────
-  // As in Rust: every row (the composer's live-elsewhere feed relies on that).
+  // As in Rust: every row (the composer's session-projects feed relies on that).
   threads_history: (): ThreadRow[] => threads,
   threads_sync_project: () => 0,
   threads_projects: ({ cwd }): ThreadProject[] =>
@@ -863,6 +861,9 @@ export const miscHandlers: MockHandlers = {
   // it needs to update the transcript, not just resolve.
   agents_logout: nothing,
   agents_authenticate: nothing,
+  // Ends a sign-in in flight; nothing is ever in flight here (the
+  // `agent-signin` scenario has one that hangs, and ends it).
+  agents_cancel_authentication: nothing,
   agents_run_auth_method: (): string => "mock-auth-run",
   agents_start_diagnostics: (): string => "mock-diagnostics-run",
   // agents_list_running lives in `fake-agent.ts`: only it knows which sessions
@@ -962,6 +963,7 @@ export const miscHandlers: MockHandlers = {
   scratch_write_bytes: (): string => abs(".atlas/scratch/pasted.png"),
   window_zoom: nothing,
   clipboard_write_text: nothing,
+  clipboard_read_text: () => navigator.clipboard.readText(),
   // A paste carrying file paths is a Finder-only gesture (see `README.md`),
   // so the browser answer is always "no files came with it".
   clipboard_file_paths: (): string[] => [],

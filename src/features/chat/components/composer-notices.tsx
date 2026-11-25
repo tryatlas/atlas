@@ -8,7 +8,6 @@ import { AiGrantBar } from "./ai-grant-bar";
 import { RemovedAgentBar } from "./removed-agent-bar";
 import { BranchChangedBar } from "./branch-changed-bar";
 import { ModeRestoreBar } from "./mode-restore-bar";
-import { LiveElsewhereBar } from "./live-elsewhere-bar";
 import { RcDriverBar } from "./rc-driver-bar";
 
 export function ComposerNotices({
@@ -48,9 +47,6 @@ export function ComposerNotices({
       {/* The last turn moved the checkout to another branch: the next
           message would run there. */}
       {!grantBarShown && <BranchChangedBar tabId={tabId} />}
-
-      {/* Another process is writing this session: sending would fork it. */}
-      {!grantBarShown && <LiveElsewhereBar tabId={tabId} />}
 
       {/* Someone else holds the remote-control seat, or asks for it. */}
       {!grantBarShown && <RcDriverBar tabId={tabId} />}

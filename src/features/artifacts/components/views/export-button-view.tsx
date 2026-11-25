@@ -38,10 +38,12 @@ const FORMATS: ReadonlyArray<{ format: ExportFormat; label: string; hint: string
 export function ExportButtonView({
   busy,
   onPick,
+  disabled = false,
 }: {
   /** The format being written, or `null` when idle. */
   busy: ExportFormat | null;
   onPick: (format: ExportFormat) => void;
+  disabled?: boolean;
 }) {
   return (
     <DropdownMenu>
@@ -51,7 +53,7 @@ export function ExportButtonView({
             <button
               type="button"
               aria-label="Export session"
-              disabled={busy !== null}
+              disabled={disabled || busy !== null}
               className={PILL_BUTTON}
             >
               {busy ? (

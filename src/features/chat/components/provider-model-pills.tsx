@@ -23,7 +23,7 @@ import {
   isPreferredModel,
   preferredModels,
 } from "@/features/settings/lib/model-catalog";
-import { loadNativeModelPref } from "../lib/native-model-pref";
+import { loadNativeModelPref, saveNativeModelPref } from "../lib/native-model-pref";
 import { ProviderModelPillsView } from "./views/provider-model-pills-view";
 
 // Curated model-list cache — `modelchat.models(provider)` hits the provider API,
@@ -149,6 +149,7 @@ export function ProviderModelPills({
     (id: string) => {
       if (viewProvider && viewProvider !== provider) onProvider(viewProvider);
       onModel(id);
+      saveNativeModelPref({ provider: viewProvider || provider, model: id });
       setOpen(false);
     },
     [viewProvider, provider, onProvider, onModel],

@@ -2,10 +2,9 @@
  * The normalized key-combo model shared by the dispatcher, the recorder and
  * every shortcut label in the app.
  *
- * Combos are matched on `KeyboardEvent.code` (the physical key) rather than
- * `e.key`: on macOS, Option rewrites the typed character (⌥B → "∫", ⌥Space →
- * NBSP), so key-based matching silently fails for every ⌥ chord. Matching on
- * the code makes that fallback the rule instead of a list of special cases.
+ * Letter shortcuts follow the typed key on the active keyboard layout.
+ * macOS Option changes that character, so Option chords use the physical
+ * position only when the typed key cannot represent the requested chord.
  *
  * String form (what lives in `keybindings.json`): lowercase tokens joined by
  * `+`, modifiers first in the canonical order `cmd+ctrl+alt+shift`, then one
@@ -18,6 +17,7 @@
  * see `effectiveCombo` for what that means for conflicts.
  */
 
+import { isComposingKey } from "@/lib/keyboard-event";
 import { isLinux, isMac, isWindows } from "@/lib/platform";
 
 export interface Combo {
@@ -205,9 +205,11 @@ export function modifiersFromEvent(
 
 /** Build a combo from a live keydown. Null while only modifiers are held. */
 export function comboFromEvent(e: KeyboardEvent, mac: boolean = isMac): Combo | null {
-  const code = e.code;
+  if (isComposingKey(e) || (!mac && e.getModifierState?.("AltGraph"))) return null;
+  const code = eventCode(e, mac);
   if (!code || MODIFIER_CODES.has(code)) return null;
-  return { code, ...modifiersFromEvent(e, mac) };
+  const combo = { code, ...modifiersFromEvent(e, mac) };
+  return parseCombo(serializeCombo(combo)) ? combo : null;
 }
 
 /**
@@ -223,7 +225,8 @@ export function effectiveCombo(c: Combo, mac: boolean = isMac): Combo {
 
 /** Exact match on all four modifiers, after platform folding. */
 export function matchesCombo(e: KeyboardEvent, c: Combo, mac: boolean = isMac): boolean {
-  if (!matchCode(e, c.code)) return false;
+  if (isComposingKey(e) || (!mac && e.getModifierState?.("AltGraph"))) return false;
+  if (eventCode(e, mac) !== c.code) return false;
   const want = effectiveCombo(c, mac);
   const got = modifiersFromEvent(e, mac);
   return (
@@ -234,15 +237,14 @@ export function matchesCombo(e: KeyboardEvent, c: Combo, mac: boolean = isMac): 
   );
 }
 
-function matchCode(e: KeyboardEvent, code: string): boolean {
-  if (e.code === code) return true;
-  // Non-US layouts, or synthetic events without a code: fall back to the
-  // typed key for the single-character cases where it's unambiguous.
-  if (!e.code && e.key) {
-    const guess = tokenToCode(e.key.length === 1 ? e.key : e.key.toLowerCase());
-    return guess === code;
+function eventCode(e: KeyboardEvent, mac: boolean): string {
+  // Printable letters on AZERTY/QWERTZ are authoritative over their position.
+  // Option transforms characters on macOS; preserve that platform's chords.
+  if (!(mac && e.altKey) && e.key) {
+    const semantic = tokenToCode(e.key.length === 1 ? e.key : e.key.toLowerCase());
+    if (semantic) return semantic;
   }
-  return false;
+  return e.code;
 }
 
 /** Keycaps for display — modifiers in the macOS order ⌃ ⌥ ⇧ ⌘, then the key.
@@ -280,6 +282,12 @@ function displayKey(c: Combo): string {
 /** Compact single-string label ("⌘⇧B", "Ctrl+Shift+B") for `title=` tooltips. */
 export function displayLabel(c: Combo): string {
   return displayKeys(c).join(isWindows || isLinux ? "+" : "");
+}
+
+/** A shortcut in its persisted spelling, rendered for the current keyboard. */
+export function shortcutLabel(shortcut: string): string {
+  const combo = parseCombo(shortcut);
+  return combo ? displayLabel(combo) : shortcut;
 }
 
 const GLYPH_TO_ARIA: Record<string, string> = {

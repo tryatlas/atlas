@@ -40,7 +40,10 @@ export function SessionElicitation({
    *  card to animate it out, so the parent keeps this component and changes
    *  this prop rather than unmounting. */
   pending: PendingElicitation | null;
-  onClose: () => void;
+  /** The question `requestId` is answered or dismissed. Named, because more
+   *  may be waiting behind it and the one shown can change while an answer
+   *  is on its way: the store closes that one, and shows the next. */
+  onClose: (requestId: string) => void;
   /** Who drives from remote control when it is not this account (`null`
    *  otherwise). Answering a question is steering: only the driver may, so
    *  the card is replaced by a line saying so until the seat comes back. */
@@ -64,7 +67,7 @@ export function SessionElicitation({
         <ElicitationModal
           key={elicitationKey(pending)}
           pending={pending}
-          onClose={onClose}
+          onClose={() => onClose(pending.requestId)}
           remoteDriver={remoteDriver}
         />
       </>
@@ -90,9 +93,10 @@ export function SessionElicitation({
   // nothing on screen to retry from — which is exactly how a wire-shape bug
   // here stayed invisible.
   const respond = (action: "accept" | "decline", content?: Record<string, unknown>) => {
+    const { requestId } = pending;
     agents
-      .respondElicitation(pending.agentId, pending.requestId, action, content)
-      .then(onClose)
+      .respondElicitation(pending.agentId, requestId, action, content)
+      .then(() => onClose(requestId))
       .catch((e) => toast.error(`Could not send your answer: ${e}`));
   };
 

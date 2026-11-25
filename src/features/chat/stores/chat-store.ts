@@ -15,6 +15,7 @@ import type {
   AgentType,
   PendingSend,
   Subagent,
+  PlanStep,
 } from "@/types/agent";
 import { CLAUDE_PERMISSION_MODES, isBusyAgentStatus, pluginIdForAgent } from "@/types/agent";
 import type { PendingPermission } from "@/types/acp";
@@ -29,7 +30,12 @@ import type {
   QueuedPrompt,
 } from "@/types/agents";
 import { splitAtlasContext } from "../lib/atlas-context";
-import { loadCachedAcpModes, saveCachedAcpModes } from "../lib/acp-modes-cache";
+import { stopReasonHaltsQueue } from "../lib/queue-halt";
+import {
+  clearCachedAcpModes,
+  loadCachedAcpModes,
+  saveCachedAcpModes,
+} from "../lib/acp-modes-cache";
 import { loadLastModePref, saveLastModePref } from "../lib/last-mode-pref";
 import { modeSelectOf, modelSelectOf } from "../lib/acp-config-options";
 import { exitPlanModeForOption, exitPlanOptionRestartsSession } from "../lib/exit-plan-modes";
@@ -38,13 +44,19 @@ import {
   KNOBS,
   cacheAdvertisedOptions,
   createSessionConfiguration,
+  onClaudeModeList,
+  startsOnClaudeModeList,
   type AdvertisedOptions,
 } from "../lib/session-configuration";
 import {
   loadCachedAcpConfigOptions,
   saveCachedAcpConfigOptions,
 } from "../lib/acp-config-options-cache";
-import { loadCachedAcpModels, saveCachedAcpModels } from "../lib/acp-models-cache";
+import {
+  clearCachedAcpModels,
+  loadCachedAcpModels,
+  saveCachedAcpModels,
+} from "../lib/acp-models-cache";
 import { resolveModelLabel } from "../lib/model-label";
 import { agentForNewSession } from "../lib/default-agent";
 import { invalidateLoad } from "../lib/load-tokens";
@@ -56,7 +68,7 @@ import { extractPlanMarkdown, type PlanRecord } from "../lib/plans";
 import { extractNextSteps, stripNextStepsDirective } from "../lib/next-steps";
 import { foldTurnFiles, turnFilesOfToolCall } from "../lib/turn-files";
 import { toolCallFacts } from "../lib/tool-changes";
-import { inlineQueuedText } from "../lib/queued-text";
+import { inlineQueuedText, type QueuedContent } from "../lib/queued-text";
 import type { MentionData } from "../lib/mentions";
 import type { TurnFile, TurnInterruption } from "@/types/agent";
 import { emitWindowEvent } from "@/lib/window-events";
@@ -66,6 +78,10 @@ import { emitWindowEvent } from "@/lib/window-events";
  *  ≤80) with headroom. */
 const FIRST_USER_PREVIEW_CHARS = 200;
 const firstUserPreview = (prose: string): string => prose.slice(0, FIRST_USER_PREVIEW_CHARS);
+
+/** The prefix of a queue id that marks an add still on its way to Rust
+ *  (`lib/session-send.ts` mints them). */
+const PENDING_QUEUE_ID = "pending:";
 
 /** Rebuild the adaptive per-turn `turnSummary` (files read/modified) from a
  *  loaded transcript's tool calls. `turnSummary` is computed live at
@@ -135,7 +151,7 @@ function forgetSessionUsage(sess: ChatSession): void {
 
 function applyPersistedModePref(sess: ChatSession, agentType: AgentType): void {
   const pref = loadLastModePref(agentType);
-  if (agentType === "claude-code") {
+  if (onClaudeModeList(sess)) {
     const valid = !!pref && (CLAUDE_PERMISSION_MODES as readonly string[]).includes(pref);
     sess.claudePermissionMode = valid ? (pref as ClaudePermissionMode) : "default";
     sess.claudePermissionModeExplicit = valid;
@@ -172,6 +188,40 @@ export function toolLocations(raw: unknown): string[] | undefined {
   return paths.length > 0 ? paths : undefined;
 }
 
+/** What a call's card shows as its result. `result` is the flattened text of
+ *  the call's `content`; an agent may report a result only as `rawOutput`
+ *  (an MCP tool's whole answer, for one), and with no content and no
+ *  structured block that is the only account of what the call did, so it is
+ *  shown rather than an empty card (ACP audit finding 100). A string goes as it is,
+ *  anything else as JSON. */
+export function toolResultText(tc: AgentToolCall): string | null {
+  if (tc.result) return tc.result;
+  if (tc.content_blocks?.length) return tc.result;
+  const raw = tc.raw_output;
+  if (raw === undefined || raw === null) return tc.result;
+  if (typeof raw === "string") return raw || tc.result;
+  try {
+    return JSON.stringify(raw, null, 2);
+  } catch {
+    return tc.result;
+  }
+}
+
+/** One wire plan entry as the plan pill and the thread hold it. `priority`
+ *  is kept as the agent gave it (ACP: high / medium / low) — it was dropped
+ *  here before (ACP audit finding 102). */
+function toPlanStep(
+  e: { content: string; status: string; priority?: string | null },
+  idx: number,
+): PlanStep {
+  return {
+    id: `plan-${idx}`,
+    description: e.content,
+    status: (e.status as PlanStep["status"]) ?? "pending",
+    ...(e.priority ? { priority: e.priority } : {}),
+  };
+}
+
 /** Convert an atlas-agents wire ToolCall into the in-store ChatMessage shape. */
 function toChatToolCall(tc: AgentToolCall): ChatMessage["toolCalls"][number] {
   return {
@@ -181,7 +231,7 @@ function toChatToolCall(tc: AgentToolCall): ChatMessage["toolCalls"][number] {
     // reliably (the bash-history panel + bash-styled cards key off it).
     kind: tc.kind ?? null,
     arguments: (tc.arguments ?? {}) as Record<string, unknown>,
-    result: tc.result,
+    result: toolResultText(tc),
     // Only present when the agent reported a diff/terminal block; the Rust
     // side omits the field entirely when empty.
     contentBlocks: tc.content_blocks,
@@ -227,6 +277,15 @@ interface ChatState {
    * Missing or short means local (code that writes `queues` alone).
    */
   queueIds: Record<string, (string | null)[]>;
+  /**
+   * Parallel to `queues`: what each item was sent as — the typed text, its
+   * mentions and its images — so the agent gets the message a direct send
+   * would have sent, and an agent switch or a restart onto a new session
+   * hands on all of it (ACP audit findings 78 and 80). `null` (or missing)
+   * for an item the window did not write: a remote driver's, or one a
+   * snapshot reported; its strip text is then the whole of what is known.
+   */
+  queueContent: Record<string, (QueuedContent | null)[]>;
   /**
    * Per-tab composer draft. Mirrors the CodeMirror text body so a tab
    * switch (which unmounts MessageInput) doesn't drop what the user was
@@ -344,13 +403,18 @@ interface ChatActions {
      *  could not apply it, so the picker now shows the agent's own mode, which
      *  the user never chose. */
     dropAcpModePick: (sessionId: string) => void;
+    /** Forget this tab's model pick: the agent refused it, so the next
+     *  snapshot's current model (`setAcpModels`) is what the picker shows. */
+    dropAcpModelPick: (sessionId: string) => void;
     /** Set or clear (`undefined`) the mode a resume could not restore. A mode
      *  pick clears it too. See `ChatSession.unrestoredModeId`. */
     setUnrestoredMode: (sessionId: string, modeId: string | undefined) => void;
     /** Set an agent-advertised config option (P2.2). Optimistic locally; the
      *  agent's own `config_option_update` is the authority and overwrites it. */
-    /** Clear the answered/dismissed elicitation (P3.3). */
-    clearElicitation: (sessionId: string) => void;
+    /** Close an answered/dismissed elicitation (P3.3) and show the next one
+     *  waiting. With `requestId`, that one (shown or waiting); without, the
+     *  one shown. */
+    clearElicitation: (sessionId: string, requestId?: string) => void;
     setAcpConfigOption: (
       sessionId: string,
       configId: string,
@@ -452,7 +516,7 @@ interface ChatActions {
     hydrateSessionSnapshot: (
       tabId: string,
       status: AgentStatus,
-      plan: Array<{ content: string; status: string }>,
+      plan: Array<{ content: string; status: string; priority?: string | null }>,
       /** The session's delegated children, from the same snapshot. Absent on
        *  the metadata-only read, like `messages`; an empty array is a session
        *  that delegated nothing, and both clear what the rebind left. */
@@ -493,16 +557,23 @@ interface ChatActions {
       text: string,
       mentions: readonly MentionData[],
       id?: string | null,
+      attachments?: ImageAttachment[],
     ) => void;
     removeQueueItem: (sessionId: string, index: number) => void;
     editQueueItem: (sessionId: string, index: number, text: string) => void;
     shiftQueue: (sessionId: string) => string | null;
     clearQueue: (sessionId: string) => void;
+    /** Lift the window's record of a failed turn's queue halt (audit #77):
+     *  the user resumed it. */
+    clearQueueHalt: (sessionId: string) => void;
     /** Re-key the item carrying id `from` (a pending marker) as `to`. */
     setQueueItemId: (sessionId: string, from: string, to: string | null) => void;
     setQueueItemIdAt: (sessionId: string, index: number, id: string | null) => void;
     /** Every item becomes local (the session its ids named is gone). */
     setAllQueueItemsLocal: (sessionId: string) => void;
+    /** Write in the whole text of items whose strip text is only the head a
+     *  `queue_changed` delta carried, from a snapshot's queue (by item id). */
+    fillQueueText: (sessionId: string, queue: QueuedPrompt[]) => void;
     // ── ACP bindings ────────────────────────────────────────────────────
     setAcpBinding: (
       tabId: string,
@@ -607,27 +678,119 @@ export interface SnapshotLive {
   held?: boolean;
 }
 
-/** `queueIds[tabId]`, aligned to `queues[tabId]` (missing entries are local). */
-function queueIdsOf(s: ChatState, tabId: string): (string | null)[] {
-  const texts = s.queues[tabId] ?? [];
-  const ids = s.queueIds[tabId] ?? [];
-  return texts.map((_, i) => ids[i] ?? null);
+/** One strip item: what it shows, its Rust id (or pending marker, or `null`
+ *  for local), and what it was sent as (see `ChatState.queueContent`). */
+export interface QueueItem {
+  text: string;
+  id: string | null;
+  content: QueuedContent | null;
 }
 
-/** Mirror Rust's queue into the strip, keeping the tab's local items after it.
- *  Pending markers go: the queue they were on their way into is what this is. */
-function mirrorQueue(s: ChatState, tabId: string, queue: QueuedPrompt[]): void {
+/** The tab's strip, the three parallel arrays zipped. */
+export function queueItemsOf(
+  s: Pick<ChatState, "queues" | "queueIds" | "queueContent">,
+  tabId: string,
+): QueueItem[] {
   const texts = s.queues[tabId] ?? [];
-  const ids = queueIdsOf(s, tabId);
-  const local = texts.filter((_, i) => ids[i] === null);
-  const nextTexts = [...queue.map((q) => q.text), ...local];
-  if (nextTexts.length === 0) {
-    delete s.queues[tabId];
-    delete s.queueIds[tabId];
+  const ids = s.queueIds[tabId] ?? [];
+  // Trusted only when it lines up: content left from a strip something wrote
+  // without it (`queues` set alone) must not attach to the wrong item.
+  const stored = s.queueContent?.[tabId];
+  const content = stored?.length === texts.length ? stored : [];
+  return texts.map((text, i) => ({ text, id: ids[i] ?? null, content: content[i] ?? null }));
+}
+
+/** Write the tab's strip; an empty one is dropped. Every queue write goes
+ *  through here, so the parallel arrays cannot drift apart. */
+function writeQueue(s: ChatState, tabId: string, items: QueueItem[]): void {
+  if (items.length === 0) {
+    dropQueue(s, tabId);
     return;
   }
-  s.queues[tabId] = nextTexts;
-  s.queueIds[tabId] = [...queue.map((q) => q.id), ...local.map(() => null)];
+  s.queues[tabId] = items.map((q) => q.text);
+  s.queueIds[tabId] = items.map((q) => q.id);
+  s.queueContent[tabId] = items.map((q) => q.content);
+}
+
+function dropQueue(s: ChatState, tabId: string): void {
+  delete s.queues[tabId];
+  delete s.queueIds[tabId];
+  delete s.queueContent[tabId];
+}
+
+/** A held first message going back to the strip, as a local item. */
+function requeueHeld(s: ChatState, tabId: string, held: PendingSend): void {
+  writeQueue(s, tabId, [
+    ...queueItemsOf(s, tabId),
+    {
+      text: inlineQueuedText(held.content, held.mentions ?? []),
+      id: null,
+      content: {
+        text: held.content,
+        mentions: [...(held.mentions ?? [])],
+        ...(held.attachments?.length ? { attachments: held.attachments } : {}),
+      },
+    },
+  ]);
+}
+
+/** Tabs whose strip shows the head of an item Rust has whole, and which are
+ *  already asking for the rest (`refillQueue`). */
+const refilling = new Set<string>();
+
+/**
+ * Mirror Rust's queue into the strip, keeping the tab's local items after it.
+ *
+ * A `queue_changed` delta carries only the head of a long prompt
+ * (`truncated`). The strip must never trade the whole text it has for that
+ * head (ACP audit finding 78): an Edit, an agent switch and a restart onto a
+ * new session all read the strip. So an item the window already holds keeps
+ * its text and content, matched by id; an add still on its way (a pending
+ * marker) is matched to the first local item Rust now lists whose text it
+ * starts with, which is exactly what the cut does. An add Rust does not list
+ * yet stays, after Rust's items. An item only a truncated delta has told the
+ * window about is fetched whole from a snapshot (`refillQueue`).
+ */
+function mirrorQueue(s: ChatState, tabId: string, queue: QueuedPrompt[]): void {
+  const old = queueItemsOf(s, tabId);
+  const byId = new Map<string, QueueItem>();
+  for (const q of old) if (q.id && !q.id.startsWith(PENDING_QUEUE_ID)) byId.set(q.id, q);
+  const pending = old.filter((q) => q.id?.startsWith(PENDING_QUEUE_ID));
+  const local = old.filter((q) => q.id === null);
+  let preview = false;
+  const mirrored = queue.map((w): QueueItem => {
+    const known = byId.get(w.id);
+    if (known) return { ...known, id: w.id };
+    if (w.origin.kind === "local") {
+      const at = pending.findIndex((p) => p.text.startsWith(w.text));
+      if (at >= 0) {
+        const [mine] = pending.splice(at, 1);
+        return { ...mine, id: w.id };
+      }
+    }
+    if (w.truncated) preview = true;
+    return { text: w.text, id: w.id, content: null };
+  });
+  writeQueue(s, tabId, [...mirrored, ...pending, ...local]);
+  if (preview) refillQueue(s, tabId);
+}
+
+/** Ask Rust for the whole text of the strip's cut items. Off the reducer: a
+ *  snapshot is an IPC round trip, applied through `fillQueueText`. */
+function refillQueue(s: ChatState, tabId: string): void {
+  const session = s.sessions[tabId];
+  if (!session?.acpAgentId || !session.acpSessionId || refilling.has(tabId)) return;
+  const key = { agent_id: session.acpAgentId, session_id: session.acpSessionId };
+  refilling.add(tabId);
+  queueMicrotask(() => {
+    agents
+      .snapshotMeta(key)
+      .then((snap) => {
+        if (snap.queue) useChatStore.getState().actions.fillQueueText(tabId, snap.queue);
+      })
+      .catch((err) => console.warn("could not read the whole queue:", err))
+      .finally(() => refilling.delete(tabId));
+  });
 }
 
 /**
@@ -645,6 +808,29 @@ const heldForPaint = new Map<string, AgentDelta[]>();
  *  `replaceMessages`), until its held deltas are released. */
 const paintedThrough = new Map<string, number>();
 
+/**
+ * Which of a session's agent-advertised lists its live agent has already
+ * delivered non-empty, as `${acpSessionId}:${list}`. It is what tells the two
+ * kinds of empty answer apart (ACP audit finding 39): an empty snapshot of a session that
+ * already said it has commands/models/knobs is a stale read and is ignored,
+ * while an empty answer from a session that never said otherwise is the
+ * agent's verdict and replaces whatever was there — a list seeded from the
+ * per-agent cache, or another session's. Keyed by ACP session, so a rebind
+ * starts unheard. Module state, not store state: nothing renders from it.
+ */
+type AdvertisedList = "modes" | "models" | "commands" | "options";
+const heardLive = new Set<string>();
+
+function noteHeard(acpSessionId: string | undefined, list: AdvertisedList, n: number): void {
+  if (acpSessionId && n > 0) heardLive.add(`${acpSessionId}:${list}`);
+}
+
+/** Whether an empty answer for `list` is a stale read rather than a verdict.
+ *  An unbound tab has no session to answer for it, so its list is kept. */
+function emptyIsStale(acpSessionId: string | undefined, list: AdvertisedList): boolean {
+  return !acpSessionId || heardLive.has(`${acpSessionId}:${list}`);
+}
+
 function forgetHeld(tabId: string): void {
   heldForPaint.delete(tabId);
   paintedThrough.delete(tabId);
@@ -652,7 +838,7 @@ function forgetHeld(tabId: string): void {
 
 /** Hold `env` if its tab is still loading its transcript. */
 function holdForPaint(s: ChatState, env: AgentDelta): boolean {
-  const tid = findTabByAcpSession(s.sessions, env.session_id);
+  const tid = findTabByAcpSession(s.sessions, env.session_id, env.agent_id);
   if (!tid || !s.sessions[tid].transcriptLoading) return false;
   const held = heldForPaint.get(tid);
   if (held) held.push(env);
@@ -660,15 +846,26 @@ function holdForPaint(s: ChatState, env: AgentDelta): boolean {
   return true;
 }
 
-/** The chat tab running `acpSessionId`, or null. */
+/**
+ * The chat tab running `acpSessionId`, or null.
+ *
+ * ACP scopes a session id to its connection, so two agents can both answer
+ * `"1"` (#86). Given `agentId` (the host's handle, `acpAgentId`), a tab bound
+ * to another agent is never the answer; a tab whose agent is not known yet
+ * (restored, not rebound) still is, after any tab bound to that agent.
+ */
 export function findTabByAcpSession(
   sessions: Record<string, ChatSession>,
   acpSessionId: string,
+  agentId?: string,
 ): string | null {
+  let unbound: string | null = null;
   for (const [tid, s] of Object.entries(sessions)) {
-    if (s.acpSessionId === acpSessionId) return tid;
+    if (s.acpSessionId !== acpSessionId) continue;
+    if (!agentId || s.acpAgentId === agentId) return tid;
+    if (!s.acpAgentId) unbound ??= tid;
   }
-  return null;
+  return unbound;
 }
 
 /**
@@ -684,7 +881,7 @@ async function capturePlanIfPresent(
   const plan = extractPlanMarkdown(req.toolCall);
   if (!plan) return;
 
-  const tabId = findTabByAcpSession(sessions, req.acpSessionId);
+  const tabId = findTabByAcpSession(sessions, req.acpSessionId, req.agentId);
   const session = tabId ? sessions[tabId] : undefined;
 
   // Original user message = the most recent user message in the session.
@@ -700,8 +897,8 @@ async function capturePlanIfPresent(
     }
   }
 
-  const { useAppStore } = await import("@/features/app/stores/app-store");
-  const projectPath = useAppStore.getState().currentProject?.path;
+  const { projectPathForTab } = await import("../lib/tab-project");
+  const projectPath = (tabId ? projectPathForTab(tabId) : null) ?? session?.workingDirectory;
   if (!projectPath) return;
 
   const record: PlanRecord = {
@@ -883,6 +1080,7 @@ export const useChatStore = create<ChatState & ChatActions>()(
     pendingPermissions: {},
     queues: {},
     queueIds: {},
+    queueContent: {},
     drafts: {},
     activeSessionId: null,
     agentStartingStatus: {},
@@ -907,14 +1105,14 @@ export const useChatStore = create<ChatState & ChatActions>()(
             updatedAt: new Date().toISOString(),
             // Permission mode is a Claude Code feature; Codex drives its
             // modes generically via ACP (acpCurrentMode).
-            claudePermissionMode: agentType === "claude-code" ? "default" : undefined,
+            claudePermissionMode: startsOnClaudeModeList(agentType) ? "default" : undefined,
             claudePermissionModeExplicit: false,
             acpModeExplicit: false,
             ...(pendingRestore ? { pendingRestore } : {}),
             // Optimistically pre-fill a non-Claude agent's mode picker from the
             // persisted cache so switching feels instant; mark pending until the
             // real session confirms (the picker shows a loading state).
-            ...(agentType !== "claude-code"
+            ...(!startsOnClaudeModeList(agentType)
               ? (() => {
                   const cached = loadCachedAcpModes(agentType);
                   return {
@@ -957,8 +1155,9 @@ export const useChatStore = create<ChatState & ChatActions>()(
           // one (agents are pooled per plugin, so the process keeps running —
           // we only clear THIS session's queue, not the agent).
           if (sess.acpSessionId) delete s.pendingPermissions[sess.acpSessionId];
+          dropBackendSession(sess);
           sess.agentType = agentType;
-          sess.claudePermissionMode = agentType === "claude-code" ? "default" : undefined;
+          sess.claudePermissionMode = startsOnClaudeModeList(agentType) ? "default" : undefined;
           sess.claudePermissionModeExplicit = false;
           sess.acpModeExplicit = false;
           // Drop the old ACP binding so the chat panel's mount effect re-binds
@@ -982,8 +1181,9 @@ export const useChatStore = create<ChatState & ChatActions>()(
           // the old agent's list must not survive the switch or it renders
           // under the new agent until its own update lands.
           sess.availableCommands = undefined;
-          if (agentType === "claude-code") {
-            // Claude has no ACP modes — clear the old agent's so no stale pill.
+          if (onClaudeModeList(sess)) {
+            // Atlas's own mode record: clear the old agent's advertised modes
+            // so no stale pill.
             sess.acpAvailableModes = [];
             sess.acpModesPending = false;
           } else {
@@ -1029,12 +1229,12 @@ export const useChatStore = create<ChatState & ChatActions>()(
             // what the pill shows meanwhile, and it must not be the previous
             // agent's.
             sess.acpConfigOptions = loadCachedAcpConfigOptions(agentType) ?? undefined;
-            sess.claudePermissionMode = agentType === "claude-code" ? "default" : undefined;
+            sess.claudePermissionMode = startsOnClaudeModeList(agentType) ? "default" : undefined;
             sess.claudePermissionModeExplicit = false;
             sess.acpModeExplicit = false;
             sess.unrestoredModeId = undefined;
-            if (agentType === "claude-code") {
-              // Claude has no ACP modes — clear any stale picker state left
+            if (onClaudeModeList(sess)) {
+              // Atlas's own mode record — clear any stale picker state left
               // by the previously-selected agent so no ghost mode pill shows.
               sess.acpAvailableModes = [];
               sess.acpModesPending = false;
@@ -1206,6 +1406,10 @@ export const useChatStore = create<ChatState & ChatActions>()(
           session.status = "error";
           session.stopping = undefined;
           session.retryStatus = undefined;
+          for (const message of session.messages) {
+            for (const tool of message.toolCalls)
+              if (tool.status === "pending" || tool.status === "running") tool.status = "failed";
+          }
           session.inflightToolIds = undefined;
           session.disconnected = true;
         }),
@@ -1276,9 +1480,15 @@ export const useChatStore = create<ChatState & ChatActions>()(
         void sessionConfiguration.pick(sessionId, KNOBS.claudeMode, mode),
       applyExitPlanSelection: (sessionId, optionId, override) => {
         const session = get().sessions[sessionId];
-        if (!session || session.agentType !== "claude-code") return;
+        if (!session) return;
+        // Keyed on the approval prompt's shape, not the agent (ADR-0002, ACP
+        // audit finding 45): only a plan-approval option id names a mode, and
+        // the permission card offers its own bypass action on that same
+        // shape, so an override only ever arrives with one. Which record the
+        // mode lands in is the session's own (`KNOBS.planExitMode`).
+        if (!exitPlanModeForOption(optionId)) return;
         const mode = override ?? exitPlanModeForOption(optionId);
-        if (!mode) return;
+        if (!mode || !KNOBS.planExitMode.offers(session, mode)) return;
         // A clear-context choice restarts the session; the adapter publishes
         // the mode itself once the replacement is up, and a set_mode sent
         // into the restart is refused. The plain choices are applied by the
@@ -1306,6 +1516,12 @@ export const useChatStore = create<ChatState & ChatActions>()(
         // snapshot actually came from (its `plugin_id`); a mismatch is stale
         // by definition, so drop it rather than reconcile it.
         if (sourceAgentType && at && sourceAgentType !== at) return;
+        const acp = get().sessions[sessionId]?.acpSessionId;
+        // An empty list from a session that never advertised modes is the
+        // agent's answer, and the cached list must go with it (ACP audit finding 39): kept, it
+        // seeded the next session's picker with modes no agent offers.
+        const clearCache = availableModes.length === 0 && !emptyIsStale(acp, "modes");
+        noteHeard(acp, "modes", availableModes.length);
         set((s) => {
           const session = s.sessions[sessionId];
           if (!session) return;
@@ -1329,11 +1545,13 @@ export const useChatStore = create<ChatState & ChatActions>()(
         });
         // Persist the confirmed modes so the next switch to this agent is
         // instant. Done outside the immer pass (side effect, not state).
-        if (availableModes.length > 0 && at && at !== "claude-code") {
+        if (availableModes.length > 0 && at && !onClaudeModeList(get().sessions[sessionId])) {
           saveCachedAcpModes(at, {
             currentMode: currentMode ?? null,
             availableModes,
           });
+        } else if (clearCache && at) {
+          clearCachedAcpModes(at);
         }
       },
       setAcpModesPending: (sessionId, pending) =>
@@ -1348,15 +1566,20 @@ export const useChatStore = create<ChatState & ChatActions>()(
           const session = s.sessions[sessionId];
           if (session) session.acpModeExplicit = false;
         }),
+      dropAcpModelPick: (sessionId) =>
+        set((s) => {
+          const session = s.sessions[sessionId];
+          if (session) session.acpCurrentModel = undefined;
+        }),
       setUnrestoredMode: (sessionId, modeId) =>
         set((s) => {
           const session = s.sessions[sessionId];
           if (session) session.unrestoredModeId = modeId;
         }),
-      clearElicitation: (sessionId) =>
+      clearElicitation: (sessionId, requestId) =>
         set((s) => {
           const session = s.sessions[sessionId];
-          if (session) session.pendingElicitation = undefined;
+          if (session) closeElicitation(session, requestId);
         }),
       setAcpConfigOption: async (sessionId, configId, value) => {
         await sessionConfiguration.pick(sessionId, KNOBS.option(configId), value);
@@ -1374,12 +1597,19 @@ export const useChatStore = create<ChatState & ChatActions>()(
         set((s) => {
           const session = s.sessions[sessionId];
           if (!session) return;
-          // An empty snapshot must not erase a list the live delta already
-          // delivered; it MAY end the picker's loading state (undefined→[])
-          // for agents that genuinely advertise nothing.
-          if (commands.length === 0 && (session.availableCommands?.length ?? 0) > 0) {
+          // An empty snapshot must not erase a list this session's agent
+          // already delivered; it MAY end the picker's loading state
+          // (undefined→[]) for agents that genuinely advertise nothing, and it
+          // does replace a list no live answer of this session stands behind
+          // (ACP audit finding 39).
+          if (
+            commands.length === 0 &&
+            (session.availableCommands?.length ?? 0) > 0 &&
+            emptyIsStale(session.acpSessionId, "commands")
+          ) {
             return;
           }
+          noteHeard(session.acpSessionId, "commands", commands.length);
           session.availableCommands = commands;
         });
       },
@@ -1395,12 +1625,18 @@ export const useChatStore = create<ChatState & ChatActions>()(
         set((s) => {
           const session = s.sessions[tabId];
           if (!session) return;
-          // An empty snapshot must not erase a list the live delta already
-          // delivered; it MAY end the undefined loading state (this agent
-          // advertises no knobs). Same rule as the commands list above.
-          if (options.length === 0 && (session.acpConfigOptions?.length ?? 0) > 0) {
+          // An empty snapshot must not erase a list this session's agent
+          // already delivered; it MAY end the undefined loading state (this
+          // agent advertises no knobs), and it replaces a list only the cache
+          // stood behind (ACP audit finding 39). Same rule as the commands list above.
+          if (
+            options.length === 0 &&
+            (session.acpConfigOptions?.length ?? 0) > 0 &&
+            emptyIsStale(session.acpSessionId, "options")
+          ) {
             return;
           }
+          noteHeard(session.acpSessionId, "options", options.length);
           session.acpConfigOptions = options;
         });
         // Survive the next restart (#36) — modes and models already do;
@@ -1423,6 +1659,7 @@ export const useChatStore = create<ChatState & ChatActions>()(
         }
       },
       setAcpModels: (sessionId, currentModel, availableModels) => {
+        let clearCache = false;
         set((s) => {
           const session = s.sessions[sessionId];
           if (!session) return;
@@ -1431,9 +1668,20 @@ export const useChatStore = create<ChatState & ChatActions>()(
           // agent that advertises no model select at all — carries [] while
           // the session may already have the real list, and the picker hides
           // itself whenever the list is empty.
-          if (availableModels.length === 0 && (session.acpAvailableModels?.length ?? 0) > 0) {
+          //
+          // That is a stale read only once this session's agent has delivered
+          // a list. Before that, an empty answer is the agent's verdict, and a
+          // list seeded from the cache (or left by another session) goes, the
+          // cached copy with it (ACP audit finding 39).
+          if (
+            availableModels.length === 0 &&
+            (session.acpAvailableModels?.length ?? 0) > 0 &&
+            emptyIsStale(session.acpSessionId, "models")
+          ) {
             return;
           }
+          clearCache = availableModels.length === 0 && !!session.acpSessionId;
+          noteHeard(session.acpSessionId, "models", availableModels.length);
           session.acpAvailableModels = availableModels;
           // Only seed the current model from the snapshot when it carries one;
           // never clobber a user-driven selection the store already reflects.
@@ -1446,6 +1694,8 @@ export const useChatStore = create<ChatState & ChatActions>()(
         const at = get().sessions[sessionId]?.agentType;
         if (availableModels.length > 0 && at) {
           saveCachedAcpModels(at, { availableModels });
+        } else if (clearCache && at) {
+          clearCachedAcpModels(at);
         }
       },
       setAcpModelsForAgent: (agentType, availableModels) => {
@@ -1567,14 +1817,7 @@ export const useChatStore = create<ChatState & ChatActions>()(
           // Re-derive the docked live plan from the snapshot (same shape as
           // the `plan_updated` delta). Cleared on the switch-away rebind, so
           // this is what makes an active plan REAPPEAR when switching back.
-          session.livePlan =
-            plan.length > 0
-              ? plan.map((e, idx) => ({
-                  id: `plan-${idx}`,
-                  description: e.content,
-                  status: (e.status as "pending" | "in_progress" | "completed") ?? "pending",
-                }))
-              : undefined;
+          session.livePlan = plan.length > 0 ? plan.map(toPlanStep) : undefined;
           // Re-seed the children the same way. This is what makes a resumed
           // or switched-back-to chat show its delegated work as subagents
           // rather than as the bare launching tool calls — the rebind above
@@ -1604,8 +1847,7 @@ export const useChatStore = create<ChatState & ChatActions>()(
           if (acp) delete s.pendingPermissions[acp];
           delete s.sessions[sessionId];
           delete s.drafts[sessionId];
-          delete s.queues[sessionId];
-          delete s.queueIds[sessionId];
+          dropQueue(s, sessionId);
           if (s.activeSessionId === sessionId) {
             const keys = Object.keys(s.sessions);
             s.activeSessionId = keys.length > 0 ? keys[0] : null;
@@ -1624,8 +1866,7 @@ export const useChatStore = create<ChatState & ChatActions>()(
             if (acp) delete s.pendingPermissions[acp];
             delete s.sessions[id];
             delete s.drafts[id];
-            delete s.queues[id];
-            delete s.queueIds[id];
+            dropQueue(s, id);
             if (s.activeSessionId === id) s.activeSessionId = null;
           }
         });
@@ -1633,10 +1874,12 @@ export const useChatStore = create<ChatState & ChatActions>()(
       resetSessions: () => {
         heldForPaint.clear();
         paintedThrough.clear();
+        heardLive.clear();
         set((s) => {
           s.sessions = {};
           s.queues = {};
           s.queueIds = {};
+          s.queueContent = {};
           s.drafts = {};
           s.pendingPermissions = {};
           s.activeSessionId = null;
@@ -1666,78 +1909,107 @@ export const useChatStore = create<ChatState & ChatActions>()(
             chips: patch.chips ?? msg.suggestions?.chips ?? [],
           };
         }),
-      enqueueMessage: (sessionId, text, mentions, id = null) =>
+      enqueueMessage: (sessionId, text, mentions, id = null, attachments) =>
         set((s) => {
-          const ids = queueIdsOf(s, sessionId);
-          const cur = s.queues[sessionId] ?? [];
-          s.queues[sessionId] = [...cur, inlineQueuedText(text, mentions)];
-          s.queueIds[sessionId] = [...ids, id];
+          writeQueue(s, sessionId, [
+            ...queueItemsOf(s, sessionId),
+            {
+              text: inlineQueuedText(text, mentions),
+              id,
+              content: {
+                text,
+                mentions: [...mentions],
+                ...(attachments?.length ? { attachments } : {}),
+              },
+            },
+          ]);
         }),
       removeQueueItem: (sessionId, index) =>
         set((s) => {
-          const cur = s.queues[sessionId];
-          if (!cur) return;
-          const ids = queueIdsOf(s, sessionId);
-          const next = cur.filter((_, i) => i !== index);
-          if (next.length === 0) {
-            delete s.queues[sessionId];
-            delete s.queueIds[sessionId];
-          } else {
-            s.queues[sessionId] = next;
-            s.queueIds[sessionId] = ids.filter((_, i) => i !== index);
-          }
+          if (!s.queues[sessionId]) return;
+          writeQueue(
+            s,
+            sessionId,
+            queueItemsOf(s, sessionId).filter((_, i) => i !== index),
+          );
         }),
       setQueueItemId: (sessionId, from, to) =>
         set((s) => {
-          const ids = queueIdsOf(s, sessionId);
-          const at = ids.indexOf(from);
+          const items = queueItemsOf(s, sessionId);
+          const at = items.findIndex((q) => q.id === from);
           if (at < 0) return;
-          ids[at] = to;
-          s.queueIds[sessionId] = ids;
+          // The delta may already have listed the item under `to` without
+          // recognising it: the one entry keeps this one's text and content.
+          const dup = to === null ? -1 : items.findIndex((q, i) => i !== at && q.id === to);
+          if (dup >= 0) {
+            items[dup] = { ...items[at], id: to };
+            items.splice(at, 1);
+          } else {
+            items[at] = { ...items[at], id: to };
+          }
+          writeQueue(s, sessionId, items);
         }),
       setQueueItemIdAt: (sessionId, index, id) =>
         set((s) => {
-          const ids = queueIdsOf(s, sessionId);
-          if (index < 0 || index >= ids.length) return;
-          ids[index] = id;
-          s.queueIds[sessionId] = ids;
+          const items = queueItemsOf(s, sessionId);
+          if (index < 0 || index >= items.length) return;
+          items[index] = { ...items[index], id };
+          writeQueue(s, sessionId, items);
         }),
       setAllQueueItemsLocal: (sessionId) =>
         set((s) => {
-          const texts = s.queues[sessionId];
-          if (!texts?.length) return;
-          s.queueIds[sessionId] = texts.map(() => null);
+          const items = queueItemsOf(s, sessionId);
+          if (!items.length) return;
+          writeQueue(
+            s,
+            sessionId,
+            items.map((q) => ({ ...q, id: null })),
+          );
+        }),
+      fillQueueText: (sessionId, queue) =>
+        set((s) => {
+          const whole = new Map(queue.filter((q) => !q.truncated).map((q) => [q.id, q.text]));
+          const items = queueItemsOf(s, sessionId);
+          let changed = false;
+          const next = items.map((q) => {
+            const text = q.id && !q.content ? whole.get(q.id) : undefined;
+            if (text === undefined || text === q.text) return q;
+            changed = true;
+            return { ...q, text };
+          });
+          if (changed) writeQueue(s, sessionId, next);
         }),
       editQueueItem: (sessionId, index, text) =>
         set((s) => {
-          const cur = s.queues[sessionId];
-          if (!cur || index < 0 || index >= cur.length) return;
-          const next = [...cur];
-          next[index] = text;
-          s.queues[sessionId] = next;
+          const items = queueItemsOf(s, sessionId);
+          if (index < 0 || index >= items.length) return;
+          // Rewritten by hand: the text is the prompt now. Images stay.
+          const attachments = items[index].content?.attachments;
+          items[index] = {
+            ...items[index],
+            text,
+            content: { text, mentions: [], ...(attachments ? { attachments } : {}) },
+          };
+          writeQueue(s, sessionId, items);
         }),
       shiftQueue: (sessionId) => {
         let head: string | null = null;
         set((s) => {
-          const cur = s.queues[sessionId];
-          if (!cur || cur.length === 0) return;
-          head = cur[0];
-          const rest = cur.slice(1);
-          const ids = queueIdsOf(s, sessionId).slice(1);
-          if (rest.length === 0) {
-            delete s.queues[sessionId];
-            delete s.queueIds[sessionId];
-          } else {
-            s.queues[sessionId] = rest;
-            s.queueIds[sessionId] = ids;
-          }
+          const items = queueItemsOf(s, sessionId);
+          if (items.length === 0) return;
+          head = items[0].text;
+          writeQueue(s, sessionId, items.slice(1));
         });
         return head;
       },
       clearQueue: (sessionId) =>
         set((s) => {
-          delete s.queues[sessionId];
-          delete s.queueIds[sessionId];
+          dropQueue(s, sessionId);
+        }),
+      clearQueueHalt: (sessionId) =>
+        set((s) => {
+          const session = s.sessions[sessionId];
+          if (session) session.queueHalted = undefined;
         }),
 
       appendAssistantText: (acpSessionId, text) =>
@@ -1774,6 +2046,11 @@ export const useChatStore = create<ChatState & ChatActions>()(
         set((s) => {
           const session = s.sessions[tabId];
           if (!session) return;
+          if (
+            session.acpSessionId &&
+            (session.acpSessionId !== acpSessionId || session.acpAgentId !== agentId)
+          )
+            dropBackendSession(session);
           // One agent session, one tab. Every delta goes to the FIRST tab
           // holding the session (`findTabByAcpSession`), so a second holder
           // never hears from it again: its status stays wherever it was, a
@@ -1781,10 +2058,15 @@ export const useChatStore = create<ChatState & ChatActions>()(
           // said "Working" for a turn that had long finished. The tab binding
           // now is the one the user is looking at, so the old holder lets go
           // and becomes a new chat. The agent session itself stays open: it is
-          // this tab's now.
+          // this tab's now. Another agent's session that happens to share the
+          // id is another conversation (#86), and its tab keeps it.
           for (const [otherId, other] of Object.entries(s.sessions)) {
-            if (otherId !== tabId && other.acpSessionId === acpSessionId) {
-              resetToNewChat(s, otherId);
+            if (
+              otherId !== tabId &&
+              other.acpSessionId === acpSessionId &&
+              (!other.acpAgentId || other.acpAgentId === agentId)
+            ) {
+              resetToNewChat(s, otherId, true);
             }
           }
           // A (re)bind points the tab at a DIFFERENT backend session — a
@@ -1894,9 +2176,7 @@ export const useChatStore = create<ChatState & ChatActions>()(
             const held = session.pendingSend;
             if (held) {
               session.pendingSend = undefined;
-              const ids = queueIdsOf(s, tabId);
-              s.queues[tabId] = [...(s.queues[tabId] ?? []), held.content];
-              s.queueIds[tabId] = [...ids, null];
+              requeueHeld(s, tabId, held);
             }
             session.status = "idle";
             session.stopping = undefined;
@@ -1923,9 +2203,7 @@ export const useChatStore = create<ChatState & ChatActions>()(
             const held = session.pendingSend;
             if (held) {
               session.pendingSend = undefined;
-              const ids = queueIdsOf(s, tabId);
-              s.queues[tabId] = [...(s.queues[tabId] ?? []), held.content];
-              s.queueIds[tabId] = [...ids, null];
+              requeueHeld(s, tabId, held);
             }
             session.status = "idle";
             session.stopping = undefined;
@@ -2037,9 +2315,14 @@ function stampProducingModel(
   return msg;
 }
 
-function appendTextToDraft(s: ChatDraft, acpSessionId: string, text: string): void {
+function appendTextToDraft(
+  s: ChatDraft,
+  acpSessionId: string,
+  text: string,
+  agentId?: string,
+): void {
   if (!text) return;
-  const tid = findTabByAcpSession(s.sessions, acpSessionId);
+  const tid = findTabByAcpSession(s.sessions, acpSessionId, agentId);
   if (!tid) return;
   const session = s.sessions[tid];
   // Find the last message that actually renders something, skipping the
@@ -2083,9 +2366,14 @@ function appendTextToDraft(s: ChatDraft, acpSessionId: string, text: string): vo
   session.messages.push(stampProducingModel(session, makeAssistantTextMessage(text)));
 }
 
-function appendThoughtToDraft(s: ChatDraft, acpSessionId: string, text: string): void {
+function appendThoughtToDraft(
+  s: ChatDraft,
+  acpSessionId: string,
+  text: string,
+  agentId?: string,
+): void {
   if (!text) return;
-  const tid = findTabByAcpSession(s.sessions, acpSessionId);
+  const tid = findTabByAcpSession(s.sessions, acpSessionId, agentId);
   if (!tid) return;
   const session = s.sessions[tid];
   const last = session.messages[session.messages.length - 1];
@@ -2105,7 +2393,7 @@ function appendThoughtToDraft(s: ChatDraft, acpSessionId: string, text: string):
  *  drops the actor + the driver-side guard (M6 — these used to leak for the
  *  whole process lifetime). UI state removal proceeds regardless. */
 function dropBackendSession(session: ChatSession | undefined): void {
-  if (!session?.acpAgentId || !session.acpSessionId || session.disconnected) return;
+  if (!session?.acpAgentId || !session.acpSessionId) return;
   void agents.dropSession(session.acpAgentId, session.acpSessionId).catch(() => {});
 }
 
@@ -2114,9 +2402,10 @@ function dropBackendSession(session: ChatSession | undefined): void {
  * The agent session it was bound to is left running: whoever cleared the tab
  * either has another tab taking that session or drops it themselves.
  */
-function resetToNewChat(s: ChatDraft, tabId: string): void {
+function resetToNewChat(s: ChatDraft, tabId: string, preserveBackend = false): void {
   const session = s.sessions[tabId];
   if (session) {
+    if (!preserveBackend) dropBackendSession(session);
     session.messages = [];
     session.tasks = [];
     session.status = "idle";
@@ -2180,10 +2469,10 @@ function resetToNewChat(s: ChatDraft, tabId: string): void {
     session.sleptMidTurn = undefined;
     session.compacting = undefined;
     session.pendingElicitation = undefined;
+    session.queuedElicitations = undefined;
     session.justSentMessageId = undefined;
   }
-  delete s.queues[tabId];
-  delete s.queueIds[tabId];
+  dropQueue(s, tabId);
   forgetHeld(tabId);
   // Whatever load was on its way into the tab is the old conversation's: it
   // must not paint or bind over the new chat. Covers a session taken by
@@ -2205,7 +2494,7 @@ function applyDeltaToDraft(
    *  the action that ran it caches them once the pass is over. */
   advertised?: AdvertisedOptions[],
 ): void {
-  const tid = findTabByAcpSession(s.sessions, env.session_id);
+  const tid = findTabByAcpSession(s.sessions, env.session_id, env.agent_id);
   if (!tid) return;
   const session = s.sessions[tid];
   switch (env.kind) {
@@ -2220,9 +2509,13 @@ function applyDeltaToDraft(
         if (isStaleTurn(session, seq)) return;
         if (seq && seq > (session.currentTurnSeq ?? 0)) {
           session.currentTurnSeq = seq;
-          // New turn — clear the previous turn's live plan so the docked panel
-          // doesn't show a stale one before this turn emits its own.
-          session.livePlan = undefined;
+          // A turn started: whatever halt the last one put on the queue is
+          // over (a resume, a direct send).
+          session.queueHalted = undefined;
+          // The live plan is NOT cleared here: a plan is the agent's, and it
+          // stands until the agent replaces or clears it (`plan_updated`). A
+          // plan spanning several turns used to vanish at every prompt
+          // (ACP audit finding 102).
           // Start a fresh per-turn files-touched scratch for the adaptive card.
           session.turnScratch = { seq, tools: {} };
           // A sleep notice still held for an older turn missed its place —
@@ -2275,6 +2568,13 @@ function applyDeltaToDraft(
       ) {
         return;
       }
+      dropElicitations(session);
+      // A refusal or a cap is a failed turn to the turn controller: it halts
+      // whatever is queued behind it (audit #77). Anything else lets it drain.
+      session.queueHalted =
+        stopReasonHaltsQueue(env.stop_reason) && (s.queues[tid]?.length ?? 0) > 0
+          ? true
+          : undefined;
       // Empty-turn detection: if no assistant content arrived
       // between the last user message and turn-end, insert a
       // placeholder so the UI doesn't show a vanishing spinner.
@@ -2348,10 +2648,14 @@ function applyDeltaToDraft(
       session.retryStatus = undefined;
       session.inflightToolIds = undefined;
       delete s.pendingPermissions[env.session_id];
-      // Per-turn usage footer (native agent): derive this turn's tokens/cost as
-      // the delta from the previous turn's cumulative snapshot, and attach it to
-      // the trailing assistant message so it renders at the end of the turn.
-      if (session.usage && session.agentType === "atlas-agent") {
+      // Per-turn usage footer: derive this turn's tokens/cost as the delta
+      // from the previous turn's cumulative snapshot, and attach it to the
+      // trailing assistant message so it renders at the end of the turn. Any
+      // agent that reports a cumulative split gets it — an ACP agent's
+      // per-turn `PromptResponse.usage` is folded into a running total in
+      // Rust — so it keys on the usage being there, never on which agent
+      // sent it (ADR-0002, ACP audit finding 26).
+      if (session.usage) {
         const cum = {
           input: session.usage.input_tokens ?? 0,
           output: session.usage.output_tokens ?? 0,
@@ -2379,11 +2683,11 @@ function applyDeltaToDraft(
           }
         }
       }
-      // ACP agents (Claude Code / Codex) can't report a per-turn input/output
-      // split, but they stream a cumulative context-window gauge. Snapshot the
-      // latest onto the trailing assistant message so its turn card renders a
-      // context gauge in the same slot the native agent uses for per-turn usage.
-      if (session.contextUsage && session.agentType !== "atlas-agent") {
+      // Agents that stream a cumulative context-window gauge: snapshot the
+      // latest onto the trailing assistant message so its turn card renders
+      // a context gauge beside the per-turn usage. Keyed on the gauge being
+      // there, like the usage above.
+      if (session.contextUsage) {
         for (let i = session.messages.length - 1; i >= 0; i--) {
           if (session.messages[i].role === "assistant") {
             session.messages[i].contextUsage = { ...session.contextUsage };
@@ -2449,6 +2753,10 @@ function applyDeltaToDraft(
     }
     case "turn_failed": {
       if (isStaleTurn(session, env.turn_seq)) return;
+      dropElicitations(session);
+      // The turn controller halts a non-empty queue behind a failed turn
+      // rather than drain it into the agent that just failed (audit #77).
+      if ((s.queues[tid]?.length ?? 0) > 0) session.queueHalted = true;
       // Sweep live tool calls to failed — turn_finished and the bare terminal
       // status both have this guard (no spinner outlives its turn), and this was
       // the one terminal without it. Rust usually pairs TurnFailed with a
@@ -2509,6 +2817,10 @@ function applyDeltaToDraft(
       // fields stay — acpSessionId IS the on-disk id resume needs (P14).
       session.disconnected = true;
       session.stopping = undefined;
+      // A turn cut short by its agent going away is not a failed turn to the
+      // controller: the rebind runs what was queued, with no halt to resume.
+      session.queueHalted = undefined;
+      dropElicitations(session);
       session.retryStatus = undefined;
       // A process that EXITED had its turn failed first, but one Atlas killed
       // (another tab's Stop pressed twice, Restart, a start that never
@@ -2582,12 +2894,12 @@ function applyDeltaToDraft(
       // narration bucket used — skipping empty placeholder/thinking markers
       // so one continuous narration never splits into broken fragments.
       session.retryStatus = undefined; // content resumed — the retry succeeded
-      appendTextToDraft(s, env.session_id, env.delta);
+      appendTextToDraft(s, env.session_id, env.delta, env.agent_id);
       return;
     }
     case "thinking_chunk": {
       session.retryStatus = undefined;
-      appendThoughtToDraft(s, env.session_id, env.delta);
+      appendThoughtToDraft(s, env.session_id, env.delta, env.agent_id);
       return;
     }
     case "message_appended": {
@@ -2643,7 +2955,16 @@ function applyDeltaToDraft(
       // Incremental in-flight index — the O(1) source for the composer's
       // busy check (hasInFlightToolCalls), replacing a per-frame scan of
       // every message's toolCalls.
-      if (env.tool_call.status === "pending" || env.tool_call.status === "running") {
+      //
+      // Only while a turn is on. A call the agent reports in progress on an
+      // IDLE session (a straggler update after the turn ended, a background
+      // task) has no turn behind it: indexed, it turned the composer into
+      // Stop/Queue with nothing to stop, nothing to drain the queue and
+      // nothing to clear `stopping` (ACP audit finding 82). The card still shows it.
+      if (
+        (env.tool_call.status === "pending" || env.tool_call.status === "running") &&
+        isBusyAgentStatus(session.status)
+      ) {
         (session.inflightToolIds ??= {})[env.tool_call.id] = true;
       } else if (session.inflightToolIds) {
         delete session.inflightToolIds[env.tool_call.id];
@@ -2709,11 +3030,7 @@ function applyDeltaToDraft(
     }
     case "plan_updated": {
       const last = session.messages[session.messages.length - 1];
-      const planSteps = env.plan.map((e, idx) => ({
-        id: `plan-${idx}`,
-        description: e.content,
-        status: (e.status as "pending" | "in_progress" | "completed") ?? "pending",
-      }));
+      const planSteps = env.plan.map(toPlanStep);
       if (last && last.role === "assistant") {
         last.plan = planSteps;
       } else if (planSteps.length > 0) {
@@ -2730,6 +3047,7 @@ function applyDeltaToDraft(
       return;
     }
     case "available_commands": {
+      noteHeard(session.acpSessionId, "commands", env.commands.length);
       session.availableCommands = env.commands;
       return;
     }
@@ -2768,10 +3086,11 @@ function applyDeltaToDraft(
       // Reflect agent-driven permission-mode changes back into the composer
       // pill. Claude Code emits `current_mode_update` when the user picks a
       // mode at the plan-review prompt (e.g. "bypass permissions") — without
-      // this the pill kept showing the old mode. Guarded to claude-code + a
-      // known permission mode so Codex's own modes don't leak into the pill.
+      // this the pill kept showing the old mode. Guarded to a session on Atlas's
+      // own mode record + a known permission mode, so another agent's own
+      // modes don't leak into that pill.
       if (
-        session.agentType === "claude-code" &&
+        onClaudeModeList(session) &&
         (CLAUDE_PERMISSION_MODES as readonly string[]).includes(env.mode_id)
       ) {
         session.claudePermissionMode = env.mode_id as ClaudePermissionMode;
@@ -2783,10 +3102,11 @@ function applyDeltaToDraft(
       return;
     }
     case "elicitation_requested": {
-      // One at a time per session — an agent that asks twice before the first
-      // is answered replaces it, which matches how the permission modal
-      // behaves and avoids stacking dialogs the user cannot see behind.
-      session.pendingElicitation = {
+      // Shown one at a time, answered in the order asked: a second question
+      // waits behind the first instead of replacing it — replaced, the
+      // first's request was never answered and the tool call behind it hung
+      // (ACP audit finding 41).
+      offerElicitation(session, {
         agentId: env.agent_id,
         requestId: env.request_id,
         // A plain string on the wire; Rust only ever sends these two.
@@ -2794,7 +3114,7 @@ function applyDeltaToDraft(
         message: env.message,
         requestedSchema: env.requested_schema,
         url: env.url,
-      };
+      });
       return;
     }
     case "title_updated": {
@@ -2808,6 +3128,7 @@ function applyDeltaToDraft(
       // Keeps the mode/model pickers honest when the change came from inside
       // the agent (its own `/model`, a thinking toggle) rather than from Atlas.
       session.acpConfigOptions = env.config_options;
+      noteHeard(session.acpSessionId, "options", env.config_options.length);
       // What it advertised is also cached for the next launch, by the action
       // that ran this fold (`cacheAdvertisedOptions`), not from in here.
       if (session.agentType) {
@@ -2819,24 +3140,43 @@ function applyDeltaToDraft(
       // session bound before the agent advertised, stayed empty and hid).
       const models = modelSelectOf(env.config_options);
       if (models) {
+        noteHeard(session.acpSessionId, "models", models.availableModels.length);
         session.acpAvailableModels = models.availableModels;
         if (models.currentModel) session.acpCurrentModel = models.currentModel;
       }
       // The mode pill rides on it too. The official Claude adapter never
       // sends `current_mode_update` for an ordinary change — its answer to a
       // `session/set_mode`, and its only word after the SDK switched modes, is
-      // this blob's `mode` select. Same claude-code + known-mode guard as the
+      // this blob's `mode` select. Same own-record + known-mode guard as the
       // `mode_changed` case, for the same reason (Codex's modes stay out of
       // the Claude pill). No push back: this is the agent telling us.
       const modes = modeSelectOf(env.config_options);
+      // The select is the agent's whole mode state, so a change to its LIST
+      // (a mode added or withdrawn mid-session) reaches the pill too, not
+      // just a change of current mode (#43). Not onto Atlas's own Claude mode
+      // record, whose list is Atlas's, and never to an empty list: a select
+      // with nothing to pick is not one (`selectOf`).
+      const modeList =
+        modes && modes.availableModes.length > 0 && !onClaudeModeList(session)
+          ? modes.availableModes
+          : null;
+      if (modeList) {
+        session.acpAvailableModes = modeList;
+        session.acpModesPending = false;
+      }
       if (modes?.currentMode) {
         session.acpCurrentMode = modes.currentMode;
         if (
-          session.agentType === "claude-code" &&
+          onClaudeModeList(session) &&
           (CLAUDE_PERMISSION_MODES as readonly string[]).includes(modes.currentMode)
         ) {
           session.claudePermissionMode = modes.currentMode as ClaudePermissionMode;
         }
+      }
+      // Whatever is current must be one of the list's modes, or the pill
+      // falls back to "Mode" with nothing to clear it (as in `setAcpModes`).
+      if (modeList && !modeList.some((m) => m.id === session.acpCurrentMode)) {
+        session.acpCurrentMode = modeList[0].id;
       }
       return;
     }
@@ -2900,6 +3240,8 @@ function applyDeltaToDraft(
     }
     case "queue_changed": {
       mirrorQueue(s, tid, env.queue);
+      // An empty queue has no halt left: Rust drops it with the last item.
+      if (!s.queues[tid]?.length) session.queueHalted = undefined;
       return;
     }
     case "hold_changed": {
@@ -2988,15 +3330,52 @@ function hydrateLive(s: ChatDraft, tabId: string, live: SnapshotLive): void {
       }));
     if (restored.length) s.pendingPermissions[acp] = [...open, ...restored];
   }
-  if (agentId && live.pendingElicitation && !session.pendingElicitation) {
+  if (agentId && live.pendingElicitation) {
     const e = live.pendingElicitation;
-    session.pendingElicitation = {
+    offerElicitation(session, {
       agentId,
       requestId: e.request_id,
-      mode: e.mode,
+      mode: e.mode === "url" ? "url" : "form",
       message: e.message,
       requestedSchema: e.requested_schema,
       url: e.url,
-    };
+    });
   }
+}
+
+type SessionElicitation = NonNullable<ChatSession["pendingElicitation"]>;
+
+/** Show `e`, or queue it behind the one shown. One already known (a snapshot
+ *  re-reporting it) is not added twice. */
+function offerElicitation(session: ChatSession, e: SessionElicitation): void {
+  const shown = session.pendingElicitation;
+  if (!shown) {
+    session.pendingElicitation = e;
+    return;
+  }
+  if (shown.requestId === e.requestId) return;
+  if (session.queuedElicitations?.some((q) => q.requestId === e.requestId)) return;
+  (session.queuedElicitations ??= []).push(e);
+}
+
+/** Take `requestId` (the one shown when omitted) out; the next waiting one,
+ *  if any, is shown. */
+function closeElicitation(session: ChatSession, requestId?: string): void {
+  const shown = session.pendingElicitation;
+  if (requestId !== undefined && shown?.requestId !== requestId) {
+    const rest = session.queuedElicitations?.filter((q) => q.requestId !== requestId);
+    session.queuedElicitations = rest?.length ? rest : undefined;
+    return;
+  }
+  const [next, ...rest] = session.queuedElicitations ?? [];
+  session.pendingElicitation = next;
+  session.queuedElicitations = rest.length ? rest : undefined;
+}
+
+/** The turn ended: every question it asked is withdrawn — Rust cancels the
+ *  outstanding requests with the turn — so none stays on screen asking for an
+ *  answer nothing is waiting on (ACP audit finding 41). */
+function dropElicitations(session: ChatSession): void {
+  session.pendingElicitation = undefined;
+  session.queuedElicitations = undefined;
 }

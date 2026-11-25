@@ -33,7 +33,7 @@ export function GitOpOutput() {
   // forces a layout in the middle of a commit.
   const newestSeq = activeOp?.lines[activeOp.lines.length - 1]?.seq;
   useEffect(() => {
-    if (!activeOp?.running || collapsed) return;
+    if (newestSeq === undefined || collapsed) return;
     const frame = requestAnimationFrame(() => {
       const el = scrollRef.current;
       if (el) el.scrollTop = el.scrollHeight;

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { useSlugAvailability } from "../hooks/use-slug-availability";
-import type { CloudDraft, CloudOrg, PromoteTab, RunAction } from "../lib/capture-flow";
+import type { CloudDraft, CloudOrg, PromoteTab } from "../lib/capture-flow";
 import type { ConnectPick, Detection } from "../types";
 import { ConnectTab } from "./connect-tab";
 import { Tabs } from "./views/controls";
@@ -16,7 +16,6 @@ export function PromoteForm({
   tab,
   onTabChange,
   busy,
-  run,
   onCancel,
   onContinue,
   onConnectContinue,
@@ -28,7 +27,6 @@ export function PromoteForm({
   tab: PromoteTab;
   onTabChange: (tab: PromoteTab) => void;
   busy: boolean;
-  run: RunAction;
   onCancel: () => void;
   /** Create: a new Project under this Slug. */
   onContinue: (draft: CloudDraft) => void;
@@ -97,7 +95,6 @@ export function PromoteForm({
             cloudOrgs={cloudOrgs}
             cloudReason={cloudReason}
             busy={busy}
-            run={run}
             onCancel={onCancel}
             onContinue={onConnectContinue}
           />

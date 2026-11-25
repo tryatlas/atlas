@@ -326,23 +326,25 @@ async fn harness_full(
 
     let (tx, events) = std::sync::mpsc::channel();
     let tx = Arc::new(std::sync::Mutex::new(tx));
-    let sink: ThreadEventSink = Arc::new(move |_id: &acp::SessionId| {
-        let (thread_tx, mut thread_rx) = tokio::sync::mpsc::unbounded_channel();
-        let out = tx.clone();
-        tokio::spawn(async move {
-            while let Some(event) = thread_rx.recv().await {
-                if out
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .send(event)
-                    .is_err()
-                {
-                    return;
+    let sink: ThreadEventSink = Arc::new(
+        move |_agent: &atlas_acp_thread::AgentId, _id: &acp::SessionId| {
+            let (thread_tx, mut thread_rx) = tokio::sync::mpsc::unbounded_channel();
+            let out = tx.clone();
+            tokio::spawn(async move {
+                while let Some(event) = thread_rx.recv().await {
+                    if out
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .send(event)
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
-            }
-        });
-        thread_tx
-    });
+            });
+            thread_tx
+        },
+    );
 
     let connection = EngineConnection::connect_full(
         AgentId::new("atlas-agent"),

@@ -122,6 +122,15 @@ pub struct MemoryDoc {
 
 /// Flatten Claude markdown memory + Codex threads into embeddable documents.
 pub async fn collect_corpus(project_path: &str) -> Vec<MemoryDoc> {
+    let path = project_path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current().block_on(collect_corpus_inner(&path))
+    })
+    .await
+    .unwrap_or_default()
+}
+
+async fn collect_corpus_inner(project_path: &str) -> Vec<MemoryDoc> {
     let project_path = project_path.trim_end_matches('/').to_string();
 
     let pp = project_path.clone();
@@ -299,7 +308,7 @@ pub async fn collect_corpus(project_path: &str) -> Vec<MemoryDoc> {
 /// enter the corpus twice under two different sources. The native agent has no
 /// dedicated reader, so its sessions come from capture like any plugin's.
 fn capture_covered_agent(agent: &str) -> bool {
-    agent.starts_with("claude") || agent == "codex"
+    agent == "codex"
 }
 
 /// Generic corpus reader over Atlas's OWN capture store (`.atlas/sessions.db`,
@@ -572,7 +581,7 @@ fn extract_wikilinks(s: &str) -> Vec<String> {
 /// `/Users/adib/Desktop/atlas` → `-Users-adib-Desktop-atlas` (Claude's
 /// per-project dir naming: every `/` becomes `-`).
 pub(crate) fn encode_project_dir(project_path: &str) -> String {
-    project_path.replace('/', "-")
+    atlas_agent_transcript::encode_cwd(project_path)
 }
 
 /// The per-project Claude memory dir (`~/.claude/projects/<encoded>/memory`) —

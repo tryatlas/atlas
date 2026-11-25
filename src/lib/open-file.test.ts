@@ -62,3 +62,12 @@ describe("openFile", () => {
     await expect(openFile("/p/logo.png")).resolves.toBe("media:/p/logo.png");
   });
 });
+
+it("uses one tab and reveal key for Windows separator variants", () => {
+  const native = openFileAs("c:\\project\\src\\file.ts", "text");
+  const slash = openFileAs("C:/project/src/file.ts", "text", { reveal: { line: 4 } });
+  expect(native).toBe(slash);
+  expect(tabIds()).toEqual([slash]);
+  expect(useLayoutStore.getState().tabs[0].data.filePath).toBe("C:/project/src/file.ts");
+  expect(useEditorStore.getState().pendingReveals["C:/project/src/file.ts"].line).toBe(4);
+});

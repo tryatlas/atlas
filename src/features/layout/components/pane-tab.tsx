@@ -217,7 +217,9 @@ export function PaneTab({
         title={filePath ?? undefined}
         data-tab-id={tab.id}
         data-active-tab={active || undefined}
-        onClick={() => onSelect(tab.id)}
+        onClick={(event) => {
+          if (event.button === 0) onSelect(tab.id);
+        }}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") onSelect(tab.id);
         }}
@@ -226,7 +228,7 @@ export function PaneTab({
         onMouseDown={(e) => {
           if (e.button === 1) e.preventDefault();
         }}
-        onAuxClick={(e) => {
+        onMouseUp={(e) => {
           if (e.button === 1 && tab.closable) {
             e.preventDefault();
             close();

@@ -457,12 +457,13 @@ async fn a_superseded_turns_late_reply_does_not_close_the_turn_that_superseded_i
         let (manager, session_id) = (manager.clone(), session_id.clone());
         tokio::spawn(async move { manager.send(&session_id, text("second")).await })
     };
-    wait_for(|| (server.prompts_started() == 2).then_some(()))
-        .await
-        .expect("the second turn supersedes the first");
+    // B stops A and waits for the agent to answer that stop: two prompts are
+    // never on the wire at once (audit #76).
+    settle_tasks().await;
+    assert_eq!(server.prompts_started(), 1, "B waits behind A's stop");
+    assert!(thread.lock().unwrap().is_stopping());
 
-    // A's late reply lands. `begin_turn` already cancelled it, so this is the
-    // cancelled turn reporting back — it must not close B's.
+    // A's reply to the cancel lands, and only then does B go out.
     first_answer.send(Ok(acp::StopReason::Cancelled)).unwrap();
     let stop = turn_a
         .await
@@ -473,6 +474,9 @@ async fn a_superseded_turns_late_reply_does_not_close_the_turn_that_superseded_i
         acp::StopReason::Cancelled,
         "the superseded caller still learns its turn was cancelled"
     );
+    wait_for(|| (server.prompts_started() == 2).then_some(()))
+        .await
+        .expect("the second turn goes out once the first has stopped");
 
     settle_tasks().await;
     assert!(
@@ -517,10 +521,9 @@ async fn a_superseded_turns_failure_does_not_mark_the_live_turn_as_errored() {
         let (manager, session_id) = (manager.clone(), session_id.clone());
         tokio::spawn(async move { manager.send(&session_id, text("second")).await })
     };
-    wait_for(|| (server.prompts_started() == 2).then_some(()))
-        .await
-        .expect("the second turn supersedes the first");
+    settle_tasks().await;
 
+    // The stopped turn answers with an error rather than `Cancelled`.
     first_answer
         .send(Err(anyhow::anyhow!("the model refused")))
         .unwrap();
@@ -528,6 +531,9 @@ async fn a_superseded_turns_failure_does_not_mark_the_live_turn_as_errored() {
         .await
         .expect("the first send task ran")
         .expect_err("the superseded turn reports its own failure");
+    wait_for(|| (server.prompts_started() == 2).then_some(()))
+        .await
+        .expect("the second turn goes out once the first has stopped");
 
     settle_tasks().await;
     let thread = thread.lock().unwrap();
@@ -541,9 +547,8 @@ async fn a_superseded_turns_failure_does_not_mark_the_live_turn_as_errored() {
     );
 }
 
-/// The guard has to let a CANCELLED turn through, and this is the case that
-/// almost went out wrong: `cancel()` clears the running turn before the agent
-/// answers, so the prompt returns `Cancelled` into a thread with no turn open.
+/// The guard has to let a CANCELLED turn through. The turn is stopping, not
+/// closed, when the agent answers, so its own `Cancelled` is what closes it.
 /// A guard that demanded "this turn is running" would swallow the only
 /// `Stopped` a cancelled turn ever emits — and `Stopped` is what produces
 /// `TurnFinished` on the wire, which is what flushes analytics, the transcript,
@@ -569,10 +574,11 @@ async fn a_cancelled_turn_still_closes_itself() {
         .await
         .expect("the turn is in flight");
 
-    // The user presses stop. The thread's turn is cleared here, before the
-    // agent has said anything.
+    // The user presses stop. The turn stays open, stopping, until the agent
+    // has said it stopped (audit #75).
     manager.cancel(&session_id);
-    assert!(!thread.lock().unwrap().is_generating());
+    assert!(thread.lock().unwrap().is_generating());
+    assert!(thread.lock().unwrap().is_stopping());
 
     // Everything announced up to here belongs to the cancel itself.
     server.drain_events(&session_id);
@@ -967,6 +973,7 @@ async fn a_restart_replaces_a_stale_connect_but_joins_a_young_one() {
     manager.set_deadlines(atlas_agent_manager::Deadlines {
         connect: atlas_agent_manager::CONNECT_DEADLINE,
         restart_stale_after: Duration::from_millis(100),
+        ..Default::default()
     });
     let key = custom("claude-code");
 
@@ -1028,6 +1035,7 @@ async fn a_connect_that_never_answers_is_evicted_at_the_deadline() {
     manager.set_deadlines(atlas_agent_manager::Deadlines {
         connect: Duration::from_millis(100),
         restart_stale_after: atlas_agent_manager::RESTART_STALE_AFTER,
+        ..Default::default()
     });
     let key = custom("claude-code");
     let mut events = manager.subscribe();
@@ -1062,4 +1070,130 @@ async fn a_connect_that_never_answers_is_evicted_at_the_deadline() {
     wait_for(|| (server.connects_cancelled() == 1).then_some(()))
         .await
         .expect("the expired connect future is dropped, not abandoned");
+}
+
+// ------------------------------------------------- audit #75/#76: stop is a state
+
+fn short_grace(manager: &atlas_agent_manager::AgentManager, grace: Duration) {
+    manager.set_deadlines(atlas_agent_manager::Deadlines {
+        stop_grace: grace,
+        ..Default::default()
+    });
+}
+
+/// An agent that never answers a stop does not hold the session in
+/// "stopping" forever: after the grace the turn closes as cancelled and the
+/// caller learns so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_the_agent_never_answers_closes_after_the_grace() {
+    let catalog = TestCatalog::new(&[]);
+    let server = TestServer::new("atlas-agent");
+    let manager = manager(catalog, server.clone());
+    short_grace(&manager, Duration::from_millis(100));
+
+    let thread = manager
+        .new_session(Agent::Native, vec![PathBuf::from("/tmp")])
+        .await
+        .expect("a session opens");
+    let session_id = thread.lock().unwrap().session_id().clone();
+
+    let _never = server.queue_prompt();
+    let turn = {
+        let (manager, session_id) = (manager.clone(), session_id.clone());
+        tokio::spawn(async move { manager.send(&session_id, text("hello")).await })
+    };
+    wait_for(|| (server.prompts_started() == 1).then_some(()))
+        .await
+        .expect("the turn is in flight");
+
+    manager.cancel(&session_id);
+    assert!(thread.lock().unwrap().is_stopping());
+
+    let stop = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the send returns once the grace has passed")
+        .unwrap()
+        .expect("a stop given up on is not an error");
+    assert_eq!(stop, acp::StopReason::Cancelled);
+    assert!(!thread.lock().unwrap().is_generating());
+}
+
+/// Stop pressed while a send waits behind the previous turn's stop aborts
+/// that send: its prompt is recorded, as a cancelled turn, and never sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_while_a_send_waits_aborts_the_send() {
+    let catalog = TestCatalog::new(&[]);
+    let server = TestServer::new("atlas-agent");
+    let manager = manager(catalog, server.clone());
+
+    let thread = manager
+        .new_session(Agent::Native, vec![PathBuf::from("/tmp")])
+        .await
+        .expect("a session opens");
+    let session_id = thread.lock().unwrap().session_id().clone();
+
+    let first_answer = server.queue_prompt();
+    let turn_a = {
+        let (manager, session_id) = (manager.clone(), session_id.clone());
+        tokio::spawn(async move { manager.send(&session_id, text("first")).await })
+    };
+    wait_for(|| (server.prompts_started() == 1).then_some(()))
+        .await
+        .expect("the first turn is in flight");
+
+    let turn_b = {
+        let (manager, session_id) = (manager.clone(), session_id.clone());
+        tokio::spawn(async move { manager.send(&session_id, text("second")).await })
+    };
+    settle_tasks().await;
+    manager.cancel(&session_id);
+
+    first_answer.send(Ok(acp::StopReason::Cancelled)).unwrap();
+    turn_a.await.unwrap().expect("the first turn returns");
+    let stop = turn_b.await.unwrap().expect("the second send returns");
+    assert_eq!(stop, acp::StopReason::Cancelled);
+    assert_eq!(
+        server.prompts_started(),
+        1,
+        "the second prompt never went out"
+    );
+    assert!(!thread.lock().unwrap().is_generating());
+}
+
+/// Audit #23: a block the agent never advertised it could take does not
+/// reach it. The thread's copy of the prompt is what was sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_send_strips_blocks_the_agent_did_not_advertise() {
+    let catalog = TestCatalog::new(&[]);
+    let server = TestServer::new("atlas-agent");
+    let manager = manager(catalog, server.clone());
+
+    let thread = manager
+        .new_session(Agent::Native, vec![PathBuf::from("/tmp")])
+        .await
+        .expect("a session opens");
+    let session_id = thread.lock().unwrap().session_id().clone();
+    assert!(!thread.lock().unwrap().prompt_capabilities().image);
+
+    let content = vec![
+        acp::ContentBlock::Text(acp::TextContent::new("look".to_string())),
+        acp::ContentBlock::Image(acp::ImageContent::new("aGk=", "image/png")),
+    ];
+    manager
+        .send(&session_id, content)
+        .await
+        .expect("the turn runs");
+
+    let thread = thread.lock().unwrap();
+    let sent: Vec<&acp::ContentBlock> = thread
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            atlas_acp_thread::AgentThreadEntry::UserMessage(message) => Some(&message.chunks),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(sent.len(), 1);
+    assert!(matches!(sent[0], acp::ContentBlock::Text(_)));
 }

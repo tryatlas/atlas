@@ -1,3 +1,4 @@
+// Modified by Atlas from upstream OpenAI Codex (Apache-2.0). See CONTEXT.md.
 //! Text encoding detection and conversion utilities for shell output.
 //!
 //! Windows users frequently run into code pages such as CP1251 or CP866 when invoking commands
@@ -65,8 +66,16 @@ pub fn bytes_to_string_smart(bytes: &[u8]) -> String {
         return String::new();
     }
 
-    if let Ok(utf8_str) = std::str::from_utf8(bytes) {
-        return utf8_str.to_owned();
+    match std::str::from_utf8(bytes) {
+        Ok(utf8_str) => return utf8_str.to_owned(),
+        Err(error) if error.error_len().is_none() && !bytes[..error.valid_up_to()].is_ascii() => {
+            // Captures are byte bounded. Valid multibyte UTF-8 followed by an
+            // incomplete final character is truncation, not a new code page.
+            // Keep the valid prefix; short ASCII + legacy-byte output still
+            // reaches the detector below.
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+        Err(_) => {}
     }
 
     let encoding = detect_encoding(bytes);

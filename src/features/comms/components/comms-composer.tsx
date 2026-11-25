@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { clipboardFilePaths } from "@/lib/clipboard-api";
@@ -232,7 +233,7 @@ export function CommsComposer({
         setHighlighted((h) => (h + step + matches.length) % matches.length);
         return true;
       }
-      if (e.key === "Enter" || e.key === "Tab") {
+      if ((e.key === "Enter" && !isComposingKey(e)) || e.key === "Tab") {
         e.preventDefault();
         insertMention(matches[highlighted]);
         return true;
@@ -250,7 +251,7 @@ export function CommsComposer({
       onFormat(shortcut);
       return true;
     }
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.key === "Enter" && !isComposingKey(e) && !e.shiftKey) {
       e.preventDefault();
       submit();
       return true;

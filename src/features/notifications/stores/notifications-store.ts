@@ -99,7 +99,7 @@ interface NotificationsState {
   actions: {
     add: (n: NewNotification) => void;
     dismiss: (id: string) => void;
-    clearAll: () => void;
+    clearAll: (ids?: readonly string[]) => void;
     markAllRead: () => void;
     /** Mark one session's items of a kind read (its question was answered). */
     markSessionKindRead: (sessionId: string, kind: NotificationKind) => void;
@@ -211,7 +211,8 @@ export const useNotificationsStore = create<NotificationsState>()(
             ].slice(0, MAX_ITEMS),
           })),
         dismiss: (id) => set((s) => ({ items: s.items.filter((i) => i.id !== id) })),
-        clearAll: () => set({ items: [] }),
+        clearAll: (ids) =>
+          set((s) => ({ items: ids ? s.items.filter((item) => !ids.includes(item.id)) : [] })),
         markAllRead: () =>
           set((s) => ({ items: s.items.map((i) => (i.read ? i : { ...i, read: true })) })),
         markSessionKindRead: (sessionId, kind) =>

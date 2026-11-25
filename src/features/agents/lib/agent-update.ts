@@ -36,22 +36,37 @@ export async function updateAgent(pluginId: string, name: string, version: strin
   if (useAgentRegistryStore.getState().updatePhases[pluginId]) return;
   // Shown until the first backend phase replaces it.
   setAgentUpdatePhase(pluginId, { phase: "installing", version });
+  let timedOut = false;
+  const updating = acpRegistry.update(pluginId);
+  void updating
+    .then(
+      () => {
+        if (timedOut)
+          toast.success(`${name} updated to v${version}`, {
+            id: `agent-update:${pluginId}:${version}`,
+          });
+      },
+      (error) => {
+        if (timedOut) notifyAgentUpdateFailed({ pluginId, name, version, error: String(error) });
+      },
+    )
+    .finally(() => {
+      setAgentUpdatePhase(pluginId, null);
+      void hydrateAgentRegistry();
+    });
   try {
     // An update can legitimately take long — it waits for a running reply,
     // then installs — but not forever. Past the deadline the label is
     // released so the button comes back; the backend's `agent_update` events
     // keep reporting the real outcome if it is still going.
-    await withDeadline(
-      acpRegistry.update(pluginId),
-      UPDATE_DEADLINE_MS,
-      `Updating ${name} has not finished`,
-    );
+    await withDeadline(updating, UPDATE_DEADLINE_MS, `Updating ${name} has not finished`);
     // Same id as App.tsx's background-update toast: one update, one toast.
     toast.success(`${name} updated to v${version}`, {
       id: `agent-update:${pluginId}:${version}`,
     });
   } catch (e) {
     if (isDeadlineError(e)) {
+      timedOut = true;
       toast.message(`${name} is still updating in the background`);
     } else {
       notifyAgentUpdateFailed({ pluginId, name, version, error: String(e) });

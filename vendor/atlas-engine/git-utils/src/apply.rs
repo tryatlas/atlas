@@ -128,6 +128,8 @@ pub fn apply_git_patch(req: &ApplyGitRequest) -> io::Result<ApplyGitResult> {
 fn resolve_git_root(cwd: &Path) -> io::Result<PathBuf> {
     let mut command = std::process::Command::new("git");
     command
+        .env_clear()
+        .envs(atlas_engine_protocol::shell_environment::host_environment())
         .args(["-c", crate::SAFE_BARE_REPOSITORY_CONFIG])
         .arg("rev-parse")
         .arg("--show-toplevel")
@@ -157,6 +159,8 @@ fn write_temp_patch(diff: &str) -> io::Result<(tempfile::TempDir, PathBuf)> {
 
 fn run_git(cwd: &Path, git_cfg: &[String], args: &[String]) -> io::Result<(i32, String, String)> {
     let mut cmd = std::process::Command::new("git");
+    cmd.env_clear()
+        .envs(atlas_engine_protocol::shell_environment::host_environment());
     for p in git_cfg {
         cmd.arg(p);
     }
@@ -341,6 +345,8 @@ pub fn stage_paths(git_root: &Path, diff: &str) -> io::Result<()> {
         return Ok(());
     }
     let mut cmd = std::process::Command::new("git");
+    cmd.env_clear()
+        .envs(atlas_engine_protocol::shell_environment::host_environment());
     cmd.args(["-c", crate::SAFE_BARE_REPOSITORY_CONFIG]);
     cmd.arg("add");
     cmd.arg("--");

@@ -51,6 +51,10 @@ export function useProjectTreeSearch({
   useEffect(() => {
     model.view.search = query ? { query, applied: search, collapsed: searchCollapsed } : null;
   }, [model, query, search, searchCollapsed]);
+  const hasQuery = !!query;
+  useEffect(() => {
+    if (hasQuery) void model.refresh();
+  }, [model, hasQuery]);
   const searchSeq = useRef(0);
   /** The query of the answer on screen. */
   const appliedRef = useRef(saved?.applied?.query ?? null);

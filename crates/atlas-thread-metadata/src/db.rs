@@ -185,6 +185,43 @@ impl Db {
         Ok(())
     }
 
+    /// Session ids Atlas opened itself and has not sent to (`opened_sessions`).
+    /// With when each was opened, as written (RFC 3339).
+    pub(crate) fn opened_sessions(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT session_id, at FROM opened_sessions")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn mark_session_opened(
+        &self,
+        session_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO opened_sessions(session_id, at) VALUES (?1, ?2) \
+             ON CONFLICT(session_id) DO NOTHING",
+            rusqlite::params![session_id, at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn unmark_session_opened(&self, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM opened_sessions WHERE session_id = ?1",
+            rusqlite::params![session_id],
+        )?;
+        Ok(())
+    }
+
     /// Session ids whose rows the user deleted (schema V4).
     pub(crate) fn deleted_sessions(&self) -> Result<Vec<String>> {
         let mut stmt = self

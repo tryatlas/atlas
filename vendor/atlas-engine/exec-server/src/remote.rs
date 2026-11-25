@@ -790,6 +790,7 @@ mod tests {
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::trace::SdkTracerProvider;
     use pretty_assertions::assert_eq;
+    use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
     use tracing::Instrument;
@@ -982,6 +983,25 @@ mod tests {
                 .accept()
                 .await
                 .expect("registry request should connect");
+            // Complete the request before sending a deliberately incomplete response.
+            // An unsolicited response can be rejected before the body timeout is tested.
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(stream.read_u8().await.expect("request headers"));
+                assert!(headers.len() < 16_384, "bounded fixture request headers");
+            }
+            let content_length = String::from_utf8(headers)
+                .expect("HTTP request headers")
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .map(|(_, value)| value.trim().parse::<usize>().expect("content length"))
+                .expect("JSON request has a content length");
+            assert!(content_length < 65_536, "bounded fixture request body");
+            stream
+                .read_exact(&mut vec![0; content_length])
+                .await
+                .expect("complete registry request body");
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 256\r\n\r\n{",
@@ -989,6 +1009,7 @@ mod tests {
                 .await
                 .expect("registry response headers should write");
             sleep(Duration::from_secs(1)).await;
+            drop(stream);
         });
         let mut client =
             EnvironmentRegistryClient::new(registry_url, static_registry_auth_provider())

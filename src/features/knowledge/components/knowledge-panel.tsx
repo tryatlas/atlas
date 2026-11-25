@@ -15,13 +15,15 @@ import {
 } from "@/features/layout/stores/layout-store";
 import { openFile } from "@/lib/open-file";
 import { useProjectStore } from "@/features/projects/stores/project-store";
-import { registerFlush } from "@/features/projects/lib/flush-registry";
 import {
   TiptapEditor,
   type TiptapEditorHandle,
 } from "@/features/editor-notion/components/tiptap-editor";
 import { ReadmeView } from "./readme-view";
-import { clearDocCache } from "@/features/editor-notion/lib/blocks-cache";
+import { clearCleanDocCache, dropCachedDoc } from "@/features/editor-notion/lib/blocks-cache";
+import { deleteDocument, documentKey } from "@/features/editor-notion/lib/document-saves";
+import { confirm } from "@/lib/confirm";
+import { toast } from "sonner";
 import {
   useEditorOutline,
   useActiveHeading,
@@ -51,6 +53,10 @@ const RECENTS_MAX = 5;
  *  while hidden (a persistent tab type), so it must not answer ⌘S elsewhere. */
 export function KnowledgePanel({ tabId }: { tabId?: string }) {
   const entries = useKnowledgeStore((s) => s.entries);
+  const loadedProjectPath = useKnowledgeStore((s) => s.projectPath);
+  const loadError = useKnowledgeStore((s) => s.error);
+  const metaError = useKnowledgeMetaStore((s) => s.error);
+  const retryMeta = useKnowledgeMetaStore((s) => s.actions.retry);
   const activeEntryId = useKnowledgeStore((s) => s.activeEntryId);
   const editContent = useKnowledgeStore((s) => s.editContent);
   const pendingOpenId = useKnowledgeStore((s) => s.pendingOpenId);
@@ -58,7 +64,6 @@ export function KnowledgePanel({ tabId }: { tabId?: string }) {
     loadEntries,
     selectEntry,
     consumePendingOpen,
-    setEditContent,
     saveEntry,
     createEntry,
     deleteEntry,
@@ -111,12 +116,7 @@ export function KnowledgePanel({ tabId }: { tabId?: string }) {
   const outline = useEditorOutline(editorInstance);
   const activeHeadingId = useActiveHeading(editorInstance, outline);
 
-  // Project change: drop the parsed-doc cache. Stale docs from another
-  // project would otherwise survive a switch (keys are entry ids alone,
-  // which can collide across projects).
-  useEffect(() => {
-    clearDocCache();
-  }, [currentProject?.path]);
+  useEffect(() => clearCleanDocCache(), [currentProject?.path]);
 
   const {
     bind: bindMeta,
@@ -133,7 +133,9 @@ export function KnowledgePanel({ tabId }: { tabId?: string }) {
 
   useEffect(() => {
     if (currentProject) {
-      loadEntries(currentProject.path);
+      void loadEntries(currentProject.path).catch((error) =>
+        toast.error(`Notes could not be loaded: ${String(error)}`),
+      );
       void bindMeta(currentProject.path);
       void bindLinks(currentProject.path);
       listClonedRepos(currentProject.path)
@@ -145,10 +147,6 @@ export function KnowledgePanel({ tabId }: { tabId?: string }) {
     }
   }, [currentProject?.path, loadEntries, bindMeta, unbindMeta, bindLinks, unbindLinks]);
 
-  useEffect(() => {
-    setIsDirty(false);
-  }, [activeEntryId]);
-
   // Push every selected entry id onto the recents stack (MRU, capped).
   useEffect(() => {
     if (!activeEntryId) return;
@@ -158,66 +156,21 @@ export function KnowledgePanel({ tabId }: { tabId?: string }) {
     });
   }, [activeEntryId]);
 
-  const flushAndSave = useCallback(async () => {
-    if (!currentProject || !editorRef.current) return;
-    // Capture the (project path, note id) this content belongs to BEFORE the
-    // async flush. The KB panel is resident across project switches, so a
-    // switch (or note change) can land mid-flush; binding the triple here and
-    // re-checking it after lets us abort rather than write one project's
-    // content into another's file (the cross-project data-loss bug).
-    const proj = currentProject.path;
-    const id = useKnowledgeStore.getState().activeEntryId;
-    if (!id) return;
-    // Gate on the EDITOR's own dirty ref — the single race-free source of truth
-    // for "has the body changed since it was loaded / last saved?". We must NOT
-    // gate on the store's `editContent`: `selectEntry`/`loadEntries` overwrite
-    // that with disk content, so comparing against it skipped real saves (the
-    // "content reverts / new note stays Untitled" data-loss bug).
-    if (!editorRef.current.isDirty()) return;
-    const md = await editorRef.current.flush();
-    if (md === null) return;
-    // Project switched or the active note changed while flushing → abort.
-    const live = useAppStore.getState().currentProject;
-    if (!live || live.path !== proj) return;
-    if (useKnowledgeStore.getState().activeEntryId !== id) return;
-    setEditContent(md);
-    await saveEntry(proj, id, md);
-    setIsDirty(false);
-    // Note bodies may have gained/lost [[wikilinks]] or @page: refs —
-    // invalidate Rust's link graph so the inspector + footer reflect
-    // the new state.
-    void invalidateLinks();
-  }, [currentProject, setEditContent, saveEntry, invalidateLinks]);
+  const flushAndSave = useCallback(async (): Promise<boolean> => {
+    try {
+      await editorRef.current?.save();
+      return true;
+    } catch (error) {
+      toast.error(`Note could not be saved: ${String(error)}`);
+      return false;
+    }
+  }, []);
 
-  // Coordinate with project switching: the switch awaits `flushAll()` BEFORE
-  // it snapshots/swaps the active project, so register a flush that writes the
-  // editor's current buffer to the OUTGOING project (`ctx.path`) — not the
-  // resident React `currentProject`, which may already have flipped. This is
-  // what guarantees a note saved in project A is persisted to A's file before
-  // we leave it, closing the window where a stale save could clobber it.
-  useEffect(() => {
-    return registerFlush("knowledge", async (ctx) => {
-      if (!ctx.path || !editorRef.current) return;
-      const id = useKnowledgeStore.getState().activeEntryId;
-      if (!id || !editorRef.current.isDirty()) return;
-      const md = await editorRef.current.flush();
-      if (md === null) return;
-      await saveEntry(ctx.path, id, md);
-    });
-  }, [saveEntry]);
-
-  // Flush on window blur (switching apps) and on unmount (tab close / switch
-  // away from the KB tab) so unsaved edits are never stranded. These are
-  // boundary flushes, not a timer — autosave was removed (it caused stale,
-  // racey writes); saves happen on Cmd+S, note switch, blur, unmount, and
-  // project switch, each gated on the editor's live dirty ref.
+  // The editor owns teardown saves; this callback is only for live app blur.
   useEffect(() => {
     const onBlur = () => void flushAndSave();
     window.addEventListener("blur", onBlur);
-    return () => {
-      window.removeEventListener("blur", onBlur);
-      void flushAndSave();
-    };
+    return () => window.removeEventListener("blur", onBlur);
   }, [flushAndSave]);
 
   // Cmd+; / Cmd+' — toggle KB sidebar / inspector. Picked over the old
@@ -285,11 +238,11 @@ export function KnowledgePanel({ tabId }: { tabId?: string }) {
       setRepoReadme(null);
       setReadmeLoading(false);
       if (activeEntryId && id !== activeEntryId) {
-        await flushAndSave();
+        if (!(await flushAndSave())) return;
       }
-      selectEntry(id);
+      if (useAppStore.getState().currentProject?.path === currentProject?.path) selectEntry(id);
     },
-    [activeEntryId, flushAndSave, selectEntry],
+    [activeEntryId, flushAndSave, selectEntry, currentProject?.path],
   );
 
   // Honor "open this note" requests from outside the panel (the left-panel
@@ -303,12 +256,27 @@ export function KnowledgePanel({ tabId }: { tabId?: string }) {
   }, [pendingOpenId, handleSelectEntry, consumePendingOpen]);
 
   const handleDeleteEntry = useCallback(
-    (id: string) => {
+    async (id: string) => {
       if (!currentProject) return;
-      editorRef.current?.evict(id);
-      void dropMeta(id);
-      deleteEntry(currentProject.path, id);
-      void invalidateLinks();
+      const path = currentProject.path;
+      if (
+        !(await confirm({
+          title: "Delete note?",
+          body: `Permanently delete “${id}” from this project's knowledge?`,
+          confirmLabel: "Delete note",
+          destructive: true,
+        }))
+      )
+        return;
+      const key = documentKey(path, "note", id);
+      try {
+        await deleteDocument(key, () => deleteEntry(path, id));
+        dropCachedDoc(key);
+        if (useKnowledgeMetaStore.getState().projectPath === path) await dropMeta(id);
+        if (useAppStore.getState().currentProject?.path === path) void invalidateLinks();
+      } catch (error) {
+        toast.error(`Note could not be deleted: ${String(error)}`);
+      }
     },
     [currentProject, deleteEntry, dropMeta, invalidateLinks],
   );
@@ -317,6 +285,12 @@ export function KnowledgePanel({ tabId }: { tabId?: string }) {
     async (name: string) => {
       if (!currentProject) return;
       const ticket = ++readmeTicket.current;
+      if (
+        !(await flushAndSave()) ||
+        ticket !== readmeTicket.current ||
+        useAppStore.getState().currentProject?.path !== currentProject.path
+      )
+        return;
       setActiveRepoName(name);
       selectEntry("");
       setRepoReadme(null);
@@ -332,18 +306,19 @@ export function KnowledgePanel({ tabId }: { tabId?: string }) {
       setRepoReadme(readme?.trim() ? readme : null);
       setReadmeLoading(false);
     },
-    [currentProject, selectEntry],
+    [currentProject, selectEntry, flushAndSave],
   );
 
   const handleCreateFolder = useCallback(async () => {
     if (!newFolderName.trim() || !currentProject) return;
+    if (!(await flushAndSave())) return;
     const name = newFolderName.trim();
     await createDir(currentProject.path, name);
     await saveKnowledgeNote(currentProject.path, `${name}/note-${Date.now()}`, `# ${name}\n\n`);
     await loadEntries(currentProject.path);
     setNewFolderName("");
     setShowFolderInput(false);
-  }, [newFolderName, currentProject, createDir, loadEntries]);
+  }, [newFolderName, currentProject, createDir, loadEntries, flushAndSave]);
 
   // Title is now owned by page metadata (set via the input next to
   // the icon), not derived from the body. Falls back to the filename
@@ -423,7 +398,16 @@ export function KnowledgePanel({ tabId }: { tabId?: string }) {
             onSelectEntry={handleSelectEntry}
             onDeleteEntry={handleDeleteEntry}
             onNewFolder={() => setShowFolderInput((v) => !v)}
-            onNewNote={() => createEntry(currentProject.path)}
+            onNewNote={() => {
+              const path = currentProject.path;
+              void flushAndSave()
+                .then(async (saved) => {
+                  if (!saved || useAppStore.getState().currentProject?.path !== path) return;
+                  setActiveRepoName(null);
+                  await createEntry(path);
+                })
+                .catch((error) => toast.error(`Note could not be created: ${String(error)}`));
+            }}
             onImportFiles={handleImportFiles}
             onImportFolder={handleImportFolder}
             onOpenGraph={() =>
@@ -440,7 +424,11 @@ export function KnowledgePanel({ tabId }: { tabId?: string }) {
             folderInputOpen={showFolderInput}
             folderInputValue={newFolderName}
             onFolderInputChange={setNewFolderName}
-            onFolderInputCommit={handleCreateFolder}
+            onFolderInputCommit={() =>
+              void handleCreateFolder().catch((error) =>
+                toast.error(`Folder could not be created: ${String(error)}`),
+              )
+            }
             onFolderInputCancel={() => {
               setShowFolderInput(false);
               setNewFolderName("");
@@ -461,7 +449,40 @@ export function KnowledgePanel({ tabId }: { tabId?: string }) {
 
       {/* Main */}
       <div className="flex min-w-0 flex-1 flex-col bg-background">
-        {activeRepoName ? (
+        {metaError && (
+          <div
+            role="alert"
+            className="flex flex-wrap items-center gap-2 border-b border-warning p-3 text-sm"
+          >
+            <p>Page properties could not be saved or loaded: {metaError}</p>
+            <button
+              type="button"
+              onClick={() => void retryMeta().catch((error) => toast.error(String(error)))}
+            >
+              Retry properties
+            </button>
+          </div>
+        )}
+        {loadError ? (
+          <div
+            role="alert"
+            className="flex h-full flex-col items-center justify-center gap-3 p-6 text-sm"
+          >
+            <p>Notes could not be loaded: {loadError}</p>
+            <button
+              type="button"
+              onClick={() =>
+                void loadEntries(currentProject.path).catch((error) => toast.error(String(error)))
+              }
+            >
+              Retry
+            </button>
+          </div>
+        ) : loadedProjectPath !== currentProject.path ? (
+          <div role="status" className="p-6 text-sm text-muted-foreground">
+            Loading notes…
+          </div>
+        ) : activeRepoName ? (
           <>
             <RepoTopbar
               name={
@@ -554,7 +575,15 @@ export function KnowledgePanel({ tabId }: { tabId?: string }) {
                     editorRef.current = handle;
                     setEditorInstance(handle?.getEditor() ?? null);
                   }}
-                  documentId={`note:${activeEntryId}`}
+                  documentId={documentKey(currentProject.path, "note", activeEntryId ?? "")}
+                  projectPath={currentProject.path}
+                  onSave={async (markdown) => {
+                    if (!activeEntryId) throw new Error("No note is selected.");
+                    await saveEntry(currentProject.path, activeEntryId, markdown);
+                    if (useAppStore.getState().currentProject?.path === currentProject.path)
+                      void invalidateLinks();
+                  }}
+                  onSaved={() => setIsDirty(false)}
                   initialMarkdown={editContent}
                   label={pageTitle || "Page"}
                   onDirty={() => {

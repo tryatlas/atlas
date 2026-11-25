@@ -1,3 +1,4 @@
+// Modified by Atlas from upstream OpenAI Codex (Apache-2.0). See CONTEXT.md.
 use super::*;
 use notify::event::AccessKind;
 use notify::event::AccessMode;
@@ -18,6 +19,32 @@ fn notify_event(kind: EventKind, paths: Vec<PathBuf>) -> Event {
         event = event.add_path(path);
     }
     event
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn replaced_directory_keeps_receiving_native_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("watched");
+    std::fs::create_dir(&root).unwrap();
+    let watcher = Arc::new(FileWatcher::new().unwrap());
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let _registration = subscriber.register_path(root.clone(), true);
+    // No await here: the replacement exists before the queued delete event is handled.
+    std::fs::remove_dir(&root).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("delete notification")
+        .unwrap();
+    while timeout(Duration::from_millis(100), rx.recv()).await.is_ok() {}
+    let created = root.join("after-replacement");
+    std::fs::write(&created, "new inode").unwrap();
+    let event = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("the recreated directory must have a live native watch")
+        .unwrap();
+    assert!(event.paths.contains(&created), "{event:?}");
 }
 
 #[tokio::test]

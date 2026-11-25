@@ -156,7 +156,7 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
     let tool_call_request = requests
         .iter()
         .find(|request| {
-            request.url.path() == "/api/atlas-agent/ps/mcp"
+            request.url.path() == "/api/codex/ps/mcp"
                 && serde_json::from_slice::<Value>(&request.body)
                     .ok()
                     .is_some_and(|body| {

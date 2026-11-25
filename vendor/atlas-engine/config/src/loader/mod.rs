@@ -1720,8 +1720,8 @@ foo = "xyzzy"
                 .expect("requirements.toml path")
                 .as_path()
                 .ends_with(
-                    Path::new("OpenAI")
-                        .join("Atlas Agent")
+                    Path::new("Atlas")
+                        .join("AtlasAgent")
                         .join("requirements.toml")
                 )
         );
@@ -1745,7 +1745,7 @@ foo = "xyzzy"
             windows_system_config_toml_file()
                 .expect("config.toml path")
                 .as_path()
-                .ends_with(Path::new("OpenAI").join("Atlas Agent").join("config.toml"))
+                .ends_with(Path::new("Atlas").join("AtlasAgent").join("config.toml"))
         );
     }
 }

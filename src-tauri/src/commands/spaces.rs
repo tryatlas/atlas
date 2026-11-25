@@ -31,6 +31,11 @@ fn safe_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+// Drafts share the local Yjs journal; this discriminator never enters a URL.
+fn safe_page_id(id: &str) -> Result<(), String> {
+    safe_id(id.strip_prefix("draft:").unwrap_or(id))
+}
+
 fn spaces(app: &AppHandle) -> Result<SpacesManager, String> {
     app.try_state::<SpacesState>()
         .map(|s| s.0.clone())
@@ -44,6 +49,172 @@ fn ctx(app: &AppHandle) -> Result<(SpacesManager, atlas_comms::CommsManager, Str
     let mgr = comms_manager(app)?;
     let org = org_of(&mgr)?;
     Ok((sp, mgr, org))
+}
+
+fn check_scope(app: &AppHandle, account_id: &str, org_id: &str) -> Result<(), String> {
+    safe_id(account_id)?;
+    safe_id(org_id)?;
+    let auth = app
+        .try_state::<super::auth::AuthState>()
+        .ok_or_else(|| "account is not ready".to_string())?;
+    match auth.core().snapshot() {
+        crate::auth::AuthSnapshot::SignedIn {
+            user: Some(user),
+            comms_org_id: Some(org),
+            ..
+        } if user.id == account_id && org == org_id => Ok(()),
+        _ => Err("Space account changed; reconnect before replaying edits".into()),
+    }
+}
+
+fn check_local_account(app: &AppHandle, account_id: &str, org_id: &str) -> Result<(), String> {
+    safe_id(account_id)?;
+    safe_id(org_id)?;
+    let auth = app
+        .try_state::<super::auth::AuthState>()
+        .ok_or("account is not ready")?;
+    match auth.core().snapshot() {
+        crate::auth::AuthSnapshot::SignedIn {
+            user: Some(user), ..
+        } if user.id == account_id => Ok(()),
+        _ => Err("Sign in to the account that owns these saved edits".into()),
+    }
+}
+
+#[tauri::command]
+pub async fn spaces_outbox_save_snapshot(
+    app: AppHandle,
+    account_id: String,
+    org_id: String,
+    conv_id: String,
+    page_id: String,
+    data: String,
+) -> Result<(), String> {
+    use base64::Engine;
+    for id in [&account_id, &org_id, &conv_id] {
+        safe_id(id)?;
+    }
+    safe_page_id(&page_id)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|_| "bad base64".to_string())?;
+    let mgr = comms_manager(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        mgr.with_store(|store| {
+            store.save_space_snapshot(&account_id, &org_id, &conv_id, &page_id, &bytes)
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(map_comms_err)
+}
+
+#[tauri::command]
+pub async fn spaces_outbox_snapshot(
+    app: AppHandle,
+    account_id: String,
+    org_id: String,
+    conv_id: String,
+    page_id: String,
+) -> Result<Option<Vec<u8>>, String> {
+    check_local_account(&app, &account_id, &org_id)?;
+    safe_id(&conv_id)?;
+    safe_page_id(&page_id)?;
+    let mgr = comms_manager(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        mgr.with_store(|store| store.load_space_snapshot(&account_id, &org_id, &conv_id, &page_id))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(map_comms_err)
+}
+
+pub(super) fn check_optional_scope(
+    app: &AppHandle,
+    account_id: Option<&str>,
+    org_id: Option<&str>,
+) -> Result<(), String> {
+    match (account_id, org_id) {
+        (Some(account), Some(org)) => check_scope(app, account, org),
+        (None, None) => Ok(()),
+        _ => Err("Space account and organization must be supplied together".into()),
+    }
+}
+
+/// Journal before attempting the socket. The captured identity is retained
+/// even if sign-out happened while the save was queued; this writes locally
+/// and never transmits under a different account.
+#[tauri::command]
+pub async fn spaces_outbox_enqueue(
+    app: AppHandle,
+    account_id: String,
+    org_id: String,
+    conv_id: String,
+    page_id: String,
+    data: String,
+) -> Result<i64, String> {
+    use base64::Engine;
+    for id in [&account_id, &org_id, &conv_id] {
+        safe_id(id)?;
+    }
+    safe_page_id(&page_id)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|_| "bad base64".to_string())?;
+    let mgr = comms_manager(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        mgr.with_store(|store| {
+            store.enqueue_space_update(&account_id, &org_id, &conv_id, &page_id, &bytes)
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(map_comms_err)
+}
+
+#[tauri::command]
+pub async fn spaces_outbox_load(
+    app: AppHandle,
+    account_id: String,
+    org_id: String,
+    conv_id: String,
+    page_id: String,
+) -> Result<Vec<atlas_comms::store::SpaceOutboxEntry>, String> {
+    check_local_account(&app, &account_id, &org_id)?;
+    safe_id(&conv_id)?;
+    safe_page_id(&page_id)?;
+    let mgr = comms_manager(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        mgr.with_store(|store| store.load_space_updates(&account_id, &org_id, &conv_id, &page_id))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(map_comms_err)
+}
+
+/// Only a server snapshot that contains the queued update may acknowledge it.
+/// A successful socket enqueue is deliberately insufficient.
+#[tauri::command]
+pub async fn spaces_outbox_acknowledge(
+    app: AppHandle,
+    account_id: String,
+    org_id: String,
+    conv_id: String,
+    page_id: String,
+    ids: Vec<i64>,
+) -> Result<(), String> {
+    check_scope(&app, &account_id, &org_id)?;
+    safe_id(&conv_id)?;
+    safe_page_id(&page_id)?;
+    let mgr = comms_manager(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        mgr.with_store(|store| {
+            store.acknowledge_space_updates(&account_id, &org_id, &conv_id, &page_id, &ids)
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(map_comms_err)
 }
 
 /// Open (or share) the socket for a conversation's Space.
@@ -77,7 +248,11 @@ pub async fn spaces_send_control(
     app: AppHandle,
     conv_id: String,
     frame: String,
+    account_id: Option<String>,
+    org_id: Option<String>,
 ) -> Result<(), String> {
+    check_optional_scope(&app, account_id.as_deref(), org_id.as_deref())?;
+    safe_id(&conv_id)?;
     spaces(&app)?.send_control(&conv_id, frame);
     Ok(())
 }
@@ -88,13 +263,18 @@ pub async fn spaces_send_binary(
     app: AppHandle,
     conv_id: String,
     data: String,
+    account_id: Option<String>,
+    org_id: Option<String>,
 ) -> Result<(), String> {
     use base64::Engine;
+    check_optional_scope(&app, account_id.as_deref(), org_id.as_deref())?;
+    safe_id(&conv_id)?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.as_bytes())
         .map_err(|_| "bad base64".to_string())?;
-    spaces(&app)?.send_binary(&conv_id, bytes);
-    Ok(())
+    spaces(&app)?
+        .send_binary(&conv_id, bytes)
+        .map_err(map_comms_err)
 }
 
 /// The REST pre-flight: creates the Space lazily and maps 401/403/404 to
@@ -224,10 +404,9 @@ pub async fn spaces_media_fetch(
         .app_cache_dir()
         .map_err(|e| e.to_string())?
         .join("spaces-media");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("{content_hash}.{ext}"));
-    if atlas_fs::cache_file_present(&path) {
-        return Ok(path.to_string_lossy().into_owned());
+    if let Some(hit) = cache_lookup(dir.clone(), path.clone()).await? {
+        return Ok(hit);
     }
 
     let (_, mgr, org) = ctx(&app)?;
@@ -249,13 +428,121 @@ pub async fn spaces_media_fetch(
         return Err("media bytes did not match their content hash".to_string());
     }
     // A cache of a download: atomic, but not flushed to disk.
-    atlas_fs::replace_cache_file(&path, &bytes).map_err(|e| e.to_string())?;
-    Ok(path.to_string_lossy().into_owned())
+    cache_store(path, bytes, MEDIA_CACHE_MAX_BYTES).await
+}
+
+/// Byte ceiling for each download cache (`spaces-media`, `comms-attachments`).
+/// Least-recently-used files go first once a write takes a cache past it.
+pub(crate) const MEDIA_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Look `path` up in the download cache `dir`, off the async runtime. A hit
+/// has its mtime bumped so pruning treats it as recently used.
+pub(crate) async fn cache_lookup(
+    dir: std::path::PathBuf,
+    path: std::path::PathBuf,
+) -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        if !atlas_fs::cache_file_present(&path) {
+            return Ok(None);
+        }
+        touch(&path);
+        Ok(Some(path.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Write a downloaded file into its cache, off the async runtime, then prune
+/// the cache back under `max_bytes`, sparing the file just written.
+pub(crate) async fn cache_store(
+    path: std::path::PathBuf,
+    bytes: impl AsRef<[u8]> + Send + 'static,
+    max_bytes: u64,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        atlas_fs::replace_cache_file(&path, bytes.as_ref()).map_err(|e| e.to_string())?;
+        if let Some(dir) = path.parent() {
+            prune_cache_dir(dir, max_bytes, &path);
+        }
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn touch(path: &std::path::Path) {
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+}
+
+/// Delete the oldest (by mtime) regular files in `dir` until what is left
+/// totals at most `max_bytes`. `keep` is never deleted. Best effort: an entry
+/// that cannot be read or removed is skipped. BLOCKING.
+pub(crate) fn prune_cache_dir(dir: &std::path::Path, max_bytes: u64, keep: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            Some((modified, meta.len(), entry.path()))
+        })
+        .collect();
+    let mut total: u64 = files.iter().map(|(_, len, _)| *len).sum();
+    if total <= max_bytes {
+        return;
+    }
+    files.sort_by_key(|(modified, _, _)| *modified);
+    for (_, len, path) in files {
+        if total <= max_bytes {
+            break;
+        }
+        if path == keep {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(len);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R5: the download caches were never pruned. A write that takes one past
+    /// its ceiling evicts the oldest files first, and never the new one.
+    #[test]
+    fn prune_evicts_oldest_first_and_spares_the_new_file() {
+        let dir = std::env::temp_dir().join(format!("atlas-prune-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(1000);
+        let mut paths = Vec::new();
+        for (i, name) in ["a", "b", "c", "d"].iter().enumerate() {
+            let p = dir.join(name);
+            std::fs::write(&p, [0u8; 100]).unwrap();
+            let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            f.set_modified(base + std::time::Duration::from_secs(i as u64 * 10))
+                .unwrap();
+            paths.push(p);
+        }
+        // `a` is the oldest but is the file just written: it must survive.
+        prune_cache_dir(&dir, 250, &paths[0]);
+        let left: Vec<bool> = paths.iter().map(|p| p.exists()).collect();
+        assert_eq!(left, vec![true, false, false, true]);
+
+        // Under the ceiling: nothing goes.
+        prune_cache_dir(&dir, 10_000, &dir.join("none"));
+        assert!(paths[0].exists() && paths[3].exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn media_mime_allowlist_matches_contract() {

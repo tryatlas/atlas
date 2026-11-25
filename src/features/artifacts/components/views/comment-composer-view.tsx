@@ -106,6 +106,8 @@ export function Composer({
 }) {
   const editing = initial !== undefined;
   const [value, setValue] = useCommentAnchorState(editing ? null : draftKey, initial ?? "");
+  const currentDraft = useRef({ value, draftKey });
+  currentDraft.current = { value, draftKey };
   const field = useRef<HTMLTextAreaElement | null>(null);
   // An edit opens with the caret after the text, where a correction starts —
   // not before the first word, where a bare focus leaves it.
@@ -126,12 +128,15 @@ export function Composer({
     setBusy(true);
     setError(null);
     onSend(body)
-      .then(() => setValue(""))
+      .then(() => {
+        if (currentDraft.current.draftKey === draftKey && currentDraft.current.value === value)
+          setValue("");
+      })
       // The text stays in the box on failure. There is no offline queue, so
       // clearing it would destroy what the developer wrote.
       .catch((e: unknown) => setError(String(e)))
       .finally(() => setBusy(false));
-  }, [value, busy, onSend, bodyPrefixLength]);
+  }, [value, busy, onSend, bodyPrefixLength, draftKey, setValue]);
 
   const totalLength = value.length + bodyPrefixLength;
   const over = totalLength > COMMENT_BODY_MAX;

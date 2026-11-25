@@ -131,13 +131,14 @@ export async function performOpen(request: UiActionRequest): Promise<unknown> {
     }
     case "url": {
       const url = a.str("url");
-      const { focusedGroupId, tabs } = layout();
-      const existing = tabs.find(
-        (t) => t.type === "browser" && (t.groupId ?? "main") === focusedGroupId,
+      const before = new Set(
+        layout()
+          .tabs.filter((tab) => tab.type === "browser")
+          .map((tab) => tab.id),
       );
       const tabId = openPlainTab("browser", { url });
-      // A mounted browser tab read its URL once, when it mounted.
-      if (existing) emitWindowEvent("atlas:browser-navigate", { tabId, url });
+      layout().actions.setTabData(tabId, { url });
+      if (before.has(tabId)) emitWindowEvent("atlas:browser-navigate", { tabId, url });
       return { tabId, url };
     }
     case "knowledge": {

@@ -337,13 +337,25 @@ export interface SignInCallbacks {
 }
 
 let signInSeq = 0;
-const signInCallbacks = new Map<number, SignInCallbacks>();
+/** Everyone waiting on a dialog request: one per asker. */
+const signInCallbacks = new Map<number, SignInCallbacks[]>();
+/** The request each agent's dialog is open for, until its callbacks are
+ *  taken (signed in, or dismissed). A second ask for the same agent joins it. */
+const openSignIns = new Map<string, { requestId: number; reason?: string }>();
 
-/** Retrieve-and-drop the callbacks registered for a dialog request. */
+/** Retrieve-and-drop the callbacks registered for a dialog request: every
+ *  asker's, as one. */
 export function takeSignInCallback(requestId: number): SignInCallbacks | undefined {
-  const cb = signInCallbacks.get(requestId);
+  const askers = signInCallbacks.get(requestId);
   signInCallbacks.delete(requestId);
-  return cb;
+  for (const [agentType, open] of openSignIns) {
+    if (open.requestId === requestId) openSignIns.delete(agentType);
+  }
+  if (!askers?.length) return undefined;
+  return {
+    onSignedIn: () => askers.forEach((cb) => cb.onSignedIn?.()),
+    onDismissed: () => askers.forEach((cb) => cb.onDismissed?.()),
+  };
 }
 
 /** Open the agent sign-in dialog (same modal treatment as Claude/Codex),
@@ -360,12 +372,30 @@ export function promptSignIn(
   agentType: string,
   opts?: { onSignedIn?: () => void; onDismissed?: () => void; reason?: string },
 ): void {
-  const requestId = ++signInSeq;
-  if (opts?.onSignedIn || opts?.onDismissed) {
-    signInCallbacks.set(requestId, {
-      onSignedIn: opts.onSignedIn,
-      onDismissed: opts.onDismissed,
-    });
+  const asker: SignInCallbacks | null =
+    opts?.onSignedIn || opts?.onDismissed
+      ? { onSignedIn: opts.onSignedIn, onDismissed: opts.onDismissed }
+      : null;
+  // Two tabs on the same agent failing at once ask for the same sign-in
+  // (ACP audit finding 72). The second used to replace the first's dialog, and the first tab
+  // was never told how it ended, so it never retried. It joins the open
+  // request instead, and hears the same outcome. Re-sent exactly as it was
+  // (a new reason would restart the dialog's discovery), which the host keeps
+  // as the same dialog — and shows again if it had none.
+  const open = openSignIns.get(agentType);
+  if (open) {
+    const askers = signInCallbacks.get(open.requestId) ?? [];
+    if (asker) signInCallbacks.set(open.requestId, [...askers, asker]);
+    emitWindowEvent("atlas:agent-signin", { agentType, ...open });
+    return;
   }
+  // The host shows one dialog, so another agent's request replaces the one
+  // open: for whoever asked for that one, it was dismissed.
+  for (const other of openSignIns.values()) {
+    takeSignInCallback(other.requestId)?.onDismissed?.();
+  }
+  const requestId = ++signInSeq;
+  openSignIns.set(agentType, { requestId, reason: opts?.reason });
+  if (asker) signInCallbacks.set(requestId, [asker]);
   emitWindowEvent("atlas:agent-signin", { agentType, requestId, reason: opts?.reason });
 }

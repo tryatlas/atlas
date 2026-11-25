@@ -4,7 +4,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
-use std::process::Stdio;
 use std::time::Duration;
 
 use self::http_client::StartupSyncHttpClient;
@@ -690,6 +689,8 @@ fn git_head_sha(repo_path: &Path, git_binary: &Path) -> Result<String, String> {
 fn git_command(git_binary: &Path) -> Command {
     let mut command = Command::new(git_binary);
     command
+        .env_clear()
+        .envs(atlas_engine_protocol::shell_environment::host_environment())
         .args(["-c", atlas_engine_git_utils::SAFE_BARE_REPOSITORY_CONFIG])
         .env("GIT_OPTIONAL_LOCKS", "0");
     for name in REPOSITORY_LOCAL_GIT_ENVIRONMENT_VARIABLES {
@@ -730,53 +731,7 @@ fn run_git_command_with_timeout(
     context: &str,
     timeout: Duration,
 ) -> Result<Output, String> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("failed to run {context}: {err}"))?;
-
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|err| format!("failed to wait for {context}: {err}"));
-            }
-            Ok(None) => {}
-            Err(err) => return Err(format!("failed to poll {context}: {err}")),
-        }
-
-        if start.elapsed() >= timeout {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    return child
-                        .wait_with_output()
-                        .map_err(|err| format!("failed to wait for {context}: {err}"));
-                }
-                Ok(None) => {}
-                Err(err) => return Err(format!("failed to poll {context}: {err}")),
-            }
-
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .map_err(|err| format!("failed to wait for {context} after timeout: {err}"))?;
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return if stderr.is_empty() {
-                Err(format!("{context} timed out after {}s", timeout.as_secs()))
-            } else {
-                Err(format!(
-                    "{context} timed out after {}s: {stderr}",
-                    timeout.as_secs()
-                ))
-            };
-        }
-
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    atlas_engine_git_utils::run_git_command_blocking(command, context, timeout)
 }
 
 fn ensure_git_success(output: &Output, context: &str) -> Result<(), String> {

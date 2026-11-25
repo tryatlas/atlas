@@ -528,6 +528,10 @@ async fn cleanup_stale_snapshots_removes_orphans_and_keeps_live() -> Result<()> 
     write_rollout_stub(&atlas_agent_home, live_session).await?;
     fs::write(&live_snapshot, "live").await?;
     fs::write(&orphan_snapshot, "orphan").await?;
+    std::fs::File::options()
+        .write(true)
+        .open(&orphan_snapshot)?
+        .set_modified(SystemTime::now() - SNAPSHOT_RETENTION - Duration::from_secs(60))?;
     fs::write(&invalid_snapshot, "invalid").await?;
 
     cleanup_stale_snapshots(&atlas_agent_home, ThreadId::new(), /*state_db*/ None).await?;
@@ -535,6 +539,34 @@ async fn cleanup_stale_snapshots_removes_orphans_and_keeps_live() -> Result<()> 
     assert_eq!(live_snapshot.exists(), true);
     assert_eq!(orphan_snapshot.exists(), false);
     assert_eq!(invalid_snapshot.exists(), false);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleanup_keeps_a_live_snapshot_without_any_rollout() -> Result<()> {
+    let dir = tempdir()?;
+    let atlas_agent_home = dir.path().abs();
+    let snapshot_dir = atlas_agent_home.join(SNAPSHOT_DIR);
+    fs::create_dir_all(&snapshot_dir).await?;
+    let path = snapshot_dir.join(format!("{}.123.sh", ThreadId::new()));
+    fs::write(&path, "live snapshot").await?;
+    let lease = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    lease.set_modified(SystemTime::now() - SNAPSHOT_RETENTION - Duration::from_secs(60))?;
+    lease.try_lock_shared()?;
+    cleanup_stale_snapshots(&atlas_agent_home, ThreadId::new(), None).await?;
+    assert!(
+        path.exists(),
+        "another session's cleanup must honor the live lease"
+    );
+    drop(lease);
+    cleanup_stale_snapshots(&atlas_agent_home, ThreadId::new(), None).await?;
+    assert!(
+        !path.exists(),
+        "an abandoned old snapshot must still be collected"
+    );
     Ok(())
 }
 

@@ -16,7 +16,7 @@
  */
 
 import { useEffect, useImperativeHandle, useLayoutEffect, useRef, useState, type Ref } from "react";
-import { Compartment, EditorState, Transaction } from "@codemirror/state";
+import { Compartment, EditorState, Text, Transaction } from "@codemirror/state";
 import {
   drawSelection,
   EditorView,
@@ -116,6 +116,7 @@ export function CodeMirrorFileView({
     wrap: new Compartment(),
     blame: new Compartment(),
     readOnly: new Compartment(),
+    lineSeparator: new Compartment(),
   }).current;
   // Bumped when the view is built, so the effects waiting on it run then.
   const [viewReady, setViewReady] = useState(0);
@@ -132,7 +133,7 @@ export function CodeMirrorFileView({
   useImperativeHandle(
     handleRef,
     () => ({
-      getText: () => viewRef.current?.state.doc.toString(),
+      getText: () => viewRef.current?.state.sliceDoc(),
       position: () => {
         const view = viewRef.current;
         if (!view) return undefined;
@@ -187,6 +188,7 @@ export function CodeMirrorFileView({
         parent,
         extensions: [
           compartments.theme.of(editorThemeExtensions()),
+          compartments.lineSeparator.of(EditorState.lineSeparator.of(lineSeparator(now.contents))),
           langExt,
           askAgentGutter(() => onAskRef.current),
           lineNumbers(),
@@ -205,7 +207,7 @@ export function CodeMirrorFileView({
           compartments.readOnly.of(lockFor(now.readOnly, now.editable)),
           keymap.of([indentWithTab, ...defaultKeymap, ...historyKeymap, ...searchKeymap]),
           EditorView.updateListener.of((update) => {
-            if (update.docChanged) onChangeRef.current(update.state.doc.toString());
+            if (update.docChanged) onChangeRef.current(update.state.sliceDoc());
           }),
           EditorState.tabSize.of(2),
         ],
@@ -227,13 +229,20 @@ export function CodeMirrorFileView({
   useEffect(() => {
     const view = viewRef.current;
     if (!view) return;
-    if (view.state.doc.toString() === contents) return;
+    if (view.state.sliceDoc() === contents) return;
     view.dispatch({
-      changes: { from: 0, to: view.state.doc.length, insert: contents },
+      effects: compartments.lineSeparator.reconfigure(
+        EditorState.lineSeparator.of(lineSeparator(contents)),
+      ),
+      changes: {
+        from: 0,
+        to: view.state.doc.length,
+        insert: Text.of(contents.split(/\r\n|\r|\n/)),
+      },
       annotations: Transaction.addToHistory.of(false),
     });
     // `contents` is the panel's buffer, which only changes with `version`.
-  }, [version, viewReady]);
+  }, [version, viewReady, compartments]);
 
   useEffect(() => {
     viewRef.current?.dispatch({
@@ -291,4 +300,8 @@ export function CodeMirrorFileView({
 function lockFor(readOnly: boolean, editable: boolean) {
   if (readOnly) return [EditorState.readOnly.of(true), EditorView.editable.of(false)];
   return editable ? [] : [EditorState.readOnly.of(true)];
+}
+
+function lineSeparator(contents: string): string {
+  return contents.match(/\r\n|\r|\n/)?.[0] ?? "\n";
 }

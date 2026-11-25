@@ -36,11 +36,13 @@ const SESSION_ENDED: &str = "Your Atlas session ended. Sign in again to reconnec
 /// Managed handle to the auth core.
 pub struct AuthState {
     core: Arc<AuthCore>,
+    cache_scope: std::sync::Mutex<Option<u64>>,
 }
 
 impl AuthState {
     pub fn new(config_dir: std::path::PathBuf) -> Self {
         Self {
+            cache_scope: std::sync::Mutex::new(None),
             core: Arc::new(AuthCore::new(
                 auth_base(),
                 config_dir,
@@ -60,6 +62,45 @@ impl AuthState {
 /// because of that: a signed-in relaunch is covered for free, and no future
 /// transition can forget to update who events are attributed to.
 fn broadcast(app: &AppHandle, snapshot: AuthSnapshot) {
+    if let Some(state) = app.try_state::<AuthState>() {
+        use std::hash::{Hash, Hasher};
+        // Compare a fingerprint, never log or retain another plaintext token.
+        let stored = state.core.stored();
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        stored.as_ref().map(|s| &s.session_token).hash(&mut hash);
+        let identity_scope = stored
+            .as_ref()
+            .and_then(|s| s.identity.as_ref())
+            .map(|i| (&i.id, &i.orgs, &i.active_org_id));
+        serde_json::to_string(&identity_scope)
+            .unwrap_or_default()
+            .hash(&mut hash);
+        serde_json::to_string(&stored.as_ref().and_then(|s| s.pinned_org.as_ref()))
+            .unwrap_or_default()
+            .hash(&mut hash);
+        let fingerprint = hash.finish();
+        let mut scope = state
+            .cache_scope
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *scope != Some(fingerprint) {
+            let previously_initialized = scope.replace(fingerprint).is_some();
+            if previously_initialized {
+                if let Some(host) = app.try_state::<Arc<super::agent_host::AgentHost>>() {
+                    host.drop_native_connection();
+                }
+            }
+            if let Some(comms) = app.try_state::<super::comms::CommsState>() {
+                comms.0.rest().invalidate_token();
+            }
+            if let Some(artifacts) = app.try_state::<super::artifacts_cloud::ArtifactsCloudState>()
+            {
+                artifacts.client.invalidate_token();
+            }
+            let account_id = stored.and_then(|s| s.identity).map(|i| i.id);
+            atlas_native_agent::engine::catalog_cache::invalidate_catalogue(account_id);
+        }
+    }
     sync_identity(
         app,
         &snapshot,
@@ -213,6 +254,7 @@ pub async fn auth_sign_in(
             }
             // Cancellation is a deliberate user action; it needs no error toast.
             Err(GrantError::Cancelled) => broadcast(&task_app, core.snapshot()),
+            Err(GrantError::AlreadyPolling) => {}
             Err(err) => {
                 broadcast(&task_app, core.snapshot());
                 let _ = task_app.emit(

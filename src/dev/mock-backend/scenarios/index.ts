@@ -36,6 +36,7 @@ import { chatLinkIcons } from "./chat-link-icons";
 import { chatLongPrompt } from "./chat-long-prompt";
 import { chatLongSession } from "./chat-long-session";
 import { chatMarkdown } from "./chat-markdown";
+import { chatMermaid } from "./chat-mermaid";
 import { chatSidePanels } from "./chat-side-panels";
 import { chatSlashCommands } from "./chat-slash-commands";
 import { chatTools } from "./chat-tools";
@@ -132,6 +133,7 @@ const all: Scenario[] = [
   chatLongPrompt,
   chatLongSession,
   chatMarkdown,
+  chatMermaid,
   chatFileChips,
   chatLinkIcons,
   chatTurnChanges,

@@ -18,8 +18,6 @@ export interface ChatSendDetail {
 interface QueueDrainArgs {
   tabId: string;
   session: ChatSession | undefined;
-  /** A session another process is writing (ADR-0001 amendment, Rule 7). */
-  heldElsewhere: boolean;
   /** The no-AI-grant hold on the queue (`send-gate.ts`). */
   grantHold: boolean;
   bindControlRef: RefObject<BindControl | null>;
@@ -31,13 +29,7 @@ interface QueueDrainArgs {
  * is `session-send.ts`'s to decide (`watch`): it keeps the last snapshot, so
  * no edge is detected here. The dependency list is what a drain reads.
  */
-export function useQueueDrain({
-  tabId,
-  session,
-  heldElsewhere,
-  grantHold,
-  bindControlRef,
-}: QueueDrainArgs): void {
+export function useQueueDrain({ tabId, session, grantHold, bindControlRef }: QueueDrainArgs): void {
   // One watch per mounted panel: a remount starts from nothing, which is what
   // hands a tab's local items to its session when the tab comes back.
   const watchRef = useRef<{ tabId: string; drain: ReturnType<typeof sessionSend.watch> }>(null);
@@ -48,7 +40,7 @@ export function useQueueDrain({
     };
   }
   useEffect(() => {
-    watchRef.current?.drain.tick({ session, heldElsewhere, grantHold });
+    watchRef.current?.drain.tick({ session, grantHold });
     // Next-step chips are extracted from the agent's own `<next_steps>` block in
     // the chat-store `turn_finished` reducer — nothing to do here.
   }, [
@@ -58,7 +50,6 @@ export function useQueueDrain({
     session?.resumePending,
     session?.unrestoredModeId,
     session?.disconnected,
-    heldElsewhere,
     grantHold,
   ]);
 }

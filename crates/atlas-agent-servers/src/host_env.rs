@@ -160,8 +160,17 @@ fn nvm_path_walk() {
         .map(|e| e.path().join("bin"))
         .filter(|p| p.is_dir())
         .collect();
-    // Newest version first (lexicographic — fine for vMAJOR.MINOR.PATCH).
-    versions.sort();
+    // Compare numeric semver components; v22 must precede v9.
+    versions.sort_by_key(|path| {
+        path.parent()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy())
+            .unwrap_or_default()
+            .trim_start_matches('v')
+            .split('.')
+            .map(|part| part.parse::<u64>().unwrap_or(0))
+            .collect::<Vec<_>>()
+    });
     versions.reverse();
     let extras: Vec<String> = versions
         .into_iter()
@@ -170,7 +179,21 @@ fn nvm_path_walk() {
     if extras.is_empty() {
         return;
     }
-    prepend_to_path(&extras);
+    let mut parts: Vec<_> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    for extra in extras {
+        let extra = std::path::PathBuf::from(extra);
+        if !parts.contains(&extra) {
+            parts.push(extra);
+        }
+    }
+    if let Ok(path) = std::env::join_paths(parts) {
+        // Startup-only, as sanitize_host_env documents.
+        unsafe {
+            std::env::set_var("PATH", path);
+        }
+    }
 }
 
 #[cfg(unix)]

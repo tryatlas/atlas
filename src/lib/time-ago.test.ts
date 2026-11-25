@@ -149,4 +149,9 @@ describe("timeAgo", () => {
     // The backend emits offsets, not always Z.
     expect(timeAgo("2026-06-15T09:00:00.000-03:00")).toBe("just now");
   });
+
+  it("shows no time for the epoch, which an import stamps on an unknown age", () => {
+    expect(timeAgo("1970-01-01T00:00:00.000Z")).toBe("");
+    expect(timeAgo(new Date(0).toISOString(), { suffix: true })).toBe("");
+  });
 });

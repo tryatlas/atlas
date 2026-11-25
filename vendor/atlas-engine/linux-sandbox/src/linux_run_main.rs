@@ -6,9 +6,13 @@ use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Read;
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,6 +48,12 @@ const FORWARDED_SIGNALS: &[libc::c_int] =
 const SYNTHETIC_MOUNT_MARKER_SYNTHETIC: &[u8] = b"synthetic\n";
 const SYNTHETIC_MOUNT_MARKER_EXISTING: &[u8] = b"existing\n";
 const PROTECTED_CREATE_MARKER: &[u8] = b"protected-create\n";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SyntheticOwnership {
+    dev: u64,
+    ino: u64,
+}
 
 #[derive(Debug)]
 struct SyntheticMountTargetRegistration {
@@ -943,14 +953,15 @@ fn register_synthetic_mount_targets(
             .iter()
             .map(|target| {
                 let marker_dir = synthetic_mount_marker_dir(target.path());
-                fs::create_dir_all(&marker_dir).unwrap_or_else(|err| {
+                ensure_private_registry_directory(&marker_dir).unwrap_or_else(|err| {
                     panic!(
                         "failed to create synthetic bubblewrap mount marker directory {}: {err}",
                         marker_dir.display()
                     )
                 });
                 let target = if target.preserves_pre_existing_path()
-                    && synthetic_mount_marker_dir_has_active_synthetic_owner(&marker_dir)
+                    && (synthetic_mount_marker_dir_has_active_synthetic_owner(&marker_dir)
+                        || recorded_synthetic_target_matches(&marker_dir, target.path()))
                 {
                     match target.kind() {
                         crate::bwrap::SyntheticMountTargetKind::EmptyFile => {
@@ -965,15 +976,15 @@ fn register_synthetic_mount_targets(
                 } else {
                     target.clone()
                 };
+                let target = prepare_synthetic_mount_target(target, &marker_dir);
                 let marker_file = marker_dir.join(std::process::id().to_string());
-                fs::write(&marker_file, synthetic_mount_marker_contents(&target)).unwrap_or_else(
-                    |err| {
+                write_private_registry_file(&marker_file, synthetic_mount_marker_contents(&target))
+                    .unwrap_or_else(|err| {
                         panic!(
                             "failed to register synthetic bubblewrap mount target {}: {err}",
                             target.path().display()
                         )
-                    },
-                );
+                    });
                 SyntheticMountTargetRegistration {
                     target,
                     marker_file,
@@ -992,19 +1003,21 @@ fn register_protected_create_targets(
             .iter()
             .map(|target| {
                 let marker_dir = synthetic_mount_marker_dir(target.path());
-                fs::create_dir_all(&marker_dir).unwrap_or_else(|err| {
+                ensure_private_registry_directory(&marker_dir).unwrap_or_else(|err| {
                     panic!(
                         "failed to create protected create marker directory {}: {err}",
                         marker_dir.display()
                     )
                 });
                 let marker_file = marker_dir.join(std::process::id().to_string());
-                fs::write(&marker_file, PROTECTED_CREATE_MARKER).unwrap_or_else(|err| {
-                    panic!(
-                        "failed to register protected create target {}: {err}",
-                        target.path().display()
-                    )
-                });
+                write_private_registry_file(&marker_file, PROTECTED_CREATE_MARKER).unwrap_or_else(
+                    |err| {
+                        panic!(
+                            "failed to register protected create target {}: {err}",
+                            target.path().display()
+                        )
+                    },
+                );
                 ProtectedCreateTargetRegistration {
                     target: target.clone(),
                     marker_file,
@@ -1021,6 +1034,76 @@ fn synthetic_mount_marker_contents(target: &crate::bwrap::SyntheticMountTarget) 
     } else {
         SYNTHETIC_MOUNT_MARKER_SYNTHETIC
     }
+}
+
+fn recorded_synthetic_target_matches(marker_dir: &Path, path: &Path) -> bool {
+    let Ok(bytes) = fs::read(marker_dir.join("ownership")) else {
+        return false;
+    };
+    let Ok(owner) = serde_json::from_slice::<SyntheticOwnership>(&bytes) else {
+        return false;
+    };
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.dev() == owner.dev && metadata.ino() == owner.ino)
+}
+
+fn prepare_synthetic_mount_target(
+    target: crate::bwrap::SyntheticMountTarget,
+    marker_dir: &Path,
+) -> crate::bwrap::SyntheticMountTarget {
+    if target.preserves_pre_existing_path() {
+        return target;
+    }
+    // Create and record the inode before spawning bwrap. A killed helper then
+    // leaves enough evidence for the next run to reclaim only our placeholder.
+    let created = match target.kind() {
+        crate::bwrap::SyntheticMountTargetKind::EmptyFile => OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(target.path())
+            .map(|_| ()),
+        crate::bwrap::SyntheticMountTargetKind::EmptyDirectory => {
+            fs::DirBuilder::new().mode(0o700).create(target.path())
+        }
+    };
+    let created = match created {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => panic!(
+            "failed to create synthetic mount target {}: {error}",
+            target.path().display()
+        ),
+    };
+    let metadata = fs::symlink_metadata(target.path())
+        .unwrap_or_else(|error| panic!("failed to inspect synthetic mount target: {error}"));
+    if !created
+        && !recorded_synthetic_target_matches(marker_dir, target.path())
+        && !synthetic_mount_marker_dir_has_active_synthetic_owner(marker_dir)
+    {
+        // A user may have created the path since the sandbox plan was built.
+        // Never turn that race into ownership of their file or directory.
+        return match target.kind() {
+            crate::bwrap::SyntheticMountTargetKind::EmptyFile => {
+                crate::bwrap::SyntheticMountTarget::existing_empty_file(target.path(), &metadata)
+            }
+            crate::bwrap::SyntheticMountTargetKind::EmptyDirectory => {
+                crate::bwrap::SyntheticMountTarget::existing_empty_directory(
+                    target.path(),
+                    &metadata,
+                )
+            }
+        };
+    }
+    let owner = SyntheticOwnership {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    };
+    let bytes = serde_json::to_vec(&owner).expect("serialize synthetic ownership");
+    write_private_registry_file(&marker_dir.join("ownership"), &bytes)
+        .unwrap_or_else(|error| panic!("failed to record synthetic mount ownership: {error}"));
+    target
 }
 
 fn synthetic_mount_marker_dir_has_active_synthetic_owner(marker_dir: &Path) -> bool {
@@ -1104,6 +1187,9 @@ fn cleanup_synthetic_mount_targets(targets: &[SyntheticMountTargetRegistration])
                 continue;
             }
             remove_synthetic_mount_target(&target.target);
+            // A nonempty or replaced path now belongs to the user. Retire our
+            // ownership evidence when the last live registration finishes.
+            let _ = fs::remove_file(target.marker_dir.join("ownership"));
             match fs::remove_dir(&target.marker_dir) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -1263,7 +1349,7 @@ fn process_is_active(pid: libc::pid_t) -> bool {
 
 fn with_synthetic_mount_registry_lock<T>(f: impl FnOnce() -> T) -> T {
     let registry_root = synthetic_mount_registry_root();
-    fs::create_dir_all(&registry_root).unwrap_or_else(|err| {
+    ensure_private_registry_directory(&registry_root).unwrap_or_else(|err| {
         panic!(
             "failed to create synthetic bubblewrap mount registry {}: {err}",
             registry_root.display()
@@ -1275,6 +1361,8 @@ fn with_synthetic_mount_registry_lock<T>(f: impl FnOnce() -> T) -> T {
         .write(true)
         .create(true)
         .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&lock_path)
         .unwrap_or_else(|err| {
             panic!(
@@ -1305,10 +1393,79 @@ fn synthetic_mount_marker_dir(path: &Path) -> PathBuf {
 }
 
 fn synthetic_mount_registry_root() -> PathBuf {
-    let effective_uid = unsafe { libc::geteuid() };
-    std::env::temp_dir().join(format!(
-        "atlas-engine-bwrap-synthetic-mount-targets-{effective_uid}"
-    ))
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let uid = unsafe { libc::geteuid() };
+        let runtime = PathBuf::from(format!("/run/user/{uid}"));
+        if fs::symlink_metadata(&runtime).is_ok_and(|metadata| {
+            metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o077 == 0
+        }) {
+            return runtime.join("atlas-engine-synthetic-mounts");
+        }
+        let mut capacity = 4096;
+        loop {
+            let mut buffer = vec![0_u8; capacity];
+            let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+            let mut result = std::ptr::null_mut();
+            let status = unsafe {
+                libc::getpwuid_r(
+                    uid,
+                    entry.as_mut_ptr(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    &mut result,
+                )
+            };
+            if status == libc::ERANGE && capacity < 1024 * 1024 {
+                capacity *= 2;
+                continue;
+            }
+            assert!(
+                status == 0 && !result.is_null(),
+                "cannot resolve the sandbox user's home directory"
+            );
+            let entry = unsafe { entry.assume_init() };
+            let home = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) };
+            let home = PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes()));
+            let metadata = fs::metadata(&home).expect("sandbox user's home directory");
+            assert!(
+                metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o022 == 0,
+                "sandbox registry requires an owned home directory without group/other write access"
+            );
+            return home.join(".atlas-agent-sandbox");
+        }
+    })
+    .clone()
+}
+
+fn ensure_private_registry_directory(path: &Path) -> std::io::Result<()> {
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "sandbox registry must be an owned private directory",
+        ));
+    }
+    Ok(())
+}
+
+fn write_private_registry_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?
+        .write_all(contents)
 }
 
 fn hash_path(path: &Path) -> u64 {

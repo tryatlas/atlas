@@ -16,17 +16,27 @@ export function SvgViewer({ filePath }: SvgViewerProps) {
   const name = filePath.split("/").pop() ?? filePath;
   const [code, setCode] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
     setCode(null);
+    setError(null);
     readFileContent(filePath)
-      .then((t) => !cancelled && setCode(t))
-      .catch(() => !cancelled && setCode(null));
+      .then((t) => {
+        if (!cancelled) {
+          setCode(t);
+          if (!t.trim()) setError("This SVG file is empty.");
+        }
+      })
+      .catch((e) => {
+        if (!cancelled) setError(`Could not read this SVG: ${String(e)}`);
+      });
     return () => {
       cancelled = true;
     };
-  }, [filePath]);
+  }, [filePath, attempt]);
 
   // Render from the file's actual markup (not the asset protocol, which can
   // 404/CSP-block and goes stale on rename) by inlining it as a data URL.
@@ -52,6 +62,8 @@ export function SvgViewer({ filePath }: SvgViewerProps) {
       name={name}
       src={src}
       copied={copied}
+      error={error}
+      onRetry={() => setAttempt((value) => value + 1)}
       onCopy={() => void copy()}
     />
   );

@@ -26,6 +26,7 @@ import { tauri } from "@/test/tauri-fake";
 import { emitWindowEvent, onWindowEvent } from "@/lib/window-events";
 import { useAgentRegistryStore } from "@/features/agents/stores/agent-registry-store";
 import { useAppStore } from "@/features/app/stores/app-store";
+import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { useLogStore } from "@/features/log/stores/log-store";
 import type { AgentCatalogEntry } from "@/types/agent-catalog";
 import { useChatStore } from "../stores/chat-store";
@@ -120,8 +121,14 @@ function usePanel(tabId: string) {
   useAgentBind(tabId, live, bindControlRef);
   return bindControlRef;
 }
-const mountPanel = (opts?: Parameters<typeof renderHook>[1]) =>
-  renderHook(() => usePanel(TAB), opts);
+/** A panel on screen whose user has started writing, which is what starts a
+ *  session: showing a chat only connects its agent (`lazy-chat-tab.test.tsx`
+ *  pins that). Everything below is about the bind that writing starts. */
+const mountPanel = (opts?: Parameters<typeof renderHook>[1]) => {
+  const mounted = renderHook(() => usePanel(TAB), opts);
+  act(() => emitWindowEvent("atlas:chat-input-started", { tabId: TAB }));
+  return mounted;
+};
 
 /** The bind and the drain halves of `ChatPanel`: what holds a first message
  *  for the bind and lets it go when the binding lands. */
@@ -129,7 +136,7 @@ function useSendingPanel(tabId: string) {
   const live = useChatStore((s) => s.sessions[tabId]);
   const bindControlRef = useRef<BindControl | null>(null);
   useAgentBind(tabId, live, bindControlRef);
-  useQueueDrain({ tabId, session: live, heldElsewhere: false, grantHold: false, bindControlRef });
+  useQueueDrain({ tabId, session: live, grantHold: false, bindControlRef });
   return bindControlRef;
 }
 
@@ -155,6 +162,19 @@ beforeEach(() => {
   useLogStore.setState({ buffer: [] });
   useAgentRegistryStore.setState({ catalogById: {} });
   useAppStore.setState({ currentProject: { path: "/proj", name: "proj" } as never });
+  // The tab sits behind another, so nothing here is the warm-up connect a
+  // tab on screen makes (`lazy-chat-tab.test.tsx` pins that): every connect
+  // counted below is the bind's own.
+  const chatTab = (id: string) =>
+    ({ id, type: "chat", title: "Session", closable: true, dirty: false, data: {} }) as never;
+  useLayoutStore.setState({
+    tabs: [chatTab(TAB), chatTab("tab-in-front")],
+    groupOrder: ["main"],
+    activeByGroup: { main: "tab-in-front" },
+    focusedGroupId: "main",
+    activeTabId: "tab-in-front",
+    viewsByWs: {},
+  });
   store().actions.createSession(TAB, "codex");
   toastError = vi.spyOn(toast, "error").mockImplementation(() => "");
   vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -163,6 +183,7 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.useRealTimers();
+  useLayoutStore.setState({ tabs: [], activeByGroup: {}, activeTabId: null, viewsByWs: {} });
 });
 
 describe("a new session", () => {
@@ -185,7 +206,7 @@ describe("a new session", () => {
     expect(toastError).not.toHaveBeenCalled();
 
     // Bound: nothing binds again, whatever asks.
-    emitWindowEvent("atlas:chat-input-focused", { tabId: TAB });
+    emitWindowEvent("atlas:chat-input-started", { tabId: TAB });
     await advance(DEADLINE_MS);
     expect(count("agents_new_session")).toBe(1);
   });
@@ -277,15 +298,44 @@ describe("a new session", () => {
     expect(session().acpModeExplicit).toBe(false);
   });
 
+  // ACP audit finding 40
+  it("shows the agent's model, not the pick, when the agent refuses the model picked before the bind", async () => {
+    const models = [
+      { id: "gpt-a", name: "A" },
+      { id: "gpt-b", name: "B" },
+    ];
+    tauri.handleRaw({
+      agents_set_model: () => {
+        throw "unknown model";
+      },
+      agents_snapshot_meta: ({ key }) =>
+        meta((key as { session_id: string }).session_id, {
+          current_model: "gpt-a",
+          available_models: models,
+        }),
+    });
+    act(() => {
+      useChatStore.setState((s) => {
+        s.sessions[TAB]!.acpCurrentModel = "gpt-b";
+      });
+    });
+
+    mountPanel();
+    await flush();
+
+    expect(count("agents_set_model")).toBe(1);
+    expect(session().acpSessionId).toBe("sess-1");
+    expect(session().acpCurrentModel).toBe("gpt-a");
+  });
+
   it("binds once under StrictMode's double mount", async () => {
     mountPanel({ wrapper: StrictMode });
     await flush();
 
     expect(count("agents_new_session")).toBe(1);
     expect(session().acpSessionId).toBe("sess-1");
-    // Both mounts ask for the connection; the manager joins the second to the
-    // first's connect (`ensureAgent` keeps no in-flight cache of its own).
-    expect(count("agents_spawn")).toBe(2);
+    // Mounting asks for nothing; the one write does.
+    expect(count("agents_spawn")).toBe(1);
   });
 
   it("two panels on the same session bind once", async () => {
@@ -312,14 +362,14 @@ describe("a new session", () => {
     expect(session().acpSessionId).toBe("sess-1");
   });
 
-  it("coalesces a kick and a composer focus into the attempt already running", async () => {
+  it("coalesces a kick and composer input into the attempt already running", async () => {
     const spawn = deferred<typeof AGENT>();
     tauri.handleRaw({ agents_spawn: () => spawn.promise });
     const { result } = mountPanel();
     await flush();
 
     act(() => result.current.current?.kick());
-    emitWindowEvent("atlas:chat-input-focused", { tabId: TAB });
+    emitWindowEvent("atlas:chat-input-started", { tabId: TAB });
     await flush();
     expect(count("agents_spawn")).toBe(1);
 
@@ -422,8 +472,11 @@ describe("once the binding lands", () => {
     mountPanel();
     await flush();
 
-    // "New session" in the same tab, before the first one's snapshot is back.
+    // "New session" in the same tab, before the first one's snapshot is back,
+    // and the user writes in it.
     act(() => store().actions.clearSession(TAB));
+    await flush();
+    act(() => emitWindowEvent("atlas:chat-input-started", { tabId: TAB }));
     await flush();
     expect(session().acpSessionId).toBe("sess-2");
     snap.resolve(advertising());
@@ -631,26 +684,26 @@ describe("a bind that fails", () => {
     expect(toastError).toHaveBeenCalledTimes(1);
   });
 
-  it("is retried by a composer focus without a second toast, and logged every time", async () => {
+  it("is retried by writing in the composer without a second toast, and logged every time", async () => {
     failSpawn("codex-acp exited with code 1");
     mountPanel();
     await flush();
     await advance(RETRY_MS);
     expect(toastError).toHaveBeenCalledTimes(1);
 
-    emitWindowEvent("atlas:chat-input-focused", { tabId: TAB });
+    emitWindowEvent("atlas:chat-input-started", { tabId: TAB });
     await flush();
     expect(count("agents_spawn")).toBe(3);
     expect(toastError).toHaveBeenCalledTimes(1);
     expect(bindLogs()).toHaveLength(3);
 
-    // Another tab's focus is not this tab's.
-    emitWindowEvent("atlas:chat-input-focused", { tabId: "some-other-tab" });
+    // Another tab's input is not this tab's.
+    emitWindowEvent("atlas:chat-input-started", { tabId: "some-other-tab" });
     await flush();
     expect(count("agents_spawn")).toBe(3);
   });
 
-  it("parks the held first message in the queue, and reports again while one waits", async () => {
+  it("keeps the held first message held, idle, and reports again while it waits", async () => {
     failSpawn("codex-acp exited with code 1");
     act(() => {
       store().actions.setPendingSend(TAB, { content: "hello", mentions: [] });
@@ -662,15 +715,51 @@ describe("a bind that fails", () => {
     expect(session().pendingSend?.content).toBe("hello");
 
     await advance(RETRY_MS);
-    expect(session().pendingSend).toBeUndefined();
+    expect(session().pendingSend?.content).toBe("hello");
     expect(session().status).toBe("idle");
-    expect(store().queues[TAB]).toEqual(["hello"]);
+    expect(store().queues[TAB]).toBeUndefined();
     expect(toastError).toHaveBeenCalledTimes(1);
 
     // Someone is waiting on this bind, so its next failure is said too.
-    emitWindowEvent("atlas:chat-input-focused", { tabId: TAB });
+    emitWindowEvent("atlas:chat-input-started", { tabId: TAB });
     await flush();
     expect(toastError).toHaveBeenCalledTimes(2);
+  });
+
+  // ACP audit finding 73 and 81: the queue carries text alone, and its drain draws the prompt.
+  it("sends the held message as it was once a later bind lands: its images, its one bubble", async () => {
+    failSpawn("codex-acp exited with code 1");
+    const image = { mimeType: "image/png", dataBase64: "AAAA" };
+    const { result } = renderHook(() => useSendingPanel(TAB));
+    // The user writes, which is what starts the bind that fails.
+    act(() => emitWindowEvent("atlas:chat-input-started", { tabId: TAB }));
+    await flush();
+    await advance(RETRY_MS);
+    expect(toastError).toHaveBeenCalledTimes(1);
+    await act(() =>
+      sessionSend.send(
+        TAB,
+        { content: "hello", mentions: [], attachments: [image] },
+        { kickBind: () => result.current.current?.kick() },
+      ),
+    );
+    await flush();
+    // The send's kick failed too: still held, with its image, beside one bubble.
+    expect(session().pendingSend?.attachments).toEqual([image]);
+    const bubbles = () => session().messages.filter((m) => m.role === "user");
+    expect(bubbles()).toHaveLength(1);
+    expect(store().queues[TAB]).toBeUndefined();
+
+    healthyBackend();
+    emitWindowEvent("atlas:chat-input-started", { tabId: TAB });
+    await flush();
+    expect(session().acpSessionId).toBe("sess-1");
+    const sent = tauri.calls("agents_send");
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.args.attachments).toEqual([image]);
+    expect(sent[0]!.args.clientMessageId).toBe(bubbles()[0]!.clientMessageId);
+    expect(count("agents_queue_add")).toBe(0);
+    expect(session().pendingSend).toBeUndefined();
   });
 
   it("binds on a later attempt and reports the next breakage afresh", async () => {
@@ -681,13 +770,14 @@ describe("a bind that fails", () => {
     expect(toastError).toHaveBeenCalledTimes(1);
 
     healthyBackend();
-    emitWindowEvent("atlas:chat-input-focused", { tabId: TAB });
+    emitWindowEvent("atlas:chat-input-started", { tabId: TAB });
     await flush();
     expect(session().acpSessionId).toBe("sess-1");
     expect(result.current.current).toBeNull();
 
     // The session is dropped (an agent switch back, a rebind of an empty
-    // chat) and the next bind fails: the earlier report must not swallow it.
+    // chat), the user writes again, and that bind fails: the earlier report
+    // must not swallow it.
     failSpawn("codex-acp exited with code 2");
     resetAgent(PLUGIN);
     act(() => {
@@ -695,6 +785,8 @@ describe("a bind that fails", () => {
         s.sessions[TAB]!.acpSessionId = undefined;
       });
     });
+    await flush();
+    act(() => emitWindowEvent("atlas:chat-input-started", { tabId: TAB }));
     await flush();
     await advance(RETRY_MS);
     expect(toastError).toHaveBeenCalledTimes(2);
@@ -729,10 +821,63 @@ describe("a bind that fails", () => {
     );
     off();
   });
+
+  // ACP audit finding 72
+  it("dismissing the sign-in offers it again on the next failure, without claiming a sign-in", async () => {
+    useAgentRegistryStore.setState({
+      catalogById: {
+        codex: { id: "codex", agentType: "codex", kind: "external", installed: true },
+      } as unknown as Record<string, AgentCatalogEntry>,
+    });
+    failSpawn("Please log in", "auth");
+    const asked: number[] = [];
+    const off = onWindowEvent("atlas:agent-signin", (d) => asked.push(d.requestId));
+    mountPanel();
+    await flush();
+    await advance(RETRY_MS);
+    expect(asked).toHaveLength(1);
+
+    act(() => takeSignInCallback(asked[0]!)?.onDismissed?.());
+    emitWindowEvent("atlas:chat-input-started", { tabId: TAB });
+    await flush();
+    expect(asked).toHaveLength(2);
+    expect(asked[1]).not.toBe(asked[0]);
+    expect(toastError.mock.calls.map((c: unknown[]) => String(c[0])).join("\n")).not.toContain(
+      "after signing in",
+    );
+    off();
+  });
+
+  it("two tabs asking to sign in to one agent share one dialog, and both hear it end", async () => {
+    useAgentRegistryStore.setState({
+      catalogById: {
+        codex: { id: "codex", agentType: "codex", kind: "external", installed: true },
+      } as unknown as Record<string, AgentCatalogEntry>,
+    });
+    failSpawn("Please log in", "auth");
+    act(() => store().actions.createSession("tab-2", "codex"));
+    const asked: number[] = [];
+    const off = onWindowEvent("atlas:agent-signin", (d) => asked.push(d.requestId));
+    mountPanel();
+    renderHook(() => usePanel("tab-2"));
+    act(() => emitWindowEvent("atlas:chat-input-started", { tabId: "tab-2" }));
+    await flush();
+    await advance(RETRY_MS);
+    expect(asked.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(asked).size).toBe(1);
+
+    // Signed in once: both tabs bind.
+    healthyBackend();
+    act(() => takeSignInCallback(asked[0]!)?.onSignedIn?.());
+    await flush();
+    expect(session().acpSessionId).toBeDefined();
+    expect(store().sessions["tab-2"]!.acpSessionId).toBeDefined();
+    off();
+  });
 });
 
 describe("a bind that hangs (ADR-0008)", () => {
-  it("is noted as stalled at 30 s and ended at 3 min: connection killed, message parked, reported", async () => {
+  it("is noted as stalled at 30 s and ended at 3 min: connection killed, message kept, reported", async () => {
     tauri.handleRaw({ agents_spawn: () => new Promise(() => {}) });
     act(() => {
       store().actions.setPendingSend(TAB, { content: "hello", mentions: [] });
@@ -752,7 +897,7 @@ describe("a bind that hangs (ADR-0008)", () => {
     await advance(1);
 
     // The documented end state: the hop is named, the plugin's connection is
-    // killed by plugin id, the held message is back in the queue, the tab idle.
+    // killed by plugin id, the message still held, the tab idle.
     expect(tauri.calls("agents_kill_plugin")).toEqual([
       { cmd: "agents_kill_plugin", args: { pluginId: PLUGIN } },
     ]);
@@ -760,9 +905,9 @@ describe("a bind that hangs (ADR-0008)", () => {
     expect(String(toastError.mock.calls[0]![0])).toContain(
       "has not finished connecting in 3 minutes",
     );
-    expect(session().pendingSend).toBeUndefined();
+    expect(session().pendingSend?.content).toBe("hello");
     expect(session().status).toBe("idle");
-    expect(store().queues[TAB]).toEqual(["hello"]);
+    expect(store().queues[TAB]).toBeUndefined();
     expect(session().acpModesPending).toBe(false);
     expect(store().agentStartingStatus[PLUGIN]).toBeUndefined();
     expect(session().acpSessionId).toBeUndefined();
@@ -773,7 +918,7 @@ describe("a bind that hangs (ADR-0008)", () => {
 
     // The way out still works: the next ask is a fresh connect.
     healthyBackend();
-    emitWindowEvent("atlas:chat-input-focused", { tabId: TAB });
+    emitWindowEvent("atlas:chat-input-started", { tabId: TAB });
     await flush();
     expect(session().acpSessionId).toBe("sess-1");
   });
@@ -788,7 +933,7 @@ describe("a bind that hangs (ADR-0008)", () => {
       "has not answered `session/new` in 3 minutes",
     );
     // The killed connection's agent is forgotten: the next attempt connects again.
-    emitWindowEvent("atlas:chat-input-focused", { tabId: TAB });
+    emitWindowEvent("atlas:chat-input-started", { tabId: TAB });
     await flush();
     expect(count("agents_spawn")).toBe(2);
   });
@@ -860,8 +1005,8 @@ describe("a panel that goes away mid-bind", () => {
     expect(count("agents_new_session")).toBe(0);
     expect(session().acpSessionId).toBeUndefined();
 
-    // Its focus listener and its clocks went with it.
-    emitWindowEvent("atlas:chat-input-focused", { tabId: TAB });
+    // Its input listener and its clocks went with it.
+    emitWindowEvent("atlas:chat-input-started", { tabId: TAB });
     await advance(10 * DEADLINE_MS);
     expect(count("agents_spawn")).toBe(1);
     expect(count("agents_kill_plugin")).toBe(0);
@@ -886,8 +1031,42 @@ describe("a panel that goes away mid-bind", () => {
     expect(session().acpSessionId).toBeUndefined();
     expect(count("agents_set_mode")).toBe(0);
     expect(count("agents_snapshot_meta")).toBe(0);
-    // As found: the session the agent did create is not handed back either.
-    expect(count("agents_drop_session")).toBe(0);
+    // The session the agent did create is handed back: nothing else knows it
+    // exists (ACP audit finding 11).
+    expect(tauri.calls("agents_drop_session").map((c) => c.args)).toEqual([
+      { agentId: AGENT.agent_id, sessionId: "sess-late" },
+    ]);
+  });
+
+  it("restarted while session/new is out: the abandoned session is dropped, the new one kept", async () => {
+    const created = deferred<unknown>();
+    let news = 0;
+    tauri.handleRaw({
+      agents_new_session: () =>
+        ++news === 1
+          ? created.promise
+          : {
+              key: { agent_id: AGENT.agent_id, session_id: "sess-new" },
+              current_mode: null,
+              available_modes: [],
+            },
+    });
+    const { result } = mountPanel();
+    await flush();
+    act(() => result.current.current?.retry());
+    await flush();
+    expect(session().acpSessionId).toBe("sess-new");
+
+    created.resolve({
+      key: { agent_id: AGENT.agent_id, session_id: "sess-abandoned" },
+      current_mode: null,
+      available_modes: [],
+    });
+    await flush();
+    expect(session().acpSessionId).toBe("sess-new");
+    expect(tauri.calls("agents_drop_session").map((c) => c.args)).toEqual([
+      { agentId: AGENT.agent_id, sessionId: "sess-abandoned" },
+    ]);
   });
 
   it("a failure that lands after the unmount is not reported or retried", async () => {
@@ -948,6 +1127,40 @@ describe("switching agent mid-bind", () => {
   });
 });
 
+describe("a start the user asked for", () => {
+  it("is carried on by an agent switch, but not once the user stopped it", async () => {
+    const hung = deferred<typeof AGENT>();
+    tauri.handleRaw({ agents_spawn: () => hung.promise });
+    const { result } = mountPanel();
+    await flush();
+
+    // Stop while it is still starting: the user let go of this session.
+    act(() => result.current.current?.abandon());
+    healthyBackend();
+    act(() => store().actions.switchChatAgent(TAB, "opencode"));
+    await flush();
+    expect(count("agents_new_session")).toBe(0);
+    expect(session().acpSessionId).toBeUndefined();
+  });
+});
+
+describe("a panel that goes away with its start unfinished", () => {
+  it("takes the request with it: mounting again starts nothing by itself", async () => {
+    const hung = deferred<typeof AGENT>();
+    tauri.handleRaw({ agents_spawn: () => hung.promise });
+    const { unmount } = mountPanel();
+    await flush();
+    unmount();
+    await flush();
+
+    healthyBackend();
+    renderHook(() => usePanel(TAB));
+    await flush();
+    expect(count("agents_new_session")).toBe(0);
+    expect(session().acpSessionId).toBeUndefined();
+  });
+});
+
 describe("an agent that disconnects", () => {
   it("is not rebound by the panel: the session id stays, and nothing runs unprompted", async () => {
     mountPanel();
@@ -956,7 +1169,7 @@ describe("an agent that disconnects", () => {
 
     act(() => store().actions.setDisconnected(TAB, true));
     resetAgent(PLUGIN);
-    emitWindowEvent("atlas:chat-input-focused", { tabId: TAB });
+    emitWindowEvent("atlas:chat-input-started", { tabId: TAB });
     await advance(10 * DEADLINE_MS);
 
     // The rebind is the next Send's or Restart's (`rebindDisconnectedSession`).

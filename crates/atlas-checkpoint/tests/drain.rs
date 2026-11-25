@@ -1077,7 +1077,7 @@ fn a_single_artifact_over_the_byte_ceiling_still_ships_alone() {
             1,
             "every artifact dwarfs the ceiling, so each ships alone"
         );
-        store.mark_sent(batch[0].row_id()).unwrap();
+        store.mark_sent(&batch[0]).unwrap();
         passes += 1;
         assert!(passes <= 10, "the queue drains rather than deadlocking");
     }

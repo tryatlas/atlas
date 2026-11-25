@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 // The inline permission card: what the agent wants to do, its preview, the
 // numbered options, and the "tell the agent what to do instead" field.
 //
@@ -139,7 +140,7 @@ export function PermissionCardView({
             value={draft}
             onChange={(e) => onDraftChange(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
+              if (e.key === "Enter" && !isComposingKey(e) && !e.shiftKey) {
                 e.preventDefault();
                 onSubmitDraft();
               }

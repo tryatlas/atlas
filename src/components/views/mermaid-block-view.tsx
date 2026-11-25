@@ -56,6 +56,18 @@ async function getMermaid() {
     mermaid.initialize({
       startOnLoad: false,
       securityLevel: "strict",
+      // WebKit taints a canvas drawn from an SVG containing foreignObject.
+      // SVG text labels keep the displayed diagram exportable on every host.
+      htmlLabels: false,
+      secure: [
+        "secure",
+        "securityLevel",
+        "startOnLoad",
+        "maxTextSize",
+        "suppressErrorRendering",
+        "maxEdges",
+        "htmlLabels",
+      ],
       // The built-in base that `themeVariables` is layered over. Mermaid
       // derives a long tail of secondary colours (pie slices, gantt bars, note
       // fills) from it, and only the matching one derives them light enough or

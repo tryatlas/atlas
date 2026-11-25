@@ -111,6 +111,9 @@ export interface AgentCatalogEntry {
   modelOrder: string[];
   /** Models the user added by id. Always empty for the native agent. */
   customModels: CustomModel[];
+  /** Running with settings older than the saved ones (a launch or credential
+   *  change it hasn't restarted for). Settings → Agents offers a restart. */
+  restartToApply?: boolean;
   login: AgentLoginSpec | null;
   iconDataUrl: string | null;
   helpUrl: string | null;

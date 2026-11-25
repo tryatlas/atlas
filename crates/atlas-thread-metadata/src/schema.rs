@@ -197,6 +197,10 @@ const MIGRATIONS: &[Migration] = &[
         name: "threads_unpinned_at",
         apply: add_unpinned_at_column,
     },
+    Migration {
+        name: "opened_sessions",
+        apply: |conn| Ok(conn.execute_batch(OPENED_SESSIONS)?),
+    },
 ];
 
 const LEDGER: &str = "
@@ -509,6 +513,25 @@ CREATE TABLE IF NOT EXISTS session_forks(
     child_session_id  TEXT PRIMARY KEY,
     parent_session_id TEXT NOT NULL,
     at                TEXT NOT NULL
+) STRICT;
+";
+
+/// Sessions Atlas opened itself (`session/new`) and has sent nothing to:
+/// recorded when the agent answers, removed when the session's conversation
+/// gets its row.
+///
+/// Keyed by agent session id, like `session_aliases`. An agent that lists a
+/// session the moment it exists (opencode) lists one Atlas opened and never
+/// sent to, and the project sync imports whatever it does not know: without
+/// this record such a session came back after a restart as an untitled row of
+/// someone else's. It is also the only thing that says a session is unused,
+/// which is what lets Atlas delete it on its agent; "has no row" does not,
+/// since a row can move to another session id. A plain table, so it rides
+/// the ledger as an additive migration.
+const OPENED_SESSIONS: &str = "
+CREATE TABLE IF NOT EXISTS opened_sessions(
+    session_id TEXT PRIMARY KEY,
+    at         TEXT NOT NULL
 ) STRICT;
 ";
 

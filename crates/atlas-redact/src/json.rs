@@ -160,6 +160,23 @@ fn is_credential_key(key: &str, credential_context: bool) -> bool {
         "database_password",
     ]
     .contains(&normalized.as_str())
+        || [
+            "password",
+            "passwd",
+            "passphrase",
+            "secret",
+            "token",
+            "api_key",
+            "apikey",
+            "access_key",
+            "private_key",
+        ]
+        .iter()
+        .any(|suffix| {
+            normalized
+                .strip_suffix(suffix)
+                .is_some_and(|prefix| prefix.ends_with('_'))
+        })
 }
 
 /// Flattened-config exporters emit dotted keys (`db.password`,
@@ -174,6 +191,29 @@ fn normalize_key(key: &str) -> String {
 mod tests {
     use super::*;
     use crate::redact_json;
+
+    #[test]
+    fn namespaced_credential_keys_and_link_credentials_are_scrubbed() {
+        for key in [
+            "SMTP_PASSWORD",
+            "JWT_SECRET",
+            "api_token",
+            "service.client-secret",
+        ] {
+            let input = serde_json::json!({key: "hunter2-live-value"}).to_string();
+            assert!(
+                !redact_json(&input).text.contains("hunter2-live-value"),
+                "{key}"
+            );
+        }
+        for key in ["api_key", "access_token"] {
+            let input = serde_json::json!({"url": format!("https://example.com/path?{key}=supersecretvalue123&next=ok")}).to_string();
+            let output = redact_json(&input).text;
+            assert!(!output.contains("supersecretvalue123"), "{output}");
+            assert!(output.contains("https://example.com/path?"), "{output}");
+            assert!(output.contains("next=ok"), "{output}");
+        }
+    }
 
     #[test]
     fn structure_and_field_names_survive() {

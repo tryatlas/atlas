@@ -23,6 +23,7 @@ pub struct RestClient {
     tokens: Arc<dyn TokenSource>,
     /// The last token minted and when; see [`RestClient::token`].
     cached: std::sync::Mutex<Option<(String, std::time::Instant)>>,
+    token_epoch: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -124,6 +125,7 @@ impl RestClient {
             base,
             tokens,
             cached: std::sync::Mutex::new(None),
+            token_epoch: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -132,6 +134,7 @@ impl RestClient {
     /// rate-limits it, and a busy chat panel alongside a Cloud Timeline was
     /// enough to exhaust the limit for every other caller too.
     async fn token(&self) -> Result<String> {
+        let epoch = self.token_epoch.load(std::sync::atomic::Ordering::SeqCst);
         {
             let cached = self
                 .cached
@@ -144,20 +147,27 @@ impl RestClient {
             }
         }
         let token = self.tokens.mint().await?;
-        *self
+        let mut cached = self
             .cached
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some((token.clone(), std::time::Instant::now()));
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.token_epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch {
+            return Err(CommsError::Unauthorized);
+        }
+        *cached = Some((token.clone(), std::time::Instant::now()));
         Ok(token)
     }
 
-    /// Drop the cached token — on a `401`, so a rejected one is never reused.
-    fn forget_token(&self) {
-        *self
+    /// Drop the cached token on a `401`/`403`, so a rejected one is never reused.
+    /// Invalidate on sign-in, sign-out and changed organisation membership.
+    pub fn invalidate_token(&self) {
+        let mut cached = self
             .cached
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.token_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *cached = None;
     }
 
     async fn request(
@@ -167,20 +177,43 @@ impl RestClient {
         org: &str,
         body: Option<serde_json::Value>,
     ) -> Result<reqwest::Response> {
+        self.request_with_timeout(
+            method,
+            path,
+            org,
+            body,
+            Some(std::time::Duration::from_secs(20)),
+        )
+        .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        org: &str,
+        body: Option<serde_json::Value>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<reqwest::Response> {
         let token = self.token().await?;
         let sep = if path.contains('?') { '&' } else { '?' };
         let url = format!("{}{path}{sep}org={org}", self.base);
-        let mut req = self
-            .http
-            .request(method, url)
-            .bearer_auth(token)
-            .timeout(std::time::Duration::from_secs(20));
+        let mut req = self.http.request(method, url).bearer_auth(token);
+        if let Some(timeout) = timeout {
+            req = req.timeout(timeout);
+        }
         if let Some(json) = body {
             req = req.json(&json);
         }
-        let res = req.send().await?;
-        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            self.forget_token();
+        // Headers/connect are bounded independently of the streamed body.
+        let res = tokio::time::timeout(std::time::Duration::from_secs(20), req.send())
+            .await
+            .map_err(|_| CommsError::Transport("request headers timed out".into()))??;
+        if matches!(
+            res.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            self.invalidate_token();
         }
         Ok(res)
     }
@@ -216,13 +249,14 @@ impl RestClient {
             #[serde(default)]
             detail: Option<serde_json::Value>,
         }
-        match res.json::<Envelope>().await {
-            Ok(env) => Err(CommsError::Refused {
+        match tokio::time::timeout(std::time::Duration::from_secs(20), res.json::<Envelope>()).await
+        {
+            Ok(Ok(env)) => Err(CommsError::Refused {
                 code: env.error.code,
                 message: env.error.message,
                 detail: env.error.detail,
             }),
-            Err(_) => Err(CommsError::Transport(format!("HTTP {status}"))),
+            _ => Err(CommsError::Transport(format!("HTTP {status}"))),
         }
     }
 
@@ -240,7 +274,10 @@ impl RestClient {
         let mut res = self
             .request(method.clone(), path, org, body.clone())
             .await?;
-        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+        if matches!(
+            res.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
             res = self.request(method, path, org, body).await?;
         }
         let res = Self::check(res).await?;
@@ -629,10 +666,11 @@ impl RestClient {
     /// as the ordinary refusal envelope (`detail.transcript_state`).
     pub async fn download_transcript(&self, org: &str, call_id: &str) -> Result<Vec<u8>> {
         let res = Self::check(
-            self.request(
+            self.request_with_timeout(
                 reqwest::Method::GET,
                 &format!("/calls/{call_id}/transcript"),
                 org,
+                None,
                 None,
             )
             .await?,
@@ -696,12 +734,12 @@ impl RestClient {
         url: &str,
         on_chunk: &mut (dyn FnMut(u64, u64) + Send),
     ) -> Result<Vec<u8>> {
-        let res = self
-            .http
-            .get(url)
-            .timeout(std::time::Duration::from_secs(300))
-            .send()
-            .await?;
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            self.http.get(url).send(),
+        )
+        .await
+        .map_err(|_| CommsError::Transport("recording headers timed out".into()))??;
         Self::drain(Self::check(res).await?, on_chunk).await
     }
 
@@ -819,10 +857,11 @@ impl RestClient {
         on_chunk: &mut (dyn FnMut(u64, u64) + Send),
     ) -> Result<Vec<u8>> {
         let res = Self::check(
-            self.request(
+            self.request_with_timeout(
                 reqwest::Method::GET,
                 &format!("/files/{file_id}"),
                 org,
+                None,
                 None,
             )
             .await?,
@@ -842,7 +881,13 @@ impl RestClient {
         let total = res.content_length().unwrap_or(0);
         let mut out: Vec<u8> = Vec::with_capacity(total.min(64 * 1024 * 1024) as usize);
         let mut stream = res.bytes_stream();
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), stream.next())
+                .await
+                .map_err(|_| {
+                    CommsError::Transport("download made no progress for 30 seconds".into())
+                })?
+        {
             let chunk = chunk?;
             out.extend_from_slice(&chunk);
             on_chunk(out.len() as u64, total);
@@ -936,10 +981,11 @@ impl RestClient {
         content_hash: &str,
     ) -> Result<Vec<u8>> {
         let res = Self::check(
-            self.request(
+            self.request_with_timeout(
                 reqwest::Method::GET,
                 &format!("/spaces/media/{content_hash}?conv={conv_id}"),
                 org,
+                None,
                 None,
             )
             .await?,
@@ -952,6 +998,119 @@ impl RestClient {
 #[cfg(test)]
 mod call_tests {
     use super::*;
+
+    struct ChangingToken {
+        account: std::sync::atomic::AtomicUsize,
+        pause_first: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl TokenSource for ChangingToken {
+        fn mint(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>>
+        {
+            Box::pin(async move {
+                let account = self.account.load(std::sync::atomic::Ordering::SeqCst);
+                if self
+                    .pause_first
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                Ok(format!("account-{account}"))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn account_invalidation_discards_cached_and_in_flight_credentials() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let source = Arc::new(ChangingToken {
+            account: AtomicUsize::new(1),
+            pause_first: AtomicBool::new(true),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let client = Arc::new(RestClient::new("http://unused".to_string(), source.clone()));
+        let first = tokio::spawn({
+            let client = client.clone();
+            async move { client.token().await }
+        });
+        source.entered.notified().await;
+        source.account.store(2, Ordering::SeqCst);
+        client.invalidate_token();
+        source.release.notify_one();
+        assert!(matches!(
+            first.await.unwrap(),
+            Err(CommsError::Unauthorized)
+        ));
+        assert_eq!(client.token().await.unwrap(), "account-2");
+        source.account.store(3, Ordering::SeqCst);
+        assert_eq!(
+            client.token().await.unwrap(),
+            "account-2",
+            "the cache still avoids needless token mints"
+        );
+        client.invalidate_token();
+        assert_eq!(client.token().await.unwrap(), "account-3");
+    }
+
+    struct Token;
+    impl TokenSource for Token {
+        fn mint(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>>
+        {
+            Box::pin(async { Ok("test".to_string()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_progressing_download_survives_twenty_seconds() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let send_rest = release.clone();
+        let serving = tokio::spawn(async move {
+            let (mut stream, _) = server.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nA")
+                .await
+                .unwrap();
+            send_rest.notified().await;
+            stream.write_all(b"B").await.unwrap();
+        });
+        let first_chunk = std::sync::Arc::new(tokio::sync::Notify::new());
+        let received = first_chunk.clone();
+        let client = RestClient::new(base, std::sync::Arc::new(Token));
+        let download = tokio::spawn(async move {
+            client
+                .download_file_with("org", "file", &mut move |got, _| {
+                    if got == 1 {
+                        received.notify_one();
+                    }
+                })
+                .await
+        });
+        first_chunk.notified().await;
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(21)).await;
+        tokio::time::resume();
+        release.notify_one();
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), download)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(body, b"AB");
+        serving.await.unwrap();
+    }
 
     #[test]
     fn a_voice_call_names_its_provider() {

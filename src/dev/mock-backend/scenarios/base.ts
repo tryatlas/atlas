@@ -15,7 +15,7 @@ import { artifactsHandlers } from "../fixtures/artifacts";
 import { captureHandlers } from "../fixtures/capture";
 import { commsHandlers } from "../fixtures/comms";
 import { externalEditorHandlers } from "../fixtures/external-editor";
-import { fsHandlers } from "../fixtures/files";
+import { fsHandlers, mockAssetUrl } from "../fixtures/files";
 import { fontHandlers } from "../fixtures/fonts";
 import { gitHandlers } from "../fixtures/git";
 import { iconThemeHandlers } from "../fixtures/icon-themes";
@@ -157,6 +157,12 @@ export const baseHandlers: MockHandlers = {
   // ── project open ──────────────────────────────────────────────────────
   save_app_state: nothing,
   asset_allow_dir: nothing,
+  asset_allow_file: nothing,
+  media_open: ({ path }) => ({
+    url: mockAssetUrl(String(path), (file) => file),
+    token: String(path),
+  }),
+  media_close: nothing,
   ensure_atlas_gitignore: nothing,
   load_editor_state: () => "{}",
   save_editor_state: nothing,

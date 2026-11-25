@@ -108,8 +108,10 @@ fn git_command_sanitizes_ambient_repository_environment() {
             command
                 .get_envs()
                 .find(|(key, _)| *key == OsStr::new(name))
-                .map(|(_, value)| value),
-            Some(None),
+                .and_then(|(_, value)| value),
+            // env_clear() makes env_remove() omit the key entirely; either form
+            // must leave no repository-local override in the command environment.
+            None,
             "{name} should be removed from startup sync Git commands"
         );
     }

@@ -36,6 +36,7 @@ async fn read_default_provider_capabilities() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "Amazon Bedrock is removed in Atlas: atlas-engine-model-provider builds without its aws feature (see model-provider/Cargo.toml)"]
 async fn read_amazon_bedrock_provider_capabilities() -> Result<()> {
     let atlas_agent_home = TempDir::new()?;
     std::fs::write(
@@ -65,6 +66,7 @@ async fn read_amazon_bedrock_provider_capabilities() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "Amazon Bedrock is removed in Atlas: atlas-engine-model-provider builds without its aws feature (see model-provider/Cargo.toml)"]
 async fn read_amazon_bedrock_runtime_provider_capabilities() -> Result<()> {
     let atlas_agent_home = TempDir::new()?;
     std::fs::write(

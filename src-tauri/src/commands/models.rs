@@ -251,8 +251,12 @@ pub async fn download_files(
     tokio::fs::create_dir_all(dir)
         .await
         .map_err(|e| format!("create model dir: {e}"))?;
+    // Connect and idle bounds, never a total one: a multi-gigabyte model on a
+    // slow line legitimately takes hours, but a stalled transfer must fail.
     let client = reqwest::Client::builder()
         .user_agent("Atlas-IDE")
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
 

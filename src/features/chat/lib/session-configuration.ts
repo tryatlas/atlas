@@ -63,6 +63,13 @@ export interface Knob<V> {
      *  (`undefined` when it held none the composer knew of). */
     restore: (session: ChatSession, value: V | undefined) => void;
   };
+  /**
+   * What a pick settles beyond its value, once the agent has taken it (or the
+   * bind will apply it). A mode pick releases the send hold a failed resume
+   * put up (`unrestoredModeId`): only once the agent is actually on a mode the
+   * user chose, so a refused pick leaves the hold where it was.
+   */
+  taken?: (session: ChatSession) => void;
   /** Does this session offer the knob, and this value of it? A pick it does
    *  not offer is refused before anything is shown. */
   offers: (session: ChatSession, value: V) => boolean;
@@ -79,10 +86,41 @@ export interface Knob<V> {
   unbound: "kept-for-bind" | "refused";
 }
 
+/** The user is on a mode they chose: a send hold a resume put up is over. */
+function releaseModeHold(session: ChatSession): void {
+  session.unrestoredModeId = undefined;
+}
+
 /**
- * Claude Code's permission mode. The list is Atlas's own
- * (`CLAUDE_PERMISSION_MODES`), not one the agent advertises, so this knob is
- * offered by agent id: the one place a mode is.
+ * Is this session on Atlas's own permission-mode record
+ * (`claudePermissionMode`, the `CLAUDE_PERMISSION_MODES` list) rather than the
+ * modes its agent advertises (`acpCurrentMode`)? Read off the session — the
+ * record is there or it is not — so no branch downstream names an agent
+ * (ADR-0002). Which sessions start on it is decided once, when the tab is
+ * given its agent (`startsOnClaudeModeList`).
+ */
+export function onClaudeModeList(
+  session: Pick<ChatSession, "claudePermissionMode"> | undefined,
+): boolean {
+  return session?.claudePermissionMode !== undefined;
+}
+
+/**
+ * The one place an agent type decides which mode record a tab starts on. It
+ * is the legacy native Claude type only (`claude-code`, spawned from
+ * `claude-code-ts`), which predates ACP mode advertisement; every installable
+ * agent, the registry's Claude (`claude-acp`) included, advertises its modes
+ * and so starts on the advertised record. Everything else asks the session
+ * (`onClaudeModeList`).
+ */
+export function startsOnClaudeModeList(agentType: string | undefined): boolean {
+  return agentType === "claude-code";
+}
+
+/**
+ * Atlas's own permission-mode record (`onClaudeModeList`). The list is
+ * Atlas's (`CLAUDE_PERMISSION_MODES`), not one the agent advertises, so the
+ * knob is offered to a session that holds that record.
  */
 const claudeMode: Knob<ClaudePermissionMode> = {
   name: "permission mode",
@@ -91,18 +129,19 @@ const claudeMode: Knob<ClaudePermissionMode> = {
     pick: (session, mode) => {
       session.claudePermissionMode = mode;
       session.claudePermissionModeExplicit = true;
-      session.unrestoredModeId = undefined;
     },
     restore: (session, mode) => {
       session.claudePermissionMode = mode ?? "default";
     },
   },
-  offers: (session) => session.agentType === "claude-code",
+  taken: releaseModeHold,
+  offers: (session) => onClaudeModeList(session),
   push: (agents, key, mode) => agents.setMode(key, mode),
   // "default" means "defer to the CLI's own configured default": picking it
   // drops the remembered pick rather than storing it.
-  remember: (prefs, _session, mode) =>
-    prefs.saveMode("claude-code", mode === "default" ? null : mode),
+  remember: (prefs, session, mode) => {
+    if (session.agentType) prefs.saveMode(session.agentType, mode === "default" ? null : mode);
+  },
   unbound: "kept-for-bind",
 };
 
@@ -110,20 +149,33 @@ const claudeMode: Knob<ClaudePermissionMode> = {
  * The mode a plan approval selected. A decision about this session, so it is
  * not the user's pick: nothing is remembered and the explicit flag is left
  * alone.
+ *
+ * Offered by the session's shape, not its agent (ADR-0002, ACP audit finding
+ * 45): the approval prompt's option ids name the mode
+ * (`exitPlanModeForOption`), and the session takes it when it is on Atlas's
+ * own record, or when its agent advertises that mode (or nothing yet, taken
+ * at its word as `acpMode` is). The registry's Claude (`claude-acp`) is on
+ * the advertised record, and was the agent this used to skip.
  */
 const planExitMode: Knob<ClaudePermissionMode> = {
   // The same name as `claudeMode`: they write the same pill, so their pushes
   // are one sequence (see `Flight`).
   name: claudeMode.name,
   mirror: {
-    read: claudeMode.mirror!.read,
+    read: (session) =>
+      onClaudeModeList(session)
+        ? session.claudePermissionMode
+        : (session.acpCurrentMode as ClaudePermissionMode | undefined),
     pick: (session, mode) => {
-      session.claudePermissionMode = mode;
+      if (onClaudeModeList(session)) session.claudePermissionMode = mode;
       session.acpCurrentMode = mode;
     },
-    restore: claudeMode.mirror!.restore,
+    restore: (session, mode) => {
+      if (onClaudeModeList(session)) session.claudePermissionMode = mode ?? "default";
+      else session.acpCurrentMode = mode;
+    },
   },
-  offers: claudeMode.offers,
+  offers: (session, mode) => onClaudeModeList(session) || acpMode.offers(session, mode),
   push: claudeMode.push,
   unbound: "kept-for-bind",
 };
@@ -136,12 +188,12 @@ const acpMode: Knob<string> = {
     pick: (session, mode) => {
       session.acpCurrentMode = mode;
       session.acpModeExplicit = true;
-      session.unrestoredModeId = undefined;
     },
     restore: (session, mode) => {
       session.acpCurrentMode = mode;
     },
   },
+  taken: releaseModeHold,
   // An id the agent did not advertise is rejected (`invalidParams`). An agent
   // that has advertised nothing yet is taken at its word.
   offers: (session, mode) => {
@@ -151,7 +203,7 @@ const acpMode: Knob<string> = {
   push: (agents, key, mode) => agents.setMode(key, mode),
   // Claude's modes have their own record, written by `claudeMode`.
   remember: (prefs, session, mode) => {
-    if (session.agentType && session.agentType !== "claude-code") {
+    if (session.agentType && !onClaudeModeList(session)) {
       prefs.saveMode(session.agentType, mode);
     }
   },
@@ -231,8 +283,9 @@ function option(configId: string): Knob<boolean | string> {
  * `requested` is the user's explicit pick, or undefined when they never made
  * one. A pick the agent does not advertise is dropped in favour of whatever
  * the agent reports, because sending it would be rejected and would leave the
- * picker stuck on a mode id that does not exist. An agent that advertises no
- * modes at all is taken at its word and the pick is kept.
+ * picker stuck on a mode id that does not exist. So is a pick for a session
+ * that advertises no modes at all: it has no mode to be put in, and a
+ * `session/set_mode` would only be refused.
  */
 export function resolveEffectiveMode(
   requested: string | undefined,
@@ -240,8 +293,7 @@ export function resolveEffectiveMode(
   availableModes: readonly SessionModeInfo[],
 ): string | null {
   if (!requested) return currentMode;
-  const advertised = availableModes.length === 0 || availableModes.some((m) => m.id === requested);
-  return advertised ? requested : currentMode;
+  return availableModes.some((m) => m.id === requested) ? requested : currentMode;
 }
 
 export const KNOBS = { claudeMode, planExitMode, acpMode, model, effort, option };
@@ -297,6 +349,11 @@ export interface ReportedModes {
 /** The mode an opened session is in, and whether it is the one asked for. */
 export interface SettledMode {
   effective: string | null;
+  /**
+   * The pick holds: the session is on it, or it offers no modes, so there is
+   * no mode it could be on instead and nothing for a resume to hold sends
+   * over. False when nothing was asked for.
+   */
   honoured: boolean;
 }
 
@@ -395,8 +452,10 @@ export function createSessionConfiguration(deps: SessionConfigurationDeps): Sess
     const { mirror } = knob;
     const shown = mirror?.read(session);
     if (mirror) deps.sessions.update(tabId, (s) => mirror.pick(s, value));
+    const { taken } = knob;
     if (!key) {
       knob.remember?.(deps.prefs, session, value);
+      if (taken) deps.sessions.update(tabId, taken);
       return "kept-for-bind";
     }
 
@@ -407,6 +466,8 @@ export function createSessionConfiguration(deps: SessionConfigurationDeps): Sess
     flight.out += 1;
     try {
       await knob.push(deps.agents, key, value);
+      // Whichever pick the agent took, it is on one the user chose.
+      if (taken) deps.sessions.update(tabId, taken);
       // Pushes reach the agent in order, so the latest accepted one is what
       // it holds, whichever answer came back first.
       if (mine > flight.heldBy) {
@@ -448,6 +509,11 @@ export function createSessionConfiguration(deps: SessionConfigurationDeps): Sess
       reported.current_mode,
       reported.available_modes,
     );
+    // A session with no modes has none to put the pick in, and none more
+    // permissive than it either: nothing is pushed, and nothing is held.
+    if (reported.available_modes.length === 0) {
+      return { effective: reported.current_mode, honoured: !!requested };
+    }
     const honoured = !!requested && effective === requested;
     if (!effective || effective === reported.current_mode) return { effective, honoured };
     try {

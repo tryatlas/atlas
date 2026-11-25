@@ -427,6 +427,11 @@ fn merge_theme(parent: Value, child: Value) -> Value {
 /// JSON with comments and trailing commas — the dialect VS Code themes are
 /// actually written in, and which `serde_json` correctly refuses.
 fn strip_jsonc(source: &str) -> String {
+    // Removing comments can reveal a trailing comma's closing bracket.
+    strip_jsonc_pass(&strip_jsonc_pass(source))
+}
+
+fn strip_jsonc_pass(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     let chars: Vec<char> = source.chars().collect();
     let mut index = 0;
@@ -663,5 +668,19 @@ mod tests {
     fn a_slash_inside_a_string_is_not_a_comment() {
         let source = r#"{"a":"http://x//y","b":"/*not*/"}"#;
         assert_eq!(strip_jsonc(source), source);
+    }
+
+    #[test]
+    fn a_trailing_comma_before_a_comment_is_accepted() {
+        let source = r##"{
+            "name": "夜", // label
+            "colors": {"editor.background": "#101010", /* last color */},
+            "tokenColors": [ // scopes
+                {"scope": "comment", "settings": {"foreground": "#888888",}}, // last scope
+            ], // last member
+        }"##;
+        let value: serde_json::Value = serde_json::from_str(&strip_jsonc(source)).unwrap();
+        assert_eq!(value["name"], "夜");
+        assert_eq!(value["colors"]["editor.background"], "#101010");
     }
 }

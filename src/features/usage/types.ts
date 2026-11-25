@@ -90,6 +90,8 @@ export interface UsageDashboard {
   daily: DailyBucket[];
   /** Most-recent first, capped at `SESSION_ROW_CAP` (2000) on the Rust side. */
   sessions: SessionRow[];
+  /** Complete identities for statistics; detailed session rows are capped. */
+  sessionIdentities?: SessionIdentity[];
   sessionsTotal: number;
   byokDaily: ByokDay[];
   byokSince: string | null;
@@ -99,6 +101,11 @@ export interface UsageDashboard {
   ledgerSince: string | null;
   generatedAt: string;
 }
+
+export type SessionIdentity = Pick<
+  SessionRow,
+  "sessionId" | "projectPath" | "agent" | "model" | "startedMs" | "lastActivityMs"
+>;
 
 // ── UI state vocabulary ─────────────────────────────────────────────────────
 

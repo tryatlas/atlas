@@ -1,3 +1,4 @@
+// Modified by Atlas from upstream OpenAI Codex (Apache-2.0). See CONTEXT.md.
 use crate::invalid_data_error;
 use crate::utils::is_missing_or_empty_text_file;
 use serde_json::Value as JsonValue;
@@ -48,9 +49,26 @@ pub(crate) fn rewrite_hook_command_for_source(
         .map(str::to_string)
         .unwrap_or_else(external_agent_config_dir);
     let source_hooks_path = format!("{source_config_dir}/{EXTERNAL_AGENT_HOOKS_SUBDIR}/");
-    let command = replace_quoted_hook_paths(command, '\'', &source_hooks_path, &target_hooks_dir);
-    let command = replace_quoted_hook_paths(&command, '"', &source_hooks_path, &target_hooks_dir);
-    replace_unquoted_hook_paths(&command, &source_hooks_path, &target_hooks_dir)
+    let command = replace_quoted_hook_paths(
+        command,
+        '\'',
+        &source_hooks_path,
+        &target_hooks_dir,
+        source_external_agent_dir,
+    );
+    let command = replace_quoted_hook_paths(
+        &command,
+        '"',
+        &source_hooks_path,
+        &target_hooks_dir,
+        source_external_agent_dir,
+    );
+    replace_unquoted_hook_paths(
+        &command,
+        &source_hooks_path,
+        &target_hooks_dir,
+        source_external_agent_dir,
+    )
 }
 
 fn replace_quoted_hook_paths(
@@ -58,6 +76,7 @@ fn replace_quoted_hook_paths(
     quote: char,
     source_hooks_path: &str,
     target_hooks_dir: &Path,
+    source_external_agent_dir: &Path,
 ) -> String {
     let mut rewritten = command.to_string();
     let mut search_start = 0usize;
@@ -72,9 +91,13 @@ fn replace_quoted_hook_paths(
         if let Some(source_hooks_start) = content.find(source_hooks_path) {
             let suffix_start = source_hooks_start + source_hooks_path.len();
             let suffix = &content[suffix_start..];
-            let Some(replacement) =
-                target_hook_path_replacement(target_hooks_dir, content, source_hooks_start, suffix)
-            else {
+            let Some(replacement) = target_hook_path_replacement(
+                target_hooks_dir,
+                content,
+                source_hooks_start,
+                suffix,
+                source_external_agent_dir,
+            ) else {
                 search_start = end + quote.len_utf8();
                 continue;
             };
@@ -91,6 +114,7 @@ fn replace_unquoted_hook_paths(
     command: &str,
     source_hooks_path: &str,
     target_hooks_dir: &Path,
+    source_external_agent_dir: &Path,
 ) -> String {
     let mut rewritten = command.to_string();
     let mut search_start = 0usize;
@@ -110,6 +134,7 @@ fn replace_unquoted_hook_paths(
             &path,
             source_hooks_start - path_start,
             &suffix,
+            source_external_agent_dir,
         ) {
             rewritten.replace_range(path_start..path_end, &replacement);
             search_start = path_start + replacement.len();
@@ -205,8 +230,11 @@ fn target_hook_path_replacement(
     path: &str,
     source_hooks_start: usize,
     suffix: &str,
+    source_external_agent_dir: &Path,
 ) -> Option<String> {
-    if !is_pure_shell_path_content(path, source_hooks_start) || !is_static_hook_path_suffix(suffix)
+    if !is_pure_shell_path_content(path, source_hooks_start)
+        || !is_static_hook_path_suffix(suffix)
+        || !prefix_matches_source_scope(&path[..source_hooks_start], source_external_agent_dir)
     {
         return None;
     }
@@ -215,8 +243,39 @@ fn target_hook_path_replacement(
     ))
 }
 
+fn prefix_matches_source_scope(prefix: &str, source: &Path) -> bool {
+    let Some(source_parent) = source.parent() else {
+        return false;
+    };
+    let same_path = |left: &Path, right: &Path| {
+        left.canonicalize().unwrap_or_else(|_| left.to_path_buf())
+            == right.canonicalize().unwrap_or_else(|_| right.to_path_buf())
+    };
+    let home = dirs::home_dir();
+    let source_is_home = home
+        .as_deref()
+        .is_some_and(|home| same_path(home, source_parent));
+    let prefix = prefix.replace('"', "");
+    if matches!(prefix.as_str(), "~/" | "$HOME/" | "${HOME}/") {
+        return source_is_home;
+    }
+    let project_var = external_agent_project_dir_env_var();
+    if prefix.is_empty()
+        || prefix == "./"
+        || prefix == format!("${project_var}/")
+        || prefix == format!("${{{project_var}}}/")
+    {
+        return !source_is_home;
+    }
+    let path = Path::new(&prefix);
+    path.is_absolute() && same_path(path, source_parent)
+}
+
 fn is_static_hook_path_suffix(suffix: &str) -> bool {
     !suffix.is_empty()
+        && Path::new(suffix)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
         && !suffix
             .chars()
             .any(|ch| matches!(ch, '\\' | '$' | '`' | '*' | '?' | '[' | '{' | '}'))

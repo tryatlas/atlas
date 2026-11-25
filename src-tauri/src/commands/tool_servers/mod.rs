@@ -38,7 +38,7 @@ use rmcp::service::{RequestContext, RoleServer};
 #[allow(unused_imports)]
 pub use host::{ToolServer, ToolServerHost};
 #[allow(unused_imports)]
-pub use offers::{SessionOffers, BRIDGE_ARG};
+pub use offers::{bridge_until_session_ends, SessionOffers, BRIDGE_ARG, BRIDGE_REAP_INTERVAL};
 #[allow(unused_imports)]
 pub use tenant::{Admit, Audience, OfferDecision, OutwardCalls, Tenant};
 #[allow(unused_imports)]
@@ -59,6 +59,16 @@ pub(crate) fn tools_list(tools: Vec<Tool>) -> ListToolsResult {
     ListToolsResult::with_all_items(tools)
         .with_ttl_ms(TOOLS_LIST_TTL_MS)
         .with_cache_scope(CacheScope::Private)
+}
+
+/// The names in a `tools/list` answer: what a tenant declares it advertises
+/// ([`Tenant::advertising`]), taken from the same answer its server serves so
+/// the two cannot drift.
+pub(crate) fn tool_names(list: &ListToolsResult) -> Vec<String> {
+    list.tools
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect()
 }
 
 /// The grant of the session making this request, as the listener's token

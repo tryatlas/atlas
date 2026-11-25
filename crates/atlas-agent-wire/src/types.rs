@@ -405,4 +405,12 @@ pub struct QueuedPrompt {
     pub id: String,
     pub text: String,
     pub origin: Origin,
+    /// `text` is only the head of the prompt: a `queue_changed` delta carries
+    /// every queued item on every change, so a long one travels cut. The
+    /// whole of it is in a session snapshot, which is where a reader that
+    /// needs it (an edit, a hand-over to another session) gets it. `Some(true)`
+    /// or omitted: a whole text says nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub truncated: Option<bool>,
 }

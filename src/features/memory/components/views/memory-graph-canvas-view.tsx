@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { GraphNodeList } from "@/components/graph-node-list";
 import { Application } from "pixi.js";
-import { destroyPixiApp, registerPixiApp } from "@/lib/pixi-app";
+import { destroyPixiApp, initPixiApp, registerPixiApp } from "@/lib/pixi-app";
 import { GraphInitError } from "@/components/graph-init-error";
 import { GraphRuler, type Viewport } from "@/components/graph-ruler";
 import { graphPalette } from "@/components/graph-palette";
@@ -107,6 +107,7 @@ function Scene({
   onLayoutSave: (layout: GraphLayout) => void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
+  const latestLayout = useRef(initialLayout);
   const [viewport, setViewport] = useState<Viewport>({ x: 0, y: 0, scale: 1 });
   const [initError, setInitError] = useState<string | null>(null);
   const vpRef = useRef<Viewport>({ x: 0, y: 0, scale: 1 });
@@ -174,17 +175,16 @@ function Scene({
     const app = new Application();
     registerPixiApp(app);
     createdApp = app;
-    void app
-      .init({
-        canvas,
-        width,
-        height,
-        resolution: canvasResolution(),
-        antialias: true,
-        backgroundAlpha: 0,
-        autoDensity: true,
-        preferWebGLVersion: 1,
-      })
+    void initPixiApp(app, {
+      canvas,
+      width,
+      height,
+      resolution: canvasResolution(),
+      antialias: true,
+      backgroundAlpha: 0,
+      autoDensity: true,
+      preferWebGLVersion: 1,
+    })
       .then(() => {
         if (disposed) {
           try {
@@ -210,11 +210,14 @@ function Scene({
           width,
           height,
           sceneRef,
-          initialLayout,
+          initialLayout: latestLayout.current,
           onSelect,
           onActivate,
           onViewport: pushViewport,
-          onLayoutSave,
+          onLayoutSave: (layout) => {
+            latestLayout.current = layout;
+            onLayoutSave(layout);
+          },
           labelFontFamily: themeBase("font-sans") || "system-ui, sans-serif",
         });
       })

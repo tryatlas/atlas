@@ -1,21 +1,17 @@
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { readFileMtimeMs } from "@/features/editor/lib/editor-fs-api";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { classifyFile, type FileKind } from "@/lib/file-types";
 import { MediaViewerView } from "./views/media-viewer-view";
 import { onWindowEvent } from "@/lib/window-events";
+import { useLocalMedia } from "../lib/use-local-media";
 
 interface MediaViewerProps {
   filePath: string;
 }
 
 /**
- * Image / video / audio tab handler. Loads the local file via
- * `convertFileSrc` (Tauri's safe local-file URL) and renders the appropriate
- * HTML element with object-fit/contain to keep aspect ratio. The Tauri
- * asset protocol must allow the file's directory via `fs.allow` capabilities
- * — `read_file_content` already proves the directory is readable; for media
- * the same path is fetched directly by the webview, not through invoke.
+ * Image / video / audio tab handler. Grants the selected file before loading
+ * it, and owns the seekable native HTTP stream used by Linux audio/video.
  *
  * The asset URL is keyed only by path, so the webview serves a stale image
  * after a file at the same path is deleted and recreated. We append the file's
@@ -24,24 +20,37 @@ interface MediaViewerProps {
  */
 export function MediaViewer({ filePath }: MediaViewerProps) {
   const kind: FileKind = classifyFile(filePath);
-  const name = filePath.split("/").pop() ?? filePath;
+  const name = filePath.split(/[/\\]/).pop() ?? filePath;
 
   const [mtime, setMtime] = useState(0);
-  const refreshMtime = useCallback(() => {
-    readFileMtimeMs(filePath)
-      .then((v) => setMtime(v))
-      .catch(() => {});
-  }, [filePath]);
+  const [retry, setRetry] = useState(0);
 
   useEffect(() => {
-    refreshMtime();
-    return onWindowEvent("atlas:window-active", refreshMtime);
-  }, [refreshMtime]);
+    let alive = true;
+    const refresh = () => {
+      void readFileMtimeMs(filePath)
+        .then((v) => {
+          if (alive) setMtime(v);
+        })
+        .catch(() => {});
+    };
+    refresh();
+    const off = onWindowEvent("atlas:window-active", refresh);
+    return () => {
+      alive = false;
+      off();
+    };
+  }, [filePath]);
+  const { url, error } = useLocalMedia(filePath, kind, mtime + retry);
 
-  const src = useMemo(() => {
-    const base = convertFileSrc(filePath);
-    return mtime ? `${base}${base.includes("?") ? "&" : "?"}v=${mtime}` : base;
-  }, [filePath, mtime]);
-
-  return <MediaViewerView filePath={filePath} name={name} kind={kind} src={src} />;
+  return (
+    <MediaViewerView
+      filePath={filePath}
+      name={name}
+      kind={kind}
+      src={url}
+      error={error}
+      onRetry={() => setRetry((n) => n + 1)}
+    />
+  );
 }

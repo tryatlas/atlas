@@ -1,0 +1,38 @@
+{
+  "claude-acp": [
+    {
+      "env": "ANTHROPIC_API_KEY",
+      "value": "",
+      "why": "Blank, not unset: with a key in its environment Claude bills the API instead of the subscription the user signed in with. Setting the API key field replaces it."
+    },
+    {
+      "env": "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+      "value": "1",
+      "when": "atlasOnlyMemory",
+      "why": "Claude's own auto memory, off while Atlas's memory is the only one (code.claude.com/docs/en/memory)."
+    }
+  ],
+  "codex-acp": [
+    {
+      "json": "CODEX_CONFIG",
+      "key": "memories.use_memories",
+      "value": false,
+      "when": "atlasOnlyMemory",
+      "why": "Codex's own memories, off while Atlas's memory is the only one. The adapter ignores launch arguments, so `-c memories.…` can't reach it; CODEX_CONFIG is merged into each session's config as `-c` overrides are."
+    },
+    {
+      "json": "CODEX_CONFIG",
+      "key": "memories.generate_memories",
+      "value": false,
+      "when": "atlasOnlyMemory",
+      "why": "As above."
+    }
+  ],
+  "gemini": [
+    {
+      "env": "SURFACE",
+      "value": "atlas",
+      "why": "Identifies the host to Gemini's telemetry."
+    }
+  ]
+}

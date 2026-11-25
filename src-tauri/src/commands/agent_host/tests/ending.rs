@@ -213,12 +213,19 @@ fn observed_host(
 }
 
 async fn open_with(hold_turns: bool) -> Opened {
-    let mut script = script()
-        .supports_close()
-        .supports_load()
-        .model_catalogue(Arc::new(ScriptedCatalogue::answering(
-            atlas_acp_thread::ModelCatalogueOutcome::ReconnectRequired,
-        )));
+    open_with_close_capability(hold_turns, true).await
+}
+
+async fn open_with_close_capability(hold_turns: bool, supports_close: bool) -> Opened {
+    let mut script =
+        script()
+            .supports_load()
+            .model_catalogue(Arc::new(ScriptedCatalogue::answering(
+                atlas_acp_thread::ModelCatalogueOutcome::ReconnectRequired,
+            )));
+    if supports_close {
+        script = script.supports_close();
+    }
     if hold_turns {
         script = script.hold_prompts();
     }
@@ -273,6 +280,22 @@ async fn until(what: &str, mut done: impl FnMut() -> bool) {
 }
 
 // ---- the window lets it go ------------------------------------------------
+
+#[tokio::test]
+async fn closing_without_an_advertised_rpc_releases_the_local_session() {
+    let s = open_with_close_capability(false, false).await;
+
+    s.host
+        .drop_session(SESSION)
+        .await
+        .expect("local release must not call an unsupported close RPC");
+
+    assert_eq!(s.residue(), Residue::default());
+    assert_eq!(s.ended(), [SESSION]);
+    assert!(s.closes().is_empty());
+    assert!(s.host.manager().connected(&Agent::Native).is_some());
+    s.done();
+}
 
 #[tokio::test]
 async fn closing_a_session_ends_it_whole_and_once() {
@@ -989,4 +1012,106 @@ async fn a_bind_refused_after_a_kill_keeps_the_row_that_was_there_before() {
         "the refused bind deleted a row it did not create"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- a running turn is cancelled before its session goes (audit #85) -------
+
+/// Open a session holding its turns and start one, waiting until the agent
+/// has it.
+async fn open_running() -> Opened {
+    let s = open_with(true).await;
+    s.host
+        .submit(&s.key, Prompt::text("go"), Origin::Local, SubmitPolicy::Now)
+        .expect("send");
+    until("the turn never reached the agent", || {
+        s.fake.prompts_started() == 1 && s.host.agent_turn_running(ATLAS_AGENT_ID)
+    })
+    .await;
+    s
+}
+
+/// Where the agent was told to cancel, among everything it was sent.
+fn cancel_at(s: &Opened) -> Option<usize> {
+    s.fake
+        .calls()
+        .iter()
+        .position(|call| matches!(call, atlas_acp_thread::test_support::FakeCall::Cancel(_)))
+}
+
+fn close_at(s: &Opened) -> Option<usize> {
+    s.fake.calls().iter().position(|call| {
+        matches!(
+            call,
+            atlas_acp_thread::test_support::FakeCall::CloseSession(_)
+        )
+    })
+}
+
+#[tokio::test]
+async fn closing_a_tab_cancels_its_running_turn_before_the_close() {
+    let s = open_running().await;
+    s.host.drop_session(SESSION).await.expect("drop");
+    let cancel = cancel_at(&s).expect("the running turn was never cancelled");
+    assert!(
+        cancel < close_at(&s).expect("closed"),
+        "the agent was told to close a session still working: {:?}",
+        s.fake.call_names()
+    );
+    s.done();
+}
+
+#[tokio::test]
+async fn the_last_hold_going_after_the_tab_cancels_the_running_turn() {
+    let s = open_running().await;
+    s.host.hold_session(SESSION, "rc:a").expect("held");
+    s.host.drop_session(SESSION).await.expect("drop");
+    assert_eq!(cancel_at(&s), None, "a held session keeps working");
+
+    s.host
+        .release_session(SESSION, "rc:a")
+        .await
+        .expect("release");
+    let cancel = cancel_at(&s).expect("the running turn was never cancelled");
+    assert!(cancel < close_at(&s).expect("closed"));
+    s.done();
+}
+
+#[tokio::test]
+async fn turning_an_agent_off_cancels_its_running_turns() {
+    let s = open_running().await;
+    s.host.kill_plugin(ATLAS_AGENT_ID).expect("kill");
+    assert!(
+        cancel_at(&s).is_some(),
+        "the turn kept running headless: {:?}",
+        s.fake.call_names()
+    );
+    s.done();
+}
+
+#[tokio::test]
+async fn quitting_cancels_every_running_turn() {
+    let s = open_running().await;
+    s.host.shutdown();
+    assert!(
+        cancel_at(&s).is_some(),
+        "the turn kept running headless: {:?}",
+        s.fake.call_names()
+    );
+    s.done();
+}
+
+/// The registry can end a session without the host's say (the turn's record
+/// is gone before anything cancelled it): the turn's own task still cancels
+/// the agent, through the thread it was sent on, rather than looking the
+/// session up by an id that no longer names anything.
+#[tokio::test]
+async fn a_turn_whose_record_is_gone_still_cancels_the_agent() {
+    let s = open_running().await;
+    let ended = s.host.sessions.close(SESSION);
+    assert!(matches!(ended, Closed::Ended(_)));
+    until("the turn's task never cancelled the agent", || {
+        cancel_at(&s).is_some()
+    })
+    .await;
+    s.done();
 }

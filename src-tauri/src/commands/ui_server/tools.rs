@@ -264,6 +264,7 @@ impl ServerHandler for UiTools {
 pub fn tenant(tools: UiTools) -> Tenant {
     let gate = tools.gate.clone();
     Tenant::new(UI_SERVER_NAME, UI_PATH, tools)
+        .advertising(crate::commands::tool_servers::tool_names(&tools_list()))
         .only_for(Audience::UiControl)
         .admitted_by(move |cwd, grant| {
             if !gate(cwd) {

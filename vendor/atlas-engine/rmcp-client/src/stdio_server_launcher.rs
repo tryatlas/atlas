@@ -378,13 +378,18 @@ impl LocalStdioServerLauncher {
 
         if let Some(stderr) = stderr {
             tokio::spawn(async move {
-                let mut reader = BufReader::new(stderr).lines();
+                let mut reader = BufReader::new(stderr);
+                let mut line = Vec::new();
                 loop {
-                    match reader.next_line().await {
-                        Ok(Some(line)) => {
-                            info!("MCP server stderr ({program_name}): {line}");
+                    line.clear();
+                    match reader.read_until(b'\n', &mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            info!(
+                                "MCP server stderr ({program_name}): {}",
+                                String::from_utf8_lossy(&line).trim_end_matches(['\r', '\n'])
+                            );
                         }
-                        Ok(None) => break,
                         Err(error) => {
                             warn!("Failed to read MCP server stderr ({program_name}): {error}");
                             break;
@@ -696,6 +701,36 @@ mod tests {
     use atlas_engine_protocol::config_types::EnvironmentVariablePattern;
     use atlas_engine_protocol::config_types::ShellEnvironmentPolicy;
     use atlas_engine_protocol::shell_environment;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_utf8_stderr_keeps_the_pipe_open_and_the_server_alive() {
+        let launcher = LocalStdioServerLauncher::new(std::env::current_dir().unwrap());
+        let script = r#"printf '\377\n' >&2
+head -c 262144 /dev/zero >&2 || exit 19
+printf '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n'
+"#;
+        let mut transport = launcher
+            .launch(StdioServerCommand::new(
+                "/bin/sh".into(),
+                vec!["-c".into(), script.into()],
+                None,
+                Vec::new(),
+                None,
+                McpProtocolMode::Legacy,
+            ))
+            .await
+            .unwrap();
+        let notification =
+            tokio::time::timeout(std::time::Duration::from_secs(5), transport.receive())
+                .await
+                .expect("stderr draining must continue after invalid UTF-8");
+        assert!(
+            notification.is_some(),
+            "server must survive writing stderr after invalid UTF-8"
+        );
+        transport.close().await.unwrap();
+    }
 
     #[test]
     fn remote_env_policy_uses_core_env_without_remote_source_vars() {

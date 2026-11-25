@@ -60,3 +60,13 @@ export async function copyText(text: string): Promise<boolean> {
     }
   }
 }
+
+/** Native clipboard access also works when WebKitGTK denies readText. */
+export async function readClipboardText(): Promise<string> {
+  try {
+    return await invoke<string>("clipboard_read_text");
+  } catch (nativeError) {
+    if (!globalThis.navigator?.clipboard?.readText) throw nativeError;
+    return navigator.clipboard.readText();
+  }
+}

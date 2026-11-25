@@ -4,8 +4,9 @@
  * binding (which is what releases a held first message).
  *
  * The panel's hook (`hooks/use-agent-bind.ts`) is a thin caller: it attaches
- * while its tab has no session, kicks once the tab is on screen or sent to,
- * and detaches. Everything a test needs is a parameter (`SessionBindDeps`).
+ * while its tab has no session, warms (connects the agent, no session) once
+ * the tab is on screen, kicks once the user writes or sends, and detaches.
+ * Everything a test needs is a parameter (`SessionBindDeps`).
  *
  * What a tab+agent pair has already been through (a failure reported, the one
  * silent retry spent, sign-in offered) outlives any one mount of the panel, so
@@ -27,12 +28,12 @@ import { useAppStore } from "@/features/app/stores/app-store";
 import { logEvent } from "@/features/log/lib/log";
 import { notifyAgentSignInRequired } from "@/features/notifications/lib/agent-notifier";
 import type { AgentInfo } from "@/types/acp";
-import { agentTypeFromPluginId, CLAUDE_PERMISSION_MODES, pluginIdForAgent } from "@/types/agent";
+import { agentTypeFromPluginId, isClaudePermissionMode, pluginIdForAgent } from "@/types/agent";
 import { sessionConfiguration, useChatStore } from "../stores/chat-store";
 import { bindFailureAction, errInfo, promptSignIn } from "./agent-signin";
 import { promptAtlasSignIn } from "./atlas-sign-in-prompt";
 import { agents, ensureAgent, resetAgent } from "./agents-api";
-import { KNOBS, type SessionConfiguration } from "./session-configuration";
+import { KNOBS, onClaudeModeList, type SessionConfiguration } from "./session-configuration";
 import { projectPathForTab } from "./tab-project";
 import { isDeadlineError, progressSince, withDeadline } from "./with-deadline";
 
@@ -60,7 +61,10 @@ const BIND_DEADLINE_MS = 3 * 60_000;
 const REAPPLY_DEADLINE_MS = 5_000;
 
 /** What the bind asks of the agents backend (`agents-api.ts`). */
-export type BindAgentsPort = Pick<typeof agents, "newSession" | "snapshotMeta" | "killPlugin">;
+export type BindAgentsPort = Pick<
+  typeof agents,
+  "newSession" | "snapshotMeta" | "killPlugin" | "dropSession"
+>;
 
 type ChatState = ReturnType<typeof useChatStore.getState>;
 
@@ -101,10 +105,19 @@ export interface BindControl {
   abandon: () => void;
   /** Make sure an attempt is running. */
   kick: () => void;
+  /** The tab is on screen. A new chat connects its agent and starts no
+   *  session: the session is the user's to start, by writing or sending
+   *  (`kick`). A saved conversation is reloaded. */
+  warm: () => void;
 }
 
 /** One mounted panel's hold on its tab's bind. */
 export interface BindAttachment extends BindControl {
+  /** The user asked this tab for a session (wrote, or sent) and none is
+   *  bound yet. Outlives one attachment, so that a panel attaching again at
+   *  once (the tab switched agent mid-start) carries the start on for the
+   *  new agent; gone with the tab's last panel, and on Stop. */
+  wanted: () => boolean;
   /** The panel is gone, or its tab is bound: whatever the attempt in flight
    *  answers from here on is dropped. */
   detach: () => void;
@@ -163,6 +176,9 @@ export function createSessionBind(deps: SessionBindDeps): SessionBind {
   const signInAttempted = new Set<string>();
   /** The bind each tab's mounted panels share. Gone with its last panel. */
   const tabs = new Map<string, TabBind>();
+  /** Tabs whose user asked for a session that is not bound yet
+   *  (`BindAttachment.wanted`). */
+  const wanted = new Set<string>();
 
   /** Await a bind hop, logging once if it stalls. The hop itself is untouched —
    *  the deadline that actually ends it is `withDeadline`. */
@@ -194,10 +210,18 @@ export function createSessionBind(deps: SessionBindDeps): SessionBind {
     let detached = false;
 
     const ensureBound = async () => {
-      if (tab.holders === 0 || tab.pending) return;
+      if (tab.holders === 0) return;
+      wanted.add(tabId);
+      if (tab.pending) return;
       tab.pending = true;
       const myEpoch = ++tab.epoch;
       const stale = () => myEpoch !== tab.epoch;
+      /** A session `session/new` made that no tab holds yet. An attempt that
+       *  ends before binding it (Stop, Restart, an agent switch mid-bind, a
+       *  failure after the create) drops it in `finally`: nothing else knows
+       *  it exists, so it would live in the backend until the agent quits
+       *  (ACP audit finding 11). */
+      let orphan: { agent_id: string; session_id: string } | null = null;
       try {
         // Bind to THIS session's chosen agent (Claude by default, or Codex),
         // not a single global default — so per-tab agents run in parallel.
@@ -240,6 +264,7 @@ export function createSessionBind(deps: SessionBindDeps): SessionBind {
           tabId,
         );
         const key = init.key;
+        orphan = key;
         if (stale()) return;
         // Guard against an agent switch that landed mid-bind: if the tab's
         // agentType changed since we picked `pluginId`, this binding is for the
@@ -254,44 +279,42 @@ export function createSessionBind(deps: SessionBindDeps): SessionBind {
         // bypassPermissions and still trigger a stray prompt on turn one.
         // Awaiting here guarantees the agent is in the right mode first.
         const session = deps.chat().sessions[tabId];
-        const selectedMode = session?.claudePermissionMode ?? "default";
-        // `default` means the user has not overridden the agent. Preserve the
-        // mode resolved by Claude/Codex from their own user-level config.
-        const requestedClaudeMode = session?.claudePermissionModeExplicit
-          ? selectedMode
-          : undefined;
-        const requestedAcpMode = session?.acpModeExplicit ? session.acpCurrentMode : undefined;
-        const requestedMode = nowAt === "claude-code" ? requestedClaudeMode : requestedAcpMode;
+        // Which record the tab's pick lives in is the session's own
+        // (`onClaudeModeList`), never the agent's id (ADR-0002). An unset or
+        // undeclared pick means the user has not overridden the agent: it
+        // keeps the mode it resolved from its own user-level config.
+        const ownRecord = onClaudeModeList(session);
+        const requestedMode = ownRecord
+          ? session?.claudePermissionModeExplicit
+            ? (session.claudePermissionMode ?? "default")
+            : undefined
+          : session?.acpModeExplicit
+            ? session.acpCurrentMode
+            : undefined;
         // The same call the resume path makes, so a mode means the same
         // thing whether a session is new or reopened (`resume-mode.ts`). A
         // pick the agent refuses leaves it in its own mode, and that is the
         // mode seeded below.
         const settled = await deps.configuration.settleMode(key, requestedMode ?? undefined, init);
         if (stale()) return;
-        const effectiveMode = settled.effective;
+        const effectiveMode = settled.effective ?? init.current_mode;
         // Seed the store before binding: binding is the point at which queued
         // sends become eligible, so the first prompt sees the agent's actual
         // default instead of a hard-coded Atlas fallback.
         if (!stale()) {
           const actions = deps.chat().actions;
-          if (
-            nowAt === "claude-code" &&
-            (effectiveMode ?? init.current_mode) &&
-            CLAUDE_PERMISSION_MODES.includes(
-              (effectiveMode ?? init.current_mode) as (typeof CLAUDE_PERMISSION_MODES)[number],
-            )
-          ) {
-            actions.hydrateClaudePermissionMode(
-              tabId,
-              (effectiveMode ?? init.current_mode) as (typeof CLAUDE_PERMISSION_MODES)[number],
-            );
-          } else if (nowAt !== "claude-code" && init.available_modes.length > 0) {
-            actions.setAcpModes(tabId, effectiveMode, init.available_modes, nowAt);
+          if (ownRecord) {
+            if (isClaudePermissionMode(effectiveMode)) {
+              actions.hydrateClaudePermissionMode(tabId, effectiveMode);
+            }
+          } else if (init.available_modes.length > 0) {
+            actions.setAcpModes(tabId, settled.effective, init.available_modes, nowAt);
           }
           // The picker shows the AGENT's mode now, which the user never
-          // chose: it is not a pick the next resume should ask for. (Claude's
-          // `hydrateClaudePermissionMode` drops its flag the same way.)
-          if (requestedMode && !settled.honoured && nowAt !== "claude-code") {
+          // chose: it is not a pick the next resume should ask for. (On the
+          // own record, `hydrateClaudePermissionMode` drops its flag the same
+          // way.)
+          if (requestedMode && !settled.honoured && !ownRecord) {
             actions.dropAcpModePick(tabId);
           }
         }
@@ -302,8 +325,21 @@ export function createSessionBind(deps: SessionBindDeps): SessionBind {
         // a rebind, the model the conversation was already on.
         const pickedModel = deps.chat().sessions[tabId]?.acpCurrentModel;
         if (pickedModel) {
-          await deps.configuration.apply(key, KNOBS.model, pickedModel);
+          const taken = await deps.configuration.apply(key, KNOBS.model, pickedModel);
           if (stale()) return;
+          // Refused (ACP audit finding 40): the agent stays on its own model, so the picker
+          // must not keep showing this one. Dropping the pick is what lets the
+          // snapshot below seed the model the agent is actually on.
+          if (!taken && deps.chat().sessions[tabId]?.acpCurrentModel === pickedModel) {
+            deps.chat().actions.dropAcpModelPick(tabId);
+            deps.report.log({
+              source: "atlas",
+              kind: "agent-bind",
+              summary: `${label}: refused the model ${pickedModel}; staying on its own`,
+              status: "failure",
+              payload: { tabId },
+            });
+          }
         }
         // The tab's session, once the binding below is out. Until then the
         // attempt can only be let go (`stale`); after it, binding is exactly
@@ -349,6 +385,8 @@ export function createSessionBind(deps: SessionBindDeps): SessionBind {
         if (stale()) return;
         deps.chat().actions.setAcpBinding(tabId, agent.agent_id, key.session_id, cwd);
         exposed = true;
+        orphan = null;
+        wanted.delete(tabId);
         // Bound successfully — re-arm the failure toast so a LATER breakage
         // (agent crashes, gets uninstalled) is reported again rather than
         // swallowed by the earlier dedupe. Same for the sign-in offer: a token
@@ -479,23 +517,22 @@ export function createSessionBind(deps: SessionBindDeps): SessionBind {
             }, BIND_RETRY_MS);
             return;
           }
-          // The first message held for this bind cannot go out: drop the
-          // "starting" state and park the text in the queue instead, where
-          // it stays visible (and retryable) beside the failure reported
-          // below. Its bubble stays in the transcript.
+          // The first message held for this bind cannot go out yet: drop the
+          // "starting" state and keep it held, idle, beside the failure
+          // reported below. Its bubble stays in the transcript, and the next
+          // bind that lands (a retry, a sign-in, the next send's kick) sends
+          // it as it was — with its images (ACP audit finding 73) and as that bubble (ACP audit finding 81). The
+          // queue it used to be parked in carries text only: the images were
+          // dropped, and the prompt was drawn a second time when it drained.
+          // No loop: a held message only goes out on a bind landing.
           const held = deps.chat().sessions[tabId]?.pendingSend;
-          if (held) {
-            const actions = deps.chat().actions;
-            actions.setPendingSend(tabId, undefined);
-            actions.updateSessionStatus(tabId, "idle");
-            actions.enqueueMessage(tabId, held.content, held.mentions ?? []);
-          }
-          // A message is sitting in the queue waiting on this bind: the user
-          // is watching, so the failure is reported even if an earlier one
-          // for this tab+agent already was. The dedupe exists to stop the
-          // focus-retry re-toasting into the void, not to hide the reason a
-          // send never went out.
-          const waiting = (deps.chat().queues[tabId]?.length ?? 0) > 0;
+          if (held) deps.chat().actions.updateSessionStatus(tabId, "idle");
+          // A message is waiting on this bind: the user is watching, so the
+          // failure is reported even if an earlier one for this tab+agent
+          // already was. The dedupe exists to stop the focus-retry
+          // re-toasting into the void, not to hide the reason a send never
+          // went out.
+          const waiting = !!held || (deps.chat().queues[tabId]?.length ?? 0) > 0;
           if (waiting || !reportedBindFailures.has(key)) {
             reportedBindFailures.add(key);
             // Cursor (and friends) reject `session/new` when signed out, so the
@@ -518,10 +555,16 @@ export function createSessionBind(deps: SessionBindDeps): SessionBind {
                   reportedBindFailures.delete(key);
                   void ensureBound();
                 },
-                // Dismissed without signing in: re-arm reporting only. The
-                // dedupe key used to stay set forever, silently swallowing
-                // every subsequent bind failure for this tab+agent.
-                onDismissed: () => reportedBindFailures.delete(key),
+                // Dismissed without signing in: re-arm reporting, and the
+                // offer (ACP audit finding 72). The dedupe key used to stay set forever,
+                // silently swallowing every subsequent bind failure for this
+                // tab+agent; and with the offer spent, the next failure said
+                // the agent "still reports no credentials after signing in"
+                // to a user who never signed in, with no way back to the dialog.
+                onDismissed: () => {
+                  reportedBindFailures.delete(key);
+                  signInAttempted.delete(key);
+                },
               });
               // The dialog is up; if the user is away it is also a banner.
               deps.report.signInBanner(tabId, at);
@@ -552,10 +595,26 @@ export function createSessionBind(deps: SessionBindDeps): SessionBind {
           }
         }
       } finally {
+        if (orphan) {
+          const { agent_id, session_id } = orphan;
+          void deps.agents.dropSession(agent_id, session_id).catch(() => {});
+        }
         // A superseded attempt does not release the flag: the attempt that
         // replaced it owns `pending` now.
         if (myEpoch === tab.epoch) tab.pending = false;
       }
+    };
+
+    /** Connect the tab's agent ahead of the session the user may start, so
+     *  that start costs only `session/new`, and let the mode pill show the
+     *  agent's cached modes instead of loading. Silent: a connect that fails
+     *  is retried, and reported, by the bind a write or a send starts. */
+    const warm = () => {
+      if (tab.holders === 0 || tab.pending) return;
+      const session = deps.chat().sessions[tabId];
+      if (!session || session.acpSessionId) return;
+      deps.chat().actions.setAcpModesPending(tabId, false);
+      void deps.connect(pluginIdForAgent(session.agentType)).catch(() => {});
     };
 
     /** Make the attempt in flight stale and free the tab for the next one. */
@@ -574,8 +633,14 @@ export function createSessionBind(deps: SessionBindDeps): SessionBind {
         retriedBinds.delete(key);
         void ensureBound();
       },
-      abandon: supersede,
+      abandon: () => {
+        // Stop: the user let go of this start, so nothing carries it on.
+        wanted.delete(tabId);
+        supersede();
+      },
       kick: () => void ensureBound(),
+      warm,
+      wanted: () => wanted.has(tabId),
       detach: () => {
         if (detached) return;
         detached = true;
@@ -585,6 +650,13 @@ export function createSessionBind(deps: SessionBindDeps): SessionBind {
         // dropped. A panel that mounts later starts from a clean entry.
         supersede();
         if (tabs.get(tabId) === tab) tabs.delete(tabId);
+        // The request goes with the panel, unless one attaches again at once:
+        // an agent switch detaches and re-attaches in the same commit, and
+        // carries the start on (`wanted`). A panel that mounts later must not
+        // start a session nobody is asking for any more.
+        setTimeout(() => {
+          if (!tabs.has(tabId)) wanted.delete(tabId);
+        }, 0);
       },
     };
   }
@@ -594,6 +666,7 @@ export function createSessionBind(deps: SessionBindDeps): SessionBind {
     reset() {
       for (const tab of tabs.values()) tab.epoch += 1;
       tabs.clear();
+      wanted.clear();
       reportedBindFailures.clear();
       retriedBinds.clear();
       signInAttempted.clear();

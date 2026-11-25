@@ -69,7 +69,11 @@ export const CommentRow = memo(function CommentRow({
 
   const run = (action: () => Promise<void>) => {
     setBusy(true);
-    void action().finally(() => setBusy(false));
+    void action()
+      .catch((error: unknown) =>
+        toast.error("Couldn't update the comment", { description: String(error) }),
+      )
+      .finally(() => setBusy(false));
   };
 
   return (

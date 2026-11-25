@@ -566,7 +566,8 @@ async fn what_a_session_is_offered() {
                 assert!(offer.ask_first().asks_every_time(ORG_SERVER_NAME, tool));
             }
         } else {
-            assert_eq!(offer.ask_first(), &atlas_agent_servers::AskFirst::none());
+            assert!(asking.is_empty(), "{what}");
+            assert_eq!(offer.ask_first().every_time_tools().count(), 0, "{what}");
         }
     }
 }
@@ -676,6 +677,50 @@ async fn no_tenants_sessions_idle_out() {
 
 // ── One token per session ────────────────────────────────────────────────────
 
+/// #86: ACP scopes a session id to its connection, so two agents can both
+/// answer `"1"`. Each one's offer binds its own token: the second bind is not
+/// a rebind of the first agent's session, and the first agent's session
+/// ending revokes only its own token.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_agents_with_the_same_session_id_keep_their_own_mcp_tokens() {
+    let (tenants, _) = four_tenants(ALL_ON);
+    let host = ToolServerHost::running(tenants).await;
+    let offers = SessionOffers::new(host.clone());
+    let session = acp::SessionId::new("1");
+
+    let native = offers.offer(&request(NATIVE));
+    let native_token = offered_entries(&native)[0].2.clone();
+    native.bind(&session);
+    let acp_offer = offers.offer(&request(ACP));
+    let acp_token = offered_entries(&acp_offer)[0].2.clone();
+    acp_offer.bind(&session);
+
+    assert_ne!(native_token, acp_token);
+    let tokens = host.tokens();
+    assert_eq!(
+        tokens.token_of("atlas-agent", "1"),
+        Some(native_token.clone()),
+        "the second agent's bind left the first agent's token live"
+    );
+    assert_eq!(tokens.token_of("claude-code", "1"), Some(acp_token.clone()));
+    assert!(tokens.grant(&native_token).is_some());
+    assert_eq!(
+        tokens.grant_for_session("1"),
+        None,
+        "a bare id two agents share answers under neither grant"
+    );
+
+    crate::commands::agent_host::SessionLifecycle::session_ended(&**tokens, "1", "claude-code");
+    assert!(
+        tokens.grant(&acp_token).is_none(),
+        "its own token is revoked"
+    );
+    assert!(
+        tokens.grant(&native_token).is_some(),
+        "the other agent's session keeps its token"
+    );
+}
+
 /// The session's one token opens every tenant; a token the host never minted
 /// opens none; and when the session ends its token stops working on all of
 /// them at once, even on a connection it already opened.
@@ -707,7 +752,7 @@ async fn every_tenant_admits_the_sessions_token_and_no_other() {
         open.push((path, url, client, tool));
     }
 
-    host.tokens().revoke("s1");
+    host.tokens().revoke("atlas-agent", "s1");
     for (path, url, client, tool) in open {
         // A call, not a list: the client answers a list from its cache.
         let refused = client

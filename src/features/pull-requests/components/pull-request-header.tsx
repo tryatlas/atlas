@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 // The header's parts: the crumbs row (repository and number, swapped for the
 // number and title once the title has scrolled away), the title editor, the
 // expanded body (author, checkout command, base ← head, files and diff stat),
@@ -212,8 +213,8 @@ export function PullRequestTitleEditor({
         aria-label="Pull request title"
         onChange={(event) => setDraft(event.target.value)}
         onKeyDown={(event) => {
-          if (event.nativeEvent.isComposing) return;
-          if (event.key === "Enter") {
+          if (isComposingKey(event)) return;
+          if (event.key === "Enter" && !isComposingKey(event)) {
             event.preventDefault();
             save(draft);
           } else if (event.key === "Escape") {

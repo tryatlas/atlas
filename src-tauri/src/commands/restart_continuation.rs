@@ -73,18 +73,16 @@ pub fn start(app: &AppHandle, host: Arc<AgentHost>) {
                 tracing::info!(%thread_id, continuations = turn.continuations, "letting a cut-short turn go");
                 continue;
             }
-            host.expect_continuation(thread_id, turn.continuations + 1);
             let host = host.clone();
             tauri::async_runtime::spawn(async move {
                 let wake = PendingWake {
                     source: WakeSource::Restart,
+                    restart_continuations: turn.continuations + 1,
                     thread_id,
                     text: CONTINUE_PROMPT.to_owned(),
                     summary: SUMMARY.to_owned(),
                 };
                 if let Err(e) = host.wake(wake).await {
-                    // Its next turn is the user's own, not a continuation.
-                    host.expect_continuation(thread_id, 0);
                     tracing::warn!(%thread_id, error = %e, "could not continue a turn cut short by the restart");
                 }
             });

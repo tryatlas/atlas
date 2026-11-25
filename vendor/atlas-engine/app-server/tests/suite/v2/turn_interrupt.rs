@@ -31,6 +31,16 @@ const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 
 #[tokio::test]
 async fn turn_interrupt_aborts_running_turn() -> Result<()> {
+    assert_turn_interrupt_aborts(true).await
+}
+
+#[tokio::test]
+async fn turn_interrupt_accepts_the_just_started_turn_without_waiting_for_notifications()
+-> Result<()> {
+    assert_turn_interrupt_aborts(false).await
+}
+
+async fn assert_turn_interrupt_aborts(wait_for_command: bool) -> Result<()> {
     // TODO(anp): Remove after the long-running command fixture can run in the selected remote environment.
     skip_if_remote!(
         Ok(()),
@@ -98,8 +108,10 @@ async fn turn_interrupt_aborts_running_turn() -> Result<()> {
         .await?;
     let turn_id = turn.id.clone();
 
-    // Give the command a brief moment to start.
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    if wait_for_command {
+        // Also cover interruption after command execution has started.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 
     let thread_id = thread.id.clone();
     // Interrupt the in-progress turn by id (v2 API).

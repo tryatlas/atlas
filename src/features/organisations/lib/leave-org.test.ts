@@ -26,7 +26,7 @@ vi.mock("@/features/comms/stores/comms-store", () => ({
 }));
 vi.mock("@/features/comms/lib/comms-api", () => ({ comms: { ready: async () => {} } }));
 vi.mock("@/features/layout/stores/layout-store", () => ({
-  useLayoutStore: { getState: () => ({}) },
+  useLayoutStore: { getState: () => ({ tabs: [], viewsByWs: {}, currentViewWsId: null }) },
 }));
 vi.mock("@/features/spaces/stores/spaces-store", () => ({
   useSpacesStore: { getState: () => ({}) },

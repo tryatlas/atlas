@@ -12,6 +12,7 @@ import { useEditorStore } from "@/features/editor/stores/editor-store";
 import type { RevealTarget } from "@/features/editor/lib/reveal";
 import { classifyFile, type FileKind } from "@/lib/file-types";
 import type { FileTabType } from "@/lib/tab-registry";
+import { normalisePath } from "./file-links";
 
 export type { RevealTarget };
 
@@ -29,7 +30,14 @@ export interface OpenFileOptions {
 /** The one tab id a text file opens under. Every opener must use it, or the
  *  same file ends up in two tabs and a reveal lands in the wrong one. */
 export function editorTabId(path: string): string {
-  return `editor:${path}`;
+  return `editor:${canonicalFilePath(path)}`;
+}
+
+/** Windows openers use both native and slash separators for the same file. */
+export function canonicalFilePath(path: string): string {
+  if (/^[a-z]:[\\/]/i.test(path)) return normalisePath(path) ?? path;
+  if (path.startsWith("\\\\")) return path.replace(/\\/g, "/");
+  return path;
 }
 
 /** Resolve the file kind, sniffing the bytes for unrecognized extensions:
@@ -51,6 +59,7 @@ export async function fileKindOf(path: string): Promise<FileKind> {
  *  return the tab id. For a caller that already knows the kind (a file it has
  *  just written as text, say); everything else should use {@link openFile}. */
 export function openFileAs(path: string, kind: FileKind, opts?: OpenFileOptions): string {
+  path = canonicalFilePath(path);
   const tabType = tabTypeFor(kind);
   const title = path.split("/").pop() ?? path;
   // `id` is stable per path + tabType so reopening the same file restores

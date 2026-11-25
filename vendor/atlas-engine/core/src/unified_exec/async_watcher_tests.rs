@@ -31,6 +31,12 @@ struct StreamingOutputHarness {
 }
 
 async fn streaming_output_harness() -> anyhow::Result<StreamingOutputHarness> {
+    streaming_output_harness_with_initial(&[]).await
+}
+
+async fn streaming_output_harness_with_initial(
+    initial: &[u8],
+) -> anyhow::Result<StreamingOutputHarness> {
     let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
     let (stdout_tx, stdout_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
@@ -57,7 +63,26 @@ async fn streaming_output_harness() -> anyhow::Result<StreamingOutputHarness> {
         "streaming-output-test".to_string(),
     );
     let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
-    start_streaming_output(&process, &context, Arc::clone(&transcript));
+    if !initial.is_empty() {
+        stdout_tx
+            .send(initial.to_vec())
+            .expect("initial process output");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while process
+                .output_handles()
+                .output_buffer
+                .lock()
+                .await
+                .to_bytes_with_omission_marker()
+                != initial
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("process must buffer output before watcher attachment");
+    }
+    start_streaming_output(&process, &context, Arc::clone(&transcript)).await;
 
     Ok(StreamingOutputHarness {
         process,
@@ -67,6 +92,44 @@ async fn streaming_output_harness() -> anyhow::Result<StreamingOutputHarness> {
         context,
         rx_event,
     })
+}
+
+#[tokio::test]
+async fn streaming_replays_startup_output_and_keeps_split_utf8_intact() -> anyhow::Result<()> {
+    let StreamingOutputHarness {
+        process,
+        stdout_tx,
+        exit_tx,
+        transcript,
+        rx_event,
+        ..
+    } = streaming_output_harness_with_initial(b"EARLY\n").await?;
+    let output_drained = process.output_drained_notify();
+    let drained = output_drained.notified();
+    tokio::pin!(drained);
+    drained.as_mut().enable();
+    for byte in "界".as_bytes() {
+        stdout_tx.send(vec![*byte]).unwrap();
+        tokio::task::yield_now().await;
+    }
+    exit_tx.send(0).unwrap();
+    drop(stdout_tx);
+    tokio::time::timeout(Duration::from_secs(2), drained).await?;
+    let expected = "EARLY\n界";
+    assert_eq!(
+        transcript.lock().await.to_bytes_with_omission_marker(),
+        expected.as_bytes()
+    );
+    let mut rendered = String::new();
+    while let Ok(event) = rx_event.try_recv() {
+        if let EventMsg::ExecCommandOutputDelta(delta) = event.msg {
+            rendered.push_str(
+                std::str::from_utf8(&delta.chunk).expect("every live delta must be complete UTF-8"),
+            );
+        }
+    }
+    assert_eq!(rendered, expected);
+    Ok(())
 }
 
 #[tokio::test]

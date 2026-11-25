@@ -79,7 +79,8 @@ pub use checkpoint::{
 pub use error::{Error, Result};
 pub use health::{evaluate as evaluate_health, CaptureHealth, HealthState, HostSignals};
 pub use import::{
-    import_all, preview as import_preview, ImportOutcome, ImportPreview, TranscriptSource,
+    import_all, import_all_filtered, preview as import_preview, ImportOutcome, ImportPreview,
+    TranscriptSource,
 };
 pub use model::{
     AgentEdit, Binding, Checkpoint, FailedCall, FileTouch, LinkState, Message, Mode,

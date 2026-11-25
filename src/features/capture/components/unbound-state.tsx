@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { useSlugAvailability } from "../hooks/use-slug-availability";
 import { captureEnableLocal, captureGitInit } from "../lib/capture-api";
 import type { CloudDraft, CloudOrg, RunAction } from "../lib/capture-flow";
-import type { Detection, ImportPreview, ProjectMode } from "../types";
+import type { ConnectPick, Detection, ImportPreview, ProjectMode } from "../types";
 import { ConnectTab } from "./connect-tab";
 import { Tabs } from "./views/controls";
 import { UnboundCreateView } from "./views/unbound-create-view";
@@ -21,6 +21,7 @@ export function UnboundState({
   onRetryPreview,
   onCancel,
   onCloudEnable,
+  onConnect,
 }: {
   projectPath: string;
   detection: Detection | null;
@@ -35,6 +36,7 @@ export function UnboundState({
   onRetryPreview: () => void;
   onCancel: () => void;
   onCloudEnable: (draft: CloudDraft) => void;
+  onConnect: (pick: ConnectPick) => void;
 }) {
   const [tab, setTab] = useState<"create" | "connect">("create");
   const [mode, setMode] = useState<ProjectMode>("local");
@@ -149,8 +151,8 @@ export function UnboundState({
             cloudOrgs={cloudOrgs}
             cloudReason={cloudReason}
             busy={busy}
-            run={run}
             onCancel={onCancel}
+            onContinue={onConnect}
           />
         </div>
       )}

@@ -66,7 +66,11 @@ export interface AuthEnvStatus {
   label: string | null;
   optional: boolean;
   satisfied: boolean;
-  source: "process-env" | "shell-env" | null;
+  /** Where the agent gets it from: Atlas's own environment, a provider key
+   *  from the shell profile, or the agent's own settings. `null` when it
+   *  doesn't reach the agent — including a variable only the shell profile
+   *  sets that Atlas doesn't pass on. */
+  source: "process-env" | "shell-env" | "agent-settings" | null;
 }
 
 export interface AuthRunDone {
@@ -176,8 +180,24 @@ export const agents = {
   //    `queue_changed`) ───────────────────────────────────────────────────
   /** Park a prompt behind the running turn. `text` is what the strip shows;
    *  `prompt` what the agent will be sent. Resolves to the item's id. */
-  queueAdd: (key: SessionKey, text: string, prompt?: string) =>
-    invoke<string>("agents_queue_add", { key, text, prompt: prompt ?? null }),
+  queueAdd: (
+    key: SessionKey,
+    text: string,
+    prompt?: string,
+    /** The rest of the prompt, as `send` takes it: a queued message is the
+     *  same message a direct send would have been. */
+    attachments?: ImageAttachment[],
+    resourceLinks?: { uri: string; name: string }[],
+    pastedTexts?: { id: string; text: string }[],
+  ) =>
+    invoke<string>("agents_queue_add", {
+      key,
+      text,
+      prompt: prompt ?? null,
+      attachments: attachments?.length ? attachments : null,
+      resourceLinks: resourceLinks?.length ? resourceLinks : null,
+      pastedTexts: pastedTexts?.length ? pastedTexts : null,
+    }),
   queueRemove: (key: SessionKey, itemId: string) =>
     invoke<boolean>("agents_queue_remove", { key, itemId }),
   queueClear: (key: SessionKey) => invoke<void>("agents_queue_clear", { key }),
@@ -187,12 +207,17 @@ export const agents = {
     invoke<void>("agents_queue_pause", { key, paused }),
   /** Start the queue's head if the session is idle and not paused. */
   queueDrain: (key: SessionKey) => invoke<number | null>("agents_queue_drain", { key }),
+  /** Lift the halt a failed turn put on the queue, then start its head if
+   *  the session is idle. A failed turn halts a non-empty queue instead of
+   *  draining it; this is the "resume queue" for it. */
+  queueResume: (key: SessionKey) => invoke<number | null>("agents_queue_resume", { key }),
   /** Run one queued prompt next, interrupting the running turn. */
   queueSendNow: (key: SessionKey, itemId: string) =>
     invoke<void>("agents_queue_send_now", { key, itemId }),
-  /** Developer toggle (debug builds): hold a session open past its tab. */
-  setHold: (sessionId: AcpSessionId, held: boolean) =>
-    invoke<void>("agents_set_hold", { sessionId, held }),
+  /** Developer toggle (debug builds): hold a session open past its tab.
+   *  `agentId` names the session's agent, since two agents can share an id. */
+  setHold: (sessionId: AcpSessionId, held: boolean, agentId?: AgentId) =>
+    invoke<void>("agents_set_hold", { sessionId, held, agentId: agentId ?? null }),
   /** Answer an elicitation the agent raised (P3.3). */
   respondElicitation: (
     agentId: AgentId,
@@ -270,9 +295,21 @@ export const listenAuthRunDone = (
   handler: (p: AuthRunDone) => void,
   runId?: string,
 ): Promise<UnlistenFn> =>
-  listen<AuthRunDone>("atlas:auth-run:done", (e) => {
-    if (runId && e.payload.runId !== runId) return;
-    handler(e.payload);
+  listen<{
+    success: boolean;
+    exit_code: number | null;
+    message: string | null;
+    agent_id: string;
+    run_id: string;
+  }>("atlas:auth-run:done", (e) => {
+    if (runId && e.payload.run_id !== runId) return;
+    handler({
+      success: e.payload.success,
+      exitCode: e.payload.exit_code,
+      message: e.payload.message,
+      agentId: e.payload.agent_id,
+      runId: e.payload.run_id,
+    });
   });
 
 /** Live output from a login CLI. The URL it prints is the fallback when the

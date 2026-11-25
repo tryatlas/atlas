@@ -28,6 +28,7 @@
 // Placement is persisted; the server mirror is not (it is re-read on launch).
 
 import { create } from "zustand";
+import { toast } from "sonner";
 import { persist } from "zustand/middleware";
 
 import {
@@ -163,7 +164,7 @@ interface OrgAgentState {
     deleteLoop: (id: string) => Promise<void>;
 
     /** Send a message in conversation `id` (temp or real). */
-    send: (id: string, text: string, options?: SendOptions) => void;
+    send: (id: string, text: string, options?: SendOptions) => boolean;
     /** Send a refused message again, under the same `client_msg_id`. */
     retrySend: (clientMsgId: string) => void;
     /** Give up on a refused message. */
@@ -232,6 +233,7 @@ function swapId(list: string[], old: string, next: string): string[] {
  *  once. Module state, like the web session's: cleared on every reconnect. */
 const resumed = new Map<string, number>();
 /** Debounced refreshes after a turn ends. */
+const submitted: { kind: "message" | "approval" | "question"; id: string }[] = [];
 const refreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 function later(key: string, ms: number, fn: () => void) {
@@ -249,6 +251,7 @@ function later(key: string, ms: number, fn: () => void) {
 /** Reset the module's bookkeeping (tests). */
 export function resetOrgAgentSessionForTests(): void {
   resumed.clear();
+  submitted.length = 0;
   for (const t of refreshTimers.values()) clearTimeout(t);
   refreshTimers.clear();
 }
@@ -288,11 +291,24 @@ export const useOrgAgentStore = create<OrgAgentState>()(
       };
 
       const transmit = (entry: PendingSend) => {
+        // Only the first prompt may create the Ask. Later prompts wait for its echo.
+        if (
+          entry.tempAskId &&
+          get().outbox.find((item) => item.tempAskId === entry.tempAskId)?.clientMsgId !==
+            entry.clientMsgId
+        )
+          return;
+        if (
+          !submitted.some(
+            (request) => request.kind === "message" && request.id === entry.clientMsgId,
+          )
+        )
+          submitted.push({ kind: "message", id: entry.clientMsgId });
         void send({
           t: "ask.send",
           ...(entry.askId ? { ask_id: entry.askId } : {}),
           client_msg_id: entry.clientMsgId,
-          text: entry.text.slice(0, ATLAS_LIMITS.messageChars),
+          text: entry.text,
           ...(entry.context ? { context: entry.context } : {}),
           ...(entry.mentions && entry.mentions.length > 0 ? { mentions: entry.mentions } : {}),
           ...(entry.mode ? { mode: entry.mode } : entry.effort ? { effort: entry.effort } : {}),
@@ -339,17 +355,27 @@ export const useOrgAgentStore = create<OrgAgentState>()(
           };
         });
         if (!get().logs[real]) void get().actions.openAsk(real);
+        for (const entry of get().outbox)
+          if (entry.askId === real && !entry.failed) transmit(entry);
       };
 
       const onEvent = (event: AtlasEvent) => {
         if (event.kind === "user_message") {
           const entry = get().outbox.find((p) => p.clientMsgId === event.payload.client_msg_id);
           if (entry) {
+            const request = submitted.findIndex(
+              (item) => item.kind === "message" && item.id === entry.clientMsgId,
+            );
+            if (request >= 0) submitted.splice(request, 1);
             set((s) => ({ outbox: s.outbox.filter((p) => p.clientMsgId !== entry.clientMsgId) }));
             if (entry.tempAskId) return onCreated(entry.tempAskId, event);
           }
         }
         if (event.kind === "approval_resolved") {
+          const request = submitted.findIndex(
+            (item) => item.kind === "approval" && item.id === event.payload.approval_id,
+          );
+          if (request >= 0) submitted.splice(request, 1);
           set((s) => ({ deciding: s.deciding.filter((d) => d !== event.payload.approval_id) }));
           // Something may have been done: today's count moves.
           if (event.payload.executed)
@@ -442,8 +468,19 @@ export const useOrgAgentStore = create<OrgAgentState>()(
        *  oldest message still on its way as not sent — the server handles one
        *  socket's frames in order, so that is the one it refused. */
       const onRefusal = (code: string, message: string) => {
+        const request = submitted.shift();
+        if (request?.kind === "approval" || request?.kind === "question") {
+          set((state) => ({
+            deciding: state.deciding.filter((id) => id !== request.id),
+            answering: state.answering.filter((id) => id !== request.id),
+            error: { code, message: message || code },
+          }));
+          return;
+        }
         if (SEND_REFUSALS.has(code)) {
-          const waiting = get().outbox.find((p) => !p.failed);
+          const waiting = request
+            ? get().outbox.find((p) => p.clientMsgId === request.id)
+            : get().outbox.find((p) => !p.failed);
           if (waiting) {
             set((s) => ({
               outbox: s.outbox.map((p) =>
@@ -453,7 +490,7 @@ export const useOrgAgentStore = create<OrgAgentState>()(
             return;
           }
         }
-        if (code === "not_found") set({ deciding: [], answering: [] });
+        set({ deciding: [], answering: [] });
         set({ error: { code, message: message || code } });
       };
 
@@ -481,6 +518,8 @@ export const useOrgAgentStore = create<OrgAgentState>()(
        *  held from its last event, and read the list again. */
       const onOpen = () => {
         resumed.clear();
+        submitted.length = 0;
+        set({ deciding: [], answering: [] });
         for (const entry of get().outbox) if (!entry.failed) transmit(entry);
         for (const [id, log] of Object.entries(get().logs)) resume(id, lastSeq(log));
         void get().actions.loadAsks();
@@ -702,11 +741,17 @@ export const useOrgAgentStore = create<OrgAgentState>()(
 
           send: (id, text, options = {}) => {
             const body = text.trim();
-            if (!body) return;
+            if (!body) return false;
+            if (body.length > ATLAS_LIMITS.messageChars) {
+              toast.error(
+                `Messages can contain up to ${ATLAS_LIMITS.messageChars.toLocaleString()} characters. Shorten this message before sending.`,
+              );
+              return false;
+            }
             const temp = isTempAsk(id);
             const entry: PendingSend = {
               clientMsgId: clientMsgId(),
-              text: body.slice(0, ATLAS_LIMITS.messageChars),
+              text: body,
               askId: temp ? null : id,
               tempAskId: temp ? id : null,
               failed: null,
@@ -742,6 +787,7 @@ export const useOrgAgentStore = create<OrgAgentState>()(
               };
             });
             transmit(entry);
+            return true;
           },
           retrySend: (id) => {
             const entry = get().outbox.find((p) => p.clientMsgId === id);
@@ -799,6 +845,7 @@ export const useOrgAgentStore = create<OrgAgentState>()(
           },
           decide: (frame) => {
             if (get().connection !== "open") return false;
+            submitted.push({ kind: "approval", id: frame.approval_id });
             void send({ t: "approval.decide", ...frame }).then((ok) => {
               if (!ok)
                 set((s) => ({ deciding: s.deciding.filter((d) => d !== frame.approval_id) }));
@@ -808,6 +855,7 @@ export const useOrgAgentStore = create<OrgAgentState>()(
           },
           answer: (questionId, answer) => {
             if (get().connection !== "open") return false;
+            submitted.push({ kind: "question", id: questionId });
             void send({ t: "question.answer", question_id: questionId, ...answer }).then((ok) => {
               if (!ok) set((s) => ({ answering: s.answering.filter((q) => q !== questionId) }));
             });

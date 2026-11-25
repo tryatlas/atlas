@@ -26,6 +26,7 @@
 //   is off for the project.
 
 import { useState } from "react";
+import { forkBranchName } from "./fork-branch-name";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
@@ -33,7 +34,6 @@ import { agentMeta } from "@/features/agents/lib/agent-meta";
 import { checkoutState } from "@/features/git/lib/git-remote-api";
 import { useGitStore } from "@/features/git/stores/git-store";
 import { busySessions } from "@/features/projects/lib/stop-agents-confirm";
-import { agentWorkingElsewhere } from "@/features/sidebar/lib/sidebar-actions";
 import { useProjectSetting } from "@/features/settings/lib/use-scoped-setting";
 
 import {
@@ -165,7 +165,7 @@ export function usePullRequestAgentActions(target: {
   }).data;
   const prBranch = detail
     ? detail.isCrossRepository
-      ? `atlas/pr-${detail.number}/${detail.headBranch}`
+      ? forkBranchName(detail.number, detail.headBranch)
       : detail.headBranch
     : null;
   const fixesInSession =
@@ -346,7 +346,7 @@ export function usePullRequestAgentActions(target: {
           description: `The project is on ${state.branch} and ${blocker}, so Atlas left it alone. Check it out in a separate worktree instead.`,
         });
       if (state.dirty) return leaveAlone("it has uncommitted changes");
-      if (busySessions(repoPath).length > 0 || (await agentWorkingElsewhere(repoPath))) {
+      if (busySessions(repoPath).length > 0) {
         return leaveAlone("an agent is working in it");
       }
     }

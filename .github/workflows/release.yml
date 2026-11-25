@@ -238,8 +238,9 @@ jobs:
   # Tells installed apps the release exists: sets the PostHog feature-flag
   # payloads the updater reads (`telemetry::fetch_remote_config`): `version`,
   # and one installer URL per platform (`telemetry::update_uri_flag`). A
-  # platform's key moves only when its build succeeded, so a skipped or failed
-  # macOS/Windows job never announces a file that isn't on the release.
+  # shared version moves only after every platform's installer succeeded.
+  # Older clients pair that version with their URL, so partial publication
+  # would advertise a new version with an old macOS or Windows installer.
   #
   # Waits on the `release` environment's approval, so someone can install the
   # new build from the GitHub release before any user is offered it. Off until
@@ -251,7 +252,8 @@ jobs:
     needs: [release-please, linux, macos, windows]
     if: >-
       always() && needs.release-please.outputs.release_created == 'true' &&
-      needs.linux.result == 'success' && vars.POSTHOG_PROJECT_ID != ''
+      needs.linux.result == 'success' && needs.macos.result == 'success' &&
+      needs.windows.result == 'success' && vars.POSTHOG_PROJECT_ID != ''
     runs-on: ubuntu-24.04-arm
     environment: release
     permissions:

@@ -36,7 +36,7 @@ const WEB_ORIGIN = "https://app.tryatlas.cc";
  */
 const STATUS_LABEL: Partial<Record<CanvasLinkStatus, string>> = {
   live: "Live — every change is shared as you make it",
-  syncing: "Reconnecting… your edits are kept and sent when the Space is back",
+  syncing: "Syncing local edits with this Space",
   offline: "Not connected — this Space refused the connection",
 };
 

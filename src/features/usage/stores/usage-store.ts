@@ -22,6 +22,8 @@ import {
 
 /** A fetch younger than this is reused for the same project set. */
 export const STALE_MS = 60_000;
+let requestGeneration = 0;
+let pendingSignature: string | null = null;
 
 type FacetAxis = keyof Facets;
 
@@ -72,15 +74,24 @@ export const useUsageStore = create<UsageState>()((set, get) => ({
       // Only the ACTIVE org's projects — Usage must never aggregate across
       // organisations.
       const projectPaths = activeOrgProjectsSnapshot().map((p) => p.path);
-      const sig = projectSignature(projectPaths);
+      const sig = JSON.stringify([
+        useOrgStore.getState().activeOrganisationId,
+        projectSignature(projectPaths),
+      ]);
       const { fetchedAt, projectSig, loading } = get();
       const fresh = fetchedAt !== null && Date.now() - fetchedAt < STALE_MS && sig === projectSig;
-      if (!opts?.force && (fresh || loading)) return;
-      set({ loading: true, error: null });
+      if (!opts?.force && (fresh || (loading && pendingSignature === sig))) return;
+      const generation = ++requestGeneration;
+      pendingSignature = sig;
+      set({ loading: true, error: null, ...(sig !== projectSig ? { data: null } : {}) });
       try {
         const data = await invoke<UsageDashboard>("usage_dashboard", { projectPaths });
+        if (generation !== requestGeneration) return;
+        pendingSignature = null;
         set({ data, loading: false, fetchedAt: Date.now(), projectSig: sig });
       } catch (e) {
+        if (generation !== requestGeneration) return;
+        pendingSignature = null;
         set({ error: String(e), loading: false });
       }
     },
@@ -104,7 +115,10 @@ export const useUsageStore = create<UsageState>()((set, get) => ({
  *  the next open of the tab fetches the incoming org's projects and nothing of
  *  the outgoing org's selection survives. */
 function resetForOrg() {
+  requestGeneration += 1;
+  pendingSignature = null;
   useUsageStore.setState({
+    loading: false,
     data: null,
     error: null,
     fetchedAt: null,

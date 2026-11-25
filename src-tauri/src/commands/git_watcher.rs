@@ -67,7 +67,7 @@ impl GitWatcherState {
     /// invalidation. Cached reads are sub-microsecond, which is the
     /// difference between the @-mention picker feeling instant and
     /// gating every keystroke on subprocess spawns.
-    pub fn get_or_compute_refs(&self, project_path: &str) -> Option<GitRefs> {
+    pub async fn get_or_compute_refs(&self, project_path: &str) -> Option<GitRefs> {
         {
             let guard = self.refs_cache.read();
             if let Some((path, refs)) = guard.as_ref() {
@@ -76,14 +76,22 @@ impl GitWatcherState {
                 }
             }
         }
-        // Cache miss — compute, install, return. Lock is dropped
-        // around the (slow) compute so concurrent callers don't pile
-        // up behind us; worst case is two compute calls land at the
-        // same time and the second overwrites the first, both with
-        // equivalent results.
-        let refs = git_refs_compute(project_path).ok()?;
-        *self.refs_cache.write() = Some((PathBuf::from(project_path), refs.clone()));
-        Some(refs)
+        // Cache miss — compute, install, return. The three `git` shell-outs
+        // run on a blocking worker, never on the async runtime the IPC
+        // channel shares. The lock is not held across the compute, so
+        // concurrent callers don't pile up behind it; worst case is two
+        // computes landing together, the second overwriting the first with
+        // an equivalent result.
+        let path = project_path.to_string();
+        let cache = self.refs_cache.clone();
+        tokio::task::spawn_blocking(move || {
+            let refs = git_refs_compute(&path).ok()?;
+            *cache.write() = Some((PathBuf::from(path), refs.clone()));
+            Some(refs)
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     pub fn invalidate_refs(&self) {
@@ -196,6 +204,7 @@ pub async fn git_watch_start(
             let project_str = root_for_task.to_string_lossy().into_owned();
             let root_for_cb = root_for_task.clone();
             let app_for_cb = app_for_task.clone();
+            let watched_dirs = git_dirs.clone();
             let mut debouncer = new_debouncer(
                 Duration::from_millis(200),
                 None,
@@ -203,7 +212,7 @@ pub async fn git_watch_start(
                     Ok(events) => {
                         // A git status reads `.git/index`; on Linux that read
                         // lands here (`fs_events`), and would announce itself.
-                        if !crate::fs_events::any_change(&events) {
+                        if !events.iter().any(|event| crate::fs_events::is_change(event.event.kind) && git_metadata_event(&watched_dirs, &event.event)) {
                             return;
                         }
                         // Flush the refs cache first — by the time
@@ -244,25 +253,16 @@ pub async fn git_watch_start(
             // refs and packed-refs live in the shared common dir; watching the
             // shared refs also surfaces commits made from sibling worktrees,
             // which the debounced walk handles as ordinary no-ops.
-            let head = git_dirs.git_dir.join("HEAD");
-            let packed_refs = git_dirs.common_dir.join("packed-refs");
-            let refs_dir = git_dirs.common_dir.join("refs");
-            let index = git_dirs.git_dir.join("index");
-
-            for (label, path, recursive) in [
-                ("HEAD", head, RecursiveMode::NonRecursive),
-                ("packed-refs", packed_refs, RecursiveMode::NonRecursive),
-                ("refs/", refs_dir, RecursiveMode::Recursive),
-                ("index", index, RecursiveMode::NonRecursive),
-            ] {
-                if path.exists() {
-                    if let Err(e) = debouncer.watch(&path, recursive) {
-                        tracing::warn!(
-                            "git_watch: failed to watch {label} at {}: {e}",
-                            path.display()
-                        );
-                    }
-                }
+            // Git publishes HEAD/index/packed-refs via rename. Watch their
+            // parent directories so replacing an inode never retires the watch.
+            let mut roots = vec![
+                (git_dirs.git_dir.clone(), RecursiveMode::NonRecursive),
+                (git_dirs.common_dir.clone(), RecursiveMode::NonRecursive),
+                (git_dirs.common_dir.join("refs"), RecursiveMode::Recursive),
+            ];
+            roots.dedup();
+            for (path, mode) in roots {
+                if path.exists() { debouncer.watch(&path, mode).map_err(|e| format!("git watch {}: {e}", path.display()))?; }
             }
 
             Ok(debouncer)
@@ -304,6 +304,7 @@ pub fn git_watch_stop(workspace_id: String, state: State<'_, GitWatcherState>) {
 }
 
 /// Where a repository's git metadata actually lives.
+#[derive(Clone)]
 struct GitDirs {
     /// The repository's own gitdir: `.git/` for an ordinary checkout, or the
     /// `.git/worktrees/<name>/` directory a worktree's `.git` file points at.
@@ -313,6 +314,18 @@ struct GitDirs {
     /// `git_dir` except for linked worktrees, whose `commondir` file points
     /// back at the main repository's `.git/`.
     common_dir: PathBuf,
+}
+
+fn git_metadata_event(dirs: &GitDirs, event: &notify::Event) -> bool {
+    if event.need_rescan() {
+        return true;
+    }
+    event.paths.iter().any(|p| {
+        p == &dirs.git_dir.join("HEAD")
+            || p == &dirs.git_dir.join("index")
+            || p == &dirs.common_dir.join("packed-refs")
+            || p.starts_with(dirs.common_dir.join("refs"))
+    })
 }
 
 /// Resolve the watchable git directories for a project root, accepting both an

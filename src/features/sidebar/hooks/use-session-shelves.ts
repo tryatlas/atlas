@@ -40,7 +40,8 @@ export function useSessionShelves(input: {
     setShelfScope(scopeProjectId);
     setSettledLimit(SETTLED_SHELF_FIRST_PAGE);
   }
-  const deferredSettledSearch = useDeferredValue(settledSearch);
+  const deferredSearch = useDeferredValue(settledSearch);
+  const deferredSettledSearch = settledExpanded ? deferredSearch : "";
   const settledFiltered = useMemo(
     () =>
       deferredSettledSearch.trim()
@@ -49,15 +50,14 @@ export function useSessionShelves(input: {
     [settled, deferredSettledSearch],
   );
   // Collapsed, the shelf still shows what must be seen: the open session,
-  // and any that came alive again. Outside activity does not un-settle a
-  // session, but it must not be buried behind a shut shelf either.
+  // and any that came alive again. Activity does not un-settle a session,
+  // but it must not be buried behind a shut shelf either.
   const shelfRows = useMemo(() => {
     if (deferredSettledSearch.trim()) return settledFiltered;
     if (settledExpanded) return settledFiltered.slice(0, settledLimit);
     return settledFiltered.filter(
       (row) =>
         (row.sessionId !== "" && row.sessionId === activeSessionId) ||
-        row.liveElsewhere ||
         row.heldWorking ||
         live.has(row.sessionId),
     );

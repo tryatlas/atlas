@@ -10,6 +10,8 @@ import { rememberMention } from "../lib/mention-registry";
 import { collapsePastes } from "../lib/pasted-text";
 import { sessionSend } from "../lib/session-send";
 import { useChatStore } from "../stores/chat-store";
+import { imageMimeFromPath } from "@/lib/byok/model-capabilities";
+import type { StagedImage } from "../lib/image-attachment";
 
 export function useComposerText({
   tabId,
@@ -53,8 +55,11 @@ export function useComposerText({
     [tabId, setDraft, valueRef],
   );
 
-  // A queued message's Edit: back into the composer, out of the queue.
-  const editQueued = (q: string, i: number) => {
+  // A queued message's Edit: back into the composer, out of the queue. With
+  // its images: answered for the caller to stage, since the composer's staged
+  // images live beside this hook (`use-composer-images.ts`), not in it.
+  const editQueued = (q: string, i: number): StagedImage[] => {
+    const images = queuedImages(tabId, i);
     const cur = inputRef.current?.getValue() ?? "";
     // A paste or a cite the queue inlined comes back as its
     // chip, not as every line it holds. Cites were written
@@ -66,7 +71,28 @@ export function useComposerText({
     writeComposer(mergeQueued(cur, text));
     sessionSend.removeQueued(tabId, i);
     requestAnimationFrame(() => inputRef.current?.focus());
+    return images;
   };
 
   return { draft, valueRef, hasText, onEmptyChange, writeComposer, editQueued };
+}
+
+/**
+ * The images queue item `i` was sent with, ready to stage again. A staged
+ * image is joined to its chip by path (`use-composer-images.ts`), and the
+ * queue keeps only the bytes, so each is paired back with the image file
+ * chips the message carries, in order. When they do not pair one for one (a
+ * chip removed before queuing, an image with no chip), the images are staged
+ * with no path: they still go with the next send, which is what Edit owes the
+ * user — the message as it was.
+ */
+export function queuedImages(tabId: string, i: number): StagedImage[] {
+  const content = useChatStore.getState().queueContent[tabId]?.[i];
+  const attachments = content?.attachments ?? [];
+  if (attachments.length === 0) return [];
+  const chips = content!.mentions.flatMap((m) =>
+    m.kind === "file" && imageMimeFromPath(m.id) ? [m.id] : [],
+  );
+  const paired = chips.length === attachments.length;
+  return attachments.map((img, n) => ({ ...img, path: paired ? chips[n]! : "" }));
 }

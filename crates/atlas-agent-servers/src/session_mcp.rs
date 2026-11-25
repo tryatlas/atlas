@@ -225,10 +225,17 @@ type Settle = Box<dyn FnOnce(Option<&acp::SessionId>) + Send>;
 /// as asking, and every other tool on the server keeps running unasked. A
 /// connection that cannot ask per tool (ACP) is never offered a server with
 /// any.
+///
+/// It also carries each offered server's own tool list
+/// ([`advertising`](Self::advertising)): what [`claude_code_meta`]
+/// pre-approves, tool by tool, so a server of the user's that happens to share
+/// a name with one of the host's never inherits a blanket approval.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AskFirst {
     /// `(server, tool)`, in the order they were declared.
     tools: Vec<(String, String)>,
+    /// `(server, tool)` for every tool each offered server advertises.
+    advertised: Vec<(String, String)>,
     /// The subset that asks on **every** call: the card for one offers no
     /// "Allow for this session", because an allowance would cover any
     /// arguments — for a message, any recipient and any words — with no card.
@@ -267,6 +274,28 @@ impl AskFirst {
             }
         }
         self
+    }
+
+    /// `server` advertises exactly `tools`: the host's own list, taken from
+    /// where the server defines what its `tools/list` answers.
+    #[must_use]
+    pub fn advertising<S: AsRef<str>>(mut self, server: &str, tools: &[S]) -> Self {
+        for tool in tools {
+            let pair = (server.to_string(), tool.as_ref().to_string());
+            if !self.advertised.contains(&pair) {
+                self.advertised.push(pair);
+            }
+        }
+        self
+    }
+
+    /// The tools `server` advertises, as declared with
+    /// [`advertising`](Self::advertising).
+    pub fn advertised_on<'a>(&'a self, server: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.advertised
+            .iter()
+            .filter(move |(s, _)| s == server)
+            .map(|(_, tool)| tool.as_str())
     }
 
     /// The tools on `server` that ask first.
@@ -378,12 +407,14 @@ pub fn offer_for(
 ///
 /// Two things ride it:
 ///
-/// - **Pre-approved servers.** The SDK's `allowedTools` rule `mcp__<server>`
-///   runs that server's tools without a permission prompt: the standing the
-///   native agent's servers have (`default_tools_approval_mode = approve`).
-///   Only `servers` (the host's offer, never the user's own) are listed, and a
-///   server with any tool in `ask_first` ([`AskFirst`]) never is, so its tools
-///   keep Claude Code's own prompt.
+/// - **Pre-approved tools.** The SDK's `allowedTools` rule
+///   `mcp__<server>__<tool>` runs that one tool without a permission prompt:
+///   the standing the native agent's servers have
+///   (`default_tools_approval_mode = approve`). Only the tools each offered
+///   server advertises ([`AskFirst::advertising`]) are listed, one by one,
+///   never a whole server (`mcp__<server>`): a server of the user's own with
+///   the same name would inherit that. A tool in `ask_first` never is, so it
+///   keeps Claude Code's own prompt.
 /// - **Thinking summaries.** Current Claude models default thinking `display`
 ///   to `"omitted"`: the thinking blocks stream empty, and the transcript's
 ///   live thought has nothing to show. `--thinking-display summarized` asks
@@ -395,12 +426,16 @@ pub fn claude_code_meta(servers: &[acp::McpServer], ask_first: &AskFirst) -> acp
         .iter()
         .filter_map(|server| match server {
             acp::McpServer::Http(acp::McpServerHttp { name, .. })
-            | acp::McpServer::Stdio(acp::McpServerStdio { name, .. })
-                if ask_first.tools_on(name).next().is_none() =>
-            {
-                Some(format!("mcp__{name}").into())
-            }
+            | acp::McpServer::Stdio(acp::McpServerStdio { name, .. }) => Some(name.as_str()),
             _ => None,
+        })
+        .flat_map(|name| {
+            let asks: Vec<&str> = ask_first.tools_on(name).collect();
+            ask_first
+                .advertised_on(name)
+                .filter(move |tool| !asks.contains(tool))
+                .map(move |tool| format!("mcp__{name}__{tool}").into())
+                .collect::<Vec<_>>()
         })
         .collect();
     let mut options = serde_json::json!({
@@ -443,28 +478,41 @@ mod tests {
     }
 
     /// Claude Code asked before every Atlas tool call (review of #354): the
-    /// offered servers ride the session request as pre-approved, whichever
-    /// transport carries them (an ACP agent gets the stdio bridge, ADR-0020).
+    /// offered servers' tools ride the session request as pre-approved,
+    /// whichever transport carries them (an ACP agent gets the stdio bridge,
+    /// ADR-0020) — tool by tool, never a whole server (audit #93: a user's
+    /// own server of the same name inherited `mcp__<server>`).
     #[test]
-    fn offered_servers_are_preapproved_for_claude_code() {
+    fn offered_servers_tools_are_preapproved_one_by_one() {
         let stdio = acp::McpServer::Stdio(acp::McpServerStdio::new("atlas_code", "/bin/atlas"));
         let servers = [http("atlas_memory"), stdio];
-        let meta = claude_code_meta(&servers, &AskFirst::none());
+        let tools = AskFirst::none()
+            .advertising("atlas_memory", &["memory_search", "share"])
+            .advertising("atlas_code", &["grep"]);
+        let meta = claude_code_meta(&servers, &tools);
         assert_eq!(
             meta["claudeCode"]["options"]["allowedTools"],
-            serde_json::json!(["mcp__atlas_memory", "mcp__atlas_code"])
+            serde_json::json!([
+                "mcp__atlas_memory__memory_search",
+                "mcp__atlas_memory__share",
+                "mcp__atlas_code__grep"
+            ])
         );
+        assert!(claude_code_meta(&[], &tools)["claudeCode"]["options"]
+            .get("allowedTools")
+            .is_none());
+        // A server that declared no tools gets no approval at all.
         assert!(
-            claude_code_meta(&[], &AskFirst::none())["claudeCode"]["options"]
+            claude_code_meta(&servers, &AskFirst::none())["claudeCode"]["options"]
                 .get("allowedTools")
                 .is_none()
         );
-        // A server with an outward action keeps Claude Code's own prompt.
-        let ask = AskFirst::none().on("atlas_memory", &["share"]);
+        // An outward action keeps Claude Code's own prompt; its siblings don't.
+        let ask = tools.on("atlas_memory", &["share"]);
         let meta = claude_code_meta(&servers, &ask);
         assert_eq!(
             meta["claudeCode"]["options"]["allowedTools"],
-            serde_json::json!(["mcp__atlas_code"])
+            serde_json::json!(["mcp__atlas_memory__memory_search", "mcp__atlas_code__grep"])
         );
     }
 

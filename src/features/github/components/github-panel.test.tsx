@@ -253,7 +253,15 @@ describe("cloning", () => {
 
   it("marks the repo cloned and refuses a second clone", async () => {
     mocks.currentProject = { path: "/Users/dev/myproject" };
-    answer({ search_github: [repo()], list_cloned_repos: [] });
+    let disk: ClonedRepo[] = [];
+    answer({
+      search_github: [repo()],
+      list_cloned_repos: () => disk,
+      clone_github_repo: () => {
+        disk = [cloned({ name: "ahammadnafiz-atlas", display_name: "ahammadnafiz/atlas" })];
+        return disk[0].path;
+      },
+    });
     render(<GithubPanel />);
     const user = await search("atlas");
 

@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 import { Building2, Check } from "lucide-react";
 import {
   Button,
@@ -75,7 +76,7 @@ export function CreateOrgDialogView({
         aria-describedby={undefined}
         className="max-w-[min(25rem,92vw)]"
         onKeyDown={(e) => {
-          if (e.key === "Enter" && canSubmit) {
+          if (e.key === "Enter" && !isComposingKey(e) && canSubmit) {
             e.preventDefault();
             onSubmit();
           }

@@ -56,6 +56,11 @@ const ALLOWED: &[(&str, usize, &str)] = &[
         "the file tree's rename command: it moves an entry in the user's project, by request",
     ),
     (
+        "src-tauri/src/state/app_state.rs",
+        1,
+        "moves an unparsable state.json aside to a .corrupt-<ms> backup before defaults load; nothing is rewritten",
+    ),
+    (
         "src-tauri/src/commands/log.rs",
         1,
         "moves the legacy pinned log to its per-organisation path once; nothing is rewritten",
@@ -79,6 +84,11 @@ const ALLOWED: &[(&str, usize, &str)] = &[
         "crates/atlas-skills/src/paths.rs",
         1,
         "moves a skill directory between stores, with a copy fallback across devices",
+    ),
+    (
+        "crates/atlas-skills/src/disk.rs",
+        3,
+        "swaps complete skill directories or projection links with a backup for rollback",
     ),
     (
         "crates/atlas-memory/src/health.rs",
@@ -136,14 +146,9 @@ const ALLOWED: &[(&str, usize, &str)] = &[
 /// content can be fetched or rebuilt again (20+ characters, checked).
 const CACHE_WRITERS: &[(&str, usize, &str)] = &[
     (
-        "src-tauri/src/commands/comms.rs",
-        2,
-        "recording tracks and message attachments, downloaded from the server by id on a cache miss",
-    ),
-    (
         "src-tauri/src/commands/spaces.rs",
         1,
-        "space media named by its content hash, downloaded and verified again on a cache miss",
+        "cache_store, the one writer for space media (named by content hash), call recording tracks and message attachments; each is downloaded again by id or hash on a cache miss",
     ),
     (
         "src-tauri/src/auth/avatar.rs",

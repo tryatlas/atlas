@@ -119,12 +119,15 @@ export function setAgentUpdatePhase(pluginId: string, phase: AgentUpdatePhase | 
  *  This is the marketplace's PREFETCH: App.tsx calls it at startup and again on
  *  every `atlas:agent-catalog:changed`, so by the time the user opens Settings →
  *  Agents the listing is already here. */
+let hydrationGeneration = 0;
 export async function hydrateAgentRegistry(): Promise<void> {
+  const generation = ++hydrationGeneration;
   try {
     const [listing, catalog] = await Promise.all([
       acpRegistry.list().catch(() => null),
       agents.catalog().catch(() => null),
     ]);
+    if (generation !== hydrationGeneration) return;
     const previous = useAgentRegistryStore.getState();
     const registryEntries = listing?.entries ?? previous.registryEntries;
     // A failed catalog call must KEEP the last good one. Emptying it would
@@ -141,7 +144,8 @@ export async function hydrateAgentRegistry(): Promise<void> {
       // A listing that arrived mid-fetch is provisional: `isFetching` says boot's
       // own refresh is still running, so this is not yet "loaded and empty".
       registryLoaded: previous.registryLoaded || (listing !== null && !listing.isFetching),
-      registryRefreshing: previous.registryRefreshing || (listing?.isFetching ?? false),
+      registryRefreshing:
+        pendingRefresh !== null || (listing?.isFetching ?? previous.registryRefreshing),
       registryError: listing ? listing.lastError : previous.registryError,
       registryRefreshedAt: listing?.lastRefreshedAt ?? previous.registryRefreshedAt,
     });
@@ -166,6 +170,7 @@ let pendingRefresh: Promise<void> | null = null;
  *  and we keep showing it, annotated with the error. */
 export function refreshAgentRegistry(): Promise<void> {
   if (pendingRefresh) return pendingRefresh;
+  hydrationGeneration++;
   useAgentRegistryStore.setState({ registryRefreshing: true });
   pendingRefresh = (async () => {
     try {
@@ -206,6 +211,7 @@ export function refreshAgentRegistry(): Promise<void> {
 }
 
 let unlistenCatalog: (() => void) | null = null;
+let listenerGeneration = 0;
 
 /** Subscribe to `atlas:agent-catalog:changed` and re-hydrate on every one.
  *  Idempotent — a second call is a no-op, so React StrictMode's double-mount
@@ -215,16 +221,19 @@ export function startCatalogListener(): void {
   if (unlistenCatalog) return;
   // Claim the slot synchronously so a second call during the await can't race
   // in a duplicate listener.
+  const generation = ++listenerGeneration;
   unlistenCatalog = () => {};
   void listenCatalogChanged(() => {
     void hydrateAgentRegistry();
   }).then((un) => {
-    unlistenCatalog = un;
+    if (generation !== listenerGeneration) un();
+    else unlistenCatalog = un;
   });
 }
 
 /** Test/teardown seam — drops the listener so the next start re-subscribes. */
 export function stopCatalogListener(): void {
+  listenerGeneration++;
   unlistenCatalog?.();
   unlistenCatalog = null;
 }

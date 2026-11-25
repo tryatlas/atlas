@@ -8,6 +8,12 @@ import { scrubMessage } from "./posthog-client";
  * first. These are the shapes the Sep-03 audit found leaving the machine.
  */
 describe("scrubMessage", () => {
+  it.each([
+    String.raw`C:\Users\Ada Lovelace\private\note.txt`,
+    String.raw`\\server\secret share\note.txt`,
+  ])("redacts Windows paths including spaces: %s", (path) => {
+    expect(scrubMessage(`open failed: '${path}'`)).toBe("open failed: '<path.txt>'");
+  });
   it("collapses home directories, any user, any platform", () => {
     expect(scrubMessage("Failed to read /Users/adib/Desktop/atlas/src/x.ts: EACCES")).not.toContain(
       "adib",

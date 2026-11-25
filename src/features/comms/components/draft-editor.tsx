@@ -27,7 +27,8 @@ import { onWindowEvent } from "@/lib/window-events";
  * to the web client).
  */
 export function DraftEditor({ conv, draft }: { conv: ChatConversation; draft: PromptDraft }) {
-  const { ytext, ready, meta, peers, publishCursor } = useDraftSession(draft);
+  const { ytext, ready, meta, peers, publishCursor, syncError, pending, retrySync } =
+    useDraftSession(draft);
   const memberList = useCommsStore((s) => s.members);
   const me = useCommsStore((s) => s.me);
   const members = useMemo(() => new Map(memberList.map((m) => [m.id, m])), [memberList]);
@@ -124,6 +125,9 @@ export function DraftEditor({ conv, draft }: { conv: ChatConversation; draft: Pr
       convName={conv.name}
       sent={sent}
       ready={ready}
+      syncError={syncError}
+      pending={pending}
+      onRetrySync={retrySync}
       editorHost={host}
       onCopy={() => void copyAll()}
       onSendToAgent={toAgent}

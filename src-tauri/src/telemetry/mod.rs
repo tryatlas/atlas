@@ -36,7 +36,7 @@
 
 pub mod device;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -73,6 +73,10 @@ pub(crate) struct QueuedEvent {
     distinct_id: String,
     properties: Value,
     timestamp: String,
+    /// The consent epoch the event was captured in ([`TelemetryClient::consent_epoch`]).
+    /// The flush loop sends only events of the current epoch, so whatever was
+    /// still queued when the user opted out is dropped, not flushed.
+    epoch: u64,
 }
 
 /// The live analytics identity: who subsequent events are attributed to.
@@ -258,6 +262,10 @@ fn payload_string(v: &Value) -> Option<String> {
 pub struct TelemetryClient {
     /// Runtime opt-in gate (flips live via `set_enabled`).
     enabled: AtomicBool,
+    /// Bumped on every opt-out. Events carry the epoch they were captured in,
+    /// and the flush loop drops any from an earlier one: opting out discards
+    /// what was queued but not yet sent.
+    consent_epoch: AtomicU64,
     /// No key resolved → permanently dead. Distinct from `enabled` so toggling
     /// on a key-less build still does nothing.
     inert: bool,
@@ -356,8 +364,8 @@ pub fn redact_message(msg: &str, max_chars: usize) -> String {
     let cleaned = msg
         .split_whitespace()
         .filter(|t| {
-            !t.starts_with('/')
-                && !t.starts_with('~')
+            !t.contains('/')
+                && !t.contains('~')
                 && !t.contains('\\')
                 && !t.contains("://")
                 && !t.contains('@')
@@ -396,6 +404,7 @@ impl TelemetryClient {
         };
         let client = Arc::new(Self {
             enabled: AtomicBool::new(false),
+            consent_epoch: AtomicU64::new(0),
             inert,
             api_key,
             host,
@@ -498,6 +507,10 @@ impl TelemetryClient {
     /// Flip the live opt-in gate. Records a single `telemetry_opt_in` on enable
     /// and `telemetry_opt_out` on disable (the latter sent while still enabled,
     /// so nothing is transmitted after the user has opted out).
+    ///
+    /// Opting out also starts a new consent epoch *before* that last event, so
+    /// everything captured earlier and still waiting in the queue is dropped by
+    /// the flush loop instead of being sent after the user said no.
     pub fn set_enabled(&self, on: bool) {
         if self.inert {
             return;
@@ -511,6 +524,7 @@ impl TelemetryClient {
             // account as a second, unrelated person.
             self.drain_pending_merge();
         } else if !on && was {
+            self.consent_epoch.fetch_add(1, Ordering::SeqCst);
             self.capture("telemetry_opt_out", json!({}));
             self.enabled.store(false, Ordering::Relaxed);
         }
@@ -531,6 +545,7 @@ impl TelemetryClient {
             distinct_id: self.current_distinct_id(),
             properties,
             timestamp: now_iso(),
+            epoch: self.consent_epoch.load(Ordering::SeqCst),
         });
     }
 
@@ -758,43 +773,39 @@ impl TelemetryClient {
         );
     }
 
-    /// Best-effort **synchronous** capture for the panic hook. Because the build
-    /// is `panic = "abort"` the process dies right after the hook, so we can't
-    /// rely on the async flush task. Runs the POST on a fresh OS thread (so a
-    /// panic on a tokio worker can still spin up a tiny runtime) with a short
-    /// timeout, and blocks until it finishes or times out.
-    pub fn capture_panic_blocking(&self, mut properties: Value) {
+    /// Panics may be caught or confined to a task (`panic = "unwind"). Queue
+    /// metadata without I/O or waiting for locks the panicking thread may own.
+    pub fn capture_panic(&self, mut properties: Value) {
         if !self.is_enabled() {
             return;
         }
-        let Some(key) = self.api_key.clone() else {
+        let Some(tx) = self.tx.as_ref() else {
             return;
         };
-        self.inject_common(&mut properties);
-        let url = format!("{}/capture/", self.host.trim_end_matches('/'));
-        let body = json!({
-            "api_key": key,
-            "event": "rust_panic",
-            "distinct_id": self.current_distinct_id(),
-            "properties": properties,
-            "timestamp": now_iso(),
+        let distinct_id = self
+            .identity
+            .try_read()
+            .map(|id| id.distinct_id.clone())
+            .unwrap_or_else(|| self.device_id.clone());
+        if let Value::Object(map) = &mut properties {
+            map.insert("app_version".into(), json!(self.app_version));
+            map.insert("os".into(), json!(self.os));
+            map.insert("arch".into(), json!(self.arch));
+            map.insert("$lib".into(), json!("atlas-rust"));
+        }
+        let _ = tx.try_send(QueuedEvent {
+            event: "rust_panic".into(),
+            distinct_id,
+            properties,
+            timestamp: now_iso(),
+            epoch: self.consent_epoch.load(Ordering::SeqCst),
         });
-        let handle = std::thread::spawn(move || {
-            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                rt.block_on(async move {
-                    if let Ok(client) = reqwest::Client::builder()
-                        .timeout(Duration::from_secs(2))
-                        .build()
-                    {
-                        let _ = client.post(&url).json(&body).send().await;
-                    }
-                });
-            }
-        });
-        let _ = handle.join();
+    }
+
+    /// Drop every buffered event captured before the latest opt-out.
+    fn drop_events_from_before_opt_out(&self, buf: &mut Vec<QueuedEvent>) {
+        let current = self.consent_epoch.load(Ordering::SeqCst);
+        buf.retain(|e| e.epoch == current);
     }
 
     fn inject_common(&self, properties: &mut Value) {
@@ -847,26 +858,33 @@ pub(crate) async fn run_flush_loop(
                     Some(ev) => {
                         buf.push(ev);
                         if buf.len() >= FLUSH_BATCH {
-                            send_batch(&http, &url, &api_key, &mut buf).await;
+                            send_batch(&client, &http, &url, &api_key, &mut buf).await;
                         }
                     }
                     None => {
                         // All senders dropped — final flush then exit.
-                        send_batch(&http, &url, &api_key, &mut buf).await;
+                        send_batch(&client, &http, &url, &api_key, &mut buf).await;
                         break;
                     }
                 }
             }
             _ = ticker.tick() => {
                 if !buf.is_empty() {
-                    send_batch(&http, &url, &api_key, &mut buf).await;
+                    send_batch(&client, &http, &url, &api_key, &mut buf).await;
                 }
             }
         }
     }
 }
 
-async fn send_batch(http: &reqwest::Client, url: &str, api_key: &str, buf: &mut Vec<QueuedEvent>) {
+async fn send_batch(
+    client: &TelemetryClient,
+    http: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    buf: &mut Vec<QueuedEvent>,
+) {
+    client.drop_events_from_before_opt_out(buf);
     if buf.is_empty() {
         return;
     }
@@ -983,6 +1001,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(32);
         let c = TelemetryClient {
             enabled: AtomicBool::new(enabled && !inert),
+            consent_epoch: AtomicU64::new(0),
             inert,
             api_key: (!inert).then(|| "phc_test".to_string()),
             host: DEFAULT_HOST.to_string(),
@@ -1054,6 +1073,30 @@ mod tests {
         let (inert, _rx) = client(false, true);
         inert.init_enabled(true);
         assert!(!inert.is_enabled());
+    }
+
+    /// Events captured before an opt-out and still queued are dropped at flush,
+    /// not sent after the user said no. The opt-out marker itself survives, and
+    /// so does anything captured after a later opt-in.
+    #[test]
+    fn opting_out_drops_what_was_still_queued() {
+        let (c, mut rx) = client(true, false);
+        c.capture("agent_turn_completed", json!({}));
+        c.capture("panel_opened", json!({}));
+        c.set_enabled(false);
+        c.set_enabled(true);
+        c.capture("after_opt_in", json!({}));
+
+        let mut buf = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            buf.push(e);
+        }
+        c.drop_events_from_before_opt_out(&mut buf);
+        let sent: Vec<_> = buf.iter().map(|e| e.event.as_str()).collect();
+        assert_eq!(
+            sent,
+            vec!["telemetry_opt_out", "telemetry_opt_in", "after_opt_in"]
+        );
     }
 
     #[test]

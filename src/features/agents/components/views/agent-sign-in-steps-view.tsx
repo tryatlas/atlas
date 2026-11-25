@@ -4,17 +4,29 @@
 //
 // Nothing here names an agent (ADR-0002): every label arrives as a prop.
 
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, ChevronRight, Copy, ExternalLink, LogOut, Terminal, X } from "lucide-react";
-import { Badge, Button, Callout, Code, Hint, Icon, IconButton, Spinner } from "@tryatlas/design";
+import {
+  Badge,
+  Button,
+  Callout,
+  Code,
+  Hint,
+  Icon,
+  IconButton,
+  Input,
+  Spinner,
+} from "@tryatlas/design";
 import { cn } from "@/lib/utils";
 import { FixWithAgentButton } from "@/features/ask-agent/components/ask-agent-button";
 import type { ErrorContext } from "@/features/ask-agent/lib/agent-context";
 import {
+  enteredEnvValues,
   envStatusLabel,
   methodBlockedReason,
   type AuthEnvStatus,
   type AuthMethodWire,
+  type EnteredEnv,
 } from "../../lib/sign-in-methods";
 
 /** Pick how to sign in: one row per method the agent advertised. */
@@ -78,12 +90,14 @@ export function ChooseStep({
   );
 }
 
-/** Read-only checklist for an `env_var` method.
+/** Checklist for an `env_var` method, with a field for each variable that
+ *  doesn't reach the agent yet.
  *
- *  There is no input field on purpose. For ACP agents, credentials live in the
- *  system environment — Atlas reads them, it does not store them (the plan's
- *  token-free delegation invariant). Taking a key here would create an
- *  Atlas-held secret for an agent that reads `process.env` anyway. */
+ *  A ticked variable is one the agent will actually get: Atlas's own
+ *  environment, a provider key, or one set for this agent. A variable only the
+ *  shell profile sets was ticked too, and never passed on (audit #61). What is
+ *  typed here is saved for this agent as a sensitive variable — in the
+ *  keychain, like any other (ADR-0023) — and the agent restarts with it. */
 export function EnvStep({
   label,
   method,
@@ -97,15 +111,18 @@ export function EnvStep({
   /** This method's variables only. */
   env: AuthEnvStatus[];
   onOpenUrl: (url: string) => void;
-  onContinue: () => void;
+  /** The values typed for variables that don't reach the agent yet; empty
+   *  when every one already does. */
+  onContinue: (values: { name: string; value: string }[]) => void;
   onBack: () => void;
 }) {
-  const blocked = useMemo(() => methodBlockedReason(method, env), [method, env]);
+  const [entered, setEntered] = useState<EnteredEnv>({});
+  const blocked = useMemo(() => methodBlockedReason(method, env, entered), [method, env, entered]);
   return (
     <div className="flex flex-col gap-2.5 px-2 py-1">
       <p className="text-xs text-secondary-foreground">
-        {label} reads these from your environment. Export them in your shell profile (
-        <Code>~/.zshrc</Code>) and they are picked up on its next start.
+        {label} reads these from its environment. Enter any that are missing and Atlas saves them
+        for {label} in your keychain and restarts it with them.
       </p>
       <div className="flex flex-col gap-1">
         {env.map((v) => (
@@ -121,9 +138,23 @@ export function EnvStep({
             <span className="min-w-0 flex-1 truncate">
               <Code>{v.name}</Code>
             </span>
-            <Badge size="sm" variant={v.satisfied ? "success" : v.optional ? "outline" : "warning"}>
-              {envStatusLabel(v)}
-            </Badge>
+            {v.satisfied ? (
+              <Badge size="sm" variant="success">
+                {envStatusLabel(v)}
+              </Badge>
+            ) : (
+              <div className="w-44 shrink-0">
+                <Input
+                  type="password"
+                  size="sm"
+                  autoComplete="off"
+                  aria-label={v.label ?? v.name}
+                  placeholder={v.optional ? "Optional" : "Value"}
+                  value={entered[v.name] ?? ""}
+                  onChange={(e) => setEntered((prev) => ({ ...prev, [v.name]: e.target.value }))}
+                />
+              </div>
+            )}
           </div>
         ))}
       </div>
@@ -139,7 +170,7 @@ export function EnvStep({
         <Button
           variant="default"
           size="md"
-          onClick={onContinue}
+          onClick={() => onContinue(enteredEnvValues(method, env, entered))}
           disabled={blocked !== null}
           title={blocked ?? undefined}
         >

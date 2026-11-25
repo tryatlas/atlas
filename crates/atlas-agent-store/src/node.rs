@@ -304,7 +304,16 @@ impl NodeRuntime {
                 }
             }
         };
-        let node_dir = job.await.map_err(|error| anyhow::anyhow!("{error:#}"))?;
+        let ticker =
+            loading_status.map(|tx| tick_status(tx.clone(), "Downloading Node.js".to_owned()));
+        let result = job.await.map_err(|error| anyhow::anyhow!("{error:#}"));
+        if let Some(ticker) = ticker {
+            ticker.abort();
+        }
+        if let Some(tx) = loading_status {
+            let _ = tx.send(None);
+        }
+        let node_dir = result?;
         *install.lock().await = Some(node_dir.clone());
         Ok(node_dir)
     }

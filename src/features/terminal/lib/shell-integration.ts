@@ -171,6 +171,8 @@ export class ShellIntegration {
       } catch {
         /* keep it raw */
       }
+      // file:///C:/... is a Windows drive path, not a POSIX absolute path.
+      if (/^\/[A-Za-z]:\//.test(next)) next = next.slice(1);
       if (next !== this.cwd) {
         this.cwd = next;
         this.onChange();

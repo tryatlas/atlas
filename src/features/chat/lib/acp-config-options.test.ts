@@ -3,12 +3,14 @@ import { modeSelectOf, modelSelectOf, parseConfigOptions } from "./acp-config-op
 
 describe("modeSelectOf", () => {
   // The official Claude adapter's only live mode signal: `config_option_update`
-  // with `id: "mode"` (no category) — never `current_mode_update`.
-  it("reads the Claude adapter's id-keyed mode select", () => {
+  // with its `mode` select (`id: "mode"`, `category: "mode"`) — never
+  // `current_mode_update`.
+  it("reads the Claude adapter's mode select", () => {
     const got = modeSelectOf([
       {
         id: "mode",
         name: "Mode",
+        category: "mode",
         type: "select",
         currentValue: "auto",
         options: [
@@ -39,6 +41,27 @@ describe("modeSelectOf", () => {
     ]);
     expect(got?.currentMode).toBe("full");
     expect(modeSelectOf([{ id: "thinking", type: "boolean", currentValue: true }])).toBeNull();
+  });
+
+  // #58: matched by id alone, an option an agent merely NAMED "mode" became
+  // the mode pill's list and overwrote its current mode, while
+  // `parseConfigOptions` (which goes by category) also showed it as a knob.
+  // ACP says what a select is with its category (`SessionConfigOptionCategory`).
+  it("ignores a select named `mode` that the agent did not categorise as one", () => {
+    const raw = [
+      {
+        id: "mode",
+        name: "Output mode",
+        type: "select",
+        currentValue: "terse",
+        options: [
+          { value: "terse", name: "Terse" },
+          { value: "verbose", name: "Verbose" },
+        ],
+      },
+    ];
+    expect(modeSelectOf(raw)).toBeNull();
+    expect(parseConfigOptions(raw).map((o) => o.id)).toEqual(["mode"]);
   });
 });
 
@@ -107,6 +130,38 @@ describe("parseConfigOptions", () => {
       },
     ]);
     expect(parsed.map((o) => o.id)).toEqual(["t"]);
+  });
+
+  /// #42: each pill holds the FIRST select of its category. A second model
+  /// (or mode) select — a "small model" beside the main one — is its own
+  /// knob, keyed by its own option id, or it sits on no control at all. The
+  /// pills read the first, so a single-select agent looks exactly as before.
+  it("offers every mode/model select after the first as a knob of its own", () => {
+    const select = (id: string, category: string, value: string) => ({
+      id,
+      name: id,
+      category,
+      type: "select",
+      currentValue: value,
+      options: [
+        { value: "a", name: "A" },
+        { value: "b", name: "B" },
+      ],
+    });
+    const raw = [
+      select("model", "model", "a"),
+      select("mode", "mode", "a"),
+      select("small_model", "model", "b"),
+      select("review_mode", "mode", "b"),
+    ];
+    const parsed = parseConfigOptions(raw);
+    expect(parsed.map((o) => o.id)).toEqual(["small_model", "review_mode"]);
+    expect(parsed[0]).toMatchObject({ kind: "select", currentValue: "b" });
+    // The pills keep the first of each.
+    expect(modelSelectOf(raw)?.currentModel).toBe("a");
+    expect(modeSelectOf(raw)?.currentMode).toBe("a");
+    // A lone select per category is still the pill's alone.
+    expect(parseConfigOptions(raw.slice(0, 2))).toEqual([]);
   });
 
   /// ...but only when the owning surface can actually render it. The mode and

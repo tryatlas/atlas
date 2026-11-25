@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -60,6 +60,21 @@ const STRANDED_HOLD: Duration = Duration::from_secs(15 * 60);
 /// the slots are in use — by the user's own turns, most likely — and a
 /// memory pass is the one caller that can always wait.
 const REFUSED_HOLD: Duration = Duration::from_secs(2 * 60);
+
+/// The first pause after the gateway failed (a `5xx`, or no connection at all),
+/// doubled for every further failure in a row up to [`FAILED_MAX_HOLD`]. Without
+/// it each finished turn re-sent the same excerpt into an outage: 167 `502`s in
+/// one log, retries under 5 s apart.
+const FAILED_BASE_HOLD: Duration = Duration::from_secs(30);
+const FAILED_MAX_HOLD: Duration = Duration::from_secs(30 * 60);
+
+/// The pause after the `failures`-th consecutive failure (1-based).
+fn failure_hold(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    FAILED_BASE_HOLD
+        .saturating_mul(1u32 << doublings)
+        .min(FAILED_MAX_HOLD)
+}
 
 /// The start of the error a gateway call returns while background calls are
 /// paused ([`GatewayGate`]). Not a failure: the pass is skipped and its turns
@@ -719,6 +734,8 @@ fn mcp_server(token: &str, dotted: bool) -> Option<&str> {
 pub struct GatewayGate {
     busy: AtomicBool,
     closed_until: Mutex<Option<Instant>>,
+    /// Failures ([`Outcome::Failed`]) in a row; any answer resets it.
+    failures: AtomicU32,
 }
 
 impl GatewayGate {
@@ -757,6 +774,9 @@ enum Outcome {
     Settled,
     /// The gateway answered `429`.
     Refused,
+    /// The gateway answered `5xx`, or could not be reached: back off,
+    /// exponentially in the run of failures ([`failure_hold`]).
+    Failed,
 }
 
 /// One background call's turn at the gateway. A permit dropped without an
@@ -776,12 +796,22 @@ impl GatewayPermit {
 
 impl Drop for GatewayPermit {
     fn drop(&mut self) {
+        if matches!(self.outcome, Some(Outcome::Settled | Outcome::Refused)) {
+            self.gate.failures.store(0, Ordering::Release);
+        }
         let (hold, why) = match self.outcome {
             Some(Outcome::Settled) => (None, ""),
             Some(Outcome::Refused) => (
                 Some(REFUSED_HOLD),
                 "the gateway is at its concurrency limit",
             ),
+            Some(Outcome::Failed) => {
+                let failures = self.gate.failures.fetch_add(1, Ordering::AcqRel) + 1;
+                (
+                    Some(failure_hold(failures)),
+                    "the gateway failed; backing off",
+                )
+            }
             None => (
                 Some(STRANDED_HOLD),
                 "an abandoned call may still hold a gateway slot",
@@ -805,6 +835,9 @@ enum GatewayFailure {
     Abandoned(String),
     /// `429`: the user's concurrency slots are all in use.
     Refused(String),
+    /// `5xx`, or the connection itself failed: the gateway is unwell, and
+    /// asking again at once only adds to it.
+    Failed(String),
     /// Failed before the request went out, or the gateway answered with an
     /// error. Either way no slot is left held.
     Other(String),
@@ -862,6 +895,10 @@ impl ExtractionModel for AppExtractionModel {
                             permit.finish(Outcome::Refused);
                             Err(e)
                         }
+                        Err(GatewayFailure::Failed(e)) => {
+                            permit.finish(Outcome::Failed);
+                            Err(e)
+                        }
                         Err(GatewayFailure::Abandoned(e)) => {
                             drop(permit);
                             Err(e)
@@ -883,7 +920,7 @@ async fn gateway_completion(app: &AppHandle, prompt: String) -> Result<String, G
     use atlas_native_agent::engine::catalog_cache::{project, resolve};
     use atlas_native_agent::engine::config::GATEWAY_BASE_URL;
     use atlas_native_agent::engine::{EngineHome, GatewayCatalogueFetcher, SystemClock};
-    use GatewayFailure::{Abandoned, Other, Refused};
+    use GatewayFailure::{Abandoned, Failed, Other, Refused};
 
     let core = app
         .try_state::<super::auth::AuthState>()
@@ -933,7 +970,7 @@ async fn gateway_completion(app: &AppHandle, prompt: String) -> Result<String, G
     // certainly does not.
     let in_transit = |e: reqwest::Error| {
         if e.is_connect() {
-            Other(e.to_string())
+            Failed(e.to_string())
         } else {
             Abandoned(e.to_string())
         }
@@ -943,6 +980,9 @@ async fn gateway_completion(app: &AppHandle, prompt: String) -> Result<String, G
     let body = response.text().await.map_err(in_transit)?;
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return Err(Refused(format!("the gateway answered {status}")));
+    }
+    if status.is_server_error() {
+        return Err(Failed(format!("the gateway answered {status}")));
     }
     if !status.is_success() {
         return Err(Other(format!("the gateway answered {status}")));
@@ -1818,6 +1858,40 @@ mod gateway_gate_tests {
         assert!(gate
             .enter_at(start + REFUSED_HOLD + Duration::from_secs(1))
             .is_some());
+    }
+
+    /// N5: a `5xx` used to count as settled, so the next turn re-sent the
+    /// same excerpt at once. Failures back off, doubling, and an answer resets.
+    #[test]
+    fn gateway_failures_back_off_exponentially_and_reset_on_an_answer() {
+        let gate = Arc::new(GatewayGate::default());
+        let start = Instant::now();
+        gate.enter().unwrap().finish(Outcome::Failed);
+        assert!(gate.enter_at(start + Duration::from_secs(1)).is_none());
+        let after_first = start + FAILED_BASE_HOLD + Duration::from_secs(1);
+        let second = gate
+            .enter_at(after_first)
+            .expect("open after the first hold");
+        second.finish(Outcome::Failed);
+        // The second failure holds for twice as long.
+        assert!(gate
+            .enter_at(Instant::now() + FAILED_BASE_HOLD + Duration::from_secs(1))
+            .is_none());
+        assert!(gate
+            .enter_at(Instant::now() + FAILED_BASE_HOLD * 2 + Duration::from_secs(1))
+            .is_some_and(|p| {
+                p.finish(Outcome::Settled);
+                true
+            }));
+        assert_eq!(gate.failures.load(Ordering::Acquire), 0, "an answer resets");
+    }
+
+    #[test]
+    fn failure_hold_doubles_and_is_capped() {
+        assert_eq!(failure_hold(1), FAILED_BASE_HOLD);
+        assert_eq!(failure_hold(2), FAILED_BASE_HOLD * 2);
+        assert_eq!(failure_hold(3), FAILED_BASE_HOLD * 4);
+        assert_eq!(failure_hold(40), FAILED_MAX_HOLD);
     }
 
     #[test]

@@ -215,7 +215,7 @@ export function ImportClaudeMemoryModal({
   const runImport = async () => {
     setImporting(true);
     try {
-      const count = await importClaude([...selected]);
+      const count = await importClaude([...selected], preview?.lines.map((line) => line.id) ?? []);
       toast.success(
         count === 0
           ? "Nothing new to import"

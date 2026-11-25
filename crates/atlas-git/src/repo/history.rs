@@ -211,7 +211,16 @@ impl Repository<'_> {
     pub fn control(&self, kind: InProgressKind, action: OpAction) -> Result<String> {
         match (kind, action) {
             (InProgressKind::Merge, OpAction::Continue) => self.mutate(&["commit", "--no-edit"]),
-            (kind, OpAction::Continue) => self.mutate(&[kind.subcommand(), "--continue"]),
+            (kind, OpAction::Continue) => {
+                let out = self
+                    .git(&[kind.subcommand(), "--continue"])
+                    .env("GIT_EDITOR", "true")
+                    .env("GIT_SEQUENCE_EDITOR", "true")
+                    .run()?
+                    .stdout;
+                self.changed();
+                Ok(out)
+            }
             (kind, OpAction::Abort) => self.mutate(&[kind.subcommand(), "--abort"]),
         }
     }

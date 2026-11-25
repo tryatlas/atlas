@@ -24,6 +24,10 @@ pub const MAX_CITATIONS: usize = 8;
 pub struct Citation {
     /// Scope-root relative, `/`-separated.
     pub path: String,
+    /// Originating worktree, verified against the repository's current roots
+    /// by the resolver. Old unscoped citations retain their original behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_root: Option<String>,
     /// 1-based, inclusive.
     pub start_line: u32,
     pub end_line: u32,
@@ -79,6 +83,20 @@ pub trait Resolver: Send + Sync {
     fn scope(&self) -> String {
         String::new()
     }
+    fn read_in_tree(&self, rel: &str, tree: Option<&str>) -> Read {
+        if tree.is_none_or(|tree| tree == self.scope()) {
+            self.read(rel)
+        } else {
+            Read::Unreadable
+        }
+    }
+    fn stamp_in_tree(&self, rel: &str, tree: Option<&str>) -> Option<(u64, i128)> {
+        if tree.is_none_or(|tree| tree == self.scope()) {
+            self.stamp(rel)
+        } else {
+            None
+        }
+    }
 }
 
 /// A line with its whitespace collapsed, as [`span_hash`] reads it.
@@ -112,15 +130,49 @@ pub fn safe_rel(rel: &str) -> Option<&str> {
 /// Reads citations from the files under a root.
 pub struct FileResolver {
     root: PathBuf,
+    worktrees: Vec<PathBuf>,
 }
 
 impl FileResolver {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            worktrees: Vec::new(),
+        }
+    }
+
+    pub fn with_worktrees(root: impl Into<PathBuf>, worktrees: Vec<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            worktrees,
+        }
+    }
+
+    fn origin(&self, tree: &str) -> Option<PathBuf> {
+        let wanted = std::fs::canonicalize(tree).ok()?;
+        std::iter::once(&self.root)
+            .chain(self.worktrees.iter())
+            .filter_map(|p| p.canonicalize().ok())
+            .find(|p| *p == wanted)
     }
 }
 
 impl Resolver for FileResolver {
+    fn read_in_tree(&self, rel: &str, tree: Option<&str>) -> Read {
+        match tree {
+            None => self.read(rel),
+            Some(tree) => self
+                .origin(tree)
+                .map_or(Read::Unreadable, |root| Self::new(root).read(rel)),
+        }
+    }
+
+    fn stamp_in_tree(&self, rel: &str, tree: Option<&str>) -> Option<(u64, i128)> {
+        match tree {
+            None => self.stamp(rel),
+            Some(tree) => Self::new(self.origin(tree)?).stamp(rel),
+        }
+    }
     fn read(&self, rel: &str) -> Read {
         let Some(rel) = safe_rel(rel) else {
             return Read::Unreadable;
@@ -204,6 +256,7 @@ pub fn cite(
         span(&lines, start, end).ok_or_else(|| format!("`{rel}` has {} lines", lines.len()))?;
     Ok(Citation {
         path: rel.replace('\\', "/"),
+        worktree_root: None,
         start_line: start,
         end_line: end,
         symbol,
@@ -213,7 +266,7 @@ pub fn cite(
 
 /// Whether `c` still holds, and the citation as it stands now.
 pub fn validate(c: &Citation, r: &dyn Resolver) -> (Validity, Citation) {
-    let lines = match r.read(&c.path) {
+    let lines = match r.read_in_tree(&c.path, c.worktree_root.as_deref()) {
         Read::Lines(l) => l,
         Read::Missing => return (Validity::Stale, c.clone()),
         Read::Unreadable => return (Validity::Unverifiable, c.clone()),
@@ -229,6 +282,11 @@ pub fn validate(c: &Citation, r: &dyn Resolver) -> (Validity, Citation) {
     if let Some((s, e)) = c
         .symbol
         .as_deref()
+        .filter(|_| {
+            c.worktree_root
+                .as_ref()
+                .is_none_or(|tree| *tree == r.scope())
+        })
         .and_then(|sym| r.symbol_span(&c.path, sym))
     {
         if span(&lines, s, e).is_some_and(|x| span_hash(&x) == c.hash) {
@@ -282,11 +340,15 @@ impl ValidationCache {
     }
 
     pub fn check(&self, c: &Citation, r: &dyn Resolver) -> (Validity, Citation) {
-        let Some((size, mtime)) = r.stamp(&c.path) else {
+        let Some((size, mtime)) = r.stamp_in_tree(&c.path, c.worktree_root.as_deref()) else {
             return validate(c, r);
         };
         let key = (
-            r.scope(),
+            format!(
+                "{}\0{}",
+                r.scope(),
+                c.worktree_root.as_deref().unwrap_or("")
+            ),
             c.path.clone(),
             size,
             mtime,
@@ -400,6 +462,22 @@ mod tests {
     }
 
     #[test]
+    fn a_worktree_citation_is_checked_at_its_origin_and_outside_roots_are_refused() {
+        let main = project(&[("file.rs", "main branch")]);
+        let branch = project(&[("file.rs", "feature branch")]);
+        let mut citation = cite(&FileResolver::new(branch.path()), "file.rs", 1, 1, None).unwrap();
+        citation.worktree_root = Some(branch.path().to_string_lossy().into_owned());
+        let scoped = FileResolver::with_worktrees(main.path(), vec![branch.path().to_path_buf()]);
+        assert_eq!(validate(&citation, &scoped).0, Validity::Valid);
+        assert_eq!(
+            ValidationCache::new().check(&citation, &scoped).0,
+            Validity::Valid
+        );
+        let unscoped = FileResolver::new(main.path());
+        assert_eq!(validate(&citation, &unscoped).0, Validity::Unverifiable);
+    }
+
+    #[test]
     fn a_moved_span_is_found_and_reported() {
         let dir = project(&[("src/ttl.rs", SRC)]);
         let r = FileResolver::new(dir.path());
@@ -483,6 +561,7 @@ mod tests {
         let dir = project(&[("bin.dat", "a\0b\n")]);
         let r = FileResolver::new(dir.path());
         let c = Citation {
+            worktree_root: None,
             path: "bin.dat".into(),
             start_line: 1,
             end_line: 1,

@@ -47,6 +47,8 @@ Keep an app-owned thread-metadata store, rendered in Atlas's design language, an
 
 ### Liveness
 
+> **Amended 2026-11-25: dropped.** Judging liveness from a transcript's file time, and from the tail of the transcript to tell whose write it was, read one agent's private storage to decide something about a session — past Rule 1's "never opens a transcript", and against ADR-0002. By decision, liveness is ACP state only: the watcher reports no activity elsewhere (`session_watcher::activity_in`), no ticker runs, and the history commands pass no file times, so `liveElsewhere` is always `false` and Rule 7's hold and delete refusal never fire. Discovery (below and above) is unchanged. The rest of this section records what was built and is now inert.
+
 A session is **live elsewhere** when its transcript was written within **~90s** (`LIVE_WINDOW`) **and** the write is not explained by Atlas's own turn. A write is explained when an Atlas turn is in flight in that session, or when it lands no more than **5s** after Atlas's last turn there ended. Atlas counts each send in and out (`AgentHost::atlas_activity`).
 
 Having the session open in Atlas does not count. Opening a sidebar row binds the session while a terminal may still be writing it, and that is exactly the fork this guards against.

@@ -123,6 +123,73 @@ fn completed_user_turn_rollout(
 }
 
 #[tokio::test]
+async fn resumed_rollback_restores_history_before_an_undone_compaction() {
+    for earlier_checkpoint in [false, true] {
+        let (session, context) = make_session_and_context().await;
+        let retained = vec![
+            user_message("keep this question"),
+            assistant_message("keep this answer"),
+        ];
+        let mut first_context = context.to_turn_context_item();
+        first_context.turn_id = Some("first".to_string());
+        let mut first_items: Vec<_> = retained
+            .clone()
+            .into_iter()
+            .map(|item| RolloutItem::ResponseItem(ResponseItemEnvelope::new(item)))
+            .collect();
+        if earlier_checkpoint {
+            first_items.push(RolloutItem::Compacted(CompactedItem {
+                message: String::new(),
+                replacement_history: Some(annotated(retained.clone())),
+                window_number: None,
+                first_window_id: None,
+                previous_window_id: None,
+                window_id: None,
+            }));
+        }
+        let mut history = completed_user_turn_rollout(first_context, first_items);
+        let mut second_context = context.to_turn_context_item();
+        second_context.turn_id = Some("second".to_string());
+        history.extend(completed_user_turn_rollout(
+            second_context,
+            vec![
+                RolloutItem::ResponseItem(ResponseItemEnvelope::new(user_message(
+                    "undo this question",
+                ))),
+                RolloutItem::Compacted(CompactedItem {
+                    message: String::new(),
+                    replacement_history: Some(annotated(vec![assistant_message(
+                        "undone checkpoint",
+                    )])),
+                    window_number: None,
+                    first_window_id: None,
+                    previous_window_id: None,
+                    window_id: None,
+                }),
+                RolloutItem::ResponseItem(ResponseItemEnvelope::new(assistant_message(
+                    "undo this answer",
+                ))),
+            ],
+        ));
+        history.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            atlas_engine_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+        )));
+        session
+            .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+                conversation_id: ThreadId::new(),
+                history: Arc::new(history),
+                rollout_path: None,
+            }))
+            .await;
+        assert_eq!(
+            raw_history_items(&session.state.lock().await.clone_history()),
+            retained,
+            "earlier checkpoint: {earlier_checkpoint}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn record_initial_history_reconstructs_typed_inter_agent_message() {
     let (session, _turn_context) = make_session_and_context().await;
     let communication = InterAgentCommunication::new(

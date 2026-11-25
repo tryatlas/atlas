@@ -38,12 +38,21 @@ pub const CONNECT_DEADLINE: Duration = Duration::from_secs(20 * 60);
 /// starts over, which is what a button labelled Restart has to mean.
 pub const RESTART_STALE_AFTER: Duration = Duration::from_secs(30);
 
-/// The two clocks above, held on the manager so a test can shorten them. The
+/// How long a stopped turn may wait for the agent to answer its cancel.
+///
+/// Stop is a state (audit #75): the turn stays open, stopping, until the
+/// agent's prompt response says it ended. An agent that never answers would
+/// hold the session there forever, so after this the turn is closed as
+/// cancelled on Atlas's side. Until then a second Stop still force-kills.
+pub const STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// The clocks above, held on the manager so a test can shorten them. The
 /// defaults are the constants; nothing in the app changes them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deadlines {
     pub connect: Duration,
     pub restart_stale_after: Duration,
+    pub stop_grace: Duration,
 }
 
 impl Default for Deadlines {
@@ -51,6 +60,7 @@ impl Default for Deadlines {
         Self {
             connect: CONNECT_DEADLINE,
             restart_stale_after: RESTART_STALE_AFTER,
+            stop_grace: STOP_GRACE,
         }
     }
 }
@@ -1061,6 +1071,14 @@ impl AgentManager {
         Some(found.clone())
     }
 
+    /// One agent's session by this id: never ambiguous, unlike
+    /// [`Self::session`] (#86).
+    pub fn session_of(&self, agent: &Agent, session_id: &acp::SessionId) -> Option<SessionHandle> {
+        self.lock_sessions()
+            .get(&(agent.clone(), session_id.clone()))
+            .cloned()
+    }
+
     /// Every open session id.
     ///
     /// Ids can repeat across agents: they come from the agent unmodified, and the
@@ -1087,6 +1105,15 @@ impl AgentManager {
     /// opened, and the turn is closed with whatever the agent stopped for. A
     /// failed prompt marks the thread rather than silently leaving it
     /// generating.
+    ///
+    /// A turn still running is stopped first, and this prompt goes out only
+    /// once the agent has answered that stop (or its grace ran out): sending
+    /// `session/prompt` straight after `session/cancel` put two prompts on
+    /// the wire at once (audit #76). A Stop pressed while this waits aborts
+    /// it: the prompt is recorded as a cancelled turn and never sent.
+    ///
+    /// When nothing is running, everything up to the prompt request happens
+    /// on the first poll — the host relies on the turn being open by then.
     pub async fn send(
         &self,
         session_id: &acp::SessionId,
@@ -1096,26 +1123,74 @@ impl AgentManager {
             .session(session_id)
             .ok_or_else(|| anyhow!("unknown session: {session_id}"))?;
         let connection = lock_thread(&handle.thread).connection().clone();
+        let grace = self.deadlines().stop_grace;
 
         // An agent that accepts client-generated message ids gets one, which is
         // what lets a later truncate name this message.
         let client_ids = connection.client_user_message_ids();
         let client_id = client_ids.as_ref().map(|caps| caps.new_id());
 
-        // The turn's identity is kept, not dropped. `begin_turn` supersedes any
-        // turn still running, so a send that overlaps another leaves the older
-        // one to return later — and closing the thread's turn unconditionally
-        // meant the *cancelled* turn closed the *live* one (ATL-229).
-        let turn = {
-            let mut thread = lock_thread(&handle.thread);
-            thread.push_user_prompt(client_id.clone(), content.iter().cloned());
-            thread.begin_turn()
+        // The prompt as the agent can take it: a block it never advertised
+        // (an image without `promptCapabilities.image`, …) violates the spec
+        // and can fail the whole turn (audit #23). The composer degrades most
+        // of these first; this is the backstop.
+        let content = {
+            let thread = lock_thread(&handle.thread);
+            atlas_acp_thread::prompt::strip_unsupported_for(content, thread.prompt_capabilities())
         };
 
+        // Captured now, before anything can wait: a newer dispatch may label
+        // the thread's next turn while this one waits for a stop to settle.
+        let (label, epoch) = {
+            let thread = lock_thread(&handle.thread);
+            (thread.next_turn_seq(), thread.stop_epoch())
+        };
+
+        // The turn's identity is kept, not dropped. A send that overlaps
+        // another leaves the older one to return later — and closing the
+        // thread's turn unconditionally meant the *cancelled* turn closed the
+        // *live* one (ATL-229).
+        let turn = loop {
+            let previous = {
+                let mut thread = lock_thread(&handle.thread);
+                match thread.stop_for_follow_up() {
+                    Some(previous) => previous,
+                    None => {
+                        thread.push_user_prompt(client_id.clone(), content.iter().cloned());
+                        let turn = thread.begin_turn_as(label);
+                        if thread.stop_epoch() != epoch {
+                            // Stop was pressed while this waited behind the
+                            // previous turn: the prompt is on record, as a
+                            // turn that never ran.
+                            thread.end_turn_unless_superseded(turn, acp::StopReason::Cancelled);
+                            return Ok(acp::StopReason::Cancelled);
+                        }
+                        break turn;
+                    }
+                }
+            };
+            self.arm_stop_grace(&handle.thread, previous);
+            wait_for_idle(&handle.thread, grace).await;
+        };
+        let mut turn_state = lock_thread(&handle.thread).watch_turn();
+
         let request = acp::PromptRequest::new(session_id.clone(), content);
-        let result = match (&client_ids, client_id) {
-            (Some(caps), Some(id)) => caps.prompt(id, request).await,
-            _ => connection.prompt(request).await,
+        let prompt = async {
+            match (&client_ids, client_id) {
+                (Some(caps), Some(id)) => caps.prompt(id, request).await,
+                _ => connection.prompt(request).await,
+            }
+        };
+        // An agent that never answers a stop is given up on after the grace
+        // (`expire_stop`); this turn's caller learns it was cancelled rather
+        // than waiting on a response that is not coming.
+        let given_up = async {
+            let _ = turn_state.wait_for(|state| state.expired >= turn).await;
+        };
+        let result = tokio::select! {
+            biased;
+            result = prompt => result,
+            () = given_up => return Ok(acp::StopReason::Cancelled),
         };
 
         // Either way the caller learns what happened to its own turn; what the
@@ -1137,16 +1212,71 @@ impl AgentManager {
                 Ok(response.stop_reason)
             }
             Err(err) => {
-                lock_thread(&handle.thread).set_error_unless_superseded(turn);
+                let mut thread = lock_thread(&handle.thread);
+                // A turn that was being stopped and then failed was stopped:
+                // an agent may answer a cancel with an error, and marking the
+                // session failed for it is wrong.
+                if thread.is_stopping() && thread.active_turn() == Some(turn) {
+                    thread.end_turn_unless_superseded(turn, acp::StopReason::Cancelled);
+                } else {
+                    thread.set_error_unless_superseded(turn);
+                }
                 Err(err)
             }
         }
     }
 
     /// Stop the running turn. Safe to call when nothing is running.
+    ///
+    /// The turn stays open, stopping, until the agent answers or
+    /// [`Deadlines::stop_grace`] passes; a send made meanwhile waits behind it.
     pub fn cancel(&self, session_id: &acp::SessionId) {
         if let Some(handle) = self.session(session_id) {
-            lock_thread(&handle.thread).cancel();
+            self.stop(&handle);
+        }
+    }
+
+    /// [`Self::cancel`], for one agent's session.
+    pub fn cancel_of(&self, agent: &Agent, session_id: &acp::SessionId) {
+        if let Some(handle) = self.session_of(agent, session_id) {
+            self.stop(&handle);
+        }
+    }
+
+    fn stop(&self, handle: &SessionHandle) {
+        let stopping = lock_thread(&handle.thread).request_stop();
+        if let Some(turn) = stopping {
+            self.arm_stop_grace(&handle.thread, turn);
+        }
+    }
+
+    /// Close `turn` as cancelled if the agent has not answered its stop
+    /// within the grace.
+    fn arm_stop_grace(&self, thread: &AcpThreadHandle, turn: u32) {
+        let grace = self.deadlines().stop_grace;
+        let thread = Arc::downgrade(thread);
+        let expire = move || {
+            if let Some(thread) = thread.upgrade() {
+                if lock_thread(&thread).expire_stop(turn) {
+                    tracing::info!(turn, "agent did not answer a stop in time; closed the turn");
+                }
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    tokio::time::sleep(grace).await;
+                    expire();
+                });
+            }
+            // Called from outside any runtime: a plain thread keeps the
+            // promise that a stop always settles.
+            Err(_) => {
+                std::thread::spawn(move || {
+                    std::thread::sleep(grace);
+                    expire();
+                });
+            }
         }
     }
 
@@ -1170,9 +1300,7 @@ impl AgentManager {
         self.lock_sessions()
             .remove(&(handle.agent.clone(), session_id.clone()));
         let connection = lock_thread(&handle.thread).connection().clone();
-        if connection.supports_close_session() {
-            connection.close_session(session_id.clone()).await?;
-        }
+        connection.release_session(session_id.clone()).await?;
         Ok(())
     }
 
@@ -1379,4 +1507,21 @@ fn lock_thread(thread: &AcpThreadHandle) -> std::sync::MutexGuard<'_, AcpThread>
     thread
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Wait until the thread has no turn running, for at most a little past the
+/// stop grace — the grace timer is what closes a turn the agent never
+/// answers, and this must not hang if that timer could not run.
+async fn wait_for_idle(thread: &AcpThreadHandle, grace: Duration) {
+    let mut state = lock_thread(thread).watch_turn();
+    let idle = state.wait_for(|state| state.running.is_none());
+    if tokio::time::timeout(grace + Duration::from_secs(1), idle)
+        .await
+        .is_err()
+    {
+        let mut thread = lock_thread(thread);
+        if let Some(turn) = thread.active_turn() {
+            thread.expire_stop(turn);
+        }
+    }
 }

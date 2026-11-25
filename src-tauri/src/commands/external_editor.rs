@@ -746,6 +746,11 @@ const SAFE_SYSTEM_OPEN_EXTENSIONS: &[&str] = &[
 /// a bundle the system treats as a program (`Foo.app`, `.prefPane`,
 /// `.workflow`, `.pkg`).
 fn system_open_would_run(path: &Path) -> bool {
+    // Judge the object the OS will open, including a symlink's target name.
+    let Ok(resolved) = dunce::canonicalize(path) else {
+        return true;
+    };
+    let path = resolved.as_path();
     let ext = path.extension().and_then(|e| e.to_str());
     if path.is_dir() {
         return ext.is_some();
@@ -1400,6 +1405,7 @@ mod tests {
 
     #[test]
     fn the_system_default_opens_documents_media_and_text() {
+        let dir = tempfile::tempdir().unwrap();
         for name in [
             "notes.md",
             "README.TXT",
@@ -1412,11 +1418,21 @@ mod tests {
             "main.rs",
             "page.html",
         ] {
-            assert!(
-                !system_open_would_run(Path::new(&format!("/nowhere/{name}"))),
-                "{name}"
-            );
+            let path = dir.path().join(name);
+            std::fs::write(&path, "document").unwrap();
+            assert!(!system_open_would_run(&path), "{name}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_document_named_symlink_to_a_script_is_not_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("run.sh");
+        let link = dir.path().join("notes.txt");
+        std::fs::write(&script, "echo would run").unwrap();
+        std::os::unix::fs::symlink(&script, &link).unwrap();
+        assert!(system_open_would_run(&link));
     }
 
     #[test]

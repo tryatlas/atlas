@@ -286,6 +286,10 @@ impl<'a> Capture<'a> {
         session_id: &str,
         call: ToolCallContent<'_>,
     ) -> Result<String> {
+        let title = match call.title {
+            Some(raw) => Some(self.scrub_or_flag(session_id, raw)?),
+            None => None,
+        };
         let arguments = match call.arguments {
             Some(raw) => Some(self.scrub_or_flag(session_id, raw)?),
             None => None,
@@ -311,7 +315,7 @@ impl<'a> Capture<'a> {
             turn_seq: call.turn_seq,
             native_call_id: call.native_call_id,
             tool_name: call.tool_name,
-            title: call.title,
+            title: title.as_deref(),
             kind: call.kind,
             status: call.status,
             locations: call.locations,
@@ -537,7 +541,7 @@ fn scrub(body: &str) -> Result<atlas_redact::Redacted> {
 /// falls through to the flat pass inside `redact_auto` itself. The guard is
 /// identical because the failure mode is identical: a redactor panic must
 /// become [`Error::RedactionFailed`], never an unwind through the caller.
-fn scrub_auto(body: &str) -> Result<atlas_redact::Redacted> {
+pub(crate) fn scrub_auto(body: &str) -> Result<atlas_redact::Redacted> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         injected_redactor_panic();
         atlas_redact::redact_auto(body)

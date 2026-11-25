@@ -900,10 +900,13 @@ impl Supervisor {
         let Some((frame, last)) = self.batch.take() else {
             return Ok(());
         };
-        write
-            .send(WsMessage::Binary(frame.into()))
-            .await
-            .map_err(|e| format!("delta: {}", transport(&e)))?;
+        if let Err(error) = write.send(WsMessage::Binary(frame.into())).await {
+            // take() consumed the batch, and a failed WebSocket write is not
+            // evidence of delivery. The next dial must send an authoritative
+            // snapshot even if no newer delta ever arrives.
+            self.needs_resync = true;
+            return Err(format!("delta: {}", transport(&error)));
+        }
         self.floor = Some(last);
         Ok(())
     }
@@ -1336,6 +1339,80 @@ async fn run_command(
 mod tests {
     use super::*;
     use crate::wire::PrincipalKind;
+
+    #[tokio::test]
+    async fn a_failed_delta_write_requires_a_snapshot_even_without_more_deltas() {
+        struct NoCalls;
+        impl TokenSource for NoCalls {
+            fn mint(
+                &self,
+            ) -> Pin<Box<dyn Future<Output = atlas_artifacts::Result<String>> + Send + '_>>
+            {
+                Box::pin(async { panic!("no socket should be dialed") })
+            }
+        }
+        impl SessionPort for NoCalls {
+            fn snapshot(&self) -> BoxFuture<Result<SnapshotDoc, String>> {
+                Box::pin(async { panic!("only a delta is being sent") })
+            }
+            fn execute(&self, _: PrincipalRef, _: Command) -> BoxFuture<Result<(), Refusal>> {
+                Box::pin(async { panic!("no command should execute") })
+            }
+        }
+        let cfg = HostConfig::new(
+            "room".into(),
+            "session".into(),
+            "owner".into(),
+            "client".into(),
+            "secret".into(),
+            "agent".into(),
+            None,
+            Vec::new(),
+        );
+        let (_handle, pending) = prepare(cfg);
+        let (results_tx, results_rx) = mpsc::unbounded_channel();
+        let (commands_tx, _commands_rx) = mpsc::unbounded_channel();
+        let mut supervisor = Supervisor {
+            cfg: pending.config,
+            tokens: Arc::new(NoCalls),
+            port: Arc::new(NoCalls),
+            on_status: Arc::new(|_| {}),
+            status: pending.status,
+            rx: pending.rx,
+            shared: pending.shared,
+            stop_rx: pending.stop_rx,
+            batch: Coalescer::default(),
+            floor: Some(1),
+            needs_resync: false,
+            recent: RecentCommands::default(),
+            driver_epoch: 1,
+            driver_id: String::new(),
+            results_tx,
+            results_rx,
+            commands_tx,
+            controls_rx: pending.controls_rx,
+        };
+        let envelope = SessionDeltaEnvelope {
+            agent_id: atlas_agent_wire::AgentId::new(),
+            session_id: "session".to_string(),
+            seq: 2,
+            delta: atlas_agent_wire::SessionDelta::TextChunk {
+                message_id: "m".into(),
+                delta: "last chunk".into(),
+            },
+        };
+        let mut closed = Box::pin(futures_util::sink::unfold((), |(), _: WsMessage| async {
+            Err::<(), WsError>(WsError::ConnectionClosed)
+        }));
+        supervisor.accept(&mut closed, envelope).await.unwrap();
+        assert!(supervisor.flush(&mut closed).await.is_err());
+        assert_eq!(supervisor.floor, Some(1));
+        assert!(supervisor.batch.last_seq().is_none());
+        assert!(
+            supervisor.needs_resync,
+            "the next connection must repair the consumed batch without waiting for another delta"
+        );
+    }
 
     #[test]
     fn the_backoff_is_jittered_and_capped() {

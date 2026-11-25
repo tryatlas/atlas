@@ -13,6 +13,7 @@ function skipLabel(reason: NotScannedFile["reason"]): string {
       generated: "generated",
       deleted_file: "deleted",
       time_budget: "ran out of time",
+      file_limit: "file limit reached",
       unsupported_lockfile: "lockfile not read",
     } as const
   )[reason];

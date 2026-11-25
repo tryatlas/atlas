@@ -188,8 +188,12 @@ pub async fn memory_index_build(
             .map_err(|e| format!("index task: {e}"))??;
 
     if !fresh.is_empty() {
-        let engine = registry.engine_for(&project_path);
-        let mut guard = engine.write().await;
+        let Some(engine) = registry.open_engine(&project_path) else {
+            return Ok(graph);
+        };
+        let Ok(mut guard) = engine.try_write() else {
+            return Ok(graph);
+        };
         // A model switch since the lookup leaves this batch in the old space;
         // the indexer re-embeds everything after its reset instead.
         if guard.index_params_match(&provider) {
@@ -376,8 +380,10 @@ pub async fn memory_index_query(
         .map_err(|e| format!("query task: {e}"))?
         .map_err(|e| format!("embed query: {e}"))?;
 
-    let engine = registry.engine_for(&project_path);
-    let guard = engine.read().await;
+    let engine = registry.inner().engine_for_async(&project_path).await?;
+    let guard = engine
+        .try_read()
+        .map_err(|_| "Memory index is being updated. Try again shortly.")?;
     // Vectors from another embedding model live in a different space; until the
     // indexer rebuilds, there is nothing comparable to rank.
     if !guard.index_params_match(&provider) {

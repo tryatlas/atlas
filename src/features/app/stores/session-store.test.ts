@@ -86,3 +86,81 @@ describe("a project's session across a restart", () => {
     expect(useSessionStore.getState().session.searchHistory).toEqual([]);
   });
 });
+
+describe("a project's search history across a switch", () => {
+  const OTHER = "/Users/dev/other";
+  const disks = new Map<string, string>();
+
+  beforeEach(() => {
+    disks.clear();
+    tauri.handleRaw({
+      save_project_session: (args) => {
+        const { projectPath, sessionData } = args as { projectPath: string; sessionData: string };
+        disks.set(projectPath, sessionData);
+        return null;
+      },
+      load_project_session: (args) =>
+        disks.get((args as { projectPath: string }).projectPath) ?? "{}",
+    });
+  });
+
+  it("drops a search that finishes after the project changed", async () => {
+    disks.set(PROJECT, JSON.stringify({ searchHistory: ["mine"] }));
+    await actions().loadSession(PROJECT);
+    await actions().loadSession(OTHER);
+
+    actions().addSearchHistory(PROJECT, "late query");
+    await actions().saveSession(PROJECT);
+
+    expect(useSessionStore.getState().session.searchHistory).toEqual([]);
+    expect(JSON.parse(disks.get(PROJECT)!).searchHistory).toEqual(["mine"]);
+    expect(disks.has(OTHER)).toBe(false);
+  });
+
+  it("never shows or saves the previous project's history while the next one loads", async () => {
+    disks.set(PROJECT, JSON.stringify({ searchHistory: ["from project"] }));
+    await actions().loadSession(PROJECT);
+    let release!: () => void;
+    tauri.handleRaw({
+      load_project_session: () =>
+        new Promise<string>((done) => {
+          release = () => done(JSON.stringify({ searchHistory: ["from other"] }));
+        }),
+    });
+    const loading = actions().loadSession(OTHER);
+    expect(useSessionStore.getState().session.searchHistory).toEqual([]);
+
+    actions().addSearchHistory(OTHER, "typed while loading");
+    const saving = actions().saveSession(OTHER);
+    release();
+    await loading;
+    await saving;
+
+    expect(useSessionStore.getState().session.searchHistory).toEqual([
+      "typed while loading",
+      "from other",
+    ]);
+    expect(JSON.parse(disks.get(OTHER)!).searchHistory).toEqual([
+      "typed while loading",
+      "from other",
+    ]);
+  });
+
+  it("ignores a load that resolves after a newer one", async () => {
+    let releaseOld!: () => void;
+    tauri.handleRaw({
+      load_project_session: (args) =>
+        (args as { projectPath: string }).projectPath === PROJECT
+          ? new Promise<string>((done) => {
+              releaseOld = () => done(JSON.stringify({ searchHistory: ["stale"] }));
+            })
+          : JSON.stringify({ searchHistory: ["current"] }),
+    });
+    const old = actions().loadSession(PROJECT);
+    await actions().loadSession(OTHER);
+    releaseOld();
+    await old;
+    expect(useSessionStore.getState().projectPath).toBe(OTHER);
+    expect(useSessionStore.getState().session.searchHistory).toEqual(["current"]);
+  });
+});

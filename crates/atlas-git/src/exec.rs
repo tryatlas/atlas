@@ -225,10 +225,11 @@ impl GitCommand {
     /// Pass `paths` as pathspecs over stdin (`--pathspec-from-file=-`), in
     /// place of `-- <paths>` on the command line. A large change set (Stage
     /// all on a few thousand files) overflows Windows' 32,767-character
-    /// command line, and the spawn itself fails. Same pathspec semantics;
+    /// command line, and the spawn itself fails. Each entry is a literal filename;
     /// only for commands that take the flag (`add`, `restore`, `rm`, `reset`,
     /// `checkout`, `commit`, `stash push`). Replaces any [`stdin`](Self::stdin).
     pub fn pathspecs<S: AsRef<str>>(mut self, paths: &[S]) -> Self {
+        self.args.insert(0, "--literal-pathspecs".into());
         self.args.push("--pathspec-from-file=-".into());
         self.args.push("--pathspec-file-nul".into());
         let mut bytes = Vec::new();
@@ -338,18 +339,15 @@ impl GitCommand {
             .stdin
             .and_then(|bytes| child.stdin.take().map(|pipe| feed_stdin(pipe, bytes)));
 
-        let out = match self.timeout {
-            None => child.wait_with_output(),
-            Some(limit) => match wait_with_deadline(child, limit) {
-                Ok(Some(out)) => Ok(out),
-                Ok(None) => {
-                    return Err(GitRunError::TimedOut {
-                        command: display,
-                        limit,
-                    })
-                }
-                Err(e) => Err(e),
-            },
+        let out = match wait_with_deadline(child, self.timeout) {
+            Ok(Some(out)) => Ok(out),
+            Ok(None) => {
+                return Err(GitRunError::TimedOut {
+                    command: display,
+                    limit: self.timeout.expect("only a deadline can time out"),
+                })
+            }
+            Err(e) => Err(e),
         }
         .map_err(|e| GitRunError::Failed(format!("{display}: {e}")))?;
         // Git has exited, so the feeder is normally done: git read the
@@ -475,7 +473,7 @@ impl GitCommand {
                 let mut raw = Vec::new();
                 loop {
                     raw.clear();
-                    match reader.read_until(b'\n', &mut raw) {
+                    match read_progress(&mut reader, &mut raw) {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {}
                     }
@@ -547,6 +545,11 @@ pub fn shallow_clone(url: &str, dest: &std::path::Path) -> Result<GitRawOutput, 
     GitCommand::without_repo(&["clone", "--depth", "1", "--no-tags", "--", url])
         .arg(dest)
         .env("GIT_LFS_SKIP_SMUDGE", "1")
+        .env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=15",
+        )
+        .timeout(Duration::from_secs(120))
         .output()
 }
 
@@ -579,6 +582,28 @@ fn decode_line(raw: &[u8]) -> String {
     String::from_utf8_lossy(raw).into_owned()
 }
 
+/// Git redraws progress with CR and terminates phases with LF. Both are
+/// complete records; waiting for LF hides every intermediate percentage.
+fn read_progress(reader: &mut impl BufRead, raw: &mut Vec<u8>) -> std::io::Result<usize> {
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(raw.len());
+        }
+        let end = chunk.iter().position(|b| *b == b'\r' || *b == b'\n');
+        let n = end.map_or(chunk.len(), |i| i + 1);
+        raw.extend_from_slice(&chunk[..n]);
+        reader.consume(n);
+        if end.is_some() {
+            if raw.len() == 1 {
+                raw.clear();
+                continue;
+            }
+            return Ok(raw.len());
+        }
+    }
+}
+
 /// `wait_with_output` with a deadline: `Ok(None)` once `limit` passes, after
 /// killing the child. Pipes drain on their own threads so a chatty child
 /// can't block on a full pipe while we poll.
@@ -590,7 +615,7 @@ fn decode_line(raw: &[u8]) -> String {
 /// reach their end, and whatever was read by then is the output.
 fn wait_with_deadline(
     mut child: Child,
-    limit: Duration,
+    limit: Option<Duration>,
 ) -> std::io::Result<Option<std::process::Output>> {
     use std::io::Read;
     use std::sync::{mpsc, Arc, Mutex};
@@ -627,7 +652,7 @@ fn wait_with_deadline(
     }
     let (out, out_ended) = drain(child.stdout.take());
     let (err, err_ended) = drain(child.stderr.take());
-    let deadline = Instant::now() + limit;
+    let deadline = limit.map(|limit| Instant::now() + limit);
     loop {
         if let Some(status) = child.try_wait()? {
             let grace = Instant::now() + STREAM_DRAIN_GRACE;
@@ -640,7 +665,7 @@ fn wait_with_deadline(
                 stderr: taken(&err),
             }));
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             let _ = child.kill();
             let _ = child.wait();
             return Ok(None);

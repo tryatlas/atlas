@@ -203,6 +203,9 @@ async fn run_compact_task_inner(
             return Err(error);
         }
     }
+    let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+    sess.emit_turn_item_started(&turn_context, &compaction_item)
+        .await;
     let result = run_compact_task_inner_impl(
         Arc::clone(&sess),
         Arc::clone(&turn_context),
@@ -211,8 +214,24 @@ async fn run_compact_task_inner(
         compaction_metadata,
     )
     .await;
+    // The UI pairs this lifecycle event even when compaction fails or is stopped.
+    sess.emit_turn_item_completed(&turn_context, compaction_item)
+        .await;
     let status = compaction_status_from_result(&result);
     let atlas_engine_error = result.as_ref().err();
+    // Manual compaction returns its error to the task owner, which emits the
+    // terminal error. Auto compaction can be handled inside the regular turn.
+    if matches!(trigger, CompactionTrigger::Auto)
+        && let Some(error) = atlas_engine_error
+        && !matches!(
+            error.details(),
+            AtlasEngineErrorDetails::Interrupted | AtlasEngineErrorDetails::TurnAborted
+        )
+    {
+        sess.track_turn_atlas_engine_error(turn_context.as_ref(), error);
+        sess.send_event(&turn_context, EventMsg::Error(error.to_error_event(None)))
+            .await;
+    }
     if result.is_ok() {
         let post_compact_outcome = run_post_compact_hooks(&sess, &turn_context, trigger).await;
         if let PostCompactHookOutcome::Stopped = post_compact_outcome {
@@ -245,9 +264,6 @@ async fn run_compact_task_inner_impl(
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
 ) -> AtlasEngineResult<String> {
-    let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
-    sess.emit_turn_item_started(&turn_context, &compaction_item)
-        .await;
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
     let mut history = sess.clone_history().await;
@@ -269,7 +285,7 @@ async fn run_compact_task_inner_impl(
         AtlasEngineResponsesRequestKind::Compaction(compaction_metadata),
     );
 
-    loop {
+    let summary_suffix = loop {
         // Clone is required because of the loop
         let turn_input = history
             .clone()
@@ -290,8 +306,8 @@ async fn run_compact_task_inner_impl(
         .await;
 
         match attempt_result {
-            Ok(()) => {
-                break;
+            Ok(summary) => {
+                break summary;
             }
             Err(err)
                 if matches!(
@@ -302,9 +318,6 @@ async fn run_compact_task_inner_impl(
                 return Err(err);
             }
             Err(e) if matches!(e.details(), AtlasEngineErrorDetails::SessionBudgetExceeded) => {
-                sess.track_turn_atlas_engine_error(turn_context.as_ref(), &e);
-                let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                sess.send_event(&turn_context, event).await;
                 return Err(e);
             }
             Err(e) if matches!(e.details(), AtlasEngineErrorDetails::ContextWindowExceeded) => {
@@ -318,13 +331,10 @@ async fn run_compact_task_inner_impl(
                     continue;
                 }
                 sess.set_total_tokens_full(turn_context.as_ref()).await;
-                sess.track_turn_atlas_engine_error(turn_context.as_ref(), &e);
-                let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                sess.send_event(&turn_context, event).await;
                 return Err(e);
             }
             Err(e) => {
-                if retries < max_retries {
+                if retries < max_retries && e.is_retryable() {
                     retries += 1;
                     let delay = backoff(retries);
                     sess.notify_stream_error(
@@ -337,19 +347,14 @@ async fn run_compact_task_inner_impl(
                     tokio::time::sleep(delay).await;
                     continue;
                 } else {
-                    sess.track_turn_atlas_engine_error(turn_context.as_ref(), &e);
-                    let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                    sess.send_event(&turn_context, event).await;
                     return Err(e);
                 }
             }
         }
-    }
+    };
 
     let history_snapshot = sess.clone_history().await;
     let history_items = history_snapshot.annotated_items();
-    let summary_suffix =
-        get_last_assistant_message_from_turn(history_snapshot.raw_items()).unwrap_or_default();
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
     let user_messages = collect_annotated_user_messages(history_items);
 
@@ -386,8 +391,6 @@ async fn run_compact_task_inner_impl(
     .await;
     sess.recompute_token_usage(&turn_context).await;
 
-    sess.emit_turn_item_completed(&turn_context, compaction_item)
-        .await;
     let warning = EventMsg::Warning(WarningEvent {
         message: "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.".to_string(),
     });
@@ -724,7 +727,7 @@ async fn drain_to_completed(
     client_session: &mut ModelClientSession,
     responses_metadata: &AtlasEngineResponsesMetadata,
     prompt: &Prompt,
-) -> AtlasEngineResult<()> {
+) -> AtlasEngineResult<String> {
     let mut stream = client_session
         .stream(
             prompt,
@@ -739,6 +742,7 @@ async fn drain_to_completed(
             &InferenceTraceContext::disabled(),
         )
         .await?;
+    let mut response_items = Vec::new();
     loop {
         let maybe_event = stream.next().await;
         let Some(event) = maybe_event else {
@@ -748,8 +752,7 @@ async fn drain_to_completed(
         };
         match event {
             Ok(ResponseEvent::OutputItemDone(item)) => {
-                sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
-                    .await;
+                response_items.push(item);
             }
             Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
                 sess.set_server_reasoning_included(included).await;
@@ -772,7 +775,17 @@ async fn drain_to_completed(
                 .await;
                 sess.update_token_usage_info(turn_context, token_usage.as_ref())
                     .await?;
-                return Ok(());
+                let summary = get_last_assistant_message_from_turn(response_items.iter())
+                    .filter(|text| !text.trim().is_empty())
+                    .ok_or_else(|| {
+                        AtlasEngineErr::InvalidRequest(
+                            "Compaction returned no text summary; the conversation was preserved."
+                                .to_string(),
+                        )
+                    })?;
+                sess.record_conversation_items(turn_context, &response_items)
+                    .await;
+                return Ok(summary);
             }
             Ok(_) => continue,
             Err(e) => return Err(e),

@@ -3,7 +3,12 @@ import { useKnowledgeMetaStore, usePageMeta } from "../stores/knowledge-meta-sto
 import { IconPicker } from "./icon-picker";
 import { CoverPicker } from "./cover-picker";
 import { gradientCss, isGradientCover as isGradientRef } from "../lib/cover-gradients";
-import { coverCacheKey, getCachedCoverUrl, putCachedCoverUrl } from "../lib/cover-url-cache";
+import {
+  coverCacheKey,
+  getCachedCoverUrl,
+  putCachedCoverUrl,
+  useCoverRevision,
+} from "../lib/cover-url-cache";
 import { knowledgeCoverDataUrl } from "../lib/knowledge-api";
 import { PageHeaderView } from "./views/page-header-view";
 
@@ -40,12 +45,12 @@ export function PageHeaderWithIcon({
       // Empty draft → clear the override so the filename fallback wins
       // again.
       if (meta.title !== null && meta.title !== undefined) {
-        void patch(entryId, { title: null });
+        void patch(entryId, { title: null }).catch(() => {});
       }
       return;
     }
     if (next !== (meta.title ?? "")) {
-      void patch(entryId, { title: next });
+      void patch(entryId, { title: next }).catch(() => {});
     }
   };
 
@@ -63,6 +68,7 @@ export function PageHeaderWithIcon({
   // that was a visible loading flash plus a main-thread parse hitch per
   // navigation. Upload evicts (the ref is entry-id-stable, not per-upload).
   const cacheKey = cover ? coverCacheKey(projectPath, cover) : null;
+  const coverRevision = useCoverRevision(cacheKey);
   const [coverUrl, setCoverUrl] = useState<string | null>(() =>
     cacheKey ? getCachedCoverUrl(cacheKey) : null,
   );
@@ -88,7 +94,7 @@ export function PageHeaderWithIcon({
     return () => {
       alive = false;
     };
-  }, [cover, cacheKey, isGradientCover, projectPath]);
+  }, [cover, cacheKey, isGradientCover, projectPath, coverRevision]);
 
   return (
     <PageHeaderView
@@ -109,7 +115,7 @@ export function PageHeaderWithIcon({
             <IconPicker
               value={meta.icon ?? null}
               anchorRect={iconAnchor}
-              onPick={(v) => entryId && void patch(entryId, { icon: v })}
+              onPick={(v) => entryId && void patch(entryId, { icon: v }).catch(() => {})}
               onClose={() => setIconAnchor(null)}
             />
           )}
@@ -119,7 +125,7 @@ export function PageHeaderWithIcon({
               projectPath={projectPath}
               entryId={entryId}
               anchorRect={coverAnchor}
-              onPick={(v) => void patch(entryId, { cover: v })}
+              onPick={(v) => void patch(entryId, { cover: v }).catch(() => {})}
               onClose={() => setCoverAnchor(null)}
             />
           )}

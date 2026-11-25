@@ -710,7 +710,6 @@ dependencies = [
  "chrono",
  "dashmap",
  "dirs",
- "dotenvy",
  "dunce",
  "futures",
  "gtk",
@@ -822,6 +821,7 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "atlas-acp-thread",
+ "atlas-agent-servers",
  "atlas-process",
  "atlas-terminal",
  "chrono",
@@ -833,6 +833,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1907,6 +1908,7 @@ dependencies = [
  "atlas-engine-thread-store",
  "atlas-engine-utils-output-truncation",
  "chrono",
+ "dirs",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -3023,7 +3025,6 @@ dependencies = [
 name = "atlas-engine-utils-cargo-bin"
 version = "0.0.0"
 dependencies = [
- "assert_cmd",
  "runfiles",
  "thiserror 2.0.21",
 ]

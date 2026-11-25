@@ -53,6 +53,8 @@ interface MemoryStoreState {
   };
 }
 
+let policyGeneration = 0;
+
 export const useMemoryStore = create<MemoryStoreState>()((set, get) => ({
   subTab: "memories",
   filesView: "preferences",
@@ -69,6 +71,7 @@ export const useMemoryStore = create<MemoryStoreState>()((set, get) => ({
 
     ensureProject: (projectPath) => {
       if (get().project === projectPath) return;
+      policyGeneration++;
       // New project → invalidate every cache.
       set({
         project: projectPath,
@@ -80,14 +83,18 @@ export const useMemoryStore = create<MemoryStoreState>()((set, get) => ({
 
     loadPolicies: async (projectPath, force = false) => {
       const s = get();
+      if (s.project !== projectPath) return;
       if (!force && s.project === projectPath && s.policies && s.policyPhase === "ready") {
         return; // cache hit — no re-index
       }
+      const generation = ++policyGeneration;
       set({ policyPhase: "loading", policyError: null });
       try {
         const rows = await memoryPolicy.list(projectPath);
+        if (generation !== policyGeneration || get().project !== projectPath) return;
         set({ policies: rows, policyPhase: "ready", project: projectPath });
       } catch (e) {
+        if (generation !== policyGeneration || get().project !== projectPath) return;
         const msg = String(e);
         if (msg.includes("model-not-downloaded")) {
           set({ policyPhase: "not-downloaded" });

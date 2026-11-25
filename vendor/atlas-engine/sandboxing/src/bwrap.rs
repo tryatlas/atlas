@@ -169,21 +169,26 @@ fn is_user_namespace_failure(output: &Output) -> bool {
 pub fn find_system_bwrap_in_path() -> Option<PathBuf> {
     let search_path = std::env::var_os("PATH")?;
     let cwd = std::env::current_dir().ok()?;
-    find_system_bwrap_in_search_paths(std::env::split_paths(&search_path), &cwd)
+    let appdir = std::env::var_os("APPDIR").map(PathBuf::from);
+    find_system_bwrap_in_search_paths(std::env::split_paths(&search_path), &cwd, appdir.as_deref())
 }
 
 fn find_system_bwrap_in_search_paths(
     search_paths: impl IntoIterator<Item = PathBuf>,
     cwd: &Path,
+    appdir: Option<&Path>,
 ) -> Option<PathBuf> {
     let search_path = std::env::join_paths(search_paths).ok()?;
     let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let cwd_is_root = cwd.parent().is_none();
+    let appdir = appdir.and_then(|path| std::fs::canonicalize(path).ok());
     which::which_in_all(SYSTEM_BWRAP_PROGRAM, Some(search_path), &cwd)
         .ok()?
         .find_map(|path| {
             let path = std::fs::canonicalize(path).ok()?;
-            if !cwd_is_root && path.starts_with(&cwd) {
+            if (!cwd_is_root && path.starts_with(&cwd))
+                || appdir.as_ref().is_some_and(|root| path.starts_with(root))
+            {
                 None
             } else {
                 Some(path)

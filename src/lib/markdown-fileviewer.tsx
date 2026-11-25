@@ -57,17 +57,24 @@ function onPreviewLinkClick(e: React.MouseEvent<HTMLAnchorElement>) {
   e.preventDefault();
 }
 
-function handleWheel(e: React.WheelEvent<HTMLElement>) {
-  const el = e.currentTarget;
-  if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
-  e.preventDefault();
+function handleWheel(e: WheelEvent) {
+  const el = e.target instanceof Element ? e.target.closest("pre, table") : null;
+  if (!el || e.defaultPrevented || Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
   let parent = el.parentElement;
   while (parent) {
     const style = getComputedStyle(parent);
     if (style.overflowY === "auto" || style.overflowY === "scroll") break;
     parent = parent.parentElement;
   }
-  parent?.scrollBy({ top: e.deltaY });
+  if (!parent) return;
+  e.preventDefault();
+  const scale =
+    e.deltaMode === 1
+      ? parseFloat(getComputedStyle(parent).lineHeight) || 16
+      : e.deltaMode === 2
+        ? parent.clientHeight
+        : 1;
+  parent.scrollBy({ top: e.deltaY * scale });
 }
 
 interface Props {
@@ -123,6 +130,11 @@ export const MarkdownFile = memo(function MarkdownFile({
   }, [trusted, fileRoot, docDir]);
   const open = useMemo(() => (fileRoot ? openFileChipUnder(fileRoot) : null), [fileRoot]);
   const host = useFileChipHost(open);
+  useEffect(() => {
+    const node = host.ref.current;
+    node?.addEventListener("wheel", handleWheel, { passive: false });
+    return () => node?.removeEventListener("wheel", handleWheel);
+  }, [host.ref]);
   return (
     <div
       ref={host.ref}
@@ -209,7 +221,6 @@ export const MarkdownFile = memo(function MarkdownFile({
                 whiteSpace: "pre",
                 wordBreak: "normal",
               }}
-              onWheel={handleWheel}
             >
               {p.children}
             </pre>
@@ -224,10 +235,7 @@ export const MarkdownFile = memo(function MarkdownFile({
           hr: () => <hr className="my-6 border-border-subtle" />,
 
           table: (p) => (
-            <div
-              className="my-4 overflow-x-auto rounded-md border border-[var(--border)]"
-              onWheel={handleWheel}
-            >
+            <div className="my-4 overflow-x-auto rounded-md border border-[var(--border)]">
               <table className="min-w-max text-base">{p.children}</table>
             </div>
           ),

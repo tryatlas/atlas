@@ -46,3 +46,13 @@ export function saveCachedAcpModels(agentType: string, models: CachedAcpModels):
     // storage full / unavailable — caching is best-effort
   }
 }
+
+/** Forget an agent's cached models: a live session answered that it has none
+ *  (see `clearCachedAcpModes`). */
+export function clearCachedAcpModels(agentType: string): void {
+  try {
+    localStorage.removeItem(key(agentType));
+  } catch {
+    // storage unavailable — caching is best-effort
+  }
+}

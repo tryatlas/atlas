@@ -59,7 +59,6 @@ export interface SidebarSession {
   snoozedUntil: string | null;
   unread: boolean;
   woke: boolean;
-  liveElsewhere: boolean;
   /** Held open in Atlas with a turn running, no tab needed (Universal RC). */
   heldWorking: boolean;
   /** The projects attached to the session, as the row carries them. The
@@ -199,7 +198,6 @@ function buildSession(
     snoozedUntil,
     unread: thread.unread,
     woke: thread.woke,
-    liveElsewhere: thread.liveElsewhere,
     heldWorking: thread.heldWorking,
   };
 }

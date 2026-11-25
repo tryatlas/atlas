@@ -707,6 +707,7 @@ async fn standalone_image_generation_is_exposed_in_code_mode_only() -> Result<()
 
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs the standalone atlas-engine-code-mode-host binary, which Atlas does not build: the engine runs in-process (ADR-0004)"]
 async fn standalone_image_generation_is_callable_from_code_mode_only() -> Result<()> {
     let call_id = "code-mode-image-run-1";
     let server = responses::start_mock_server().await;

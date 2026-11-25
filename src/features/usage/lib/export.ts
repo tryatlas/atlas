@@ -55,15 +55,16 @@ async function pickSave(defaultName: string, ext: string): Promise<string | null
 const stamp = () => new Date().toISOString().slice(0, 10);
 
 /** Export the dashboard node as a JPEG image. */
-export async function exportJpeg(node: HTMLElement): Promise<void> {
+export async function exportJpeg(node: HTMLElement): Promise<boolean> {
   const dataUrl = await capture(node, "jpeg");
   const target = await pickSave(`atlas-usage-${stamp()}.jpg`, "jpg");
-  if (!target) return;
+  if (!target) return false;
   await invoke("usage_write_file", { targetPath: target, bytes: dataUrlToBytes(dataUrl) });
+  return true;
 }
 
 /** Export the dashboard node as a multi-page PDF (image-per-page slices). */
-export async function exportPdf(node: HTMLElement): Promise<void> {
+export async function exportPdf(node: HTMLElement): Promise<boolean> {
   const dataUrl = await capture(node, "png");
   const { jsPDF } = await import("jspdf");
   const img = new Image();
@@ -97,17 +98,19 @@ export async function exportPdf(node: HTMLElement): Promise<void> {
   }
 
   const target = await pickSave(`atlas-usage-${stamp()}.pdf`, "pdf");
-  if (!target) return;
+  if (!target) return false;
   const buf = pdf.output("arraybuffer");
   await invoke("usage_write_file", { targetPath: target, bytes: Array.from(new Uint8Array(buf)) });
+  return true;
 }
 
 /** Export a Markdown report of the current view. */
-export async function exportMarkdown(view: UsageView): Promise<void> {
+export async function exportMarkdown(view: UsageView): Promise<boolean> {
   const md = buildMarkdown(view);
   const target = await pickSave(`atlas-usage-${stamp()}.md`, "md");
-  if (!target) return;
+  if (!target) return false;
   await invoke("usage_export_markdown", { targetPath: target, markdown: md });
+  return true;
 }
 
 /** Copy the same Markdown report used for file export straight to the clipboard. */

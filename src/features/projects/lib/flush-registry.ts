@@ -11,8 +11,8 @@
  * Each store registers a `flush()` that MUST: cancel its debounce timer,
  * perform the save immediately, and return a promise that resolves only once
  * the underlying `invoke` settles. `flushAll()` awaits every registered
- * flush. It is intentionally resilient — one store throwing never blocks the
- * others (and therefore never blocks a project switch).
+ * flush. All callbacks settle even if one fails. Required user-content
+ * failures reject the barrier so callers can keep the project open and retry.
  */
 
 /** Context passed to each flush so it writes to the OUTGOING project even
@@ -34,6 +34,7 @@ interface Registration {
   /** Stable label, for dedupe + diagnostics. */
   id: string;
   flush: FlushFn;
+  required: boolean;
 }
 
 const registry = new Map<string, Registration>();
@@ -42,8 +43,12 @@ const registry = new Map<string, Registration>();
  * Register (or replace) a store's flush function. Returns an unregister
  * callback. Safe to call at module load — stores register once on import.
  */
-export function registerFlush(id: string, flush: FlushFn): () => void {
-  registry.set(id, { id, flush });
+export function registerFlush(
+  id: string,
+  flush: FlushFn,
+  options?: { required?: boolean },
+): () => void {
+  registry.set(id, { id, flush, required: options?.required ?? false });
   return () => {
     const current = registry.get(id);
     if (current && current.flush === flush) registry.delete(id);
@@ -53,14 +58,20 @@ export function registerFlush(id: string, flush: FlushFn): () => void {
 /**
  * Flush every registered store for the given project. Resolves only after
  * ALL flushes settle, so callers can `await flushAll(ctx)` and be certain
- * pending writes have hit disk. Individual failures are swallowed (logged) so
- * a single bad store can't strand a project switch.
+ * pending writes have hit disk. Required failures reject after every callback
+ * has settled; optional UI metadata failures are logged.
  */
 export async function flushAll(ctx: FlushCtx = { projectId: null, path: null }): Promise<void> {
+  const failures: unknown[] = [];
   const pending = Array.from(registry.values()).map((r) =>
-    r.flush(ctx).catch((e) => {
-      console.warn(`flushAll: "${r.id}" flush failed:`, e);
-    }),
+    Promise.resolve()
+      .then(() => r.flush(ctx))
+      .catch((e) => {
+        console.warn(`flushAll: "${r.id}" flush failed:`, e);
+        if (r.required) failures.push(e);
+      }),
   );
   await Promise.all(pending);
+  if (failures.length > 0)
+    throw new AggregateError(failures, "Some edits could not be saved. Retry before closing.");
 }

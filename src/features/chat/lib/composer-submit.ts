@@ -3,6 +3,8 @@
 // button shows; plus two text helpers the composer's hooks share. No React,
 // store or DOM here — `use-composer-submit.ts` carries out the plan.
 
+import type { AtlasCommandNames } from "./slash-command-model";
+
 export type ComposerButtonMode = "send" | "queue" | "stop";
 
 export type SubmitPlan =
@@ -27,8 +29,9 @@ export interface SubmitInput {
   running: boolean;
   remoteDriving: boolean;
   modeUnrestored: boolean;
-  heldForTerminal: boolean;
-  supportsFork: boolean;
+  /** What Atlas's `/fork` and `/queue` are called for this agent: renamed, or
+   *  absent, where the agent advertises the name (`atlasCommandNames`). */
+  atlasCommands: AtlasCommandNames;
 }
 
 export function planSubmit({
@@ -38,8 +41,7 @@ export function planSubmit({
   running,
   remoteDriving,
   modeUnrestored,
-  heldForTerminal,
-  supportsFork,
+  atlasCommands,
 }: SubmitInput): SubmitPlan {
   // Hard gate: Claude Code missing or not authed — sending would just
   // surface a confusing ACP spawn error. The banner above tells the user
@@ -47,22 +49,25 @@ export function planSubmit({
   if (disabled) return { kind: "blocked" };
   // A GitHub repo is still syncing into `.atlas/repos` — block the send so the
   // prompt can't reference a half-cloned repo.
-  if (githubSyncing) return { kind: "blocked" };
   const trimmed = text.trim();
   if (!trimmed) {
     // Empty + running → act as a stop button.
     return running ? { kind: "stop" } : { kind: "noop" };
   }
+  if (githubSyncing) return { kind: "blocked" };
   // Someone else holds the seat: nothing typed here sends or queues, not
   // even `/queue` (which used to slip past this check and park the prompt
   // locally, to be drained under the remote driver's seat later). The
   // strip above says who is driving and offers Take over.
   if (remoteDriving) return { kind: "blocked" };
   // Atlas-surface commands, typed in full (the picker's Enter lands here
-  // too). They drive app affordances, so they never reach the agent.
-  if (trimmed === "/fork" && supportsFork) return { kind: "fork" };
-  if (trimmed === "/queue" || trimmed.startsWith("/queue ")) {
-    const queued = trimmed.slice("/queue".length).trim();
+  // too). They drive app affordances, so they never reach the agent. A name
+  // the agent advertises is the agent's: Atlas's command goes by another.
+  const fork = atlasCommands.fork && `/${atlasCommands.fork}`;
+  if (fork && trimmed === fork) return { kind: "fork" };
+  const queue = atlasCommands.queue && `/${atlasCommands.queue}`;
+  if (queue && (trimmed === queue || trimmed.startsWith(`${queue} `))) {
+    const queued = trimmed.slice(queue.length).trim();
     return { kind: "queue-command", message: queued || null };
   }
   if (running) {
@@ -75,7 +80,7 @@ export function planSubmit({
     // pasted or cited, so the queue puts its text into the queued string.
     return { kind: "enqueue", text: trimmed };
   }
-  if (modeUnrestored || heldForTerminal) return { kind: "blocked" };
+  if (modeUnrestored) return { kind: "blocked" };
   return { kind: "send", text: trimmed };
 }
 
@@ -90,14 +95,12 @@ export function submitButtonState({
   hasText,
   disabled,
   modeUnrestored,
-  heldForTerminal,
   remoteDriving,
 }: {
   running: boolean;
   hasText: boolean;
   disabled: boolean;
   modeUnrestored: boolean;
-  heldForTerminal: boolean;
   remoteDriving: boolean;
 }): { mode: ComposerButtonMode; enabled: boolean } {
   const mode: ComposerButtonMode = running
@@ -106,9 +109,7 @@ export function submitButtonState({
       : "stop"
     : "send";
   const enabled =
-    disabled ||
-    (mode === "send" && (modeUnrestored || heldForTerminal)) ||
-    (mode !== "stop" && remoteDriving)
+    disabled || (mode === "send" && modeUnrestored) || (mode !== "stop" && remoteDriving)
       ? false
       : mode === "stop"
         ? true

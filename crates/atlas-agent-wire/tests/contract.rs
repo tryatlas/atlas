@@ -291,6 +291,7 @@ fn samples() -> Vec<SessionDelta> {
                     id: "q-1".into(),
                     text: "and then the tests".into(),
                     origin: Origin::Local,
+                    truncated: Some(true),
                 },
                 QueuedPrompt {
                     id: "q-2".into(),
@@ -299,6 +300,7 @@ fn samples() -> Vec<SessionDelta> {
                         id: "user-7".into(),
                         name: None,
                     },
+                    truncated: None,
                 },
             ],
         },
@@ -635,7 +637,12 @@ fn golden() -> BTreeMap<&'static str, serde_json::Value> {
             json!({
                 "kind": "queue_changed",
                 "queue": [
-                    { "id": "q-1", "text": "and then the tests", "origin": { "kind": "local" } },
+                    {
+                        "id": "q-1",
+                        "text": "and then the tests",
+                        "origin": { "kind": "local" },
+                        "truncated": true,
+                    },
                     { "id": "q-2", "text": "ship it", "origin": { "kind": "remote", "id": "user-7" } },
                 ],
             }),
@@ -819,6 +826,16 @@ fn optional_fields_are_omitted_rather_than_null() {
         let value = serde_json::to_value(&delta).unwrap();
         assert!(value.get("origin").is_none(), "{value}");
     }
+
+    // A queued prompt that travels whole says nothing about being cut.
+    let value = serde_json::to_value(QueuedPrompt {
+        id: "q-1".into(),
+        text: "short".into(),
+        origin: Origin::Local,
+        truncated: None,
+    })
+    .unwrap();
+    assert!(value.get("truncated").is_none(), "{value}");
 
     let mut tool_call = sample_tool_call();
     tool_call.raw_output = None;

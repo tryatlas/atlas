@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Calendar,
@@ -172,7 +173,7 @@ function StatusEditor({
           placeholder="Status…"
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") pick(draft.trim() || null);
+            if (e.key === "Enter" && !isComposingKey(e)) pick(draft.trim() || null);
           }}
         />
         <div className="mt-1.5 flex flex-wrap gap-1">
@@ -227,7 +228,7 @@ function TextEditor({
           setEditing(false);
         }}
         onKeyDown={(e) => {
-          if (e.key === "Enter") {
+          if (e.key === "Enter" && !isComposingKey(e)) {
             onChange(draft);
             setEditing(false);
           } else if (e.key === "Escape") {
@@ -294,7 +295,7 @@ function TagsEditor({ tags, onChange }: { tags: string[]; onChange: (tags: strin
           onChange={(e) => setDraft(e.target.value)}
           onBlur={commit}
           onKeyDown={(e) => {
-            if (e.key === "Enter") commit();
+            if (e.key === "Enter" && !isComposingKey(e)) commit();
             else if (e.key === "Escape") {
               setDraft("");
               setAdding(false);

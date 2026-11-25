@@ -386,8 +386,36 @@ impl AppState {
 
     /// [`Self::load`] for a known path, so the read is reachable without an
     /// `AppHandle`.
+    ///
+    /// A `state.json` that exists but cannot be read or parsed is moved aside
+    /// to `state.json.corrupt-<ms>` (see [`set_aside_corrupt`]) before the
+    /// defaults are returned. The setup-time save writes those defaults back
+    /// to `state.json` moments later, so without the move every project and
+    /// organisation in the file would be overwritten with no trace.
     fn load_at(path: &Path) -> Self {
-        Self::from_raw(std::fs::read_to_string(path).ok().as_deref())
+        let raw = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::from_raw(None),
+            Err(e) => {
+                tracing::error!("state.json at {} unreadable: {e}", path.display());
+                set_aside_corrupt(path, None);
+                return Self::from_raw(None);
+            }
+        };
+        let parsed = std::str::from_utf8(&raw)
+            .map_err(|e| e.to_string())
+            .and_then(|text| serde_json::from_str::<AppState>(text).map_err(|e| e.to_string()));
+        match parsed {
+            Ok(mut state) => {
+                state.migrate();
+                state
+            }
+            Err(e) => {
+                tracing::error!("state.json at {} does not parse: {e}", path.display());
+                set_aside_corrupt(path, Some(&raw));
+                Self::from_raw(None)
+            }
+        }
     }
 
     /// The parse+migrate half of [`Self::load`], split out so it is reachable
@@ -421,11 +449,30 @@ impl AppState {
     /// shadow of the settings, and `groups`, the project folders the sidebar
     /// no longer has.
     fn merged_for_save(path: &Path, state: &AppState) -> serde_json::Result<serde_json::Value> {
-        let mut merged = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-            .filter(serde_json::Value::is_object)
-            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        let existing = match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                // Unreadable is not "absent": writing over it would destroy
+                // whatever it holds, so the save fails instead.
+                return Err(serde_json::Error::io(e));
+            }
+        };
+        let parsed = existing.as_deref().and_then(|bytes| {
+            serde_json::from_slice::<serde_json::Value>(bytes)
+                .ok()
+                .filter(serde_json::Value::is_object)
+        });
+        if let (Some(bytes), None) = (existing.as_deref(), parsed.as_ref()) {
+            // Not a JSON object: keep it before the merge replaces it.
+            tracing::error!(
+                "state.json at {} is not a JSON object; setting it aside",
+                path.display()
+            );
+            set_aside_corrupt(path, Some(bytes));
+        }
+        let mut merged =
+            parsed.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
 
         let fresh = serde_json::to_value(state)?;
         if let (Some(dst), Some(src)) = (merged.as_object_mut(), fresh.as_object()) {
@@ -469,6 +516,47 @@ impl AppState {
         let raw = serde_json::to_string_pretty(&merged)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         atlas_fs::replace_file(path, raw)
+    }
+}
+
+/// Move an unusable `state.json` aside to `state.json.corrupt-<ms>`, next to
+/// it, so the next save cannot overwrite the only copy of the user's projects.
+///
+/// A rename is atomic and keeps the file byte for byte. When it fails (a
+/// filesystem that refuses it) and the bytes are in hand, they are written to
+/// the backup name through `atlas_fs::replace_file` instead, which is atomic
+/// too. Returns the backup path, or `None` when neither worked; every outcome
+/// is logged.
+fn set_aside_corrupt(path: &Path, bytes: Option<&[u8]>) -> Option<PathBuf> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let name = path
+        .file_name()
+        .map_or_else(|| "state.json".into(), |n| n.to_string_lossy().into_owned());
+    let mut backup = path.with_file_name(format!("{name}.corrupt-{now}"));
+    let mut n = 1;
+    while backup.exists() {
+        backup = path.with_file_name(format!("{name}.corrupt-{now}-{n}"));
+        n += 1;
+    }
+    match std::fs::rename(path, &backup) {
+        Ok(()) => {
+            tracing::warn!("kept the unusable state file as {}", backup.display());
+            return Some(backup);
+        }
+        Err(e) => tracing::warn!("could not move {} aside: {e}", path.display()),
+    }
+    match bytes.map(|bytes| atlas_fs::replace_file(&backup, bytes)) {
+        Some(Ok(())) => {
+            tracing::warn!("copied the unusable state file to {}", backup.display());
+            Some(backup)
+        }
+        Some(Err(e)) => {
+            tracing::error!("could not back up {}: {e}", path.display());
+            None
+        }
+        None => None,
     }
 }
 
@@ -783,6 +871,63 @@ mod tests {
         assert_eq!(state.organisations.len(), 1);
         assert_eq!(state.organisations[0].name, "Personal");
         assert!(state.active_organisation_id.is_some());
+    }
+
+    fn corrupt_backups(dir: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("state.json.corrupt-"))
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// D2: a `state.json` that does not parse is kept, byte for byte, before
+    /// the boot-time save writes defaults over `state.json`.
+    #[test]
+    fn a_corrupt_state_file_is_kept_before_the_boot_save_overwrites_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let corrupt = r#"{"recentProjects": [ {"name": "precious""#;
+        std::fs::write(&path, corrupt).unwrap();
+
+        let loaded = AppState::load_at(&path);
+        assert_eq!(loaded.organisations.len(), 1, "defaults still load");
+        AppState::save_at(&path, &loaded).unwrap();
+
+        let backups = corrupt_backups(dir.path());
+        assert_eq!(backups.len(), 1, "no corrupt backup next to state.json");
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), corrupt);
+        assert!(AppState::load_at(&path).organisations.len() == 1);
+    }
+
+    /// D2: valid JSON that is not an object is kept by the merge too, rather
+    /// than silently replaced.
+    #[test]
+    fn a_non_object_state_file_is_kept_before_a_save_replaces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, "[1, 2, 3]").unwrap();
+
+        AppState::save_at(&path, &AppState::default()).unwrap();
+
+        let backups = corrupt_backups(dir.path());
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), "[1, 2, 3]");
+    }
+
+    /// A missing file is a first run, not corruption: nothing is set aside.
+    #[test]
+    fn a_missing_state_file_leaves_no_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let loaded = AppState::load_at(&path);
+        AppState::save_at(&path, &loaded).unwrap();
+        assert!(corrupt_backups(dir.path()).is_empty());
     }
 
     /// A patch with unknown/extra keys (an older or newer frontend) still parses,

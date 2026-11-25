@@ -8,7 +8,6 @@ vi.mock("@tauri-apps/api/core", () => import("@/test/tauri-core"));
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { useChatStore } from "@/features/chat/stores/chat-store";
 import { useTerminalStore } from "@/features/terminal/stores/terminal-store";
-import { useLiveElsewhereStore } from "@/features/chat/stores/live-elsewhere-store";
 import { useProjectStore } from "@/features/projects/stores/project-store";
 import { performUiAction } from "./ui-actions";
 import { seedWindow, tab, uiRequest } from "./test-fixtures";
@@ -72,7 +71,6 @@ beforeEach(() => {
     ] as never,
     activeProjectId: "w-1",
   });
-  useLiveElsewhereStore.setState({ live: {}, overridden: {} });
   useTerminalStore.setState({
     tabs: {},
     pendingCommands: {},
@@ -100,7 +98,7 @@ describe("ui_chat", () => {
     const focus = await heard(() => act("ui_chat", { op: "focus", tabId: "chat-2" }));
     expect(focus.focus).toContainEqual({ tabId: "chat-2" });
     const jump = await heard(() => act("ui_chat", { op: "jump", tabId: "chat-2", index: 3 }));
-    expect(jump.jump).toContainEqual({ index: 3 });
+    expect(jump.jump).toContainEqual({ tabId: "chat-2", index: 3 });
   });
 
   /// Own-session refusal: the agent may not speak for the user in its own
@@ -141,26 +139,6 @@ describe("ui_chat", () => {
       act("ui_chat", { op: "send", tabId: "chat-2", text: "status?" }),
     );
     expect(events.send).toContainEqual({ tabId: "chat-2", text: "status?" });
-  });
-
-  it("refuses send into a chat whose session another process is writing, until Send anyway", async () => {
-    // ADR-0001 amendment, Rule 7: another agent must not fork a terminal
-    // session with no prompt. The refusal names the way out.
-    useLiveElsewhereStore.getState().actions.setLive(["sess-2"]);
-    const held = await heard(async () =>
-      expect(error(await act("ui_chat", { op: "send", tabId: "chat-2", text: "go" }))).toMatch(
-        /active in another process.*prefill/,
-      ),
-    );
-    expect(held.send).toEqual([]);
-    // Prefill is still allowed: the user decides.
-    expect(result(await act("ui_chat", { op: "prefill", tabId: "chat-2", text: "go" })).op).toBe(
-      "prefill",
-    );
-
-    useLiveElsewhereStore.getState().actions.sendAnyway("sess-2");
-    const sent = await heard(() => act("ui_chat", { op: "send", tabId: "chat-2", text: "go" }));
-    expect(sent.send).toContainEqual({ tabId: "chat-2", text: "go" });
   });
 
   it("refuses a chat another project owns, naming it", async () => {

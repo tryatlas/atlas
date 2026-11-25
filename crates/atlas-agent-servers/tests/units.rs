@@ -38,6 +38,7 @@ fn registered(registry: &SessionRegistry, id: &str) -> Arc<Mutex<AcpThread>> {
             thread: Arc::downgrade(&thread),
             cancel_signal: CancelSignal::new(),
             session_modes: None,
+            modes_from_config: None,
             config_options: None,
             ref_count: 1,
         },
@@ -501,60 +502,6 @@ fn a_subscriber_gets_the_backlog_and_then_live_messages() {
         live.message,
         AcpDebugMessageContent::Stderr { .. }
     ));
-}
-
-// ------------------------------------------------------------- env workarounds
-
-#[test]
-fn the_claude_workaround_blanks_the_api_key_rather_than_unsetting_it() {
-    let env = env_quirks(&AgentId::new("claude-code"));
-    assert_eq!(env.get("ANTHROPIC_API_KEY"), Some(&String::new()));
-}
-
-#[test]
-fn an_agent_with_no_workaround_gets_a_clean_environment() {
-    assert!(env_quirks(&AgentId::new("some-installed-agent")).is_empty());
-}
-
-/// Codex's auth reads `CODEX_API_KEY` and `OPENAI_API_KEY`. The second was once
-/// forwarded as `OPEN_AI_API_KEY`, a name nothing reads, so a
-/// key the user exported never reached the agent.
-#[test]
-fn codex_gets_the_api_keys_its_auth_actually_reads() {
-    let host = |key: &str| match key {
-        "CODEX_API_KEY" => Some("codex-key".to_owned()),
-        "OPENAI_API_KEY" => Some("openai-key".to_owned()),
-        "OPEN_AI_API_KEY" => Some("misspelled".to_owned()),
-        "ANTHROPIC_API_KEY" => Some("not-codex".to_owned()),
-        _ => None,
-    };
-    let env = env_quirks_from(&AgentId::new("codex"), host);
-
-    assert_eq!(
-        env.get("CODEX_API_KEY").map(String::as_str),
-        Some("codex-key")
-    );
-    assert_eq!(
-        env.get("OPENAI_API_KEY").map(String::as_str),
-        Some("openai-key")
-    );
-    assert_eq!(
-        env.len(),
-        2,
-        "only the keys codex reads are forwarded: {env:?}"
-    );
-}
-
-/// A key the host does not have is left out rather than forwarded empty.
-#[test]
-fn codex_forwards_no_key_the_host_does_not_have() {
-    assert!(env_quirks_from(&AgentId::new("codex"), |_| None).is_empty());
-}
-
-#[test]
-fn gemini_is_told_which_host_it_is_running_in() {
-    let env = env_quirks(&AgentId::new("gemini"));
-    assert_eq!(env.get("SURFACE"), Some(&"atlas".to_owned()));
 }
 
 // ------------------------------------------------------------- capabilities

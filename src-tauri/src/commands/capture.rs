@@ -487,7 +487,7 @@ pub(crate) fn registered_store(
     root: &Path,
 ) -> Option<(Arc<Mutex<Store>>, bool)> {
     lock_ok(stores)
-        .get(root)
+        .get(Path::new(&project_id_for(root)))
         .map(|h| (h.store.clone(), h.is_writer))
 }
 
@@ -604,7 +604,7 @@ impl CaptureState {
     /// process holds it.
     fn writer_claim(&self, root: &Path) -> Option<bool> {
         lock_ok(&self.stores)
-            .get(root)
+            .get(Path::new(&project_id_for(root)))
             .map(|handle| handle.is_writer)
     }
 
@@ -672,7 +672,7 @@ impl CaptureState {
         model: Option<&str>,
         prompt: &str,
     ) {
-        if cwd.is_empty() {
+        if cwd.is_empty() || !enabled_on_disk(Path::new(cwd)) {
             // No project directory means nowhere to put `.atlas/`. Capture is a
             // no-op rather than an error — the agent turn is unaffected.
             return;
@@ -697,6 +697,14 @@ impl CaptureState {
             0
         };
 
+        let branch = if lock_ok(&self.sessions)
+            .get(session_id)
+            .is_none_or(|entry| entry.branch.is_none())
+        {
+            atlas_checkpoint::git::current_branch(Path::new(cwd))
+        } else {
+            None
+        };
         let binding = {
             let mut sessions = lock_ok(&self.sessions);
             let entry = sessions
@@ -707,9 +715,7 @@ impl CaptureState {
                     native_session_id: session_id.to_string(),
                     agent: Some(plugin_id.to_string()),
                     model: model.map(str::to_string),
-                    // Resolved here, inside `or_insert_with`, so the `git` call
-                    // happens once per Session rather than on every send.
-                    branch: atlas_checkpoint::git::current_branch(Path::new(cwd)),
+                    branch: branch.clone(),
                     cwd: cwd.to_string(),
                     turn_seq: seed,
                 });
@@ -721,7 +727,7 @@ impl CaptureState {
             // Ask again on each send until it has one — one `git` call per
             // send, only while unknown — so a later prompt fills it in.
             if entry.branch.is_none() {
-                entry.branch = atlas_checkpoint::git::current_branch(Path::new(cwd));
+                entry.branch = branch;
             }
             entry.clone()
         };
@@ -867,12 +873,12 @@ impl CaptureState {
         let calls = lock_ok(&self.session_calls).remove(session_id);
         if let Some(calls) = calls {
             self.forget_shell_windows(&calls);
-            self.forget_turn_head(session_id);
             let mut pending = lock_ok(&self.pending_writes);
             for call_id in calls {
                 pending.remove(&call_id);
             }
         }
+        self.forget_turn_head(session_id);
         // The binding registry itself — without this, one SessionBinding per
         // session ever seen survived for the process lifetime (and the map is
         // scanned under its mutex on every delta). Re-sighting the same session
@@ -882,6 +888,14 @@ impl CaptureState {
         self.submit(Job::EndSession {
             native_session_id: binding.native_session_id.clone(),
         });
+    }
+
+    /// A normal tab close need not emit AgentDisconnected. The lifecycle
+    /// observer performs the same idempotent cleanup for that path.
+    pub fn session_ended(&self, session_id: &str) {
+        if let Some(binding) = self.binding(session_id) {
+            self.flush_session_end(session_id, &binding);
+        }
     }
 
     fn submit_pending_messages(&self, turn: &PendingTurn) {
@@ -1243,6 +1257,7 @@ pub async fn capture_detect(
     project_path: String,
 ) -> Result<atlas_checkpoint::ProjectDetection, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let project_path = project_id_for(Path::new(&project_path));
         Ok(atlas_checkpoint::detect(std::path::Path::new(
             &project_path,
         )))
@@ -1257,6 +1272,7 @@ pub async fn capture_binding(
     project_path: String,
 ) -> Result<Option<atlas_checkpoint::Binding>, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let project_path = project_id_for(Path::new(&project_path));
         let Some(store) = open_reader(&project_path)? else {
             return Ok(None);
         };
@@ -1282,6 +1298,7 @@ pub async fn capture_enable(
     app: AppHandle,
 ) -> Result<atlas_checkpoint::Binding, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let project_path = project_id_for(Path::new(&project_path));
         let mode =
             ProjectMode::parse(&mode).ok_or_else(|| format!("unknown project mode: {mode}"))?;
         if mode == ProjectMode::Cloud {
@@ -1348,6 +1365,7 @@ pub async fn capture_import_preview(
     project_path: String,
 ) -> Result<atlas_checkpoint::ImportPreview, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let project_path = project_id_for(Path::new(&project_path));
         let store = open_reader(&project_path)?;
         let mode = store
             .as_ref()
@@ -1380,6 +1398,7 @@ pub async fn capture_import_preview(
 #[tauri::command]
 pub async fn capture_import_confirm(project_path: String, app: AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let project_path = project_id_for(Path::new(&project_path));
         let root = std::path::Path::new(&project_path);
         let state = app.state::<CaptureState>();
         let handle = state.writer(root)?;
@@ -1428,6 +1447,7 @@ pub async fn capture_disable(project_path: String, app: AppHandle) -> Result<(),
     let hook_app = app.clone();
     let hook_path = project_path.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let project_path = project_id_for(Path::new(&project_path));
         let handle = app
             .state::<CaptureState>()
             .writer(std::path::Path::new(&project_path))?;
@@ -1451,6 +1471,7 @@ pub async fn capture_git_init(
     app: AppHandle,
 ) -> Result<Option<atlas_checkpoint::Binding>, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let project_path = project_id_for(Path::new(&project_path));
         let status = atlas_git::GitCommand::without_repo(&["-C", &project_path, "init"])
             .output()
             .map_err(|e| format!("git init: {e}"))?;
@@ -1473,6 +1494,7 @@ pub async fn capture_git_init(
 #[tauri::command]
 pub async fn capture_activate(project_path: String, app: AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let project_path = project_id_for(Path::new(&project_path));
         let root = std::path::Path::new(&project_path);
         if !enabled_on_disk(root) {
             return Ok(());
@@ -1498,6 +1520,7 @@ pub async fn capture_activate(project_path: String, app: AppHandle) -> Result<()
 #[tauri::command]
 pub async fn capture_retry_failed(project_path: String, app: AppHandle) -> Result<i64, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let project_path = project_id_for(Path::new(&project_path));
         let root = std::path::Path::new(&project_path);
         let state = app.state::<CaptureState>();
         let handle = state.writer(root)?;
@@ -1538,6 +1561,7 @@ pub async fn capture_health(
     heal_git_watcher(&app, &project_path, workspace_id.as_deref()).await;
 
     tauri::async_runtime::spawn_blocking(move || {
+        let project_path = project_id_for(Path::new(&project_path));
         let root = std::path::Path::new(&project_path);
         // A reader, so a status poll never waits behind an import — and
         // therefore one that cannot answer whether this process holds the
@@ -1679,6 +1703,7 @@ pub async fn artifacts_session(
     session_id: String,
 ) -> Result<Option<atlas_checkpoint::SessionDetail>, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let project_path = project_id_for(Path::new(&project_path));
         let root = std::path::Path::new(&project_path).to_path_buf();
         let Some(store) = open_reader(&project_path)? else {
             return Ok(None);
@@ -1720,6 +1745,7 @@ pub async fn capture_session_summary(
     session_id: String,
 ) -> Result<Option<atlas_checkpoint::SessionSummary>, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let project_path = project_id_for(Path::new(&project_path));
         let Some(store) = open_reader(&project_path)? else {
             return Ok(None);
         };
@@ -1778,10 +1804,17 @@ pub struct SessionFile {
 
 /// Line counts of a unified diff: `+`/`-` body lines, headers excluded.
 fn patch_line_counts(patch: &str) -> (i64, i64) {
-    let mut added = 0;
-    let mut removed = 0;
+    let (mut added, mut removed) = (0, 0);
+    let mut in_hunk = false;
     for line in patch.lines() {
-        if line.starts_with("+++") || line.starts_with("---") {
+        if line.starts_with("diff --git ") {
+            in_hunk = false;
+        }
+        if line.starts_with("@@ ") {
+            in_hunk = true;
+            continue;
+        }
+        if !in_hunk {
             continue;
         }
         match line.as_bytes().first() {
@@ -1855,6 +1888,7 @@ pub async fn capture_session_files(
     session_id: String,
 ) -> Result<Vec<SessionFile>, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let project_path = project_id_for(Path::new(&project_path));
         let Some(store) = open_reader(&project_path)? else {
             return Ok(Vec::new());
         };
@@ -2672,6 +2706,7 @@ pub async fn capture_commit_sessions(
     commit_sha: String,
 ) -> Result<Vec<CommitSession>, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let project_path = project_id_for(Path::new(&project_path));
         let Some(store) = open_reader(&project_path)? else {
             return Ok(Vec::new());
         };
@@ -2771,6 +2806,7 @@ pub async fn capture_slug_available(
     app: AppHandle,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let project_path = project_id_for(Path::new(&project_path));
         let token = token_provider(&app);
         let config = sync_config(&project_path, &org_id, &token);
         Ok(match atlas_checkpoint::sync::check_slug(&config, &slug) {
@@ -2888,6 +2924,7 @@ pub async fn capture_connect_options(
     app: AppHandle,
 ) -> Result<ConnectOptions, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let project_path = project_id_for(Path::new(&project_path));
         let token = token_provider(&app);
         let config = sync_config(&project_path, &org_id, &token);
         let projects = atlas_checkpoint::list_workspaces(&config).map_err(|e| e.to_string())?;
@@ -2969,6 +3006,7 @@ pub async fn capture_connect(
     let hook_app = app.clone();
     let hook_path = project_path.clone();
     let result = tauri::async_runtime::spawn_blocking(move || -> Result<ConnectResult, String> {
+        let project_path = project_id_for(Path::new(&project_path));
         let root = std::path::Path::new(&project_path);
         let state = app.state::<CaptureState>();
 
@@ -3069,6 +3107,7 @@ pub async fn capture_switch_project(
     let hook_app = app.clone();
     let hook_path = project_path.clone();
     let result = tauri::async_runtime::spawn_blocking(move || -> Result<ConnectResult, String> {
+        let project_path = project_id_for(Path::new(&project_path));
         let root = std::path::Path::new(&project_path);
         let state = app.state::<CaptureState>();
 
@@ -3195,6 +3234,7 @@ pub async fn capture_git_available() -> bool {
 #[tauri::command]
 pub async fn capture_promotion_preview(project_path: String) -> Result<PromotionPreview, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let project_path = project_id_for(Path::new(&project_path));
         let store = open_reader(&project_path)?.ok_or("enable capture for this Project first")?;
         let sessions = store
             .sessions_for_project(&project_path)
@@ -3256,15 +3296,17 @@ pub async fn capture_promote(
     slug: String,
     name: Option<String>,
     visibility: Option<String>,
+    git_url: Option<String>,
     app: AppHandle,
 ) -> Result<i64, String> {
     let hook_app = app.clone();
     let hook_path = project_path.clone();
     let moved = tauri::async_runtime::spawn_blocking(move || -> Result<i64, String> {
+        let project_path = project_id_for(Path::new(&project_path));
         let state = app.state::<CaptureState>();
         let root = std::path::Path::new(&project_path);
 
-        let (root_commit_sha, git_url) = {
+        let (root_commit_sha, detected_git_url) = {
             let handle = state.writer(root)?;
             let store = lock_ok(&handle);
             let binding = store
@@ -3273,6 +3315,10 @@ pub async fn capture_promote(
                 .ok_or("enable capture for this Project first")?;
             (binding.root_commit_sha, binding.git_url)
         };
+        let git_url = git_url
+            .map(|url| url.trim().to_owned())
+            .or(detected_git_url)
+            .filter(|url| !url.is_empty());
 
         // Registration first, and outside the lock — cancelling or failing
         // leaves the Project exactly as it was: still Local, still captured,
@@ -3415,6 +3461,8 @@ fn enabled_on_disk(root: &Path) -> bool {
 /// the timeline, the health counts and the promotion preview all silently read
 /// as empty after a rename.
 fn open_in(stores: &StoreRegistry, root: &Path) -> Result<StoreHandle, String> {
+    let canonical = PathBuf::from(project_id_for(root));
+    let root = canonical.as_path();
     let mut registry = lock_ok(stores);
     if let Some(handle) = registry.get(root) {
         if handle.is_writer {
@@ -3451,7 +3499,7 @@ fn open_in(stores: &StoreRegistry, root: &Path) -> Result<StoreHandle, String> {
 
     if is_writer {
         if let Ok(Some(binding)) = store.binding() {
-            let current = root.to_string_lossy().to_string();
+            let current = project_id_for(root);
             if binding.workspace_id != current {
                 match store.rekey_project(&binding.workspace_id, &current, &current) {
                     Ok(()) => tracing::info!(
@@ -3823,8 +3871,18 @@ fn process_job(job: Job, session_ids: &mut HashMap<String, String>, stores: &Sto
         tracing::warn!(target: "atlas::capture", "capture failed: {e}");
     }
 
-    if !link_after.is_empty() {
-        match atlas_checkpoint::link_commits(store, &key.workspace_id, &root, &link_after, mode) {
+    if let Some(session_id) = session_ids
+        .get(&binding.native_session_id)
+        .filter(|_| !link_after.is_empty())
+    {
+        match atlas_checkpoint::link_commits(
+            store,
+            &key.workspace_id,
+            session_id,
+            &root,
+            &link_after,
+            mode,
+        ) {
             Ok(created) if created > 0 => {
                 tracing::info!(
                     target: "atlas::capture",
@@ -3860,7 +3918,11 @@ const DRAIN_BACKOFF_CEILING: Duration = Duration::from_secs(15 * 60);
 ///
 /// Never fails the caller: a missing transcript directory (the developer has
 /// never run this agent) is the ordinary case, not an error.
-fn import_for(store: &mut Store, root: &std::path::Path) {
+fn import_for(
+    store: &mut Store,
+    root: &std::path::Path,
+    excluded: &std::collections::HashSet<String>,
+) {
     let Ok(Some(binding)) = store.binding() else {
         return;
     };
@@ -3879,8 +3941,14 @@ fn import_for(store: &mut Store, root: &std::path::Path) {
         return;
     };
 
-    let workspace_id = root.to_string_lossy().to_string();
-    match atlas_checkpoint::import_all(store, &workspace_id, &source, binding.mode) {
+    let workspace_id = project_id_for(root);
+    match atlas_checkpoint::import_all_filtered(
+        store,
+        &workspace_id,
+        &source,
+        binding.mode,
+        excluded,
+    ) {
         Ok(outcome) if outcome.sessions_imported > 0 => tracing::info!(
             target: "atlas::capture",
             sessions = outcome.sessions_imported,
@@ -3947,7 +4015,7 @@ fn drain_for(
         }
     }
 
-    let project_key = root.to_string_lossy().to_string();
+    let project_key = project_id_for(root);
 
     let provider = token.clone();
     let mint_token = move || {
@@ -4113,7 +4181,12 @@ fn sync_worker(
 
         // One import and one drain pass, then back to the channel.
         if let Some(root) = queue.next_import() {
-            if with_sibling(&stores, &root, |store| import_for(store, &root)).is_some() {
+            let excluded = lock_ok(&notify)
+                .as_ref()
+                .and_then(tauri::Manager::try_state::<Arc<super::agent_host::AgentHost>>)
+                .map(|host| host.transcript_alias_ids())
+                .unwrap_or_default();
+            if with_sibling(&stores, &root, |store| import_for(store, &root, &excluded)).is_some() {
                 dirty = true;
             }
         }
@@ -5051,6 +5124,7 @@ mod diff_path_tests {
     #[test]
     fn a_call_first_seen_completed_falls_back_to_the_turn_anchor() {
         let root = repo("shell-terminal-first");
+        let _store = Store::open(atlas_checkpoint::atlas_dir(&root)).expect("enable capture");
         let state = CaptureState::new();
         // The prompt is where the anchor is taken.
         state.note_prompt(
@@ -5098,6 +5172,7 @@ mod diff_path_tests {
     #[test]
     fn the_turn_anchor_advances_so_commits_are_claimed_once() {
         let root = repo("shell-anchor-advances");
+        let _store = Store::open(atlas_checkpoint::atlas_dir(&root)).expect("enable capture");
         let state = CaptureState::new();
         state.note_prompt("s1", root.to_str().unwrap(), "claude-code", None, "work");
 

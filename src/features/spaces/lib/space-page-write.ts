@@ -23,6 +23,7 @@ import * as Y from "yjs";
 
 import { toBase64 } from "@/features/comms/lib/draft-sync";
 import { applyPageContent, frameUpdate, LOCAL } from "./space-doc";
+import { updateBatches } from "./space-outbox";
 import { drawingUpdate } from "./space-diagram";
 import { layoutDiagram, type Diagram } from "./space-layout";
 import {
@@ -45,6 +46,16 @@ const refuse = (words: string): never => {
 /** What a write needs of the Space, as a seam: the app's is
  *  `appSpaceTransport` (`live-spaces.ts`); the tests' is in memory. */
 export interface SpacePageTransport {
+  /** Bind an action to its originating account/org before its first await. */
+  capture?(): SpacePageTransport;
+  preparePage?(convId: string, pageId: string, doc: Y.Doc): Promise<void>;
+  persistPage?(
+    convId: string,
+    pageId: string,
+    update: Uint8Array,
+    snapshot: Uint8Array,
+  ): Promise<void>;
+  pendingPageUpdates?(convId: string, pageId: string): Uint8Array[];
   /** The Space's summary: its page tree, archive state and doc version. */
   summary(convId: string): Promise<SpaceSummary>;
   /** The page's doc as a canvas here holds it, caught up; else `null`. */
@@ -156,6 +167,7 @@ export async function writeSpacePage(
   diagram: Diagram,
   timeoutMs = PAGE_OPEN_TIMEOUT_MS,
 ): Promise<PageWritten> {
+  transport = transport.capture?.() ?? transport;
   const { convId, pageId } = target;
   const deadline = Date.now() + timeoutMs;
   const inTime = () => {
@@ -191,13 +203,23 @@ export async function writeSpacePage(
   const live = transport.openPage(convId, pageId);
   if (live) {
     if (live.readOnly !== null) refuse(`the page is read-only (${live.readOnly}).`);
+    await transport.preparePage?.(convId, pageId, live.doc);
+    inTime();
+    const current = transport.openPage(convId, pageId);
+    if (!current || current.doc !== live.doc || current.readOnly !== null)
+      refuse("the page's access changed while the drawing was prepared.");
     const scratch = new Y.Doc();
-    Y.applyUpdate(scratch, Y.encodeStateAsUpdate(live.doc));
-    const update = drawingUpdate(scratch, placed);
-    scratch.destroy();
+    let update: Uint8Array;
+    try {
+      Y.applyUpdate(scratch, Y.encodeStateAsUpdate(live.doc));
+      update = drawingUpdate(scratch, placed);
+    } finally {
+      scratch.destroy();
+    }
     checkSize(update);
     // A local edit to the canvas's doc: the canvas sends it on its slot.
     Y.applyUpdate(live.doc, update, LOCAL);
+    await transport.persistPage?.(convId, pageId, update, Y.encodeStateAsUpdate(live.doc));
     return answer;
   }
 
@@ -217,12 +239,22 @@ export async function writeSpacePage(
     const opened = await openOnSocket(transport, convId, pageId, events, deadline);
     if (opened.read_only !== null) refuse(`the page is read-only (${opened.read_only}).`);
     const scratch = new Y.Doc();
-    applyPageContent(scratch, opened);
-    const update = drawingUpdate(scratch, placed);
-    scratch.destroy();
+    let update: Uint8Array;
+    let snapshot: Uint8Array;
+    try {
+      applyPageContent(scratch, opened);
+      await transport.preparePage?.(convId, pageId, scratch);
+      update = drawingUpdate(scratch, placed);
+      snapshot = Y.encodeStateAsUpdate(scratch);
+    } finally {
+      scratch.destroy();
+    }
     checkSize(update);
     inTime();
-    await transport.sendBinary(convId, toBase64(frameUpdate(opened.slot, update)));
+    await transport.persistPage?.(convId, pageId, update, snapshot);
+    for (const batch of updateBatches(transport.pendingPageUpdates?.(convId, pageId) ?? [update])) {
+      await transport.sendBinary(convId, toBase64(frameUpdate(opened.slot, batch)));
+    }
     return answer;
   } finally {
     // Queued frames still go out: the socket drains before it closes.

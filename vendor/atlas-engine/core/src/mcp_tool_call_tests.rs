@@ -1032,6 +1032,7 @@ async fn mcp_tool_call_request_meta_includes_turn_metadata_for_custom_server() {
         "custom_server",
         "call-custom",
         /*metadata*/ None,
+        Some("stdio"),
     )
     .expect("custom servers should receive turn metadata");
     let turn_metadata = meta
@@ -1071,6 +1072,52 @@ async fn mcp_tool_call_request_meta_includes_turn_metadata_for_custom_server() {
     );
 }
 
+/// Atlas: the turn metadata (absolute repo path, git remotes, HEAD, session
+/// ids) stays on this machine. A remote server, or one whose origin is
+/// unknown, gets the call id and nothing about the workspace.
+#[tokio::test]
+async fn mcp_tool_call_request_meta_omits_turn_metadata_for_a_remote_server() {
+    let (_, turn_context) = make_session_and_context().await;
+    for origin in [
+        Some("https://mcp.example.com"),
+        Some("http://10.0.0.5:8080"),
+        Some("not a url"),
+        None,
+    ] {
+        assert_eq!(
+            build_mcp_tool_call_request_meta(
+                &turn_context,
+                "remote_server",
+                "call-remote",
+                /*metadata*/ None,
+                origin,
+            ),
+            Some(serde_json::json!({ "callId": "call-remote" })),
+            "{origin:?}",
+        );
+    }
+    for origin in [
+        "stdio",
+        "http://127.0.0.1:4321",
+        "http://localhost:4321",
+        "http://[::1]:4321",
+    ] {
+        let meta = build_mcp_tool_call_request_meta(
+            &turn_context,
+            "local_server",
+            "call-local",
+            /*metadata*/ None,
+            Some(origin),
+        )
+        .expect("meta");
+        assert!(
+            meta.get(crate::X_ATLAS_AGENT_TURN_METADATA_HEADER)
+                .is_some(),
+            "{origin} is local"
+        );
+    }
+}
+
 #[tokio::test]
 async fn mcp_tool_call_request_meta_includes_turn_started_at_unix_ms() {
     let (_, turn_context) = make_session_and_context().await;
@@ -1083,6 +1130,7 @@ async fn mcp_tool_call_request_meta_includes_turn_started_at_unix_ms() {
         "custom_server",
         "call-custom",
         /*metadata*/ None,
+        Some("stdio"),
     )
     .expect("custom servers should receive turn metadata");
     let turn_metadata = meta
@@ -1160,7 +1208,13 @@ async fn plugin_mcp_tool_call_request_meta_includes_plugin_id() {
     metadata.plugin_id = Some("sample@test".to_string());
 
     assert_eq!(
-        build_mcp_tool_call_request_meta(&turn_context, "sample", "call-plugin", Some(&metadata),),
+        build_mcp_tool_call_request_meta(
+            &turn_context,
+            "sample",
+            "call-plugin",
+            Some(&metadata),
+            Some("http://127.0.0.1:4321"),
+        ),
         Some(serde_json::json!({
             "callId": "call-plugin",
             crate::X_ATLAS_AGENT_TURN_METADATA_HEADER: expected_turn_metadata,
@@ -1270,9 +1324,8 @@ async fn mcp_tool_call_item_includes_app_identity() {
 }
 
 #[tokio::test]
-async fn atlas_apps_tool_call_request_meta_includes_turn_metadata_and_atlas_apps_meta() {
+async fn atlas_apps_tool_call_request_meta_includes_atlas_apps_meta_but_no_turn_metadata() {
     let (_, turn_context) = make_session_and_context().await;
-    let expected_turn_metadata = expected_mcp_turn_metadata(&turn_context);
     let metadata = McpToolApprovalMetadata {
         annotations: None,
         connector_id: Some("calendar".to_string()),
@@ -1303,10 +1356,10 @@ async fn atlas_apps_tool_call_request_meta_includes_turn_metadata_and_atlas_apps
             ATLAS_APPS_MCP_SERVER_NAME,
             "call_abc123xyz789",
             Some(&metadata),
+            Some("https://chatgpt.com"),
         ),
         Some(serde_json::json!({
             "callId": "call_abc123xyz789",
-            crate::X_ATLAS_AGENT_TURN_METADATA_HEADER: expected_turn_metadata,
             MCP_TOOL_ATLAS_APPS_META_KEY: {
                 "call_id": "call_abc123xyz789",
                 "resource_uri": "connector://calendar/tools/calendar_create_event",
@@ -1320,7 +1373,6 @@ async fn atlas_apps_tool_call_request_meta_includes_turn_metadata_and_atlas_apps
 #[tokio::test]
 async fn atlas_apps_tool_call_request_meta_includes_call_id_without_existing_atlas_apps_meta() {
     let (_, turn_context) = make_session_and_context().await;
-    let expected_turn_metadata = expected_mcp_turn_metadata(&turn_context);
 
     assert_eq!(
         build_mcp_tool_call_request_meta(
@@ -1328,10 +1380,10 @@ async fn atlas_apps_tool_call_request_meta_includes_call_id_without_existing_atl
             ATLAS_APPS_MCP_SERVER_NAME,
             "call_abc123xyz789",
             /*metadata*/ None,
+            Some("https://chatgpt.com"),
         ),
         Some(serde_json::json!({
             "callId": "call_abc123xyz789",
-            crate::X_ATLAS_AGENT_TURN_METADATA_HEADER: expected_turn_metadata,
             MCP_TOOL_ATLAS_APPS_META_KEY: {
                 "call_id": "call_abc123xyz789",
             },

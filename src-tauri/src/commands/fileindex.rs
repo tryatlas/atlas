@@ -43,6 +43,7 @@ type BuiltIndex = (
     Arc<AtomicU64>,
     FolderCache,
     Debouncer,
+    HashMap<PathBuf, RecursiveMode>,
 );
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,6 +56,7 @@ pub struct FileMatch {
 /// `_debouncer` handle; dropping `ProjectIndex` stops the watcher.
 struct ProjectIndex {
     root: PathBuf,
+    watch_plan: HashMap<PathBuf, RecursiveMode>,
     /// When the last full `walk_project` ran (initial build, watcher-forced
     /// rewalk, or background refresh). Gates the stale-while-revalidate
     /// rebuild in `fileindex_open_project` so rapid project toggles /
@@ -87,6 +89,8 @@ struct ProjectIndex {
 #[derive(Default)]
 pub struct FileIndexState {
     per_window: RwLock<HashMap<String, ProjectIndex>>,
+    operations: parking_lot::Mutex<HashMap<String, u64>>,
+    next_operation: AtomicU64,
 }
 
 impl FileIndexState {
@@ -115,6 +119,8 @@ impl FileIndexState {
     /// project root when no other window still has it open, so the caller can
     /// release that root's code index too.
     pub fn drop_window(&self, label: &str) -> Option<PathBuf> {
+        let mut operations = self.operations.lock();
+        operations.remove(label);
         let mut per_window = self.per_window.write();
         let gone = per_window.remove(label)?;
         (!root_still_open(per_window.values().map(|p| p.root.as_path()), &gone.root))
@@ -228,6 +234,9 @@ pub async fn fileindex_open_project(
         return Err(format!("not a directory: {path}"));
     }
 
+    let operation = state.next_operation.fetch_add(1, Ordering::Relaxed);
+    state.operations.lock().insert(key.clone(), operation);
+
     // Resident index → return the current count instantly (project
     // switches must stay cheap), but kick off a THROTTLED background
     // rebuild: fresh walk AND fresh watch plan, swapped in atomically when
@@ -238,7 +247,7 @@ pub async fn fileindex_open_project(
     // and the picker's ensure path genuinely recover, stale-while-revalidate.
     let resident = {
         let guard = state.per_window.read();
-        guard.get(&key).map(|ex| {
+        guard.get(&key).filter(|ex| ex.root == root).map(|ex| {
             let stale = ex.last_walk.lock().elapsed() >= REFRESH_MIN_INTERVAL;
             // `swap` claims the refresh slot — only one rebuild in flight.
             let claimed = stale
@@ -254,49 +263,67 @@ pub async fn fileindex_open_project(
             let key_bg = key.clone();
             let window_bg = window_label.clone();
             let root_bg = root.clone();
-            tauri::async_runtime::spawn(async move {
-                match build_project_index(
-                    root_bg,
-                    app_bg.clone(),
-                    key_bg.clone(),
-                    window_bg.clone(),
-                )
-                .await
-                {
-                    Ok(index) => {
-                        let fresh_count = index.files.read().len();
-                        let st = app_bg.state::<FileIndexState>();
-                        // Swap in the fresh index (dropping the old watcher) —
-                        // but ONLY if the project still holds an index for
-                        // this same root. If it was closed (or repointed at a
-                        // different project) mid-rebuild, inserting would
-                        // resurrect a torn-down watcher.
-                        let swapped = {
-                            let mut guard = st.per_window.write();
-                            match guard.get(&key_bg) {
-                                Some(existing) if existing.root == index.root => {
-                                    guard.insert(key_bg.clone(), index);
-                                    true
-                                }
-                                _ => false,
-                            }
-                        };
-                        if swapped {
-                            let _ = app_bg.emit_to(
-                                window_bg.as_str(),
-                                "atlas:fileindex:updated",
-                                serde_json::json!({ "workspaceId": key_bg, "count": fresh_count }),
-                            );
+            tauri::async_runtime::spawn_blocking(move || {
+                let result = (|| -> Result<(), String> {
+                    let st = app_bg.state::<FileIndexState>();
+                    let generation = st
+                        .per_window
+                        .read()
+                        .get(&key_bg)
+                        .map(|idx| idx.files_gen.load(Ordering::Acquire));
+                    let fresh = walk_project(&root_bg);
+                    let plan: HashMap<_, _> = watch_roots(&root_bg).into_iter().collect();
+                    let count = fresh.len();
+                    let mut guard = st.per_window.write();
+                    let Some(index) = guard.get_mut(&key_bg) else {
+                        return Ok(());
+                    };
+                    // Pointer identity distinguishes a close/reopen of the same path.
+                    if !Arc::ptr_eq(&index.refreshing, &refreshing) {
+                        return Ok(());
+                    }
+                    // Extend the existing watcher, never allocate a second complete
+                    // inotify tree. A failed extension retains every working watch.
+                    for (path, mode) in &plan {
+                        if index.watch_plan.get(path) == Some(mode) {
+                            continue;
                         }
+                        index
+                            ._debouncer
+                            .watch(path, *mode)
+                            .map_err(|e| format!("watch {}: {e}", path.display()))?;
+                        index.watch_plan.insert(path.clone(), *mode);
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "atlas::fileindex",
-                            "background reindex failed: {e}"
-                        );
-                        // Release the slot so a later open can retry.
-                        refreshing.store(false, std::sync::atomic::Ordering::SeqCst);
+                    let removed: Vec<_> = index
+                        .watch_plan
+                        .keys()
+                        .filter(|p| !plan.contains_key(*p))
+                        .cloned()
+                        .collect();
+                    for path in removed {
+                        let _ = index._debouncer.unwatch(&path);
+                        index.watch_plan.remove(&path);
                     }
+                    let mut files = index.files.write();
+                    if Some(index.files_gen.load(Ordering::Acquire)) != generation {
+                        return Ok(());
+                    }
+                    *files = fresh;
+                    index.files_gen.fetch_add(1, Ordering::Release);
+                    *index.folders.write() = None;
+                    *index.last_walk.lock() = std::time::Instant::now();
+                    drop(files);
+                    drop(guard);
+                    let _ = app_bg.emit_to(
+                        window_bg.as_str(),
+                        "atlas:fileindex:updated",
+                        serde_json::json!({ "workspaceId": key_bg, "count": count }),
+                    );
+                    Ok(())
+                })();
+                refreshing.store(false, Ordering::Release);
+                if let Err(error) = result {
+                    tracing::warn!(target: "atlas::fileindex", "background reindex failed: {error}");
                 }
             });
         }
@@ -305,7 +332,13 @@ pub async fn fileindex_open_project(
 
     let index = build_project_index(root, app.clone(), key.clone(), window_label.clone()).await?;
     let count = index.files.read().len();
-    state.per_window.write().insert(key.clone(), index);
+    {
+        let operations = state.operations.lock();
+        if operations.get(&key) != Some(&operation) {
+            return Ok(0);
+        }
+        state.per_window.write().insert(key.clone(), index);
+    }
 
     // Tell the window the index is now searchable. Mirrors the event the
     // watcher fires on file-set changes — palette + mention picker both listen
@@ -344,7 +377,7 @@ async fn build_project_index(
     // target) — they differ now that one window hosts many projects.
     let key_for_task = key.clone();
     let window_for_task = window_label.clone();
-    let (files, files_gen, folders, debouncer): BuiltIndex =
+    let (files, files_gen, folders, debouncer, watch_plan): BuiltIndex =
         tokio::task::spawn_blocking(move || -> Result<_, String> {
             let walked = walk_project(&root_for_task);
             let files = Arc::new(RwLock::new(walked));
@@ -402,14 +435,15 @@ async fn build_project_index(
                         let events: Vec<_> = events
                             .into_iter()
                             .filter(|e| {
-                                !e.event.paths.iter().all(|p| {
-                                    is_ignored_event_path(&root_for_watch, p)
-                                        || is_gitignored_event_path(
-                                            &root_for_watch,
-                                            ignore_root.as_deref(),
-                                            p,
-                                        )
-                                })
+                                e.event.need_rescan()
+                                    || !e.event.paths.iter().all(|p| {
+                                        is_ignored_event_path(&root_for_watch, p)
+                                            || is_gitignored_event_path(
+                                                &root_for_watch,
+                                                ignore_root.as_deref(),
+                                                p,
+                                            )
+                                    })
                             })
                             .collect();
                         if events.is_empty() {
@@ -485,25 +519,20 @@ async fn build_project_index(
             )
             .map_err(|e| format!("failed to create watcher: {e}"))?;
 
-            // One watch per non-ignored top-level entry rather than one recursive
-            // watch of everything. A failure on a single subtree is not fatal —
-            // losing live updates for one directory beats refusing to index at all.
-            for (path, mode) in watch_roots(&root_for_task) {
-                if let Err(e) = debouncer.watch(&path, mode) {
-                    tracing::warn!(
-                        target: "atlas::fileindex",
-                        "failed to watch {}: {e}", path.display()
-                    );
-                }
+            let watch_plan: HashMap<_, _> = watch_roots(&root_for_task).into_iter().collect();
+            for (path, mode) in &watch_plan {
+                debouncer
+                    .watch(path, *mode)
+                    .map_err(|e| format!("failed to watch {}: {e}", path.display()))?;
             }
-
-            Ok((files, files_gen, folders, debouncer))
+            Ok((files, files_gen, folders, debouncer, watch_plan))
         })
         .await
         .map_err(|e| e.to_string())??;
 
     Ok(ProjectIndex {
         root,
+        watch_plan,
         files_gen,
         last_walk: Arc::new(parking_lot::Mutex::new(std::time::Instant::now())),
         refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -923,6 +952,9 @@ fn summarise_events(events: &[DebouncedEvent]) -> (std::collections::HashSet<Pat
     let mut dirs: HashSet<PathBuf> = HashSet::new();
     let mut full_refresh = false;
     for ev in events {
+        if ev.event.need_rescan() {
+            full_refresh = true;
+        }
         match ev.event.kind {
             EventKind::Create(_) | EventKind::Remove(_) => {
                 for p in &ev.event.paths {
@@ -959,6 +991,7 @@ fn apply_events(
     let mut needs_rewalk = false;
 
     for ev in events {
+        needs_rewalk |= ev.event.need_rescan();
         match ev.event.kind {
             EventKind::Create(_) => {
                 for p in &ev.event.paths {

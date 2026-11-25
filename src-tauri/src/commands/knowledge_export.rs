@@ -3,6 +3,25 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const SERVER_SOURCE: &[(&str, &str)] = &[
+    (
+        "Cargo.toml",
+        include_str!("../../../crates/atlas-kb-server/Cargo.toml"),
+    ),
+    (
+        "Cargo.lock",
+        include_str!("../../../crates/atlas-kb-server/Cargo.lock"),
+    ),
+    (
+        "build.rs",
+        include_str!("../../../crates/atlas-kb-server/build.rs"),
+    ),
+    (
+        "src/main.rs",
+        include_str!("../../../crates/atlas-kb-server/src/main.rs"),
+    ),
+];
+
 /// Stylesheet embedded into every exported HTML page. Dark theme that
 /// mirrors Atlas's readme-view typography so a note reads the same in a
 /// browser as it does inside the app.
@@ -68,7 +87,8 @@ fn resolve_title(project_path: &str, entry_id: &str) -> String {
     if let Ok(raw) = fs::read_to_string(&meta_path) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let Some(title) = json
-                .get(entry_id)
+                .get("pages")
+                .and_then(|pages| pages.get(entry_id))
                 .and_then(|p| p.get("title"))
                 .and_then(|t| t.as_str())
             {
@@ -113,7 +133,12 @@ fn walk(dir: &Path, root: &Path, project_path: &str, out: &mut Vec<NoteFile>) {
             continue;
         }
         let rel = path.strip_prefix(root).unwrap_or(&path);
-        let id = rel.with_extension("").to_string_lossy().to_string();
+        let id = rel
+            .with_extension("")
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
         let Ok(body_md) = fs::read_to_string(&path) else {
             continue;
         };
@@ -243,6 +268,7 @@ fn build_nav(notes: &[NoteFile], active_id: &str) -> String {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServerExportResult {
     /// Final absolute path of the produced binary.
     pub binary_path: String,
@@ -267,12 +293,8 @@ pub async fn knowledge_export_server(
 ) -> Result<ServerExportResult, String> {
     tokio::task::spawn_blocking(move || -> Result<ServerExportResult, String> {
         // 1. Render the HTML site into a fresh tmp dir.
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let web_dir = std::env::temp_dir().join(format!("atlas-kb-web-{stamp}"));
-        let _ = fs::remove_dir_all(&web_dir);
+        let build = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let web_dir = build.path().join("web");
         fs::create_dir_all(&web_dir).map_err(|e| e.to_string())?;
 
         let notes = walk_notes(&project_path);
@@ -290,25 +312,17 @@ pub async fn knowledge_export_server(
         let index_page = html_page("Knowledge", &index_body, Some(&build_nav(&notes, "")));
         fs::write(web_dir.join("index.html"), index_page).map_err(|e| e.to_string())?;
 
-        // 2. Locate the atlas-kb-server crate, relative to src-tauri.
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let server_manifest = manifest_dir
-            .parent()
-            .ok_or("can't locate crates dir")?
-            .join("crates/atlas-kb-server/Cargo.toml");
-        if !server_manifest.exists() {
-            return Err(format!(
-                "atlas-kb-server crate missing at {}",
-                server_manifest.display()
-            ));
+        // Source travels inside Atlas; a release never requires its original checkout.
+        let crate_dir = build.path().join("server");
+        fs::create_dir_all(crate_dir.join("src")).map_err(|e| e.to_string())?;
+        for (name, contents) in SERVER_SOURCE {
+            fs::write(crate_dir.join(name), contents).map_err(|e| e.to_string())?;
         }
-
-        // Dedicated target dir so this doesn't conflict with the main
-        // Atlas build's incremental cache.
-        let target_dir = std::env::temp_dir().join("atlas-kb-server-target");
+        let server_manifest = crate_dir.join("Cargo.toml");
+        let target_dir = build.path().join("target");
 
         let output = atlas_process::command("cargo")
-            .args(["build", "--release", "--manifest-path"])
+            .args(["build", "--locked", "--release", "--manifest-path"])
             .arg(&server_manifest)
             .arg("--target-dir")
             .arg(&target_dir)
@@ -346,9 +360,6 @@ pub async fn knowledge_export_server(
             perms.set_mode(0o755);
             let _ = fs::set_permissions(&target_path, perms);
         }
-
-        // Clean up the temp web dir; the binary already embeds its contents.
-        let _ = fs::remove_dir_all(&web_dir);
 
         Ok(ServerExportResult {
             binary_path: target_path,

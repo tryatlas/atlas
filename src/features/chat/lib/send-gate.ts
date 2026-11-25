@@ -34,8 +34,8 @@
  *   release skips the drain for it.
  * - **The grant hold pauses the queue but not the held first message.** A
  *   message held for the bind goes out when the bind lands, grant or no grant.
- * - **A retry checks neither live-elsewhere nor the grant hold**, and sends
- *   without passing the send gates.
+ * - **A retry does not check the grant hold**, and sends without passing the
+ *   send gates.
  */
 import { isBusyAgentStatus, type ChatSession } from "@/types/agent";
 
@@ -59,9 +59,6 @@ export interface SendState {
   session: SendSession | undefined;
   /** How many prompts the strip shows queued. */
   queued: number;
-  /** Live in another process and not overridden: a send would fork the
-   *  session (ADR-0001 amendment, Rule 7). */
-  heldElsewhere: boolean;
   /** The no-AI-grant answer on the agent that bills the gateway: what the
    *  composer lock would be with no turn running (`grantLocksComposer`). */
   grantHold: boolean;
@@ -79,7 +76,6 @@ export function sendStateOf(
   return {
     session,
     queued: rest.queued ?? 0,
-    heldElsewhere: rest.heldElsewhere ?? false,
     grantHold: rest.grantHold ?? false,
     remoteDriving: rest.remoteDriving ?? false,
     switchPending: rest.switchPending ?? false,
@@ -89,18 +85,11 @@ export function sendStateOf(
 // ── The gate ────────────────────────────────────────────────────────────────
 
 /** Why a send cannot go to the agent now, in the order a send meets them. */
-export type GateReason =
-  | "mode-unrestored"
-  | "live-elsewhere"
-  | "no-grant"
-  | "resuming"
-  | "starting";
+export type GateReason = "mode-unrestored" | "no-grant" | "resuming" | "starting";
 
 export interface SendGate {
   /** A resume could not restore the user's mode; no send until they pick one. */
   modeUnrestored: boolean;
-  /** Another process is writing the session and the user has not said "Send anyway". */
-  liveElsewhere: boolean;
   /** The gateway agent has no AI grant. */
   noGrant: boolean;
   /** A resume is still loading: the session id is optimistic. */
@@ -112,8 +101,8 @@ export interface SendGate {
   remoteDriver: boolean;
   /**
    * The drain gate: nothing leaves the queue, and a held first message stays
-   * held. A resume still loading, a mode it could not restore, or a session
-   * live elsewhere. Either cause clearing is the release.
+   * held. A resume still loading, or a mode it could not restore. Either
+   * cause clearing is the release.
    */
   closed: boolean;
   /**
@@ -130,14 +119,12 @@ export interface SendGate {
 export function sendGate(state: SendState): SendGate {
   const s = state.session;
   const modeUnrestored = !!s?.unrestoredModeId;
-  const liveElsewhere = state.heldElsewhere;
   const noGrant = state.grantHold;
   const resuming = !!s?.resumePending;
   const unbound = !s?.acpAgentId || !s.acpSessionId;
-  const closed = resuming || modeUnrestored || liveElsewhere;
+  const closed = resuming || modeUnrestored;
   return {
     modeUnrestored,
-    liveElsewhere,
     noGrant,
     resuming,
     unbound,
@@ -146,15 +133,13 @@ export function sendGate(state: SendState): SendGate {
     holdsQueue: closed || noGrant,
     reason: modeUnrestored
       ? "mode-unrestored"
-      : liveElsewhere
-        ? "live-elsewhere"
-        : noGrant
-          ? "no-grant"
-          : resuming
-            ? "resuming"
-            : unbound
-              ? "starting"
-              : null,
+      : noGrant
+        ? "no-grant"
+        : resuming
+          ? "resuming"
+          : unbound
+            ? "starting"
+            : null,
   };
 }
 
@@ -173,14 +158,12 @@ export function composerGates(
 ): {
   blockedByGrant: boolean;
   modeUnrestored: boolean;
-  heldForTerminal: boolean;
   remoteDriving: boolean;
 } {
   const gate = sendGate(state);
   return {
     blockedByGrant: gate.noGrant && !running,
     modeUnrestored: gate.modeUnrestored,
-    heldForTerminal: gate.liveElsewhere,
     remoteDriving: gate.remoteDriver,
   };
 }
@@ -289,10 +272,8 @@ export function sessionCanRetry(
  * which carry a session id by definition.
  *
  * And nothing drains while the gate is closed (`SendGate.closed`): a resume
- * still loading, or one that could not restore the user's mode, or a session
- * another process is writing that the user has not said "Send anyway" to
- * (ADR-0001 amendment Rule 7). The gate's falling edge — either cause
- * clearing — is the release.
+ * still loading, or one that could not restore the user's mode. The gate's
+ * falling edge — either cause clearing — is the release.
  *
  * The grant hold is the same shape for the native agent's no-AI-grant answer
  * (`grantLocksComposer`). That answer can land mid-turn, and the lock waits
@@ -311,12 +292,17 @@ export interface DrainEdges {
   /** The binding just landed: the held first message goes out ahead of the queue. */
   justBound: boolean;
   /** The gate just opened on a bound session: an optimistic resume became
-   *  sendable, a restored mode was picked, or a live-elsewhere hold lifted. */
+   *  sendable, or a restored mode was picked. */
   justResumed: boolean;
   /** A real turn ended on a bound session. */
   turnFinished: boolean;
   /** The grant hold lifted on an idle, bound session. */
   grantReleased: boolean;
+  /** A dead agent came back (the Restart banner, or a send's restart) on an
+   *  idle session: a message held through a restart that failed goes out,
+   *  and what queued behind it follows. Not while a turn runs — a send's own
+   *  restart dispatches its message itself and is already running. */
+  reconnected: boolean;
 }
 
 export function drainEdges(prev: SendState | null, cur: SendState): DrainEdges {
@@ -338,6 +324,12 @@ export function drainEdges(prev: SendState | null, cur: SendState): DrainEdges {
     turnFinished: wasRunning && !isRunning && !!curAcp && !curGated,
     grantReleased:
       prevGrantHold && !cur.grantHold && !!curAcp && prevAcp === curAcp && !isRunning && !curGated,
+    reconnected:
+      !!prev?.session?.disconnected &&
+      !cur.session?.disconnected &&
+      !!curAcp &&
+      !isRunning &&
+      !curGated,
   };
 }
 
@@ -366,8 +358,6 @@ export type SendDecision =
   /** The first message into a session that is still starting: record it as
    *  sent, hold it on the session, make sure a bind is running. */
   | { do: "hold-first"; why: "starting" | "resuming" }
-  /** A held first message that still cannot go: back onto the session, idle. */
-  | { do: "keep-held"; why: "live-elsewhere" }
   /** Park it in the queue. */
   | { do: "queue"; why: GateReason }
   /** The agent process is gone: restart it, then decide again. */
@@ -394,7 +384,7 @@ export function decide(state: SendState, intent: SendIntent): SendDecision {
       return decideStop(state);
     case "drain": {
       const edges = drainEdges(intent.prev, state);
-      const opened = edges.justBound || edges.justResumed;
+      const opened = edges.justBound || edges.justResumed || edges.reconnected;
       return {
         do: "drain",
         // The first message held while the session was starting goes out
@@ -428,19 +418,6 @@ function decideSend(state: SendState, recorded: boolean, rebound: boolean): Send
   // sends it once the user has picked a mode. The composer already refuses;
   // this catches every other sender (chips, handoffs).
   if (gate.modeUnrestored) return { do: "queue", why: "mode-unrestored" };
-  // Fail closed on a session another process is still writing (ADR-0001
-  // amendment, Rule 7): sending would fork its transcript. This is the choke
-  // point every sender passes — the composer (which already refuses), chips
-  // and `atlas:chat-send` (another agent's `ui_chat` send, agent-switch
-  // handoffs), the queue drain, the permission modal. Nothing is dropped:
-  // the message queues (a held first message stays held, already recorded),
-  // and the drain gate releases it on "Send anyway" or once the session
-  // stops being live.
-  if (gate.liveElsewhere) {
-    return recorded
-      ? { do: "keep-held", why: "live-elsewhere" }
-      : { do: "queue", why: "live-elsewhere" };
-  }
   // The same for the no-AI-grant hold: the composer is locked, but a
   // next-step chip or a handoff is not the composer. Park it with the rest
   // of the held queue rather than send it to a gateway that will refuse it;

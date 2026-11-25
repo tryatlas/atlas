@@ -355,7 +355,8 @@ fn strip_jsonc(source: &str) -> String {
     while index < bytes.len() {
         let byte = bytes[index];
         if in_string {
-            out.push(byte as char);
+            let char_end = next_char_boundary(source, index);
+            out.push_str(&source[index..char_end]);
             if byte == b'\\' && index + 1 < bytes.len() {
                 // An escape consumes the next byte whatever it is, so a `\"`
                 // does not end the string and a `\\` does not swallow the quote
@@ -367,7 +368,7 @@ fn strip_jsonc(source: &str) -> String {
             if byte == b'"' {
                 in_string = false;
             }
-            index += 1;
+            index = char_end;
             continue;
         }
         match byte {
@@ -420,7 +421,8 @@ fn strip_trailing_commas(source: &str) -> String {
     while index < bytes.len() {
         let byte = bytes[index];
         if in_string {
-            out.push(byte as char);
+            let char_end = next_char_boundary(source, index);
+            out.push_str(&source[index..char_end]);
             if byte == b'\\' && index + 1 < bytes.len() {
                 out.push(bytes[index + 1] as char);
                 index += 2;
@@ -429,7 +431,7 @@ fn strip_trailing_commas(source: &str) -> String {
             if byte == b'"' {
                 in_string = false;
             }
-            index += 1;
+            index = char_end;
             continue;
         }
         if byte == b'"' {
@@ -456,6 +458,24 @@ fn strip_trailing_commas(source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_strings_survive_comments_and_trailing_commas() {
+        let source = r#"{ // theme
+          "iconDefinitions": { "é": { "iconPath": "./图标/é.svg", }, },
+          "fileNames": { "界面.rs": "é", },
+        }"#;
+        let document = IconThemeDocument::parse(source, "test").unwrap();
+        assert!(document.icon_definitions.contains_key("é"));
+        assert_eq!(
+            document
+                .associations
+                .file_names
+                .get("界面.rs")
+                .map(String::as_str),
+            Some("é")
+        );
+    }
 
     #[test]
     fn strips_line_and_block_comments() {

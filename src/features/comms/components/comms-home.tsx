@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { toast } from "sonner";
 import { comms } from "../lib/comms-api";
 import { useCommsStore } from "../stores/comms-store";
 import { useMembersStore } from "@/features/organisations/stores/members-store";
@@ -48,10 +49,12 @@ export function CommsHome({
     try {
       // Idempotent server-side: 200 = opened the existing one, 201 = created.
       const result = await comms.createDm(userId);
+      if (useCommsStore.getState().connection.orgId !== rosterOrgId) return;
       actions.adoptConversation(result.conversation);
       actions.openConversation(result.conversation.id);
     } catch (e) {
       console.warn("comms: DM create failed:", userId, e);
+      toast.error("Could not start that conversation. Try again.");
     } finally {
       setStartingDm(null);
     }

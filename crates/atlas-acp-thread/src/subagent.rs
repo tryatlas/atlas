@@ -198,23 +198,21 @@ pub fn parent_tool_call_id(meta: Option<&acp::Meta>) -> Option<Arc<str>> {
 /// keep arriving for minutes afterwards.
 const ASYNC_LAUNCH_KEYS: &[&str] = &["isAsync", "async_launched", "asyncLaunched"];
 
-/// The sentence an agent puts in an async launch's result text.
+/// `status` values that say a launch was handed off to run on its own.
 ///
-/// Claude's `Agent` answers with "Async agent launched successfully." before
-/// a model-directed trailer. Matched case-insensitively on the two words that
-/// carry the meaning, so a reworded sentence stops matching (and the child
-/// shows as finished early) rather than matching something else.
-fn text_says_async(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.contains("async") && (lower.contains("launched") || lower.contains("started"))
-}
+/// Matched exactly: this is a machine-readable token an agent chose, not prose.
+/// Reading the result's *text* for "async" and "launched" discarded a child
+/// whose own report merely mentioned both words (audit #105).
+const ASYNC_LAUNCH_STATUSES: &[&str] = &["async_launched", "asyncLaunched"];
 
 /// Whether the launch handed the child off to run independently.
 ///
 /// Read from the call's output and its metadata, because agents put it in
 /// both: Claude sends `_meta.claudeCode.toolResponse.{isAsync, status:
-/// "async_launched"}` AND a `rawOutput` whose first text block opens "Async
-/// agent launched successfully."
+/// "async_launched"}`. Only structured evidence counts — a boolean flag or an
+/// exact status token. The sentence in a `rawOutput` text block ("Async agent
+/// launched successfully.") is not read: a finished child's report can say
+/// the same words.
 ///
 /// Without this a child shows as finished the instant it starts: an async
 /// launch's call goes `completed` while the child's own tool calls keep
@@ -231,7 +229,6 @@ pub fn launched_async(raw_output: Option<&serde_json::Value>, meta: Option<&acp:
             return false;
         }
         match value {
-            serde_json::Value::String(text) => text_says_async(text),
             serde_json::Value::Array(items) => items.iter().any(|item| walk(item, depth - 1)),
             serde_json::Value::Object(object) => {
                 for key in ASYNC_LAUNCH_KEYS {
@@ -242,7 +239,7 @@ pub fn launched_async(raw_output: Option<&serde_json::Value>, meta: Option<&acp:
                 if object
                     .get("status")
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(text_says_async)
+                    .is_some_and(|status| ASYNC_LAUNCH_STATUSES.contains(&status))
                 {
                     return true;
                 }
@@ -417,7 +414,7 @@ fn meta_announces_subagent(meta: Option<&acp::Meta>) -> bool {
 }
 
 /// The agent's own tool name from `_meta`, whatever namespace it chose.
-fn meta_tool_name(meta: Option<&acp::Meta>) -> Option<&str> {
+pub(crate) fn meta_tool_name(meta: Option<&acp::Meta>) -> Option<&str> {
     meta_leaf(meta, META_TOOL_NAME_KEYS)?.as_str()
 }
 
@@ -741,11 +738,11 @@ mod tests {
         }
     }
 
-    /// Both spellings of "this child is now running on its own", taken from
-    /// a real Claude async `Agent` result. Without this the child is marked
-    /// finished the moment it starts.
+    /// The structured spellings of "this child is now running on its own",
+    /// taken from a real Claude async `Agent` result. Without this the child
+    /// is marked finished the moment it starts.
     #[test]
-    fn an_async_launch_is_recognised_in_the_result_and_in_the_metadata() {
+    fn an_async_launch_is_recognised_from_structured_evidence() {
         let launched = meta(serde_json::json!({
             "claudeCode": {
                 "toolResponse": {
@@ -757,9 +754,7 @@ mod tests {
         }));
         assert!(launched_async(None, Some(&launched)));
 
-        let output = serde_json::json!([
-            { "type": "text", "text": "Async agent launched successfully. (internal metadata)" },
-        ]);
+        let output = serde_json::json!({ "status": "async_launched" });
         assert!(launched_async(Some(&output), None));
 
         // A synchronous delegation says neither, so its call finishing is the
@@ -771,6 +766,22 @@ mod tests {
             ))
         ));
         assert!(!launched_async(None, None));
+    }
+
+    /// A finished child whose report happens to say "async" and "started"
+    /// is a finished child. Reading prose for the words discarded its report
+    /// as a mere launch receipt (audit #105).
+    #[test]
+    fn a_report_mentioning_async_and_started_is_not_an_async_launch() {
+        let output = serde_json::json!([{
+            "type": "text",
+            "text": "Done. The async worker is started from main() and launched on boot.",
+        }]);
+        assert!(!launched_async(Some(&output), None));
+        let meta = meta(serde_json::json!({
+            "claudeCode": { "toolResponse": { "status": "completed", "summary": "async job started" } },
+        }));
+        assert!(!launched_async(Some(&output), Some(&meta)));
     }
 
     /// The tail of a real Claude `Agent` result, as replayed on `session/load`.

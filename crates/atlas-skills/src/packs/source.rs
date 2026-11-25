@@ -68,6 +68,7 @@ fn git_clone_shallow(owner: &str, repo: &str, dest: &Path) -> Result<String, Str
     let rev = atlas_git::GitCommand::without_repo(&["-C"])
         .arg(dest)
         .args(&["rev-parse", "HEAD"])
+        .timeout(std::time::Duration::from_secs(30))
         .output()
         .map_err(|e| format!("failed to read HEAD: {e}"))?;
     Ok(rev.stdout_text().trim().to_string())
@@ -79,6 +80,7 @@ fn git_clone_shallow(owner: &str, repo: &str, dest: &Path) -> Result<String, Str
 fn git_ls_remote_head(owner: &str, repo: &str) -> Result<String, String> {
     let url = format!("https://github.com/{owner}/{repo}.git");
     let out = atlas_git::GitCommand::without_repo(&["ls-remote", "--quiet", &url, "HEAD"])
+        .timeout(std::time::Duration::from_secs(30))
         .output()
         .map_err(|e| format!("failed to run `git` (is it installed?): {e}"))?;
     if !out.success() {

@@ -3642,9 +3642,6 @@ async fn manual_compact_retries_after_context_window_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// TODO(ccunningham): Re-enable after the follow-up compaction behavior PR lands.
-// Current main behavior around non-context manual /compact failures is known-incorrect.
-#[ignore = "behavior change covered in follow-up compaction PR"]
 async fn manual_compact_non_context_failure_retries_then_emits_task_error() {
     skip_if_no_network!();
 
@@ -3711,10 +3708,104 @@ async fn manual_compact_non_context_failure_retries_then_emits_task_error() {
     })
     .await;
     assert!(
-        task_error_message.contains("Error running local compact task"),
-        "expected local compact task error prefix, got {task_error_message}"
+        task_error_message.contains("temporary compact failure two"),
+        "expected the final compaction failure, got {task_error_message}"
     );
     wait_for_event(&atlas_engine, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_compact_without_summary_preserves_history_and_closes_item() {
+    let server = start_mock_server().await;
+    let requests = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("initial", FIRST_REPLY),
+                ev_completed("first"),
+            ]),
+            sse(vec![ev_completed("empty-compaction")]),
+            sse(vec![
+                ev_assistant_message("followup", "done"),
+                ev_completed("last"),
+            ]),
+        ],
+    )
+    .await;
+    let model_provider = non_openai_model_provider(&server);
+    let test = test_atlas_engine()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config.model_auto_compact_token_limit = Some(200_000);
+        })
+        .build(&server)
+        .await
+        .expect("build engine");
+    let engine = test.atlas_engine;
+    engine
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "preserve this user message".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .unwrap();
+    wait_for_event(&engine, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    engine.submit(Op::Compact).await.unwrap();
+    let mut started = None;
+    let mut completed = None;
+    let mut error_message = None;
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), engine.next_event())
+            .await
+            .expect("compaction must terminate")
+            .unwrap();
+        match event.msg {
+            EventMsg::ItemStarted(ItemStartedEvent {
+                item: TurnItem::ContextCompaction(item),
+                ..
+            }) => {
+                started = Some(item.id);
+            }
+            EventMsg::ItemCompleted(ItemCompletedEvent {
+                item: TurnItem::ContextCompaction(item),
+                ..
+            }) => {
+                completed = Some(item.id);
+            }
+            EventMsg::Error(error) => error_message = Some(error.message),
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+    assert!(started.is_some(), "compaction must have a lifecycle item");
+    assert_eq!(
+        completed, started,
+        "failed compaction must close its lifecycle item"
+    );
+    assert!(error_message.is_some_and(|message| message.contains("no text summary")));
+
+    engine
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "continue".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .unwrap();
+    wait_for_event(&engine, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let requests = requests.requests();
+    assert_eq!(requests.len(), 3, "an empty summary must not be retried");
+    let body = requests[2].body_json();
+    let history = body["input"].as_array().unwrap();
+    assert!(history.iter().any(
+        |item| item["role"] == "assistant" && item["content"].to_string().contains(FIRST_REPLY)
+    ));
+    assert!(body_contains_text(
+        &body.to_string(),
+        "preserve this user message"
+    ));
+    assert!(!body_contains_text(&body.to_string(), SUMMARY_PREFIX));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Loader2,
@@ -273,7 +274,7 @@ function GraphReady({
           value={query}
           onChange={onQueryChange}
           onKeyDown={(e) => {
-            if (e.key === "Enter") onRunQuery(query);
+            if (e.key === "Enter" && !isComposingKey(e)) onRunQuery(query);
             else if (e.key === "Escape") onClearQuery();
           }}
           placeholder="Ask your memory… (Enter to search)"

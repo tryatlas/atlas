@@ -129,7 +129,12 @@ fn ended(closed: Closed) -> Ended {
     }
 }
 
-const CLOSE_STEPS: [&str; 3] = ["AnnounceEnded", "ForgetHistoryBinding", "CloseProjection"];
+const CLOSE_STEPS: [&str; 4] = [
+    "AnnounceEnded",
+    "ForgetHistoryBinding",
+    "CloseProjection",
+    "CloseOnAgent",
+];
 
 // ---- the window lets it go ------------------------------------------------
 
@@ -708,4 +713,56 @@ async fn binding_and_ending_from_many_tasks_at_once_neither_deadlocks_nor_tears(
     f.registry.end_all();
     assert_eq!(f.registry.counts(), (0, 0, 0));
     assert!(f.manager.sessions().is_empty());
+}
+
+/// #86: ACP scopes a session id to its connection. Two agents that both
+/// answer `"1"` have two sessions: binding the second does not replace the
+/// first, the bare id is not guessed at while both hold it, and ending one
+/// agent's session leaves the other's bound, handle and all.
+#[tokio::test]
+async fn two_agents_with_the_same_session_id_stay_separate() {
+    let manager = manager(
+        TestCatalog::new(&["agent-a", "agent-b"]),
+        TestServer::new("native"),
+    );
+    let (a, b) = (custom("agent-a"), custom("agent-b"));
+    manager.request_connection(a.clone(), TestServer::with_fixed_session_id("agent-a", "1"));
+    manager.request_connection(b.clone(), TestServer::with_fixed_session_id("agent-b", "1"));
+    let registry = SessionRegistry::<Parked>::new(manager.clone());
+    for agent in [&a, &b] {
+        let ticket = registry.begin_bind(agent, None);
+        let thread = manager
+            .new_session(agent.clone(), Vec::new())
+            .await
+            .expect("a session opens");
+        registry
+            .bind(ticket, &thread, meta(agent))
+            .expect("nothing ended it meanwhile");
+    }
+
+    assert_eq!(registry.holders("1"), 2, "B's bind did not replace A's");
+    assert_eq!(registry.counts().0, 2);
+    assert_eq!(registry.info_of(&a, "1").map(|i| i.agent), Some(a.clone()));
+    assert_eq!(registry.info_of(&b, "1").map(|i| i.agent), Some(b.clone()));
+    assert!(
+        registry.info("1").is_none() && manager.session(&acp::SessionId::new("1")).is_none(),
+        "an id two agents share is not resolved by guessing"
+    );
+    assert!(matches!(registry.close("1"), Closed::Unknown));
+    assert_eq!(registry.holders("1"), 2, "nor closed by guessing");
+
+    let Closed::Ended(ended) = registry.close_of(&b, "1") else {
+        panic!("B's session closes by name");
+    };
+    assert_eq!(ended.agent, b);
+    assert!(registry.info_of(&a, "1").is_some(), "A's stays bound");
+    assert_eq!(
+        manager.session(&acp::SessionId::new("1")).map(|h| h.agent),
+        Some(a.clone()),
+        "and A's handle with it"
+    );
+
+    // Ending B's agent touches nothing of A's.
+    registry.end_agent(&b, AgentEnd::stopping());
+    assert_eq!(registry.info("1").map(|i| i.agent), Some(a));
 }

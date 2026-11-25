@@ -126,7 +126,7 @@ export function OrgAgentThread({
   const onSend = (text: string, mentions: ReturnType<OrgAgentInputHandle["getMentions"]>) => {
     const s = useOrgAgentStore.getState();
     atEnd.current = true;
-    send(askId, text, { mentions, effort: s.effort, deepResearch: s.deepResearch });
+    return send(askId, text, { mentions, effort: s.effort, deepResearch: s.deepResearch });
   };
 
   return (
@@ -338,7 +338,7 @@ function Composer({
   canStop: boolean;
   onStop: () => void;
   autoFocus?: boolean;
-  onSend: (text: string, mentions: ReturnType<OrgAgentInputHandle["getMentions"]>) => void;
+  onSend: (text: string, mentions: ReturnType<OrgAgentInputHandle["getMentions"]>) => boolean;
 }) {
   const input = useRef<OrgAgentInputHandle>(null);
   const root = useRef<HTMLDivElement>(null);
@@ -361,8 +361,7 @@ function Composer({
   const submit = () => {
     const text = input.current?.getValue().trim() ?? "";
     if (!text || !connected) return;
-    onSend(text, input.current?.getMentions() ?? []);
-    input.current?.clear();
+    if (onSend(text, input.current?.getMentions() ?? [])) input.current?.clear();
   };
 
   const menuOpen = () =>

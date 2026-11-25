@@ -5,7 +5,8 @@
 // File path: a run with at least one `/`, made of safe path chars, with an
 // optional `:line[:col]` suffix. Colons are excluded from the body so URLs
 // don't match as paths (guarded again by the `:` look-behind at use site).
-const PATH_RE = /[A-Za-z0-9._~@+\-/]*\/[A-Za-z0-9._~@+\-/]*(?::\d+(?::\d+)?)?/g;
+const PATH_RE =
+  /(?:[A-Za-z]:)?[A-Za-z0-9._~@+\-/\\]*[/\\][A-Za-z0-9._~@+\-/\\]*(?::\d+(?::\d+)?)?/g;
 
 // URLs: explicit-scheme (http/https/file), `www.` hosts, and bare local hosts
 // that carry a port (so we don't linkify the bare word "localhost"). Trailing

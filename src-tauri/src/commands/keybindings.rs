@@ -104,6 +104,8 @@ pub struct KeybindingsLoadResult {
     /// Non-fatal problems: a corrupt file we fell back from, repairs made
     /// while normalising. Surfaced in Settings, never blocking.
     pub warnings: Vec<String>,
+    /// False until an existing unreadable or invalid file is repaired.
+    pub writable: bool,
 }
 
 fn keybindings_path() -> Result<PathBuf, String> {
@@ -297,6 +299,12 @@ fn is_valid_when(s: &str) -> bool {
 }
 
 fn validate(file: &KeybindingsFile) -> Result<(), String> {
+    if file.version != SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported keybindings.json version {}",
+            file.version
+        ));
+    }
     let mut ids = HashSet::new();
     for p in &file.profiles {
         if p.id.trim().is_empty() {
@@ -344,22 +352,48 @@ fn validate(file: &KeybindingsFile) -> Result<(), String> {
     Ok(())
 }
 
-fn read_file(path: &PathBuf) -> (KeybindingsFile, Vec<String>) {
+fn read_file(path: &PathBuf) -> Result<KeybindingsFile, String> {
     match fs::read_to_string(path) {
-        Ok(raw) => match serde_json::from_str::<KeybindingsFile>(&raw) {
-            Ok(file) => (file, Vec::new()),
-            Err(e) => (
-                KeybindingsFile::default(),
-                vec![format!(
-                    "keybindings.json could not be read ({e}); using the Default profile. The file was left untouched."
-                )],
-            ),
-        },
-        Err(_) => (KeybindingsFile::default(), Vec::new()),
+        Ok(raw) => serde_json::from_str(&raw).map_err(|e| format!("keybindings.json: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(KeybindingsFile::default()),
+        Err(e) => Err(format!("read keybindings.json: {e}")),
+    }
+}
+
+fn load_file(path: PathBuf) -> KeybindingsLoadResult {
+    let exists = path.try_exists().unwrap_or(true);
+    let mut warnings = Vec::new();
+    let loaded = read_file(&path).and_then(|mut file| {
+        validate(&file)?;
+        warnings.extend(normalize(&mut file));
+        validate(&file)?;
+        Ok(file)
+    });
+    let writable = loaded.is_ok();
+    let file = loaded.unwrap_or_else(|error| {
+        warnings.push(format!(
+            "{error}. Repair the file and reload before saving."
+        ));
+        KeybindingsFile::default()
+    });
+    KeybindingsLoadResult {
+        file,
+        path: path.to_string_lossy().into_owned(),
+        exists,
+        warnings,
+        writable,
     }
 }
 
 fn write_file(path: &PathBuf, file: &KeybindingsFile) -> Result<(), String> {
+    static WRITE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let _guard = WRITE_LOCK.lock();
+    // Re-read before every write, including onboarding and external edits.
+    let mut previous = read_file(path)?;
+    validate(&previous)?;
+    normalize(&mut previous);
+    validate(&previous)?;
+    validate(file)?;
     let payload = serde_json::to_string_pretty(file).map_err(|e| e.to_string())?;
     atlas_fs::replace_file(path, payload).map_err(|e| e.to_string())
 }
@@ -370,20 +404,7 @@ fn write_file(path: &PathBuf, file: &KeybindingsFile) -> Result<(), String> {
 #[tauri::command]
 pub async fn keybindings_load() -> Result<KeybindingsLoadResult, String> {
     tokio::task::spawn_blocking(move || -> Result<KeybindingsLoadResult, String> {
-        let path = keybindings_path()?;
-        let exists = path.exists();
-        let (mut file, mut warnings) = read_file(&path);
-        warnings.extend(normalize(&mut file));
-        if let Err(e) = validate(&file) {
-            warnings.push(format!("{e}; using the Default profile"));
-            file = KeybindingsFile::default();
-        }
-        Ok(KeybindingsLoadResult {
-            file,
-            path: path.to_string_lossy().into_owned(),
-            exists,
-            warnings,
-        })
+        Ok(load_file(keybindings_path()?))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -428,31 +449,22 @@ pub fn menu_set_accelerators(
     app: AppHandle,
     accelerators: std::collections::HashMap<String, Option<String>>,
 ) -> Result<(), String> {
-    // The menu module is macOS-only (lib.rs); elsewhere there is no item to retarget.
-    #[cfg(target_os = "macos")]
-    {
-        use tauri::Manager;
-        let Some(items) = app.try_state::<crate::menu::MenuItems>() else {
-            return Ok(());
-        };
-        let mut failed = Vec::new();
-        for (id, accelerator) in &accelerators {
-            if let Some(item) = items.0.get(id) {
-                if let Err(e) = item.set_accelerator(accelerator.as_deref()) {
-                    failed.push(format!("{id}: {e}"));
-                }
+    use tauri::Manager;
+    let Some(items) = app.try_state::<crate::menu::MenuItems>() else {
+        return Ok(());
+    };
+    let mut failed = Vec::new();
+    for (id, accelerator) in &accelerators {
+        if let Some(item) = items.0.get(id) {
+            if let Err(e) = item.set_accelerator(accelerator.as_deref()) {
+                failed.push(format!("{id}: {e}"));
             }
         }
-        if failed.is_empty() {
-            Ok(())
-        } else {
-            Err(failed.join("; "))
-        }
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (app, accelerators);
+    if failed.is_empty() {
         Ok(())
+    } else {
+        Err(failed.join("; "))
     }
 }
 
@@ -542,14 +554,36 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_load_cannot_be_saved_over_and_can_be_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        for original in [
+            "{ damaged",
+            r#"{"version":999,"profiles":[]}"#,
+            r#"{"profiles":[{"id":"mine","name":"","bindings":{}}]}"#,
+        ] {
+            fs::write(&path, original).unwrap();
+            assert!(write_file(&path, &KeybindingsFile::default()).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        }
+        fs::write(
+            &path,
+            serde_json::to_vec(&KeybindingsFile::default()).unwrap(),
+        )
+        .unwrap();
+        write_file(&path, &KeybindingsFile::default()).unwrap();
+    }
+
+    #[test]
     fn corrupt_json_falls_back_with_a_warning() {
         let dir = std::env::temp_dir().join(format!("atlas-kb-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(FILE_NAME);
         fs::write(&path, "{ not json").unwrap();
-        let (file, warnings) = read_file(&path);
-        assert_eq!(file, KeybindingsFile::default());
-        assert_eq!(warnings.len(), 1);
+        let loaded = load_file(path.clone());
+        assert_eq!(loaded.file, KeybindingsFile::default());
+        assert_eq!(loaded.warnings.len(), 1);
+        assert!(!loaded.writable);
         // Untouched.
         assert_eq!(fs::read_to_string(&path).unwrap(), "{ not json");
         let _ = fs::remove_dir_all(&dir);
@@ -563,8 +597,7 @@ mod tests {
         file.profiles.push(profile("mine", &[("tabs.close", None)]));
         write_file(&path, &file).unwrap();
         assert!(!path.with_extension("json.tmp").exists());
-        let (back, warnings) = read_file(&path);
-        assert!(warnings.is_empty());
+        let back = read_file(&path).unwrap();
         assert_eq!(back, file);
         let _ = fs::remove_dir_all(&dir);
     }

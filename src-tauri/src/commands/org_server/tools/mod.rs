@@ -654,7 +654,10 @@ impl OrgTools {
         if !self.orgs.signed_in() {
             return tool_error(SIGNED_OUT_NOTE);
         }
-        if self.orgs.bound_to(&grant.cwd).as_ref() != Some(&scope) {
+        let orgs = self.orgs.clone();
+        let cwd = grant.cwd.clone();
+        let bound = tokio::task::spawn_blocking(move || orgs.bound_to(&cwd)).await;
+        if bound.ok().flatten().as_ref() != Some(&scope) {
             return tool_error(UNBOUND_NOTE);
         }
         if outward && !consented {
@@ -1009,7 +1012,10 @@ impl OutwardCalls for OrgTools {
 /// outward actions ask first.
 pub fn tenant(tools: OrgTools) -> Tenant {
     let admit = super::offers::admission(tools.gate.clone(), tools.orgs.clone());
+    // Every tool a session can be offered, admin ones included: a session
+    // that isn't offered one never calls it.
     Tenant::new(ORG_SERVER_NAME, ORG_PATH, tools.clone())
+        .advertising(crate::commands::tool_servers::tool_names(&tools_list(true)))
         .only_for(Audience::OrgAccess)
         .admitted_by(admit)
         .asking_first(Arc::new(tools))

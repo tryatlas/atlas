@@ -47,7 +47,7 @@ import {
   type ProjectRef,
 } from "./app-warning-rules";
 import { computeAway, type NotificationEnv } from "./decide";
-import { deliverNotification } from "./deliver";
+import { deliverNotification, forgetNotification } from "./deliver";
 import { registerNotificationAction } from "./notification-actions";
 import { prefsFromSettings } from "./prefs";
 import { clearResolved } from "./resolve";
@@ -171,7 +171,7 @@ function onAutoFetchStatus(status: {
         kind: "git-autofetch-failing",
         target: { type: "git-panel", projectId: p.projectId, projectName: p.projectName },
         dedupeKey: `autofetch:${p.projectId}:${fetched.resolved}`,
-        markRead: [{ kind: "git-autofetch-failing" }],
+        markRead: [{ kind: "git-autofetch-failing", projectId: p.projectId }],
       });
     }
 
@@ -234,6 +234,7 @@ function noteConfig(error: string | null): void {
       if (d) deliverNotification(d);
     }
     if (r.resolved !== null) {
+      forgetNotification(configErrorDedupeKey(r.resolved));
       clearResolved({
         kind: "config-error",
         target: { type: "config-file" },

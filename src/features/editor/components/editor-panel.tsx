@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { onExplorerChanged } from "@/features/explorer/lib/fs-api";
-import { onGitChanged } from "@/features/git/lib/git-watch-api";
+import { useIsTabVisible } from "@/features/layout/lib/use-tab-visible";
 import { toast } from "sonner";
 import { Code2, Eye, Pencil, RefreshCw, Table2, WrapText } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -26,9 +26,10 @@ import { FixWithAgentButton } from "@/features/ask-agent/components/ask-agent-bu
 import type { AgentContext, ErrorContext } from "@/features/ask-agent/lib/agent-context";
 import type { AskHandler } from "../lib/ask-gutter";
 import { registerEditorView } from "../lib/editor-views";
+import { useGitChangedRefresh } from "../lib/use-git-changed-refresh";
 import { filePreviewDelimiter } from "../lib/delimited-preview";
 import { relativeToRoot, retainedBreadcrumbTrail } from "../lib/file-path";
-import { registerFileSaver } from "../lib/dirty-close";
+import { registerFileDraft, registerFileSaver, releaseFileBuffer } from "../lib/dirty-close";
 import {
   FileTooLargeError,
   MAX_OPEN_BYTES,
@@ -125,6 +126,7 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
   const layoutActions = useLayoutStore((s) => s.actions);
   const viewRef = useRef<CodeMirrorFileViewHandle | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
   // Set when the file is over `MAX_OPEN_BYTES`: it is never read.
   const [tooLargeBytes, setTooLargeBytes] = useState<number | null>(null);
   // Bumped when the document is replaced from disk; the code view takes the
@@ -232,7 +234,7 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
     return () => {
       live = false;
     };
-  }, [path, buffer, openBuffer, isUntitled]);
+  }, [path, buffer, openBuffer, isUntitled, loadAttempt]);
 
   // ── Change bars and blame ──
   const refreshDiffGutter = useCallback(() => {
@@ -317,8 +319,10 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
       await writeFileContent(newPath, content);
       const mtime = await fileMtimeMs(newPath);
       openBuffer(newPath, content, mtime);
-      markSaved(newPath, content, mtime);
+      if (useEditorStore.getState().buffers[newPath]?.dirty) markExternallyChanged(newPath, mtime);
+      else reloadBuffer(newPath, content, mtime);
       layoutActions.closeTab(tabId);
+      releaseFileBuffer(path, useLayoutStore.getState().tabs);
       // Still being written: the new tab opens for editing, as this one was.
       openFileAs(newPath, "text", { edit: true });
       logEvent({
@@ -332,7 +336,13 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
       toastSaveFailure("Couldn't save the file", err, path);
       return false;
     }
-  }, [projectPath, openBuffer, markSaved, layoutActions, tabId]);
+  }, [projectPath, openBuffer, reloadBuffer, markExternallyChanged, layoutActions, tabId, path]);
+
+  const replacementVersion = buffer?.documentVersion ?? 0;
+  useEffect(() => {
+    const current = useEditorStore.getState().buffers[path];
+    if (current && replacementVersion > 0) save.reset(current.originalContent);
+  }, [path, replacementVersion, save]);
 
   const handleSave = useCallback(
     (): Promise<boolean> => (isUntitled ? saveAs() : save.flush()),
@@ -342,6 +352,9 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
   const handleSaveRef = useRef(handleSave);
   handleSaveRef.current = handleSave;
   useEffect(() => registerFileSaver(tabId, () => handleSaveRef.current()), [tabId]);
+  // A rename or move in the explorer carries the unsaved text to the new
+  // path through here (`project-file-ops.ts`).
+  useEffect(() => registerFileDraft(tabId, () => viewRef.current?.getText()), [tabId]);
 
   // ── External changes ──
   const replaceDocument = useCallback(
@@ -408,15 +421,13 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
 
   // Repaint bars and blame when the working tree changes elsewhere (commits,
   // stage/unstage, external edits) — the event the git store listens to.
-  useEffect(() => {
-    const un = onGitChanged(() => {
-      refreshDiffGutter();
-      refreshBlame();
-    });
-    return () => {
-      void un.then((u) => u());
-    };
-  }, [refreshDiffGutter, refreshBlame]);
+  // Only this project's repository, debounced; a hidden tab refreshes when
+  // it is shown again (`use-git-changed-refresh.ts`).
+  const tabVisible = useIsTabVisible(tabId);
+  useGitChangedRefresh(projectPath, tabVisible, () => {
+    refreshDiffGutter();
+    refreshBlame();
+  });
 
   // Reconcile with disk on the signals of an external edit: the buffer
   // mounting (a close-then-reopen must not show a stale cached buffer), the
@@ -625,7 +636,14 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
         detail={path}
         action={
           <div className="flex items-center gap-2">
-            <Button variant="outline" size="xs" onClick={() => setLoadError(null)}>
+            <Button
+              variant="outline"
+              size="xs"
+              onClick={() => {
+                setLoadError(null);
+                setLoadAttempt((attempt) => attempt + 1);
+              }}
+            >
               Try again
             </Button>
             <FixWithAgentButton
@@ -681,8 +699,8 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
             key={path}
             handleRef={viewRef}
             name={path}
-            contents={buffer.originalContent}
-            version={docVersion}
+            contents={buffer.draft ?? buffer.originalContent}
+            version={docVersion + replacementVersion}
             wordWrap={wordWrap}
             readOnly={large}
             editable={editing}
@@ -692,6 +710,10 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
             onRevealed={(nonce) => consumeReveal(path, nonce)}
             onChange={(content) => save.change(content)}
             onReady={() => {
+              // Opened on edits carried from the file's old path: they are
+              // still unsaved here.
+              const carried = useEditorStore.getState().buffers[path]?.draft;
+              if (carried !== undefined) save.change(carried);
               refreshDiffGutter();
               refreshBlame();
             }}

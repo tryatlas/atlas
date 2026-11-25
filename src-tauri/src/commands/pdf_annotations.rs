@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -21,16 +22,24 @@ pub type Annotation = serde_json::Value;
 pub struct PdfAnnotationsFile {
     #[serde(default, rename = "byPath")]
     pub by_path: HashMap<String, Vec<Annotation>>,
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
 }
+
+// The file contains every PDF's annotations: serialize the entire read/change/write.
+static WRITER: Mutex<()> = Mutex::new(());
 
 fn annotations_path(project_path: &str) -> std::path::PathBuf {
     atlas_profile::dir_in(Path::new(project_path)).join("pdf-annotations.json")
 }
 
-fn read_all(project_path: &str) -> PdfAnnotationsFile {
+fn read_all(project_path: &str) -> Result<PdfAnnotationsFile, String> {
     match fs::read_to_string(annotations_path(project_path)) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
-        Err(_) => PdfAnnotationsFile::default(),
+        Ok(raw) => serde_json::from_str(&raw).map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(PdfAnnotationsFile::default())
+        }
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -46,7 +55,7 @@ pub async fn pdf_annotations_load(
     pdf_path: String,
 ) -> Result<Vec<Annotation>, String> {
     tokio::task::spawn_blocking(move || {
-        Ok(read_all(&project_path)
+        Ok(read_all(&project_path)?
             .by_path
             .remove(&pdf_path)
             .unwrap_or_default())
@@ -64,7 +73,8 @@ pub async fn pdf_annotations_save(
     annotations: Vec<Annotation>,
 ) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        let mut file = read_all(&project_path);
+        let _writer = WRITER.lock().map_err(|error| error.to_string())?;
+        let mut file = read_all(&project_path)?;
         if annotations.is_empty() {
             file.by_path.remove(&pdf_path);
         } else {
@@ -103,5 +113,43 @@ mod tests {
             crate::commands::file_names_in(&atlas_profile::dir_in(project.path())),
             ["pdf-annotations.json"]
         );
+    }
+    #[tokio::test]
+    async fn concurrent_pdf_saves_preserve_every_document() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().to_string_lossy().into_owned();
+        let mut jobs = tokio::task::JoinSet::new();
+        for i in 0..32 {
+            let root = root.clone();
+            jobs.spawn(async move {
+                pdf_annotations_save(
+                    root,
+                    format!("/{i}.pdf"),
+                    vec![serde_json::json!({"id": i})],
+                )
+                .await
+                .unwrap();
+            });
+        }
+        while let Some(job) = jobs.join_next().await {
+            job.unwrap();
+        }
+        assert_eq!(read_all(&root).unwrap().by_path.len(), 32);
+    }
+
+    #[tokio::test]
+    async fn corrupt_annotation_storage_is_never_overwritten() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().to_string_lossy().into_owned();
+        let path = annotations_path(&root);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "broken annotations").unwrap();
+        assert!(pdf_annotations_load(root.clone(), "/a.pdf".into())
+            .await
+            .is_err());
+        assert!(pdf_annotations_save(root, "/a.pdf".into(), vec![])
+            .await
+            .is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), "broken annotations");
     }
 }

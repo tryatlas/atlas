@@ -31,6 +31,9 @@ interface KnowledgeLinksState {
 }
 
 let unlisten: UnlistenFn | null = null;
+/** Bumped by every `unbind`. A `bind` whose `listen` resolves after a newer
+ *  bind/unbind disposes its own listener instead of leaking it. */
+let bindingGeneration = 0;
 
 const store = create<KnowledgeLinksState>()((set, get) => ({
   projectPath: null,
@@ -39,13 +42,23 @@ const store = create<KnowledgeLinksState>()((set, get) => ({
     bind: async (projectPath) => {
       if (get().projectPath === projectPath && unlisten) return;
       get().actions.unbind();
+      const binding = bindingGeneration;
       set({ projectPath, rev: 0 });
-      unlisten = await listen<{ projectPath: string }>("atlas:knowledge:links-changed", (event) => {
-        if (!projectPath || event.payload?.projectPath !== projectPath) return;
-        set((s) => ({ rev: s.rev + 1 }));
-      });
+      const off = await listen<{ projectPath: string }>(
+        "atlas:knowledge:links-changed",
+        (event) => {
+          if (binding !== bindingGeneration || event.payload?.projectPath !== projectPath) return;
+          set((s) => ({ rev: s.rev + 1 }));
+        },
+      ).catch(() => null);
+      if (binding !== bindingGeneration) {
+        off?.();
+        return;
+      }
+      unlisten = off;
     },
     unbind: () => {
+      bindingGeneration += 1;
       if (unlisten) {
         unlisten();
         unlisten = null;

@@ -46,6 +46,67 @@ fn resolved_under(root: &Path, path: &str) -> anyhow::Result<PathBuf> {
 }
 
 #[test]
+fn self_moves_keep_the_updated_file_in_both_modes() -> anyhow::Result<()> {
+    for preserve in ["0", "1"] {
+        for destination in ["note.txt", "./note.txt", "nested/../note.txt"] {
+            let tmp = tempdir()?;
+            fs::create_dir(tmp.path().join("nested"))?;
+            fs::write(tmp.path().join("note.txt"), "before\n")?;
+            let patch = format!(
+                "*** Begin Patch\n*** Update File: note.txt\n*** Move to: {destination}\n@@\n-before\n+after\n*** End Patch"
+            );
+            apply_patch_command(tmp.path())?
+                .env(
+                    ATLAS_AGENT_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR,
+                    preserve,
+                )
+                .arg(patch)
+                .assert()
+                .success();
+            assert_eq!(fs::read_to_string(tmp.path().join("note.txt"))?, "after\n");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn addition_only_context_goes_immediately_after_the_named_line() -> anyhow::Result<()> {
+    for preserve in ["0", "1"] {
+        let tmp = tempdir()?;
+        fs::write(tmp.path().join("note.txt"), "header\nfooter\n")?;
+        apply_patch_command(tmp.path())?
+            .env(
+                ATLAS_AGENT_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR,
+                preserve,
+            )
+            .arg("*** Begin Patch\n*** Update File: note.txt\n@@ header\n+middle\n*** End Patch")
+            .assert()
+            .success();
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("note.txt"))?,
+            "header\nmiddle\nfooter\n"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn normalizing_an_update_preserves_unedited_trailing_blank_lines() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    fs::write(tmp.path().join("note.txt"), "before\n\n")?;
+    apply_patch_command(tmp.path())?
+        .env(ATLAS_AGENT_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR, "0")
+        .arg("*** Begin Patch\n*** Update File: note.txt\n@@\n-before\n+after\n*** End Patch")
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("note.txt"))?,
+        "after\n\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_apply_patch_cli_applies_multiple_operations() -> anyhow::Result<()> {
     let tmp = tempdir()?;
     let add_path = tmp.path().join("nested/new.txt");

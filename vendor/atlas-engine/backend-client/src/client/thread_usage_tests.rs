@@ -16,7 +16,7 @@ fn thread_usage_contract_uses_expected_paths_and_payload() {
     let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
     assert_eq!(
         Client::new("https://example.test", factory.clone()).thread_usage_url(),
-        "https://example.test/api/codex/usage/thread_usage/query"
+        "https://example.test/api/atlas-agent/usage/thread_usage/query"
     );
     assert_eq!(
         Client::new("https://chatgpt.com/backend-api", factory).thread_usage_url(),

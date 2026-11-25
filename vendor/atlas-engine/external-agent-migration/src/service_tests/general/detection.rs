@@ -699,7 +699,7 @@ description = "Research role"
 model_reasoning_effort = "high"
 sandbox_mode = "workspace-write"
 developer_instructions = """
-Research with AtlasEngine carefully."""
+Research with Atlas Agent carefully."""
 "#,
     )
     .expect("parse expected agent");

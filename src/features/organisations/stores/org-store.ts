@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { logEvent } from "@/features/log/lib/log";
-import { scheduleAppStateSave } from "@/features/app/stores/app-store";
+import { flushAppStateSave, scheduleAppStateSave } from "@/features/app/stores/app-store";
 import { useProjectStore } from "@/features/projects/stores/project-store";
 import type { Organisation } from "../types";
 import { isSyncedOrg, slugify } from "../types";
@@ -446,6 +446,7 @@ export const useOrgStore = create<OrgState>()((set, get) => ({
         // The org id did not change but its *kind* did — local→cloud — and
         // with it what telemetry may say about it (a synced org has a
         // server-side name worth defining on the group). Re-resolve.
+        await flushAppStateSave();
         if (get().activeOrganisationId === id) syncOrgTelemetry(id);
         logEvent({
           source: "project",

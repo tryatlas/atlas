@@ -1,6 +1,5 @@
 // Modified by Atlas from upstream OpenAI Codex (Apache-2.0). See CONTEXT.md.
 use super::RewriteProfile;
-use super::external_agent_config_dir;
 use super::invalid_data_error;
 use super::json_u64;
 use super::rewrite_hook_command_for_source;
@@ -11,7 +10,6 @@ use serde_json::Value as JsonValue;
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::path::PathBuf;
 
 pub fn hooks_migration_description_cla(
     source_external_agent_dir: &Path,
@@ -92,6 +90,7 @@ pub(super) fn hook_migration_cla(
             &mut migration,
             target_config_dir,
             rewrite_profile,
+            source_external_agent_dir,
         );
     }
 
@@ -103,6 +102,7 @@ pub(super) fn append_convertible_hook_groups_cla(
     hooks_payload: &mut serde_json::Map<String, JsonValue>,
     target_config_dir: Option<&Path>,
     rewrite_profile: RewriteProfile,
+    source_external_agent_dir: &Path,
 ) {
     let Some(hooks_config) = settings.get("hooks").and_then(JsonValue::as_object) else {
         return;
@@ -176,7 +176,11 @@ pub(super) fn append_convertible_hook_groups_cla(
                         .insert("type".to_string(), JsonValue::String("command".to_string()));
                     command_payload.insert(
                         "command".to_string(),
-                        JsonValue::String(rewrite_hook_command_cla(command, target_config_dir)),
+                        JsonValue::String(rewrite_hook_command_for_source(
+                            command,
+                            target_config_dir,
+                            source_external_agent_dir,
+                        )),
                     );
                     if let Some(timeout) = hook_object
                         .get("timeout")
@@ -224,7 +228,11 @@ pub(super) fn append_convertible_hook_groups_cla(
     }
 }
 
+#[cfg(test)]
 pub(super) fn rewrite_hook_command_cla(command: &str, target_config_dir: Option<&Path>) -> String {
-    let source_external_agent_dir = PathBuf::from(external_agent_config_dir());
+    let source_external_agent_dir = target_config_dir
+        .and_then(Path::parent)
+        .unwrap_or(Path::new("."))
+        .join(super::external_agent_config_dir());
     rewrite_hook_command_for_source(command, target_config_dir, &source_external_agent_dir)
 }

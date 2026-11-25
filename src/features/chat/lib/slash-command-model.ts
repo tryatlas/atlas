@@ -2,19 +2,26 @@
 // highlights rows, how the keyboard steps the highlight, and where the panel
 // sits. Pure, so it is tested without a DOM (`slash-command-model.test.ts`).
 
-/** Exactly two outcomes (S1): `/login` — the one command Atlas synthesizes —
- *  and passthrough for everything the agent advertises itself. The former
- *  per-agent login handlers, the `/skills` settings row and the dimmed
- *  "unavailable" guard rows are gone; Atlas renders what ACP gives, nothing
- *  else.
+/** Who answers a row: Atlas (its few own commands) or the agent.
  *
- *  - `agent-login` — opens Atlas's own sign-in dialog for the bound agent (the
- *    ACP adapter filters `/login` from its slash list, so sending it as text
+ *  - `agent-login` — opens Atlas's own sign-in dialog for the bound agent (most
+ *    ACP adapters filter `/login` from their slash list, so sending it as text
  *    is a no-op; we drive a host-side OAuth flow instead).
- *  - `passthrough` — sent verbatim as the user's next prompt. The agent
- *    processes it locally and its response flows through the normal
- *    `agent_message_chunk` pipeline. */
+ *  - `fork` / `queue` — a new tab from this conversation; the send queue.
+ *  - `passthrough` — everything the agent advertises, sent verbatim as the
+ *    user's next prompt. The agent processes it locally and its response flows
+ *    through the normal `agent_message_chunk` pipeline.
+ *
+ *  An agent's command is never shadowed by Atlas's: where the names collide,
+ *  Atlas's row is renamed (`buildAgentSlashCommands`). */
 export type SlashCommandHandler = "agent-login" | "fork" | "queue" | "passthrough";
+
+/** The names Atlas's `/fork` and `/queue` go by for one agent, `null` where
+ *  it has none (`atlasCommandNames`). Without the slash. */
+export interface AtlasCommandNames {
+  fork: string | null;
+  queue: string | null;
+}
 
 export interface SlashCommand {
   /** Unique slug used both as the visible command name and matched query. */

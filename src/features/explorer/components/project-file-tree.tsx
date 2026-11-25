@@ -16,6 +16,7 @@ import { useIconThemeStore } from "@/features/icon-theme/stores/icon-theme-store
 import { useWorkingTreeChanges } from "@/features/git/lib/use-working-tree-changes";
 import {
   addToGitignore,
+  literalGitignorePattern,
   openInTerminal,
   readDirectories,
   type DirectoryListing,
@@ -355,7 +356,8 @@ export function ProjectFileTree({
   const openInDefaultApp = (abs: string) => openInEditor(SYSTEM_EDITOR_ID, abs);
   const terminalAt = (abs: string) => void openInTerminal(abs).catch((e) => toast.error(String(e)));
   const ignore = (rel: string) =>
-    void addToGitignore(root, rel)
+    void Promise.resolve()
+      .then(() => addToGitignore(root, literalGitignorePattern(rel)))
       .then(() => toast.success(`Added to .gitignore: ${rel}`))
       .catch((e) => toast.error(String(e)));
 

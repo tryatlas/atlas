@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { agentTypeFromPluginId } from "@/types/agent";
 import { useChatStore } from "../stores/chat-store";
 import { agents } from "../lib/agents-api";
+import { onClaudeModeList } from "../lib/session-configuration";
 
 /** The composer's ACP mode picker: seeds the modes when the session-bind path
  *  missed them, and settles a pending pill whose boot hung. */
@@ -21,7 +22,7 @@ export function useComposerModesSelfHeal(tabId: string): void {
   // consumer-side self-heal pattern (file index / knowledge mentions).
   const seedBinding = useChatStore((s) => {
     const sess = s.sessions[tabId];
-    if (!sess || sess.agentType === "claude-code") return null;
+    if (!sess || onClaudeModeList(sess)) return null;
     if (!sess.acpAgentId || !sess.acpSessionId) return null;
     if ((sess.acpAvailableModes?.length ?? 0) > 0) return null;
     return `${sess.acpAgentId}::${sess.acpSessionId}`;

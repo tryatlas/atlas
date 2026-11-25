@@ -171,10 +171,12 @@ describe("the boot reconciliation", () => {
     expect(layout().tabs).toBe(before);
   });
 
-  it("leaves nothing of the stale organisation in what is persisted", () => {
+  it("leaves nothing of the stale organisation in what is persisted", async () => {
     showingStaleOrg();
     commsActions().applyEnvelope(envelopeFrom("org_a"));
-    layout().actions.saveEditorState("/p");
+    // Its own path: the layout store skips a write whose JSON matches the last
+    // one that landed for that path, and an earlier test already saved "/p".
+    await layout().actions.flushEditorState("/p-reconciled");
 
     expect(persistedTabs().some((t) => ORG_SCOPED_TYPES.has(t.type))).toBe(false);
   });

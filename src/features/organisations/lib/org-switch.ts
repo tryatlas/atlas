@@ -16,6 +16,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { auth } from "@/features/auth/lib/auth-api";
 import { useAuthStore } from "@/features/auth/stores/auth-store";
 import { useOrgStore } from "../stores/org-store";
+import { confirmCloseFileTabs, dirtyFileTabs } from "@/features/editor/lib/dirty-close";
 import {
   busySessions,
   cancelBusySessions,
@@ -49,23 +50,29 @@ export async function switchOrg(id: string): Promise<void> {
 
   switchingOrg = true;
 
-  // Running agents die with the outgoing org's teardown — never silently.
-  // Warn first (before the overlay, so the dialog is readable); "Go back"
-  // aborts the switch entirely. Only the mounted (= outgoing) org's sessions
-  // can be busy, so an unscoped count is the outgoing org's count.
+  // The teardown below unmounts every project's editors and stops their
+  // agents: unsaved file edits are saved or let go by the user, and running
+  // agents confirmed, first — never dropped silently. Asked before the
+  // overlay, so the dialogs are readable; Cancel or "Go back" aborts the
+  // switch entirely. Only the mounted (= outgoing) org's tabs and sessions
+  // exist, so unscoped lookups are the outgoing org's.
+  const unsaved = dirtyFileTabs();
   const busy = busySessions().length;
-  if (busy > 0) {
+  if (unsaved.length > 0 || busy > 0) {
     // The boot push waits for the answer: a sign-in that lands behind the
     // prompt would otherwise send the organisation being left, beside the
     // call this switch is about to make.
     const answered = switchAwaitsAnswer();
     let ok = false;
     try {
-      ok = await useStopAgentsConfirmStore.getState().actions.ask({
-        count: busy,
-        actionLabel: "Switching organizations",
-        confirmLabel: "Stop agents & switch",
-      });
+      ok = await confirmCloseFileTabs(unsaved, "Switching organizations");
+      if (ok && busy > 0) {
+        ok = await useStopAgentsConfirmStore.getState().actions.ask({
+          count: busy,
+          actionLabel: "Switching organizations",
+          confirmLabel: "Stop agents & switch",
+        });
+      }
     } finally {
       answered(ok);
     }
@@ -231,6 +238,7 @@ export async function deleteOrgAndData(id: string): Promise<boolean> {
     const next = organisations.find((o) => o.id !== id);
     if (!next) return false;
     await switchOrg(next.id); // teardown active set + load the next org
+    if (useOrgStore.getState().activeOrganisationId === id) return false;
   }
 
   // Synced org → delete it server-side first so the add-only merge won't

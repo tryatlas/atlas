@@ -4,6 +4,7 @@
 // on the history rail, with a way back to that session) and how agents use
 // it. Editing is in place: a draft, ⌘↵ to save, Esc to put it back.
 
+import { shortcutLabel } from "@/features/keybindings/lib/combo";
 import {
   ArchiveRestore,
   ArrowLeft,
@@ -172,7 +173,9 @@ export function MemoryEntryDetailView(p: MemoryEntryDetailViewProps) {
                 <Button size="sm" variant="ghost" onClick={p.onCancel}>
                   Cancel
                 </Button>
-                <span className="ml-1 text-2xs text-disabled">⌘↵ to save · Esc to cancel</span>
+                <span className="ml-1 text-2xs text-disabled">
+                  {shortcutLabel("cmd+enter")} to save · Esc to cancel
+                </span>
               </>
             ) : (
               <>

@@ -2,7 +2,7 @@
 // packs that ship no skills. Manage opens one dialog: what the skill does, the
 // agent tools it is delivered to, and update / uninstall.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 
@@ -62,6 +62,9 @@ export function InstalledSkills({
 }) {
   const effectiveProject = scope === "project" ? projectPath : null;
   const projectMissing = scope === "project" && !projectPath;
+  const currentKey = useRef(cacheKeyFor(scope, effectiveProject));
+  currentKey.current = cacheKeyFor(scope, effectiveProject);
+  const loadGeneration = useRef(0);
 
   const seed = installedCache.get(cacheKeyFor(scope, effectiveProject));
   const [view, setView] = useState<ReconcileView | null>(seed?.view ?? null);
@@ -80,26 +83,30 @@ export function InstalledSkills({
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
+    const key = cacheKeyFor(scope, effectiveProject);
+    if (currentKey.current !== key) return;
+    const generation = ++loadGeneration.current;
     if (projectMissing) {
       setView(null);
       setPackList([]);
       setPackProjected({});
       return;
     }
-    const key = cacheKeyFor(scope, effectiveProject);
     // Paint the cached snapshot immediately (stale-while-revalidate).
     const cached = installedCache.get(key);
     if (cached) {
       setView(cached.view);
       setPackList(cached.packList);
       setPackProjected(cached.packProjected);
+    } else {
+      setView(null);
+      setPackList([]);
+      setPackProjected({});
     }
     const [v, pl] = await Promise.all([
       skillsApi.reconcile(scope, effectiveProject),
       packsApi.list(scope, effectiveProject),
     ]);
-    setView(v);
-    setPackList(pl);
     const entries = await Promise.all(
       pl.map(async (p) => {
         const views = await packsApi.projections(scope, p.pack.name, effectiveProject);
@@ -107,16 +114,28 @@ export function InstalledSkills({
       }),
     );
     const projected = Object.fromEntries(entries);
-    setPackProjected(projected);
     installedCache.set(key, { view: v, packList: pl, packProjected: projected });
+    if (currentKey.current !== key || generation !== loadGeneration.current) return;
+    setView(v);
+    setPackList(pl);
+    setPackProjected(projected);
   }, [scope, effectiveProject, projectMissing]);
 
   useEffect(() => {
     setLoadError(null);
+    setTarget(null);
+    setBusy(null);
+    setOptimistic({});
+    let alive = true;
     void refresh().catch((e) => {
+      if (!alive) return;
       setLoadError(String(e));
       toast.error(String(e));
     });
+    return () => {
+      alive = false;
+      loadGeneration.current++;
+    };
   }, [refresh]);
 
   // Reflect installs/mutations happening elsewhere (e.g. Discover).

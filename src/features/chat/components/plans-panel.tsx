@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ClipboardList } from "lucide-react";
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { usePaneTopInset } from "@/features/layout/lib/pane-top-inset";
@@ -28,12 +28,20 @@ export function PlansPanel({ onClose }: PlansPanelProps) {
   const { setPlansPanelWidth } = useLayoutStore((s) => s.actions);
   const projectPath = useAppStore((s) => s.currentProject)?.path ?? null;
 
-  const [plans, setPlans] = useState<PlanRecord[]>([]);
+  // Tagged with the project it was loaded for: after a project switch the
+  // previous project's plans are never listed under the new one, and a load
+  // that resolves after a newer one (or after the switch) is dropped.
+  const [loaded, setLoaded] = useState<{ path: string; plans: PlanRecord[] } | null>(null);
+  const plans = loaded && loaded.path === projectPath ? loaded.plans : [];
+  const loadSeq = useRef(0);
 
   const load = useCallback(() => {
+    const request = ++loadSeq.current;
     if (!projectPath) return;
     void loadPlans(projectPath)
-      .then(setPlans)
+      .then((next) => {
+        if (request === loadSeq.current) setLoaded({ path: projectPath, plans: next });
+      })
       .catch(() => {});
   }, [projectPath]);
 
@@ -41,7 +49,11 @@ export function PlansPanel({ onClose }: PlansPanelProps) {
   useEffect(() => {
     load();
     const onSaved = () => load();
-    return onWindowEvent("atlas:plan-saved", onSaved);
+    const off = onWindowEvent("atlas:plan-saved", onSaved);
+    return () => {
+      loadSeq.current += 1;
+      off();
+    };
   }, [load]);
 
   return (

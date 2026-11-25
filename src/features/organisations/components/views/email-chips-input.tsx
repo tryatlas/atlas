@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 import { X } from "lucide-react";
 import { Hint, Icon } from "@tryatlas/design";
 
@@ -111,7 +112,7 @@ export function EmailChipsInput({
           else onDraftChange(e.target.value);
         }}
         onKeyDown={(e) => {
-          if (e.key === "Enter") {
+          if (e.key === "Enter" && !isComposingKey(e)) {
             e.preventDefault();
             if (draft.trim()) commit(draft);
             else onSubmit();

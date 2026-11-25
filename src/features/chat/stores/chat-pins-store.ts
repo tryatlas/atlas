@@ -72,13 +72,42 @@ export function resolvePinIndex(messages: ReadonlyArray<ChatMessage>, pin: ChatP
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
     if (m.role !== role) continue;
-    if (m.id === pin.messageId) return i;
-    if (byStamp >= 0) continue;
-    if ((role === "user" ? userMessageText(m) : assistantMessageText(m)) !== pin.text) continue;
+    // An id is only the pinned message while it still says what was pinned:
+    // positional ids are reused, and after a rewind the next message sent
+    // takes the id of the one rewound away — the pin followed it.
+    const same = (role === "user" ? userMessageText(m) : assistantMessageText(m)) === pin.text;
+    if (m.id === pin.messageId && same) return i;
+    if (byStamp >= 0 || !same) continue;
     if (m.timestamp === pin.timestamp) byStamp = i;
     else if (byText < 0) byText = i;
   }
   return byStamp >= 0 ? byStamp : byText;
+}
+
+/**
+ * The pins re-pointed at the messages showing now: each one that resolves
+ * takes its message's current id and timestamp. The same array when nothing
+ * moved.
+ *
+ * Why: the id a pin is placed with is the live stream's, and a reopened
+ * thread paints the snapshot's (`snapshot-message.ts`), so after every reopen
+ * the row no longer showed as pinned, and pinning it again added a second
+ * pin. Re-pointed while the thread shows, a pin keeps an id the row has.
+ */
+export function reconcilePins(
+  pins: readonly ChatPin[],
+  messages: ReadonlyArray<ChatMessage>,
+): readonly ChatPin[] {
+  let out: ChatPin[] | null = null;
+  pins.forEach((pin, k) => {
+    const i = resolvePinIndex(messages, pin);
+    if (i < 0) return;
+    const m = messages[i];
+    if (m.id === pin.messageId && m.timestamp === pin.timestamp) return;
+    out ??= [...pins];
+    out[k] = { ...pin, messageId: m.id, timestamp: m.timestamp };
+  });
+  return out ?? pins;
 }
 
 /** Per-scope cap. Pins are a shortlist; an unbounded one is a second thread. */
@@ -90,6 +119,12 @@ interface ChatPinsState {
   actions: {
     toggle: (scope: string, pin: ChatPin) => void;
     unpin: (scope: string, messageId: string) => void;
+    /** Re-point `scope`'s pins at `messages` (`reconcilePins`). */
+    reconcile: (scope: string, messages: ReadonlyArray<ChatMessage>) => void;
+    /** Move a tab's pins to its session once it binds: placed before the
+     *  bind they were tab-scoped, and the session scope is the one a reopen
+     *  reads, so they were lost with the tab. */
+    adopt: (from: string, to: string) => void;
   };
 }
 
@@ -113,6 +148,22 @@ export const useChatPinsStore = create<ChatPinsState>()(
               [scope]: (s.pins[scope] ?? []).filter((p) => p.messageId !== messageId),
             },
           })),
+        reconcile: (scope, messages) =>
+          set((s) => {
+            const current = s.pins[scope];
+            if (!current?.length) return s;
+            const next = reconcilePins(current, messages);
+            return next === current ? s : { pins: { ...s.pins, [scope]: [...next] } };
+          }),
+        adopt: (from, to) =>
+          set((s) => {
+            const moving = s.pins[from];
+            if (!moving?.length || from === to) return s;
+            const kept = s.pins[to] ?? [];
+            const fresh = moving.filter((p) => !kept.some((k) => k.messageId === p.messageId));
+            const { [from]: _gone, ...rest } = s.pins;
+            return { pins: { ...rest, [to]: [...fresh, ...kept].slice(0, CAP) } };
+          }),
       },
     }),
     {

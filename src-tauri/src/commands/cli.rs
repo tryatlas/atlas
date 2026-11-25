@@ -104,6 +104,11 @@ pub fn parse_initial_project() -> Option<String> {
 /// already have the program name stripped. Returns `Some(abs_dir)` only when
 /// there's exactly one positional, it isn't a flag, and it's an existing dir.
 pub fn parse_project_path(args: &[String]) -> Option<String> {
+    parse_project_path_from(args, &std::env::current_dir().ok()?)
+}
+
+/// Forwarded relative paths belong to the launching process's directory.
+pub fn parse_project_path_from(args: &[String], cwd: &std::path::Path) -> Option<String> {
     if args.len() != 1 {
         // Zero (a plain launch) or multiple args — refuse rather than guess.
         return None;
@@ -112,7 +117,7 @@ pub fn parse_project_path(args: &[String]) -> Option<String> {
     if raw.starts_with('-') {
         return None;
     }
-    let abs = dunce::canonicalize(raw).ok()?;
+    let abs = dunce::canonicalize(cwd.join(raw)).ok()?;
     if abs.is_dir() {
         Some(abs.to_string_lossy().into_owned())
     } else {

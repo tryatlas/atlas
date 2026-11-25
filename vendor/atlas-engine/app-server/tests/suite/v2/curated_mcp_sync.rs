@@ -162,6 +162,9 @@ url = "{mcp_server_url}/mcp""#
                 ("REAL_GIT", Some(real_git.as_ref())),
                 ("GIT_CONFIG_GLOBAL", Some(git_config.as_ref())),
                 ("CURATED_SYNC_BARRIER", Some(sync_barrier_env.as_ref())),
+                // Atlas: curated sync is opt-in (`start_curated_repo_sync`); the
+                // git rewrite above keeps it on the local fixture repo.
+                ("ATLAS_CURATED_PLUGIN_SYNC", Some("1")),
             ])
             .build_initialized_with_timeout(DEFAULT_TIMEOUT)
             .await?;
