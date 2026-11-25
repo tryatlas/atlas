@@ -766,6 +766,136 @@ export function requestPermissionLongTitle(): Promise<void> {
   });
 }
 
+/** One request shape per call, cycling, for walking the permission card
+ *  through every way agents describe a call (`__atlasMock.actions.
+ *  requestPermissionNext`). Each logs its name; answer or Esc, then call
+ *  again for the next. */
+const PERMISSION_SHAPES: {
+  name: string;
+  title: string;
+  kind: string;
+  rawInput: unknown;
+  toolName?: string;
+}[] = [
+  {
+    name: "Claude Bash: prose title, command + description in the input",
+    title: "Check merge status of native-agent-model-catalogue and 0.3.1's unique commits",
+    kind: "execute",
+    rawInput: {
+      command: [
+        'echo "=== branches containing the unique commit ==="',
+        "git branch -r --contains 8f34cf30",
+        'echo; echo "=== 0.3.1\'s 3 unique commits - where else do they appear? ==="',
+        "for c in a97ce8cb 5c309391 4c9c32e1; do",
+        '  echo "-- $c --"',
+        "  git branch -r --contains $c",
+        "done",
+        'git log --all --oneline --grep="GLM\'s null arrays"',
+      ].join("\n"),
+      description: "Check merge status of native-agent-model-catalogue and 0.3.1's unique commits",
+    },
+  },
+  {
+    name: "Claude adapter: backticked command as the title",
+    title: "`git status --short`",
+    kind: "execute",
+    rawInput: { command: "git status --short" },
+  },
+  {
+    name: "Native agent: command as the title, no input",
+    title: "bun run test src/features/chat",
+    kind: "execute",
+    rawInput: undefined,
+  },
+  {
+    name: "A command that reads one file",
+    title: "Read the summary module",
+    kind: "execute",
+    rawInput: { command: "sed -n '1,120p' src/features/chat/lib/permission-summary.ts" },
+  },
+  {
+    name: "A command that searches",
+    title: "Find the relabel helper",
+    kind: "execute",
+    rawInput: { command: 'rg -n "relabelAgentBrand" src 2>/dev/null' },
+  },
+  {
+    name: "Edit: short title, path and strings as fields",
+    title: "Edit permission-modal.tsx",
+    kind: "edit",
+    rawInput: {
+      file_path: "src/features/chat/components/permission-modal.tsx",
+      old_string: 'const AGENT_BRANDS = ["Claude Code", "Codex", "Claude"];',
+      new_string: "const AGENT_BRANDS = /\\b(?:Claude Code|Codex|Claude)\\b/g;",
+      replace_all: false,
+    },
+  },
+  {
+    name: "Write: a long file body (capped field)",
+    title: "Write notes.md",
+    kind: "edit",
+    rawInput: {
+      file_path: "docs/notes.md",
+      content: Array.from({ length: 300 }, (_, i) => `- note ${i}: lorem ipsum dolor`).join("\n"),
+    },
+  },
+  {
+    name: "Fetch: URL and prompt",
+    title: "Fetch https://agentclientprotocol.com/protocol/tool-calls",
+    kind: "fetch",
+    rawInput: {
+      url: "https://agentclientprotocol.com/protocol/tool-calls",
+      prompt: "What does a permission request carry?",
+    },
+  },
+  {
+    name: "Third-party MCP tool, no title, nested input",
+    title: "",
+    kind: "other",
+    toolName: "mcp__linear__save_issue",
+    rawInput: {
+      team: "ATL",
+      title: "Permission card shows JSON",
+      labels: ["bug", "ui"],
+      estimate: 2,
+      parent: { id: "ATL-978", relation: "sub-issue" },
+    },
+  },
+  {
+    name: "Long prose title, no command",
+    title:
+      "Search the organisation's knowledge base for every decision about session identity, then summarise the three most recent ones with links",
+    kind: "search",
+    rawInput: { query: "session identity", limit: 3 },
+  },
+];
+
+let permissionShape = 0;
+
+export function requestPermissionNext(): Promise<void> {
+  const shape = PERMISSION_SHAPES[permissionShape % PERMISSION_SHAPES.length];
+  console.info(
+    `[mock-backend] permission ${(permissionShape % PERMISSION_SHAPES.length) + 1}/${PERMISSION_SHAPES.length}: ${shape.name}`,
+  );
+  permissionShape++;
+  const id = permId();
+  return raisePermission({
+    transcriptCall: tool.other(shape.toolName ?? shape.kind, {}, { id, status: "pending" }),
+    title: shape.title,
+    kind: shape.kind,
+    rawInput: shape.rawInput,
+    toolName: shape.toolName,
+    options: standardOptions("calls like this"),
+    result: (allowed) => (allowed ? "ok\n" : "Rejected by user."),
+    reply: (decision, option) =>
+      decision.kind === "cancelled"
+        ? null
+        : option && isAllowKind(option.kind)
+          ? "Done."
+          : "Understood — skipping it.",
+  });
+}
+
 /** ExitPlanMode's two-panel review (`__atlasMock.actions.requestPermissionPlan`). */
 export function requestPermissionPlan(): Promise<void> {
   const id = permId();
