@@ -83,7 +83,9 @@ describe("the permission card draws what the request changes", () => {
       contentBlocks: [{ type: "diff", path: "/repo/a.ts", oldText: "a\n", newText: "b\n" }],
     });
     expect(screen.getByTestId("permission-diff")).toBeTruthy();
-    expect(screen.getByText(/"replace_all": true/)).toBeTruthy();
+    // As a named field, not JSON.
+    expect(screen.getByText("replace_all")).toBeTruthy();
+    expect(screen.getByTestId("permission-preview").textContent).toBe("replace_alltrue");
   });
 
   it("ignores blocks that are not well-formed diffs", () => {

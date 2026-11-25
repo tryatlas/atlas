@@ -3,7 +3,7 @@
 // An agent may send its whole command as the request's title (the native
 // agent does, with no input beside it). The headline has no scroll, so a long
 // one grew the card past the window and took the options off screen. The
-// card names the kind in the headline and draws the command in its preview
+// card names the action in the headline and draws the command in its preview
 // box, the one part of the card that scrolls.
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -42,22 +42,25 @@ function pending(toolCall: Record<string, unknown>) {
 const HEREDOC = ["python3 - <<'EOF'", ...Array(60).fill('print("patched")'), "EOF"].join("\n");
 
 describe("the permission card with a command for a title", () => {
-  it("names the kind in the headline and scrolls the command in the preview", () => {
+  it("names the action in the headline and scrolls the command in the preview", () => {
     pending({ title: HEREDOC });
-    expect(screen.getByText("The agent wants to run a command?")).toBeTruthy();
+    expect(screen.getByText("Run a command")).toBeTruthy();
     const preview = screen.getByTestId("permission-preview");
     expect(preview.textContent).toBe(HEREDOC);
-    // The box is what bounds the card: capped, scrolling, line breaks kept.
-    expect(preview.className).toContain("max-h-32");
+    // The box is what bounds the card: capped, scrolling with no bar, line
+    // breaks kept.
+    expect(preview.className).toContain("max-h-40");
     expect(preview.className).toContain("overflow-auto");
-    expect(preview.className).toContain("whitespace-pre-wrap");
+    expect(preview.className).toContain("hide-scrollbar");
+    expect(preview.querySelector("pre")?.className).toContain("whitespace-pre-wrap");
     // Nowhere else: the command is in the card once.
     expect(screen.getByTestId("permission-card").textContent?.split("patched").length).toBe(61);
   });
 
-  it("keeps a short title in the headline", () => {
+  it("shows a short command once, as code, under the action", () => {
     pending({ title: "rm -rf dist" });
-    expect(screen.getByText("rm -rf dist")).toBeTruthy();
-    expect(screen.queryByTestId("permission-preview")).toBeNull();
+    expect(screen.getByText("Run a command")).toBeTruthy();
+    expect(screen.getByTestId("permission-preview").textContent).toBe("rm -rf dist");
+    expect(screen.getByTestId("permission-card").textContent?.split("rm -rf dist").length).toBe(2);
   });
 });

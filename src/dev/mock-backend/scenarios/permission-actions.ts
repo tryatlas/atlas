@@ -12,6 +12,7 @@ import {
   requestPermission,
   requestPermissionLongArgs,
   requestPermissionLongTitle,
+  requestPermissionNext,
   requestPermissionOutward,
   requestPermissionOutwardMessage,
   requestPermissionOutwardPreparing,
@@ -29,6 +30,8 @@ export const permissionActions = {
   requestPermission,
   requestPermissionLongArgs,
   requestPermissionLongTitle,
+  // Every request shape agents send, one per call, cycling.
+  requestPermissionNext,
   requestPermissionPlan,
   requestPermissionQuestion,
   requestPermissionQuestionMulti,

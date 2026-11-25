@@ -7,12 +7,14 @@
 // stays with the data, not here. The card takes no focus when it appears: the
 // composer keeps it.
 
-import type { Ref } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode, type Ref } from "react";
 import { AlertTriangle, CheckCircle2, XCircle } from "lucide-react";
 import { Button, Icon, Kbd, Spinner, Textarea } from "@tryatlas/design";
+import { ToolGlyph } from "@tryatlas/design/session";
 import { cn } from "@/lib/utils";
 import { CONTENT_COLUMN } from "../../lib/row-metrics";
 import type { PermissionDiff } from "../../lib/permission-diff";
+import type { PermissionSummary } from "../../lib/permission-summary";
 import type {
   OutwardApproval,
   OutwardPreparing,
@@ -28,19 +30,12 @@ export interface PermissionOptionItem {
 }
 
 export type PermissionCardHeading =
-  | {
-      kind: "tool";
-      title: string;
-      /** The title names the call's kind ("a command"), so it reads as part
-       *  of the sentence, not as code. */
-      generic?: boolean;
-    }
+  | { kind: "tool"; summary: PermissionSummary }
   | { kind: "outward"; approval: OutwardApproval }
   | { kind: "preparing"; preparing: OutwardPreparing };
 
 export function PermissionCardView({
   heading,
-  preview,
   diffs = [],
   locations = [],
   options,
@@ -52,10 +47,6 @@ export function PermissionCardView({
   onSelect,
 }: {
   heading: PermissionCardHeading;
-  /** The tool call's input as formatted text (and its title, when that is
-   *  too long for the headline), or null for none. Ignored on an outward
-   *  card, which shows the words it will post instead. */
-  preview: string | null;
   /** The edits the request proposes, from its own diff blocks. Drawn on a
    *  tool card only, above its input. */
   diffs?: readonly PermissionDiff[];
@@ -85,19 +76,9 @@ export function PermissionCardView({
             ) : heading.kind === "outward" ? (
               <OutwardActionHeading approval={heading.approval} />
             ) : (
-              <div className="text-base font-medium leading-snug text-foreground">
-                The agent wants to run{" "}
-                {heading.generic ? (
-                  heading.title
-                ) : (
-                  <span className="font-mono break-words text-foreground">{heading.title}</span>
-                )}
-                ?
-              </div>
+              <ToolHeading summary={heading.summary} queueNote={queueNote} />
             )}
-            {queueNote && (
-              <div className="mt-0.5 text-xs text-secondary-foreground">{queueNote}</div>
-            )}
+            {queueNote && heading.kind !== "tool" && <QueueNote note={queueNote} />}
           </div>
         </div>
 
@@ -113,19 +94,7 @@ export function PermissionCardView({
             {diffs.map((diff, i) => (
               <PermissionDiffView key={`${diff.path}:${i}`} diff={diff} />
             ))}
-            {preview ? (
-              <div className="mx-3 mt-2 rounded-md border border-border bg-background px-3 py-2">
-                <pre
-                  data-testid="permission-preview"
-                  // The one part of the card that grows with the request, so
-                  // it is the part that scrolls: the options below stay on
-                  // screen whatever the agent sent.
-                  className="max-h-32 overflow-auto whitespace-pre-wrap font-mono text-xs leading-snug text-secondary-foreground"
-                >
-                  {preview}
-                </pre>
-              </div>
-            ) : null}
+            {heading.kind === "tool" ? <ToolInput summary={heading.summary} /> : null}
           </>
         )}
 
@@ -133,7 +102,7 @@ export function PermissionCardView({
           <PermissionOptionList options={options} onSelect={onSelect} />
         </div>
 
-        <div className="border-t border-border px-3 py-2.5">
+        <div className="atlas-permission-draft border-t border-border px-3 py-2.5">
           <Textarea
             ref={draftRef}
             value={draft}
@@ -147,8 +116,10 @@ export function PermissionCardView({
             rows={1}
             placeholder="Tell the agent what to do instead…"
             // One line until the user types more: the package field opens at
-            // four lines, which would double the card for a fallback.
-            className="min-h-0 resize-none"
+            // four lines, which would double the card for a fallback. It
+            // grows with what is typed (the field sizes to its content) up to
+            // a cap, then scrolls with no bar (`.atlas-permission-draft`).
+            className="max-h-24 min-h-0 resize-none"
           />
         </div>
       </div>
@@ -270,7 +241,7 @@ export function PermissionDiffView({ diff }: { diff: PermissionDiff }) {
           </span>
         </span>
       </div>
-      <div className="max-h-48 overflow-auto py-1 font-mono text-xs leading-snug">
+      <ScrollBox className="max-h-48 py-1 font-mono text-xs leading-snug">
         {diff.lines.map((line, i) => (
           <div
             key={i}
@@ -292,7 +263,7 @@ export function PermissionDiffView({ diff }: { diff: PermissionDiff }) {
             {diff.more} more {diff.more === 1 ? "line" : "lines"} not shown
           </div>
         )}
-      </div>
+      </ScrollBox>
     </div>
   );
 }
@@ -303,13 +274,152 @@ export function PermissionDiffView({ diff }: { diff: PermissionDiff }) {
  */
 export function OutwardActionBody({ approval }: { approval: OutwardApproval }) {
   return (
-    <div className="mx-3 mt-2 rounded-md border border-border bg-background px-3 py-2">
-      <div
+    <div className="mx-3 mt-2 overflow-hidden rounded-md border border-border bg-background">
+      <ScrollBox
         data-testid="outward-body"
-        className="max-h-64 overflow-auto whitespace-pre-wrap text-sm leading-snug text-foreground"
+        className="max-h-64 px-3 py-2 whitespace-pre-wrap text-sm leading-snug text-foreground"
       >
         {approval.body}
+      </ScrollBox>
+    </div>
+  );
+}
+
+/**
+ * A tool call's headline, in the transcript's words: the glyph its line will
+ * wear, what it will do, and the agent's own account of why underneath. The
+ * headline does not scroll, so the account is held to three lines; the whole
+ * of it is on hover.
+ */
+function ToolHeading({
+  summary,
+  queueNote,
+}: {
+  summary: PermissionSummary;
+  /** Drawn in the headline's column, past the glyph. */
+  queueNote: string | null;
+}) {
+  return (
+    <div className="flex items-start gap-2">
+      <span aria-hidden className="mt-1 shrink-0 text-secondary-foreground">
+        <ToolGlyph tool={summary.tool} failed={false} />
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="break-words text-base font-medium leading-snug text-foreground">
+          {summary.action}
+          {summary.source ? (
+            <span className="ml-1.5 text-xs font-normal text-muted-foreground">
+              · {summary.source}
+            </span>
+          ) : null}
+        </div>
+        {summary.description ? (
+          <div
+            title={summary.description}
+            className="mt-0.5 line-clamp-3 break-words text-xs text-secondary-foreground"
+          >
+            {summary.description}
+          </div>
+        ) : null}
+        {queueNote && <QueueNote note={queueNote} />}
       </div>
+    </div>
+  );
+}
+
+function QueueNote({ note }: { note: string }) {
+  return <div className="mt-0.5 text-xs text-secondary-foreground">{note}</div>;
+}
+
+/**
+ * What the call will be run with: the command as shell text, then any other
+ * input as named rows. The one part of the card that grows with the request,
+ * so it is the part that scrolls, and the options below stay on screen
+ * whatever the agent sent.
+ */
+function ToolInput({ summary }: { summary: PermissionSummary }) {
+  const { command, fields } = summary;
+  if (command === null && fields.length === 0) return null;
+  return (
+    <div className="mx-3 mt-2 overflow-hidden rounded-md border border-border bg-background">
+      <ScrollBox
+        data-testid="permission-preview"
+        className="max-h-40 px-3 py-2 font-mono text-xs leading-snug"
+      >
+        {command !== null ? (
+          <pre className="whitespace-pre-wrap break-words text-foreground">{command}</pre>
+        ) : null}
+        {fields.length > 0 ? (
+          <dl
+            className={cn(
+              "grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1",
+              command !== null && "mt-2 border-t border-border pt-2",
+            )}
+          >
+            {fields.map((field, i) =>
+              field.name ? (
+                <div key={`${field.name}:${i}`} className="contents">
+                  <dt className="text-muted-foreground">{field.name}</dt>
+                  <dd className="min-w-0 whitespace-pre-wrap break-words text-secondary-foreground">
+                    {field.value}
+                  </dd>
+                </div>
+              ) : (
+                <div
+                  key={i}
+                  className="col-span-2 whitespace-pre-wrap break-words text-secondary-foreground"
+                >
+                  {field.value}
+                </div>
+              ),
+            )}
+          </dl>
+        ) : null}
+      </ScrollBox>
+    </div>
+  );
+}
+
+/**
+ * A capped box that scrolls with no bar: the app's global scrollbar style
+ * gives every overflowing box a bar of its own in WebKit, which in a card this
+ * small reads as clutter. Without the bar, a fade along the bottom edge is
+ * what says there is more — drawn only while the content runs past it.
+ */
+function ScrollBox({
+  className,
+  children,
+  "data-testid": testId,
+}: {
+  className: string;
+  children: ReactNode;
+  "data-testid"?: string;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [more, setMore] = useState(false);
+  const measure = useCallback(() => {
+    const el = ref.current;
+    if (el) setMore(el.scrollTop + el.clientHeight < el.scrollHeight - 1);
+  }, []);
+  // After every render: new content can run past a box already at its cap,
+  // which no resize reports. An unchanged answer re-renders nothing.
+  useEffect(measure);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [measure]);
+  return (
+    <div
+      ref={ref}
+      data-testid={testId}
+      onScroll={measure}
+      className={cn("hide-scrollbar overflow-auto", more && "mask-b-from-75%", className)}
+    >
+      {children}
     </div>
   );
 }
