@@ -279,8 +279,8 @@ function PermissionModalImpl({ tabId, onSendMessage }: PermissionModalProps) {
     onSendMessage?.(text);
   };
 
-  // The headline and the preview box's text: a title too long for a headline
-  // moves to the box (`permission-summary.ts`).
+  // The headline, the command and the input's fields, in the transcript's
+  // words (`permission-summary.ts`).
   const summary = permissionSummaryOf(current.toolCall);
   const planMarkdown = extractPlanMarkdown(current.toolCall);
   const questions = extractQuestions(current.toolCall);
@@ -360,9 +360,8 @@ function PermissionModalImpl({ tabId, onSendMessage }: PermissionModalProps) {
               ? { kind: "preparing", preparing }
               : outward
                 ? { kind: "outward", approval: outward }
-                : { kind: "tool", title: summary.title, generic: summary.generic }
+                : { kind: "tool", summary }
           }
-          preview={outward || preparing ? null : summary.preview}
           diffs={diffs}
           locations={locations}
           options={optionItems}
