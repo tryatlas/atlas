@@ -56,17 +56,22 @@ export function useComposerText({
   // A queued message's Edit: back into the composer, out of the queue.
   const editQueued = (q: string, i: number) => {
     const cur = inputRef.current?.getValue() ?? "";
-    // A paste or a cite the queue inlined comes back as its
-    // chip, not as every line it holds. Cites were written
-    // last, so they come off first.
-    const uncited = collapseCites(q);
-    const { text, pastes } = collapsePastes(uncited.text);
-    for (const p of pastes) rememberMention(p, projectPath);
-    for (const c of uncited.cites) rememberMention(c, projectPath);
-    writeComposer(mergeQueued(cur, text));
+    writeComposer(mergeQueued(cur, recalledText(q, projectPath)));
     sessionSend.removeQueued(tabId, i);
     requestAnimationFrame(() => inputRef.current?.focus());
   };
 
   return { draft, valueRef, hasText, onEmptyChange, writeComposer, editQueued };
+}
+
+/** Sent text made composer text again — a queued message's Edit, a message
+ *  recalled with ↑. A paste or a cite the send inlined comes back as its
+ *  chip, not as every line it holds. Cites were written last, so they come
+ *  off first. */
+export function recalledText(sent: string, projectPath: string | null): string {
+  const uncited = collapseCites(sent);
+  const { text, pastes } = collapsePastes(uncited.text);
+  for (const p of pastes) rememberMention(p, projectPath);
+  for (const c of uncited.cites) rememberMention(c, projectPath);
+  return text;
 }

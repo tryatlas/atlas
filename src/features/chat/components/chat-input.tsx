@@ -76,6 +76,9 @@ export interface ChatInputHandle {
   replaceRange(from: number, to: number, text: string): void;
   /** Insert text at the caret, as a paste would. */
   insertText(text: string): void;
+  /** Whether a collapsed caret sits on the prompt's first visual line
+   *  ("up") or its last ("down"): where ↑/↓ would leave the text. */
+  caretAtEdge(direction: "up" | "down"): boolean;
 }
 
 interface ChatInputProps {
@@ -91,6 +94,9 @@ interface ChatInputProps {
   onEmptyChange?: (blank: boolean) => void;
   /** Every document change, no payload. */
   onDocChange?: () => void;
+  /** Every keydown, before the composer's own bindings and its pickers'.
+   *  Return true to consume it. */
+  onKeyDown?: (event: KeyboardEvent) => boolean;
   onMentionTrigger?: (trigger: MentionTrigger | null) => void;
   onSlashTrigger?: (trigger: SlashTrigger | null) => void;
   /** Up/Down/Enter/Escape/Backspace/Tab while a picker is open. Return true
@@ -209,6 +215,14 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
       },
       replaceRange: (from, to, text) => inner.current?.replaceRange(from, to, text),
       insertText: (text) => inner.current?.insertText(text),
+      caretAtEdge: (direction) => {
+        const view = inner.current?.editor()?.view;
+        if (!view || !view.state.selection.empty) return false;
+        const { $head } = view.state.selection;
+        const block = $head.index(0);
+        const edgeBlock = direction === "up" ? 0 : view.state.doc.childCount - 1;
+        return block === edgeBlock && view.endOfTextblock(direction);
+      },
     }),
     [],
   );

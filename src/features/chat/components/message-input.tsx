@@ -1,5 +1,5 @@
 import { useTipsStore } from "@/features/tips/stores/tips-store";
-import { useRef } from "react";
+import { useCallback, useLayoutEffect, useRef } from "react";
 import { CONTENT_COLUMN } from "../lib/row-metrics";
 import { useChatStore } from "../stores/chat-store";
 import { sessionSend } from "../lib/session-send";
@@ -25,6 +25,7 @@ import { useChatInputFocusedSignal, useComposerFocus } from "../hooks/use-compos
 import { useComposerPickers } from "../hooks/use-composer-pickers";
 import { useComposerEvents } from "../hooks/use-composer-events";
 import { useComposerSubmit } from "../hooks/use-composer-submit";
+import { useComposerHistory } from "../hooks/use-composer-history";
 import { ComposerPickers } from "./composer-pickers";
 import { ComposerNotices } from "./composer-notices";
 import { ComposerTray } from "./composer-tray";
@@ -115,6 +116,20 @@ export function MessageInput({
     attachPicked: attach.attachPicked,
   });
   const { trigger } = pickers;
+  // ↑/↓ through what was sent (`use-composer-history.ts`); an open picker
+  // keeps the arrows.
+  const pickerOpenRef = useRef(false);
+  // After commit, never during render (see `ChatInput`'s refs).
+  useLayoutEffect(() => {
+    pickerOpenRef.current = trigger !== null || pickers.slashOpen;
+  });
+  const historyKeyDown = useComposerHistory({
+    tabId,
+    inputRef,
+    projectPath,
+    writeComposer,
+    pickerOpen: useCallback(() => pickerOpenRef.current, []),
+  });
 
   const { dropZoneEl, isDropTarget } = useComposerDropZone({ composerRef, disabled, attachPaths });
 
@@ -245,6 +260,7 @@ export function MessageInput({
                     onPastePaths={attachPaths}
                     onPasteLargeText={attach.handlePasteLargeText}
                     keyInterceptor={pickers.keyInterceptor}
+                    onKeyDown={historyKeyDown}
                   />
                 </SessionProjectsContext.Provider>
               ) : (
