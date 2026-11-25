@@ -35,7 +35,6 @@ import { cycleChatAgent } from "@/features/chat/lib/switch-agent";
 import { readChatTabSession } from "@/features/chat/lib/chat-tab-session";
 import { HintOverlay } from "@/features/hint-nav/components/hint-overlay";
 import { NavigationHints } from "@/features/keybindings/components/navigation-hints";
-import { BrowserOverlayWatcher } from "@/features/browser/components/browser-overlay-watcher";
 import {
   fileIndex,
   openFileIndex,
@@ -784,7 +783,7 @@ export function App() {
     "split.focusRight": () => focusAdjacentGroup(1),
     // Close the focused split column (tabs move to the left neighbour).
     "split.close": () => closeGroup(useLayoutStore.getState().focusedGroupId),
-    // Zen mode: Session │ Knowledge │ Browser, side panels hidden. Again restores.
+    // Zen mode: the session alone, side panels hidden. Again restores.
     "panels.zen": () => {
       if (currentProject) toggleZenMode();
     },
@@ -914,7 +913,6 @@ export function App() {
       <LinkPullRequestDialogHost />
       <SessionDetailsDialogs />
       <RemoveAgentDialog />
-      <BrowserOverlayWatcher />
       <ThemeEditorHost />
       {/* Renders nothing at all until a glyph-based icon theme is in use, and
           so costs an SVG theme (including the bundled default) nothing. */}

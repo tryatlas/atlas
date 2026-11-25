@@ -55,7 +55,7 @@ src/features/<feature>/
   lib/          — pure helpers, and the invoke()/listen() wrappers (<domain>-api.ts)
 ```
 
-`src/features/` holds ~30 slices: app, chat, editor, terminal, browser, git, github, explorer, knowledge, canvas, layout, log, monitor, settings, memory, mission-control, model-chat, organisations, packs, projects, skills, telemetry, updater, and more.
+`src/features/` holds ~30 slices: app, chat, editor, terminal, git, github, explorer, knowledge, canvas, layout, log, monitor, settings, memory, mission-control, model-chat, organisations, packs, projects, skills, telemetry, updater, and more.
 
 - **Cross-feature widgets** live in `src/components/`.
 - **UI primitives** come from the design package, `@tryatlas/design` (ADR-0027).
@@ -139,7 +139,7 @@ Other stores: `project/stores/project-store.ts` (current project, recents), `git
 
 `src/lib/tab-registry.ts` holds `TAB_REGISTRY`: one entry per tab type, stating its placement (ADR-0024), scope, mount policy, multiplicity, whether it shows a file, its ⌘T row and the shape of its `data`. `TabType` is that object's keys, and every list the app reads (`TAB_TYPES`, the projectless, window and org-scoped sets, the persistent types, the launcher's `SURFACES`) is derived from it. It holds no React, so the layout store can import it: a type's icon is in `tabIcons` (`src/features/layout/components/pane-tab.tsx`) and its lazy import and render branch in `src/features/layout/components/tab-panels.tsx`, both keyed by `TabType` and checked exhaustive (`center-panel.tsx` lays out the split columns that host them). New panel type = one registry entry + its icon + its lazy import and render branch.
 
-**Persistent module types — editor, terminal, browser, knowledge-graph, pdf — stay mounted across tab switches** via `display: contents` / `display: none` instead of unmounting. Remounting would rebuild the file view and drop its unsaved edits, kill the PTY's rendered scrollback, or tear down the native embedded webview.
+**Persistent module types — editor, terminal, knowledge-graph, pdf — stay mounted across tab switches** via `display: contents` / `display: none` instead of unmounting. Remounting would rebuild the file view and drop its unsaved edits, or kill the PTY's rendered scrollback.
 
 ## Backend (`src-tauri/src/`)
 
@@ -149,7 +149,7 @@ One Rust module per IPC domain under `src-tauri/src/commands/`. `commands/mod.rs
 |---|---|
 | Agents (ported ACP stack) | agents, agent_host, agent_transcript, agent_analytics, agent_memory, catalog, registry, capture, artifacts_cloud |
 | Agent tool servers | tool_servers (the host: listener, token, offer), memory_server (ADR-0010), memory_bridge (ADR-0019, ADR-0020), ui_server (ADR-0012), org_server (ADR-0014), code_server (ADR-0015) |
-| Terminal / browser / fs | terminal, browser, fs |
+| Terminal / fs | terminal, fs |
 | Git | git, git_graph, git_watcher, git_autofetch, gitdiff, git_ops, git_conflicts, git_snapshot, git_stage_ops, git_avatars (author avatars, via `gh api`) |
 | GitHub | github (search and clone reference repositories), pull_requests (the pull-request surface, via `gh api`; see below) |
 | Knowledge | knowledge, knowledge_meta, knowledge_links, knowledge_export, knowledge_graph_layout |
@@ -216,7 +216,6 @@ Streaming from Rust to the UI runs on Tauri events, `atlas:*` channels, most pay
 | `atlas:agent-catalog:changed`, `atlas:registry-install:progress` | Marketplace catalog and install progress |
 | `atlas:auth-run:progress` / `:done` | interactive agent sign-in run |
 | `atlas:modelchat` | model-chat streaming |
-| `atlas:browser-nav` | embedded-webview navigation state |
 | `atlas:git-changed`, `atlas:git-status-fresh`, `atlas:git:op` | git state invalidation from the fs-watcher, and long-op progress |
 | `atlas:update-checking` / `-available` / `-progress` / `-ready` / `-applied` / `-error` | auto-updater lifecycle |
 | `atlas:auth-changed` / `-signed-out` / `-error` | account/session state |

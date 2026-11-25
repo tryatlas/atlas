@@ -61,6 +61,8 @@ interface ZenSnapshot {
   activeByGroup: Record<string, string | null>;
   focusedGroupId: string;
   tabGroups: Record<string, string>;
+  /** Absent in a snapshot saved before zen hid the surfaces pane. */
+  surfaces?: SurfacesMode;
 }
 
 interface LayoutState {
@@ -113,8 +115,8 @@ interface LayoutState {
   activeByGroup: Record<string, string | null>;
   /** The column that owns keyboard focus (tab hotkeys target it). */
   focusedGroupId: string;
-  /** Zen mode: the session beside a browser, with the global side panels
-   *  hidden. `zenPrev` snapshots the layout to restore. */
+  /** Zen mode: the session alone, the surfaces pane hidden with its tabs
+   *  still running. `zenPrev` snapshots the layout to restore. */
   zen: boolean;
   zenPrev: ZenSnapshot | null;
   /** The surfaces pane — every split column after the first, which is the
@@ -207,8 +209,8 @@ interface LayoutActions {
     /** Close a split column, moving its tabs to the left neighbour (never the
      *  last remaining column). */
     closeGroup: (groupId: string) => void;
-    /** Toggle Zen mode: the session beside a browser with the global side
-     *  panels hidden; toggling again restores the prior layout. */
+    /** Toggle Zen mode: the session alone, the surfaces pane hidden;
+     *  toggling again restores the prior layout. */
     toggleZenMode: () => void;
     /** Apply a predefined layout template to the active project: set panels +
      *  split columns + a tab of each template type per column (reusing existing
@@ -297,7 +299,7 @@ export function groupOf(tab: { groupId?: string } | undefined): string {
 }
 
 /** Return `base` if no tab uses it, else a suffixed variant ("base-2", …).
- *  Lets a singleton type (terminal/browser/settings…) be opened in more than
+ *  Lets a singleton type (terminal/settings…) be opened in more than
  *  one split column: callers may reuse a fixed id (e.g. "terminal"), and two
  *  tabs sharing an id would collide React keys / activeByGroup / closeTab. */
 function uniqueTabId(s: LayoutState, base: string): string {
@@ -1008,13 +1010,15 @@ export const useLayoutStore = create<LayoutState & LayoutActions>()(
               s.activeByGroup = { ...p.activeByGroup };
               s.focusedGroupId = p.focusedGroupId;
               for (const t of s.tabs) t.groupId = p.tabGroups[t.id] ?? s.groupOrder[0];
+              s.surfaces = p.surfaces ?? "shown";
               s.zen = false;
               s.zenPrev = null;
               reconcileGroups(s);
               keepMainForSessions(s);
+              syncActiveMirror(s);
               return;
             }
-            // Enter: snapshot the current layout, then build Session │ Browser.
+            // Enter: snapshot the current layout, then show the session alone.
             const tabGroups: Record<string, string> = {};
             for (const t of s.tabs) tabGroups[t.id] = groupOf(t);
             s.zenPrev = {
@@ -1022,31 +1026,12 @@ export const useLayoutStore = create<LayoutState & LayoutActions>()(
               activeByGroup: { ...s.activeByGroup },
               focusedGroupId: s.focusedGroupId,
               tabGroups,
+              surfaces: s.surfaces,
             };
-            const G_CHAT = "zen-chat";
-            const G_BROWSER = "zen-browser";
-            // Reuse the existing singleton tab if present, else create one.
-            const ensure = (type: TabType, title: string, gid: string): string => {
-              const existing = s.tabs.find((x) => x.type === type);
-              if (existing) {
-                existing.groupId = gid;
-                return existing.id;
-              }
-              const id = `${type}-zen`;
-              s.tabs.push({
-                id,
-                type,
-                title,
-                closable: true,
-                dirty: false,
-                data: {},
-                groupId: gid,
-              });
-              return id;
-            };
+            const main = s.groupOrder[0];
             // A chat tab always exists (welcome-chat is the non-closable baseline).
             let chat =
-              s.tabs.find((x) => x.id === s.activeByGroup[s.groupOrder[0]] && x.type === "chat") ??
+              s.tabs.find((x) => x.id === s.activeByGroup[main] && x.type === "chat") ??
               s.tabs.find((x) => x.type === "chat");
             if (!chat) {
               chat = {
@@ -1056,20 +1041,17 @@ export const useLayoutStore = create<LayoutState & LayoutActions>()(
                 closable: true,
                 dirty: false,
                 data: {},
-                groupId: G_CHAT,
+                groupId: main,
               };
               s.tabs.push(chat);
             } else {
-              chat.groupId = G_CHAT;
+              chat.groupId = main;
             }
-            const browserId = ensure("browser", "Browser", G_BROWSER);
-            for (const tab of s.tabs) tab.groupId = isSession(tab.type) ? G_CHAT : G_BROWSER;
-            // The agent first: the main column holds the session.
-            s.groupOrder = [G_CHAT, G_BROWSER];
-            s.activeByGroup = { [G_CHAT]: chat.id, [G_BROWSER]: browserId };
-            s.focusedGroupId = G_CHAT;
-            // Team chat, like every tab outside the three, stays where it
-            // was and comes back on exit.
+            s.activeByGroup[main] = chat.id;
+            s.focusedGroupId = main;
+            // Like the one-column Focus template: the tools beside the session
+            // keep running, out of sight, and come back on exit.
+            if (s.groupOrder.length > 1) s.surfaces = "hidden";
             s.zen = true;
             syncActiveMirror(s);
           }),

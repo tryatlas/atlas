@@ -3,9 +3,7 @@ import type { Combo } from "./combo";
 
 /**
  * A chord in Tauri's accelerator spelling, for the native menu bar
- * (`src-tauri/src/menu.rs`). Its items show the user's chords, and they are
- * what catches a chord while the embedded browser — a separate native webview
- * the dispatcher never sees — has focus.
+ * (`src-tauri/src/menu.rs`), whose items show the user's chords.
  *
  * Null for a chord Tauri can't express; the caller leaves the item unbound
  * rather than guessing at a near-miss.
@@ -71,9 +69,8 @@ const NAMED: Record<string, string> = {
  *
  * Only chords with ⌘ or ⌃ go on a menu item: AppKit treats a menu's key
  * equivalent as taking the keystroke, so an Option-only chord such as ⌥Z (Zen
- * mode) bound there would stop typing Ω in a text field of the embedded
- * browser. Those still work from the keyboard in the main window; the item
- * simply shows no chord.
+ * mode) bound there would stop typing Ω in a text field. Those still work from
+ * the keyboard in the main window; the item simply shows no chord.
  */
 export function toMenuAccelerator(combo: Combo, mac: boolean = isMac): string | null {
   if (!combo.meta && !combo.ctrl) return null;

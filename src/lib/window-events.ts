@@ -109,7 +109,6 @@ export interface AtlasWindowEvents {
   "atlas:session-chat-jump": JumpDetail;
   "atlas:comms-jump-to-message": CommsJumpDetail;
   "atlas:org-agent-report": { askId: string; title: string; partial: boolean };
-  "atlas:browser-navigate": { tabId: string; url: string };
   /** A repository was cloned or linked: project lists re-read. */
   "atlas:repo-cloned": void;
   /** Skills or packs changed on disk: pickers and lists re-read. */

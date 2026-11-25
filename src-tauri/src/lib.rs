@@ -190,8 +190,8 @@ pub fn run() {
     // The app menu bar, built from `menu.json`; every custom item hands its
     // id to the renderer, which runs it. See `menu.rs`.
     //
-    // The hidden Win32/GTK menu retains accelerators for embedded browser
-    // focus; the frontend draws its visible menu from the same model.
+    // On Windows and Linux the native menu is hidden; the frontend draws its
+    // visible menu from the same model.
     let builder = builder.menu(menu::build).on_menu_event(|app, event| {
         let id = event.id().as_ref();
         if id == menu::QUIT_MENU_ID {
@@ -256,6 +256,21 @@ pub fn run() {
                 commands::window::apply_traffic_light_inset(&window);
                 #[cfg(not(target_os = "macos"))]
                 let _ = window.hide_menu();
+            }
+            // The built-in browser is gone; delete the cookie and login
+            // profile it kept under the app data dir so no session outlives
+            // it. (On macOS 14+ it used a WebKit data store, which this does
+            // not reach.) The asset-scope deny on the path stays for a
+            // machine where the delete fails.
+            if let Ok(data_dir) = app.path().app_data_dir() {
+                let profile = data_dir.join("browser-profile");
+                tauri::async_runtime::spawn_blocking(move || {
+                    if profile.is_dir() {
+                        if let Err(e) = std::fs::remove_dir_all(&profile) {
+                            tracing::warn!("could not remove the old browser profile: {e}");
+                        }
+                    }
+                });
             }
             // Arrow keys the webview leaves unhandled are not typed into the
             // focused field; see the module.
@@ -458,7 +473,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_window_state::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
-        .manage(commands::browser::BrowserState::new())
         .manage(commands::quit_guard::QuitGuardState::default())
         .manage(TerminalState::new())
         .manage(commands::modelchat::ModelChatState::new())
@@ -603,15 +617,6 @@ pub fn run() {
             commands::clipboard::scratch_write_bytes,
             commands::fonts::list_font_families,
             commands::window::set_window_title,
-            commands::browser::browser_open_window,
-            commands::browser::browser_embed_create,
-            commands::browser::browser_embed_navigate,
-            commands::browser::browser_embed_back,
-            commands::browser::browser_embed_forward,
-            commands::browser::browser_embed_reload,
-            commands::browser::browser_embed_set_bounds,
-            commands::browser::browser_embed_set_visible,
-            commands::browser::browser_embed_destroy,
             commands::terminal::terminal_create,
             commands::terminal::terminal_write,
             commands::terminal::terminal_write_text,
@@ -846,7 +851,6 @@ pub fn run() {
             commands::knowledge::log_interaction,
             commands::knowledge::save_editor_state,
             commands::knowledge::load_editor_state,
-            commands::knowledge::fetch_readable,
             commands::markdown_preview::markdown_preview_image,
             commands::knowledge::knowledge_cover_upload,
             commands::knowledge::knowledge_cover_data_url,

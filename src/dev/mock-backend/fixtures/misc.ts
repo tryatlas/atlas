@@ -7,11 +7,6 @@
 // unanswered command there is indistinguishable from a broken screen. The
 // grouping is "everything the wave-2 domain files did not claim", which is why
 // the sections below jump between subsystems.
-//
-// The native Browser tab is here too, as deliberate no-ops: it is a real
-// `WebviewWindow` that a plain browser cannot host (see `README.md`), and the
-// point of answering its commands is only to keep the unmocked badge honest
-// about what is *missing* rather than about what is *native*.
 
 import { emit } from "@tauri-apps/api/event";
 import type { ComposedPrompt } from "@/features/chat/lib/mentions";
@@ -973,24 +968,6 @@ export const miscHandlers: MockHandlers = {
   usage_write_file: nothing,
   usage_export_markdown: nothing,
 
-  // ── native Browser tab — answered, never faked ──────────────────────────
-  // These drive a real child `WebviewWindow`. There is nothing to stand in for
-  // it in a plain browser, so the panel draws its chrome around an empty area;
-  // that is the known limitation, not a missing fake.
-  browser_embed_create: nothing,
-  browser_embed_destroy: nothing,
-  browser_embed_navigate: nothing,
-  browser_embed_back: nothing,
-  browser_embed_forward: nothing,
-  browser_embed_reload: nothing,
-  browser_embed_set_bounds: nothing,
-  browser_embed_set_visible: nothing,
-  browser_open_window: nothing,
-  fetch_readable: ({ url }) => ({
-    title: "Reader mode is served by Rust, not the webview",
-    url: String(url ?? "https://example.invalid"),
-    html: "<h1>Readable</h1><p>The reader pane is ordinary HTML, so it themes and renders here even though the Browser tab itself cannot.</p>",
-  }),
   // A plain browser has no CSP refusing remote images, so the URL itself is
   // the answer. Relative paths would need the real disk; they show alt text.
   markdown_preview_image: ({ src }) => {

@@ -45,19 +45,15 @@ atlas-fs = { path = "../crates/atlas-fs" }
 # builds regardless of this feature. Add `devtools` back here only if you
 # need to debug a production-only issue and accept the binary-size and
 # attack-surface cost.
-# `unstable` enables the multiwebview API (`Window::add_child`) used to embed a
-# real WebKit child webview inside the browser tab (see `commands::browser`).
-# Pinned to the 2.11.1 already in the lockfile — no new resolution.
+# `unstable` enabled the multiwebview API (`Window::add_child`) for the removed
+# browser tab's child webview. Nothing uses it now, but dropping it changes how
+# the main webview is built on macOS (see `arrow_keys.rs`), so it goes in its
+# own change with native QA. Pinned to the 2.11.1 already in the lockfile.
 tauri = { version = "2", features = ["protocol-asset", "macos-private-api", "unstable"] }
 # Used to embed KB cover images as `data:` URLs (covers live under the
 # hidden `.atlas/` dir, which the asset protocol won't serve). Pinned to the
 # version already in the lockfile so no new resolution is pulled in.
 base64 = "0.23"
-# Allowlist HTML sanitizer (html5ever-based) for the browser reader. Replaces
-# a hand-rolled string-level denylist whose bypass list kept growing —
-# <meta refresh>, <base>, unquoted javascript: hrefs, `</script >` variants.
-# A real parser closes the class, not the instance.
-ammonia = "4"
 # Plugin selection — only what JS actually invokes is kept. The Atlas
 # Rust command surface does all its own fs/shell/http work via the std,
 # reqwest, etc. directly; the JS side only touches: `dialog` (Open
@@ -180,8 +176,8 @@ dirs = "7"
 # lockfile via the engine tree, so no new resolution.
 dunce = "1"
 sha2 = "0.10"
-# URL parsing for the embedded browser (`commands::browser`). Already in the
-# lockfile transitively via tauri/reqwest; declared here to name the type.
+# URL parsing (file URIs, GitHub and gateway URLs, the public-host check).
+# Already in the lockfile transitively via tauri/reqwest.
 url = "2"
 # `rustls` (not `native-tls`): TLS is rustls on aws-lc-rs, with certificates
 # verified by rustls-platform-verifier (reqwest 0.13's default; 0.12's

@@ -109,7 +109,7 @@ A husky pre-commit hook runs `lint-staged` (oxfmt + oxlint on staged files) plus
 - **Blank or broken panel?** Check the badge in the bottom-right corner. It lists commands nothing answered yet (they return `null`). Add an answer to `scenarios/base.ts` or to your scenario.
 - **Type your fakes** with the frontend's own API types, so `bun run typecheck` catches it when Rust changes a return shape.
 
-The fake backend is never part of a build, and it switches itself off inside the Tauri window. It can't fake the Browser tab, drag-and-drop from Finder or native window controls, and Chrome doesn't render exactly like the app's WebKit view. Check your change in `bun run dev:app` before opening the PR.
+The fake backend is never part of a build, and it switches itself off inside the Tauri window. It can't fake drag-and-drop from Finder or native window controls, and Chrome doesn't render exactly like the app's WebKit view. Check your change in `bun run dev:app` before opening the PR.
 
 If you're working on the **Claude Code** agent specifically, you also need the `claude` CLI on your `PATH`. The native Atlas agent needs nothing extra.
 

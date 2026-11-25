@@ -103,7 +103,7 @@ export const TabContentContainer = memo(function TabContentContainer({
 
   // Persist expensive tabs across tab switches within this column. For a
   // BACKGROUND project we additionally drop the types that keep working while
-  // hidden (`persistent-idle-expensive`, in the tab registry) — off-screen terminals/browser embeds/
+  // hidden (`persistent-idle-expensive`, in the tab registry) — off-screen terminals/
   // graphs were a major source of idle heat. Chat/knowledge/settings stay
   // mounted even in background projects: unmounting chat re-ran the whole
   // transcript-load path (window fill, markdown settle, anchor) on every

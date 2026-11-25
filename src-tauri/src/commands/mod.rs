@@ -11,7 +11,6 @@ pub mod app_state;
 pub mod artifacts_cloud;
 pub mod atlas_config;
 pub mod auth;
-pub mod browser;
 pub mod byok;
 pub mod canvas;
 pub mod capture;

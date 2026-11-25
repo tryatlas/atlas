@@ -275,7 +275,6 @@ None of the following leaves your machine as telemetry, with or without consent:
 - **API keys and credentials.** No provider keys, no Atlas session token, no access JWT,
   no device code. These are never logged either.
 - **Terminal input or output.**
-- **Browser URLs, page contents, or history** from the in-app browser.
 - **Your avatar path**, which is an absolute local path.
 - **Keystrokes, screenshots, or session recordings** — except a screenshot you
   deliberately attach to feedback, which you can preview and remove before sending.

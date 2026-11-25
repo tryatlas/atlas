@@ -28,7 +28,6 @@ type Rule = "per-id" | "one" | "one-per-column" | "destination" | "destination-p
 const RULES: Record<Tab["type"], Rule> = {
   chat: "per-id",
   canvas: "destination",
-  browser: "one-per-column",
   tasks: "one-per-column",
   editor: "per-id",
   files: "one",
@@ -100,7 +99,7 @@ beforeEach(() => {
 
 describe("tab multiplicity, by type", () => {
   it("has a rule for every tab type", () => {
-    expect(Object.keys(RULES)).toHaveLength(31);
+    expect(Object.keys(RULES)).toHaveLength(30);
   });
 
   for (const [type, rule] of Object.entries(RULES) as [Tab["type"], Rule][]) {

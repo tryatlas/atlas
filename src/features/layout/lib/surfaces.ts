@@ -4,7 +4,6 @@ import {
   FolderTree,
   GitBranch,
   GitPullRequest,
-  Globe,
   MessagesSquare,
   ScrollText,
   Terminal,
@@ -49,7 +48,6 @@ export interface Surface {
 const SURFACE_ICONS: Record<LauncherType, ElementType> = {
   chat: AtlasIcon,
   terminal: Terminal,
-  browser: Globe,
   editor: Code,
   files: FolderTree,
   "source-control": GitBranch,

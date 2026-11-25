@@ -9,8 +9,7 @@
 //! app's own origins. External links never needed to navigate it — they open
 //! in the system browser through the opener plugin.
 //!
-//! Only the `main` webview is guarded. The built-in browser's webviews exist
-//! to load external pages and carry their own labels.
+//! Only the `main` webview is guarded.
 
 use tauri::{plugin::TauriPlugin, Manager, Runtime, Url};
 

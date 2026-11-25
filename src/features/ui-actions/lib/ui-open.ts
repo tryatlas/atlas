@@ -23,7 +23,6 @@ import { openSpaceOnPage } from "@/features/spaces/lib/open-space";
 import { readArgs, refuse } from "./args";
 import { activeProject, resolvePath, tabInScope } from "./scope";
 import type { UiActionRequest } from "./types";
-import { emitWindowEvent } from "@/lib/window-events";
 
 const TARGETS = [
   "file",
@@ -33,7 +32,6 @@ const TARGETS = [
   "thread",
   "new_chat",
   "timeline",
-  "url",
   "knowledge",
   "space_page",
 ] as const;
@@ -42,7 +40,6 @@ const TARGETS = [
  *  diffs, chats and terminals have their own targets and tools. */
 const PLAIN_TABS: Record<string, string> = {
   canvas: "Spaces",
-  browser: "Browser",
   tasks: "Tasks",
   knowledge: "Knowledge",
   "knowledge-graph": "Knowledge Graph",
@@ -128,18 +125,6 @@ export async function performOpen(request: UiActionRequest): Promise<unknown> {
           .getState()
           .actions.openSession({ sessionId, projectPath: activeProject().path });
       return { tabId };
-    }
-    case "url": {
-      const url = a.str("url");
-      const before = new Set(
-        layout()
-          .tabs.filter((tab) => tab.type === "browser")
-          .map((tab) => tab.id),
-      );
-      const tabId = openPlainTab("browser", { url });
-      layout().actions.setTabData(tabId, { url });
-      if (before.has(tabId)) emitWindowEvent("atlas:browser-navigate", { tabId, url });
-      return { tabId, url };
     }
     case "knowledge": {
       const noteId = a.str("noteId");

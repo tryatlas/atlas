@@ -17,7 +17,6 @@ import {
   GitCompare,
   GitPullRequest,
   GitPullRequestArrow,
-  Globe,
   Inbox,
   Layers,
   Loader2,
@@ -54,7 +53,6 @@ import {
 export const tabIcons: Record<TabType, FallbackIcon> = {
   chat: AtlasIcon,
   canvas: Map,
-  browser: Globe,
   tasks: CheckSquare,
   editor: Code,
   files: FolderTree,

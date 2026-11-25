@@ -9,18 +9,14 @@
 //!
 //! Why Atlas ships its own menu at all: without one Tauri installs its
 //! *default* menu, whose Window ▸ Close (Cmd+W) calls `performClose:` on the
-//! key window. In the main webview that is harmless — the keybinding
-//! dispatcher (`useActionHotkeys` in `App.tsx`) `preventDefault()`s every chord
-//! it handles, so WebKit reports the key equivalent as handled and the menu
-//! never fires. But the embedded browser (`commands::browser`) is a separate
-//! native child webview loading remote pages that don't preventDefault Cmd+W,
-//! so the chord fell through to the default Close item and tore down the whole
+//! key window. The keybinding dispatcher (`useActionHotkeys` in `App.tsx`)
+//! `preventDefault()`s every chord it handles, so WebKit reports the key
+//! equivalent as handled and the menu never fires; but a Cmd+W the dispatcher
+//! does not take would reach the default Close item and tear down the whole
 //! window. Here the chord belongs to the Close Tab item, which closes the tab.
 //!
-//! The same fallthrough is what makes every accelerator below useful: while
-//! the embedded browser has focus, the menu is the only thing that hears
-//! Atlas's chords. In the main webview the dispatcher still wins, so nothing
-//! runs twice. Accelerators follow the user's bindings
+//! In the main webview the dispatcher wins, so nothing runs twice. The menu
+//! items show the user's chords. Accelerators follow the user's bindings
 //! (`menu_set_accelerators`); items start without one until the renderer has
 //! read `keybindings.json`.
 
@@ -63,8 +59,8 @@ pub enum ItemDef {
 /// selectors, which macOS routes straight to WKWebView's native editing undo
 /// WITHOUT dispatching a JS keydown — that shadowed CodeMirror's own history,
 /// so Cmd+Z did nothing in the code editor. Without them Cmd+Z reaches the
-/// page: CodeMirror undoes, and the embedded browser's text fields still undo
-/// through WebKit's built-in editing default.
+/// page: CodeMirror undoes, and plain text fields still undo through WebKit's
+/// built-in editing default.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum Role {

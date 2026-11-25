@@ -68,7 +68,7 @@ export const TIPS = [
     steps: [
       {
         title: "Open tools beside the session",
-        body: "Press ⌘T for a terminal, the editor, files, source control or a browser, in columns next to your session.",
+        body: "Press ⌘T for a terminal, the editor, files or source control, in columns next to your session.",
       },
       {
         title: "Everything else is in ⌘K",

@@ -35,8 +35,9 @@ import { fileURLToPath } from "node:url";
  * webview never renders and must never read: the session file
  * (`auth/store.rs`, under the app config dir, plus its `.tmp` during an
  * atomic save), and under the app *data* dir the memory bridge's per-launch
- * token files (`agents.rs` roots `mcp-bridge/` there) and the built-in
- * browser's cookie profile (`browser.rs`). On macOS config and data are the
+ * token files (`agents.rs` roots `mcp-bridge/` there) and the cookie profile
+ * of the removed built-in browser, which `lib.rs` deletes at startup but may
+ * fail to. On macOS config and data are the
  * same folder, reached through `$HOME/**` as well; on Linux they differ, so
  * each pattern must name the base dir the Rust code actually uses. Tauri checks
  * `deny` before `allow`, so listing them there is what keeps a script running
@@ -73,7 +74,7 @@ describe("asset protocol scope", () => {
   it.each([
     ["the session file and its atomic-save temp", "$APPCONFIG/atlas-session.*"],
     ["the memory bridge's token files", "$APPDATA/mcp-bridge/**"],
-    ["the built-in browser's cookie profile", "$APPDATA/browser-profile/**"],
+    ["the removed browser's cookie profile", "$APPDATA/browser-profile/**"],
   ])("denies %s", (_what, pattern) => {
     expect(scope.deny as string[]).toContain(pattern);
   });

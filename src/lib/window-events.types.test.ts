@@ -27,7 +27,7 @@ function useRefused(): void {
   // @ts-expect-error the detail is a menu id, not an object
   emitWindowEvent("atlas:composer-menu-open", { menu: "add" });
   // @ts-expect-error another event's payload
-  emitWindowEvent("atlas:browser-navigate", { tabId: "t" });
+  emitWindowEvent("atlas:org-agent-report", { tabId: "t" });
   // @ts-expect-error a field the payload does not have
   emitWindowEvent("atlas:chat-stop", { tabId: "t", force: true });
   // @ts-expect-error an event with no payload takes none

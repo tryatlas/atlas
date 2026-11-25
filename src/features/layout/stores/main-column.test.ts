@@ -61,9 +61,9 @@ describe("the main column holds sessions only", () => {
 
   it("moves a closed column's tools to the other surfaces column", () => {
     useLayoutStore.setState((s) => ({
-      tabs: [...s.tabs, tab("browser-1", "browser", "g3")],
+      tabs: [...s.tabs, tab("log-1", "log", "g3")],
       groupOrder: ["main", "g2", "g3"],
-      activeByGroup: { ...s.activeByGroup, g3: "browser-1" },
+      activeByGroup: { ...s.activeByGroup, g3: "log-1" },
     }));
     actions().closeGroup("g2");
     expect(layout().groupOrder).toEqual(["main", "g3"]);

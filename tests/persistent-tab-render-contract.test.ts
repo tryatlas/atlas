@@ -67,7 +67,6 @@ vi.mock("@tauri-apps/api/core", () => import("@/test/tauri-core"));
 vi.mock("@/features/chat/components/chat-panel", panel("ChatPanel", "chat"));
 vi.mock("@/features/terminal/components/terminal-panel", panel("TerminalPanel", "terminal"));
 vi.mock("@/features/editor/components/editor-panel", panel("EditorPanel", "editor"));
-vi.mock("@/features/browser/components/browser-panel", panel("BrowserPanel", "browser"));
 vi.mock("@/features/media/components/media-viewer", panel("MediaViewer", "media"));
 vi.mock("@/features/svg/components/svg-viewer", panel("SvgViewer", "svg"));
 vi.mock("@/features/pdf/components/pdf-viewer", panel("PdfViewer", "pdf"));
@@ -130,7 +129,6 @@ import {
 const MOUNTS: Record<TabType, string> = {
   chat: "chat",
   canvas: "placeholder",
-  browser: "browser",
   tasks: "placeholder",
   editor: "editor",
   files: "files",
@@ -165,7 +163,6 @@ const MOUNTS: Record<TabType, string> = {
  *  listed, and so rendered by the keep-mounted tests below. */
 const PERSISTENT: Record<PersistentTabType, true> = {
   chat: true,
-  browser: true,
   editor: true,
   terminal: true,
   pdf: true,
@@ -232,7 +229,7 @@ afterEach(cleanup);
 describe("the column's render contract", () => {
   it("covers every tab type (a floor, so the tables cannot pass empty)", () => {
     expect(Object.keys(MOUNTS).sort()).toEqual([...TAB_TYPES].sort());
-    expect(TAB_TYPES.length).toBeGreaterThanOrEqual(31);
+    expect(TAB_TYPES.length).toBeGreaterThanOrEqual(30);
     expect(PERSISTENT_TYPES.sort()).toEqual(TAB_TYPES.filter(isPersistent).sort());
     expect(PERSISTENT_TYPES.length).toBeGreaterThanOrEqual(5);
   });
@@ -282,7 +279,7 @@ describe("the column's render contract", () => {
     rerender(column(tabs, "log-1", false));
     const idle = PERSISTENT_TYPES.filter(isIdleExpensive);
     // A PTY, a web embed, a PDF worker: the ones that burn while hidden.
-    expect(idle.length).toBeGreaterThanOrEqual(3);
+    expect(idle.length).toBeGreaterThanOrEqual(2);
     await waitFor(() => {
       for (const type of idle) expect(node(container, MOUNTS[type]), type).toBeNull();
     });

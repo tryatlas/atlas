@@ -30,7 +30,6 @@ import {
   FolderTree,
   GitBranch,
   GitPullRequest,
-  Globe,
   type LucideIcon,
   Map as MapIcon,
   Maximize2,
@@ -469,7 +468,6 @@ function OpenCommandPalette(props: {
             shortcutAction: "tabs.newUntitled",
           },
         ),
-        action("open:browser", "Open browser", Globe, () => openTab("browser", "Browser")),
         action("open:knowledge", "Knowledge base", Brain, () => openTab("knowledge", "Knowledge")),
         action("open:knowledge-graph", "Knowledge graph", Network, () =>
           openTab("knowledge-graph", "Graph"),
