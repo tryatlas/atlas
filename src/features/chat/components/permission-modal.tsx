@@ -78,18 +78,18 @@ function keyReachesCard(tabId: string, anchor: HTMLElement | null): boolean {
 // Some agents bake their own brand into permission-option labels (e.g.
 // codex-acp emits "No, and tell Codex what to do differently"). Rewrite any
 // OTHER agent's brand to the agent actually bound to this session so the card
-// never names the wrong agent. Ordered longest-first to avoid partial matches.
-const AGENT_BRANDS = ["Claude Code", "Codex", "Claude", "OpenCode", "Cursor"];
+// never names the wrong agent.
+//
+// One pass over one alternation, longest brand first: replacing brand by
+// brand ran each pass over the last one's output, so "Codex" became "Claude
+// Code" and the `Claude` pass then matched inside it — "Claude Code Code".
+// Matching the bound agent's own brand rewrites it to itself.
+const AGENT_BRANDS = /\b(?:Claude Code|OpenCode|Codex|Cursor|Claude)\b/g;
 function relabelAgentBrand(label: string, display: string): string {
   // `display` is `agentMeta(agentType).label`, not a raw AGENT_LABEL read: that
   // table only covers first-party agents, so every external one rendered as
   // the anonymous "the agent".
-  let out = label;
-  for (const brand of AGENT_BRANDS) {
-    if (brand === display) continue;
-    out = out.replace(new RegExp(`\\b${brand}\\b`, "g"), display);
-  }
-  return out;
+  return label.replace(AGENT_BRANDS, display);
 }
 
 interface PermissionModalProps {
