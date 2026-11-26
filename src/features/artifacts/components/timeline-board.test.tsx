@@ -62,8 +62,8 @@ vi.mock("@tanstack/react-virtual", () => ({
       })),
     getTotalSize: () => count * 80,
     measureElement: () => {},
-    // The package calendar indexes this for its end space (measured
-    // here); a missing array would throw.
+    // The package calendar indexes this for its end space even with
+    // `endSpace` off; a missing array would throw.
     measurementsCache: [],
   }),
 }));
@@ -153,6 +153,16 @@ describe("TimelineBoard", () => {
     expect(headings).toHaveLength(2);
     expect(headings[0]).toContain("Today");
     expect(headings[1]).not.toContain("Today");
+  });
+
+  it("draws no measured end space, which looped to a crash under the interface zoom", () => {
+    // `@tryatlas/design` <= 0.1.19 measures `endSpace="measure"` against
+    // `scrollHeight`, which rounds differently from the rects it is compared
+    // with once the page is zoomed. Each pass undid the last until React threw
+    // "Maximum update depth exceeded" and the Timeline took the app down.
+    board([session({ id: "a" })]);
+    expect(screen.getByRole("heading", { level: 2 })).toBeTruthy();
+    expect(document.querySelector('[data-slot="timeline-calendar-end"]')).toBeNull();
   });
 
   it("says why the list is empty, and tells the two reasons apart", () => {

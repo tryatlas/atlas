@@ -292,14 +292,13 @@ export function InboxPanel() {
                   items={items}
                   renderRow={renderRow}
                   root={scroller as RefObject<HTMLElement | null>}
-                  // Measured, as on the board, but only at the real end. The
-                  // column's own `pb-32` follows the list, so the end space
-                  // leaves room only for what that doesn't already give.
-                  // While another page is pending it stays off: the end space
-                  // would push the load-more sentinel out of its 400px
-                  // margin, so a short first page would stop fetching the
-                  // next one until the user scrolled.
-                  endSpace={load.cursor ? false : "measure"}
+                  // Off, as on the board (see `timeline-board.tsx` for why
+                  // neither `true` nor `"measure"` is safe here). Off is also
+                  // what a pending page needs: an end space would push the
+                  // load-more sentinel out of its 400px margin, so a short
+                  // first page would stop fetching the next one until the
+                  // user scrolled.
+                  endSpace={false}
                 />
                 {load.cursor && <MoreSentinel state={more} onReach={loadMore} />}
               </>

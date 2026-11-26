@@ -113,12 +113,20 @@ export function TimelineBoard({
                 items={items}
                 renderRow={renderRow}
                 root={scroller as RefObject<HTMLElement | null>}
-                // Measured: this column's `pb-32` (room under the search bar)
-                // and the note follow the list in the scroller, and a plain
-                // `endSpace` would add its room on top of theirs, so the last
-                // day overshot the sticky date. `"measure"` subtracts them, so
-                // the end stops with the last day under the date.
-                endSpace="measure"
+                // Off, so a short last day stops short of the sticky date
+                // rather than scrolling up to become it.
+                //
+                // Not `true`: this column's `pb-32` (room under the search bar)
+                // and the note follow the list, and the package's end space
+                // does not count them, so the last day overshot the date.
+                //
+                // Not `"measure"`, which subtracts them: through
+                // `@tryatlas/design` 0.1.19 it reads `scrollHeight`, which
+                // rounds differently from the rects it is compared with once
+                // the interface zoom is not 100%. Each pass undid the last
+                // until React threw "Maximum update depth exceeded" and the
+                // Timeline took the app down.
+                endSpace={false}
               />
             ) : loading ? (
               // Geometry-matched rows rather than a spinner: the shape of what
