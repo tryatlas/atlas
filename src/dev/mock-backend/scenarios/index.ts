@@ -50,6 +50,7 @@ import { collab } from "./collab";
 import { designSystem } from "./design-system";
 import { diffComments, diffLarge } from "./diff-large";
 import { filesLarge } from "./files-large";
+import { filesMarkdown } from "./files-markdown";
 import { freshInstall } from "./fresh-install";
 import { gitConflict } from "./git-conflict";
 import { inboxLong } from "./inbox-long";
@@ -146,6 +147,7 @@ const all: Scenario[] = [
   diffLarge,
   diffComments,
   filesLarge,
+  filesMarkdown,
   knowledge,
   collab,
   captureHealthy,

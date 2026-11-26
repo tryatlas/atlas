@@ -8,6 +8,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { Image as ImageIcon } from "lucide-react";
 import { Icon } from "@tryatlas/design";
 import { PREVIEW_SANITIZE_SCHEMA } from "@/lib/markdown-sanitize";
+import { readableCellClass } from "@/lib/markdown-table";
 import { rehypeFileChips } from "@/lib/file-chip-hast";
 import { openFileChipUnder, useFileChipHost } from "@/lib/file-chip-host";
 import "../readme.css";
@@ -81,7 +82,8 @@ function imageLabel(alt: string | undefined, src: unknown): string {
 
 // Typography is `.prose-session` plus `readme.css`. A table gets a scroll box
 // so a wide one scrolls inside it rather than pushing the column (the table
-// keeps `display: table` and so its table semantics).
+// keeps `display: table` and so its table semantics), and a prose cell keeps
+// a readable width rather than being squeezed to fit (`markdown-table.ts`).
 const README_COMPONENTS: NonNullable<Options["components"]> = {
   // A web or mail link opens outside Atlas: navigating the webview would
   // replace the app. A relative or anchor link does nothing; its tooltip says
@@ -117,4 +119,6 @@ const README_COMPONENTS: NonNullable<Options["components"]> = {
       <table {...p} />
     </div>
   ),
+  th: ({ node, ...p }) => <th {...p} className={readableCellClass(node)} />,
+  td: ({ node, ...p }) => <td {...p} className={readableCellClass(node)} />,
 };
