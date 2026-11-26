@@ -108,6 +108,17 @@
 .atlas-chat-composer .ProseMirror::-webkit-scrollbar {
   display: none;
 }
+/* The permission card's "tell the agent what to do instead" field: one line,
+   growing to a cap, scrolling with no bar — the composer's convention. The
+   global ::-webkit-scrollbar gives a one-row textarea in WebKit both bars
+   for a pixel of overflow. On a wrapper because the field is the package's
+   <Textarea>, which takes no restyling at the call site. */
+.atlas-permission-draft textarea {
+  scrollbar-width: none;
+}
+.atlas-permission-draft textarea::-webkit-scrollbar {
+  display: none;
+}
 .atlas-chat-composer .atlas-composer-placeholder {
   top: 12px;
   left: 16px;

@@ -24,8 +24,17 @@ function renderCard(
   const onDraftChange = vi.fn();
   render(
     <PermissionCardView
-      heading={{ kind: "tool", title: "rm -rf dist" }}
-      preview={'{\n  "command": "rm -rf dist"\n}'}
+      heading={{
+        kind: "tool",
+        summary: {
+          tool: "run",
+          action: "Run a command",
+          description: null,
+          source: null,
+          command: "rm -rf dist",
+          fields: [],
+        },
+      }}
       options={OPTIONS}
       queueNote={null}
       draft="do this instead"

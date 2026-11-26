@@ -247,9 +247,11 @@ export function useComposerPickers({
           if (t.query === "" && p.goBack()) return true;
           return false;
         case "Tab":
-          // Not handled for the mention picker — fall through to the
-          // composer's Tab (list indent / outdent).
-          return false;
+          // Tab completes the highlighted row, same as Enter. It is
+          // swallowed even with no row, so focus never leaves the
+          // composer while the picker is open.
+          p.commit();
+          return true;
       }
     },
     [],
