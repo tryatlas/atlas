@@ -70,3 +70,43 @@ test("a transcript's markdown renders as structure", async ({ page }) => {
   `);
   await expect(page.getByRole("button", { name: "Copy code" }).first()).toBeVisible();
 });
+
+test("a seeded scenario opens on its conversation and raises its scripted prompt", async ({
+  page,
+}) => {
+  // The scenario's transcript is a stored session the mock opens in the first
+  // chat tab (`boot-session.ts`), and its script then plays a live turn and a
+  // permission request into that session. Neither appears when the tab has no
+  // session, which is the state the app itself boots a chat in.
+  await openScenario(page, "chat-tools");
+
+  await expect(
+    page
+      .getByRole("paragraph")
+      .filter({ hasText: /^Add a disabled state to the Button component/ }),
+  ).toBeVisible();
+  await expect(page.getByTestId("permission-card")).toBeVisible({ timeout: 30_000 });
+});
+
+test("a new chat starts no agent session until the user writes", async ({ page }) => {
+  await openScenario(page, "northwind");
+  const started = () =>
+    page.evaluate(
+      () =>
+        (window as unknown as { __atlasMock: { calls: () => { cmd: string }[] } }).__atlasMock
+          .calls()
+          .filter((call) => call.cmd === "agents_new_session").length,
+    );
+
+  await page.getByRole("button", { name: /Switch session/ }).click();
+  await page.getByRole("menu").getByRole("button", { name: "New session", exact: true }).click();
+  await expect(composer(page)).toBeFocused();
+  await expect(composer(page)).toHaveText("");
+  // Shown and focused is not asked for: an agent that keeps every session it
+  // opens would list one empty session per launch.
+  await page.waitForTimeout(1_500);
+  expect(await started()).toBe(0);
+
+  await page.keyboard.type("h");
+  await expect.poll(started).toBe(1);
+});

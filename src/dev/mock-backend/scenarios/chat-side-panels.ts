@@ -51,7 +51,7 @@ export const chatSidePanels: Scenario = {
     setSeedTranscript(seed);
   },
   setup: async () => {
-    // The chat tab binds its session shortly after mount (as `chat-tools`).
+    // A beat after the seed is on screen (as `chat-tools`).
     await new Promise((r) => setTimeout(r, 1500));
     await setStatus("running");
     await emitForLatest((ids) => ({ kind: "plan_updated", ...ids, plan: PLAN }));

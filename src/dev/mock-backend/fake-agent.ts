@@ -35,6 +35,8 @@ interface FakeSession {
   cwd: string;
   pluginId: string;
   messages: SessionMessage[];
+  /** The title the agent last gave it (`sendTitle`). */
+  title?: string;
   /** Children this session delegated to, keyed by launch in the real wire and
    *  held as a list here because that is the shape the snapshot carries. */
   subagents?: Subagent[];
@@ -80,6 +82,21 @@ export interface NewSessionInfo {
 let sessionSeeder: ((info: NewSessionInfo) => SessionMessage[] | null) | null = null;
 export function setSessionSeeder(seeder: typeof sessionSeeder): void {
   sessionSeeder = seeder;
+}
+
+/**
+ * For a scenario whose `setup` plays its turns live: the first chat opens on
+ * a stored session with nothing said in it yet, and any later one is an
+ * ordinary new session. Without a seed the first chat has no session until
+ * its user writes, and scripted turns have nowhere to play.
+ */
+export function seedEmptySession(): void {
+  let opened = false;
+  setSessionSeeder(() => {
+    if (opened) return null;
+    opened = true;
+    return [];
+  });
 }
 
 /**
@@ -156,6 +173,7 @@ export async function emitForLatest(
 export function sendTitle(sessionId: string, title: string): Promise<void> {
   const s = latest(sessionId);
   if (!s) return Promise.resolve();
+  s.title = title;
   return sendDelta({ kind: "title_updated", ...at(s), title });
 }
 
@@ -173,6 +191,59 @@ export function adoptSession(
 ): void {
   if (sessions.has(key.session_id)) return;
   sessions.set(key.session_id, { key, cwd, pluginId, messages });
+}
+
+/** The stored session a seeded scenario opens on (`boot-session.ts`). */
+export const SEED_THREAD_ID = "mock-seed-thread";
+
+/** Whether this scenario opens on a conversation: it gave a transcript
+ *  (`setSeedTranscript`) or a per-session seeder (`setSessionSeeder`). */
+export function hasSeed(): boolean {
+  return sessionSeeder !== null || seedTranscript.length > 0;
+}
+
+/** The seed session made ready for `threads_resume`, which carries a thread
+ *  id and nothing else. */
+let preparedSeed: SessionKey | null = null;
+
+/**
+ * Make the seed a stored session, for a chat tab of agent `pluginId` in `cwd`
+ * to open (`boot-session.ts`). Answers its session id, or null when this
+ * scenario has no session for that tab: a per-session seeder decides by
+ * agent, and its "no" (null) must not leave a session bound to the tab. An
+ * empty transcript is a yes: a stored session with nothing said in it yet,
+ * for a scenario whose `setup` plays the turns.
+ *
+ * The seed used to be played into whatever session the first chat tab started
+ * on mount. A tab no longer starts a session until its user writes
+ * (`use-agent-bind.ts`), and in the app a conversation that is on screen
+ * without anyone typing is always a stored one, reopened. So that is what a
+ * seeded scenario is now: a session the agent stored, transcript included
+ * (`adoptSession`), opened in the first tab.
+ */
+export function prepareSeed(opener: { pluginId: string; cwd: string }): string | null {
+  const key = { agent_id: `agent-${opener.pluginId}`, session_id: `sess-${++seq}` };
+  const seed = sessionSeeder
+    ? sessionSeeder({ sessionId: key.session_id, ...opener })
+    : seedTranscript;
+  if (!seed) return null;
+  adoptSession(key, opener.pluginId, opener.cwd, seed);
+  preparedSeed = key;
+  return key.session_id;
+}
+
+/** `threads_resume` for the seed: the agent has the session `prepareSeed`
+ *  stored, and answers with it. */
+export function resumeSeed(): { key: SessionKey; resumedWithoutHistory: boolean } {
+  if (!preparedSeed) throw new Error("no seed session was prepared");
+  return { key: preparedSeed, resumedWithoutHistory: false };
+}
+
+/** Say a session's title again, once a tab holds it: a seeder titles its
+ *  session as it makes it, before any tab is listening for that session. */
+export function resendTitle(sessionId: string): Promise<void> {
+  const title = sessions.get(sessionId)?.title;
+  return title ? sendTitle(sessionId, title) : Promise.resolve();
 }
 
 function sessionOrThrow(key: SessionKey): FakeSession {

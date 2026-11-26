@@ -50,7 +50,11 @@
 import type { Scenario } from "../types";
 import { CONTENT } from "./northwind-content";
 import { flashCueMiss } from "../badge";
-import { ensureVideo1Session, installNorthwindAgent } from "./northwind-agent";
+import {
+  ensureVideo1Session,
+  installNorthwindAgent,
+  openingSessionPending,
+} from "./northwind-agent";
 import {
   northwindCommsCommands,
   postAsMe,
@@ -207,9 +211,18 @@ export const northwind: Scenario = {
     // Open the agent chat the videos come back to (see `?chat=`), unless this
     // is video 1's starting state, which begins in the editor.
     if (BEFORE_VIDEO_1) return;
-    // Reuses the chat tab the app opens on its own rather than adding a second.
-    const { openNewAgentChat } = await import("@/features/chat/lib/open-agent-session");
+    // Already there when the app's own first chat tab was that Session's
+    // agent: the mock opens a scenario's seed in it before `setup` runs
+    // (`boot-session.ts`).
+    if (!openingSessionPending()) return;
+    // Otherwise make that tab the agent's (reusing it rather than adding a
+    // second), and open the recorded Session in it, as a stored one.
+    const [{ openNewAgentChat }, { openSeedSession }] = await Promise.all([
+      import("@/features/chat/lib/open-agent-session"),
+      import("../boot-session"),
+    ]);
     openNewAgentChat("claude-code");
+    await openSeedSession();
   },
   actions,
 };

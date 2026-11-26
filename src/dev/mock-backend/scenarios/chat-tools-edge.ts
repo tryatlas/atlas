@@ -62,7 +62,7 @@ export const chatToolsEdge: Scenario = {
     "Every tool kind incl. MCP, a 50,000-line output, a cancelled turn and a failed turn.",
   init: () => setSeedTranscript([...everyKind, ...hugeOutput]),
   setup: async () => {
-    // The chat tab binds its session shortly after mount; the seed plays then.
+    // A beat after the seed is on screen (the mock opens it before `setup`).
     await new Promise((r) => setTimeout(r, 1500));
     await cancelledTurn();
     await new Promise((r) => setTimeout(r, 500));

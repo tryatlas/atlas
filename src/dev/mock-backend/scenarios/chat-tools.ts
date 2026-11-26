@@ -209,7 +209,7 @@ export const chatTools: Scenario = {
     "Finished turn with folded tools, edits and a failed run; then a live running command.",
   init: () => setSeedTranscript(settledTurn),
   setup: async () => {
-    // The chat tab binds its session shortly after mount; the seed plays then.
+    // A beat after the seed is on screen (the mock opens it before `setup`).
     await new Promise((r) => setTimeout(r, 1500));
     await delegatingTurn();
     await new Promise((r) => setTimeout(r, 1500));

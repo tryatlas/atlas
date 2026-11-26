@@ -194,7 +194,8 @@ function attachBoth(sessionId: string): void {
   });
 }
 
-/** The chat tab binds its session shortly after mount; the turn plays then. */
+/** A beat after the session is in the tab (the mock opens it before `setup`
+ *  runs, `boot-session.ts`), so the turn is seen arriving. */
 const BIND_WAIT_MS = 1500;
 
 export const sessionProjects: Scenario = {
@@ -202,12 +203,14 @@ export const sessionProjects: Scenario = {
   description: "Two attached projects (read, read & write), changes across three roots and Other.",
   init: () => {
     live = null;
+    // The first session is the one the scenario is about: stored with its two
+    // projects attached and nothing said yet (`setup` plays the turns). Any
+    // later one is an ordinary new session.
     setSessionSeeder((info) => {
-      if (!live) {
-        live = info.sessionId;
-        attachBoth(live);
-      }
-      return null;
+      if (live) return null;
+      live = info.sessionId;
+      attachBoth(live);
+      return [];
     });
   },
   setup: async () => {

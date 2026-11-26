@@ -16,6 +16,7 @@ import { resetStores } from "./reset-stores";
 import { mockAssetUrl } from "./fixtures/files";
 import type { MockArgs, MockHandlers, Scenario } from "./types";
 import { onWindowEvent } from "@/lib/window-events";
+import { SEED_THREAD_ID, resumeSeed } from "./fake-agent";
 
 declare global {
   interface Window {
@@ -79,6 +80,10 @@ export function startMockBackend(name: string): MockBackend {
     const a = (args ?? {}) as MockArgs;
     if (calls.length < 2000) calls.push({ cmd, args: a });
 
+    // The seed is the fake agent's own stored session, whichever scenario's
+    // history is in play (`boot-session.ts`).
+    if (cmd === "threads_resume" && a.threadId === SEED_THREAD_ID) return resumeSeed();
+
     const handler = overrides[cmd] ?? baseHandlers[cmd];
     if (handler) return handler(a);
 
@@ -99,16 +104,20 @@ export function startMockBackend(name: string): MockBackend {
     resetStores,
   };
 
-  if (scenario?.setup) {
-    const run = scenario.setup;
-    // Once: the unsubscribe is the first thing the listener does.
-    const off = onWindowEvent("atlas:app-ready", () => {
-      off();
-      // Let the first commit settle so stores have hydrated before the
-      // scenario opens tabs or fires events.
-      setTimeout(() => void run(), 0);
-    });
-  }
+  // Once: the unsubscribe is the first thing the listener does.
+  const off = onWindowEvent("atlas:app-ready", () => {
+    off();
+    // Let the first commit settle so stores have hydrated before the
+    // scenario opens tabs or fires events. The seed first, and `setup` only
+    // once its session is in the tab: a scenario's scripted turns and its
+    // `actions` play into that session (`boot-session.ts`).
+    setTimeout(() => {
+      void import("./boot-session")
+        .then(({ openSeedSession }) => openSeedSession())
+        .catch((err: unknown) => console.warn("[mock-backend] seed not opened:", err))
+        .then(() => scenario?.setup?.());
+    }, 0);
+  });
 
   console.info(`[mock-backend] active — scenario "${name}"`);
   return { answer, assetUrl: mockAssetUrl };

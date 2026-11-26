@@ -658,9 +658,17 @@ function openingSession(): string | null {
   return BEFORE_VIDEO_1 ? null : "s-discount";
 }
 
+/** The recorded Session still waiting to be opened in the first agent chat. */
+let opening: string | null = null;
+
+/** Whether the opening Session has yet to be put in a chat tab. */
+export function openingSessionPending(): boolean {
+  return opening !== null;
+}
+
 export function installNorthwindAgent(runHooks: RunHooks): void {
   hooks = runHooks;
-  let opening = openingSession();
+  opening = openingSession();
 
   setAgentModels((pluginId) => {
     const key = agentKeyOf(pluginId);

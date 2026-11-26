@@ -29,6 +29,23 @@ run `__atlasMock.unmocked()` in the console. An unmocked command resolves
 `null`, so an empty or broken panel is usually a missing fake here, not a UI
 bug. `__atlasMock.actions.<name>()` fires a scenario's console triggers.
 
+## A scenario that opens on a conversation
+
+The app starts no agent session for a chat tab until its user writes, so a
+scenario cannot count on one being there at boot. A scenario that gives a
+transcript (`setSeedTranscript`, `setSessionSeeder`) is given a **stored
+session** instead: once the app is ready, `boot-session.ts` opens it in the
+first chat tab through the same call a sidebar row makes, and the fake agent
+answers as if it were reloading a session it kept. That is the only way a
+conversation is on screen in the app without anyone typing, so it is the only
+way one is here.
+
+A scenario's `setup` runs after that session is in the tab, so scripted turns
+and `__atlasMock.actions` have a session to play into. A scenario with turns to
+play and no transcript says `init: seedEmptySession`: a stored session with
+nothing said in it yet. A scenario with neither boots as the app does, on an
+empty chat with no session.
+
 ## Native-only surfaces
 
 Two things in Atlas are not `invoke()` calls, so nothing in this directory

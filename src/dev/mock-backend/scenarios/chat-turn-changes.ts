@@ -18,7 +18,14 @@ import type { Scenario } from "../types";
 import type { SessionMessage, ToolCall } from "@/types/agents";
 import { ended, lines, text, thinking, tool, tools, user, t } from "../fixtures/chat";
 import { abs } from "../project";
-import { appendWithTools, closeTurn, openTurn, playTurns, streamText } from "../fake-agent";
+import {
+  appendWithTools,
+  closeTurn,
+  openTurn,
+  playTurns,
+  seedEmptySession,
+  streamText,
+} from "../fake-agent";
 
 let n = 0;
 const nextId = () => `ttc-${++n}`;
@@ -187,12 +194,14 @@ async function streamTurn(): Promise<void> {
   await closeTurn(seq, { startedAt, endedAt: Date.now() });
 }
 
-/** The chat tab binds its session shortly after mount; the turns play then. */
+/** A beat after the session is in the tab (`seedEmptySession`; the mock opens
+ *  it before `setup` runs), so the turns are seen arriving. */
 const BIND_WAIT_MS = 1500;
 
 export const chatTurnChanges: Scenario = {
   name: "chat-turn-changes",
   description: "Turns that change files: fragments, whole files, diff blocks, a nested chain.",
+  init: seedEmptySession,
   setup: async () => {
     await new Promise((r) => setTimeout(r, BIND_WAIT_MS));
     await playTurns(exchange(0, 0));
@@ -203,6 +212,7 @@ export const chatTurnChanges: Scenario = {
 export const chatTurnChangesLong: Scenario = {
   name: "chat-turn-changes-long",
   description: "Thirty rounds of file-changing turns, for scroll and streaming measurements.",
+  init: seedEmptySession,
   setup: async () => {
     await new Promise((r) => setTimeout(r, BIND_WAIT_MS));
     await playTurns(Array.from({ length: 30 }, (_, i) => exchange(i, i * 300)).flat());
@@ -378,6 +388,7 @@ function nativeExchange(base: number): SessionMessage[][] {
 export const chatTurnChangesNative: Scenario = {
   name: "chat-turn-changes-native",
   description: "Turns the native engine edited: per-file hunks and whole files in one patch.",
+  init: seedEmptySession,
   setup: async () => {
     await new Promise((r) => setTimeout(r, BIND_WAIT_MS));
     await playTurns(nativeExchange(0));
