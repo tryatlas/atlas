@@ -2,6 +2,7 @@
 // line classification, and the entry point that opens the review diff.
 
 import { invoke } from "@tauri-apps/api/core";
+import { coalesceByKey } from "@/lib/coalesce-by-key";
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { requestDiffJump } from "./diff-jump";
 import { openCommit } from "./open-commit";
@@ -12,13 +13,13 @@ export interface DiffLineStatus {
   deletedBefore: number[];
 }
 
-export function gitDiffLineStatus(
-  repoPath: string,
-  file: string,
-  staged: boolean,
-): Promise<DiffLineStatus> {
-  return invoke<DiffLineStatus>("git_diff_line_status", { path: repoPath, file, staged });
-}
+/** The editor gutter's change bars for `file`. Calls for the same file share
+ *  one `git diff`, as `gitBlameFile` does for blame. */
+export const gitDiffLineStatus = coalesceByKey(
+  (repoPath: string, file: string, staged: boolean) => `${repoPath}\0${file}\0${staged}`,
+  (repoPath: string, file: string, staged: boolean) =>
+    invoke<DiffLineStatus>("git_diff_line_status", { path: repoPath, file, staged }),
+);
 
 /** The review diff's tab id for a repository: one per repository. */
 export function diffTabId(repoPath: string): string {
