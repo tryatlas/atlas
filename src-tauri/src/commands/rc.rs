@@ -1333,7 +1333,9 @@ impl SessionPort for AppSessionPort {
                     // crate's gate already refused keys that name a sandbox
                     // or approval switch). An option the agent no longer
                     // lists, or lists uncategorised, is owner-only.
-                    if !is_owner && !member_may_set(host.config_option_category(&key, &option)) {
+                    let category = host.config_option_category(&key, &option);
+                    config_mode_refusal(category.as_ref(), &value)?;
+                    if !is_owner && !member_may_set(category) {
                         return Err(Refusal::new(
                             Gate::Widening,
                             "only the owner may change this session's options",
@@ -1345,6 +1347,25 @@ impl SessionPort for AppSessionPort {
             done.map_err(refusal_for)
         })
     }
+}
+
+/// Mode selection through the generic option door has the same widening
+/// restriction as SetMode, including for the owner's remote device.
+fn config_mode_refusal(
+    category: Option<&acp::SessionConfigOptionCategory>,
+    value: &serde_json::Value,
+) -> Result<(), Refusal> {
+    if matches!(category, Some(acp::SessionConfigOptionCategory::Mode))
+        && value
+            .as_str()
+            .is_some_and(atlas_remote_control::gate::mode_widens)
+    {
+        return Err(Refusal::new(
+            Gate::Widening,
+            "a wider session mode must be selected on the desktop",
+        ));
+    }
+    Ok(())
 }
 
 /// The config-option categories a Driver who is not the owner may set: the

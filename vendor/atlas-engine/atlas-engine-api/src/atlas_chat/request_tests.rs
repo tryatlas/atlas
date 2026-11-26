@@ -60,6 +60,55 @@ fn body_of(built: &BuiltChatRequest) -> Value {
 }
 
 #[test]
+fn tool_images_follow_the_complete_group_of_tool_results() {
+    let mut image_output = output("image", "");
+    if let ResponseItem::FunctionCallOutput { output, .. } = &mut image_output {
+        output.body =
+            FunctionCallOutputBody::ContentItems(vec![FunctionCallOutputContentItem::InputImage {
+                image_url: "data:image/png;base64,TOOLIMAGE".to_string(),
+                detail: None,
+            }]);
+    }
+    let items = [
+        message("user", "inspect the image and file"),
+        call("image", "view_image", "{}"),
+        call("file", "read_file", "{}"),
+        image_output,
+        output("file", "file contents"),
+    ];
+    for model in ["claude-sonnet-4-6", "gpt-5.1"] {
+        let body = body_of(&build(model, &items, &[]));
+        let messages = body["messages"].as_array().expect("messages");
+        let result_index = messages
+            .iter()
+            .position(|m| m["tool_call_id"] == "image")
+            .expect("image result");
+        assert_eq!(messages[result_index + 1]["tool_call_id"], "file");
+        assert_eq!(messages[result_index + 2]["role"], "user");
+        assert_eq!(
+            messages[result_index + 2]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,TOOLIMAGE"
+        );
+        assert!(
+            messages[result_index + 2]["content"][0]["text"]
+                .as_str()
+                .expect("image label")
+                .contains("image")
+        );
+    }
+    let mut old_items = items.to_vec();
+    old_items.extend([
+        message("assistant", "description"),
+        message("user", "next"),
+        message("assistant", "reply"),
+        message("user", "third turn"),
+    ]);
+    let serialized = body_of(&build("gpt-5.1", &old_items, &[])).to_string();
+    assert!(!serialized.contains("TOOLIMAGE"));
+    assert!(serialized.contains("earlier image omitted"));
+}
+
+#[test]
 fn the_body_carries_nothing_the_gateway_would_refuse() {
     // The gateway answers *anything* off its allowlist with a 400, nested keys
     // included — so the whole request dies for one stray field. This asserts

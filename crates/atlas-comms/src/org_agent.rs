@@ -24,7 +24,7 @@ use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::conn::{classify_handshake, ticket_request, ExitReason};
+use crate::conn::{ticket_request, ExitReason};
 use crate::rest::RestClient;
 use crate::{agent_base, ws_scheme, CommsError, TokenSource};
 
@@ -379,12 +379,11 @@ impl OrgAgentManager {
                 return (ExitReason::Transport("request".into()), false);
             }
         };
-        let (stream, _response) = match tokio_tungstenite::connect_async(request).await {
+        let (stream, _response) = match crate::conn::connect(request).await {
             Ok(ok) => ok,
-            Err(err) => {
+            Err(reason) => {
                 // The classification only: the error can carry the request,
                 // and the request the ticket.
-                let reason = classify_handshake(&err);
                 tracing::warn!(target: "atlas_comms::org_agent", "handshake failed: {reason:?}");
                 return (reason, false);
             }

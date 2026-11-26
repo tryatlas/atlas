@@ -27,6 +27,8 @@ use atlas_engine_utils_pty::SpawnedProcess;
 use atlas_engine_utils_pty::TerminalSize;
 use atlas_engine_utils_pty::WindowsTtyInputNormalizer;
 use std::collections::HashMap;
+use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 use std::ptr;
 use std::sync::Arc;
@@ -56,13 +58,13 @@ struct LegacyProcessHandles {
     writer_handle: tokio::task::JoinHandle<()>,
     hpc: Option<HANDLE>,
     conpty_owner: Option<ConptyInstance>,
-    token_handle: HANDLE,
+    token_handle: OwnedHandle,
     desktop: Option<LaunchDesktop>,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_legacy_process(
-    h_token: HANDLE,
+    h_token: OwnedHandle,
     command: &[String],
     cwd: &Path,
     env_map: &HashMap<String, String>,
@@ -76,7 +78,7 @@ fn spawn_legacy_process(
 ) -> Result<LegacyProcessHandles> {
     let (pi, job, output_join, writer_handle, hpc, conpty_owner, desktop) = if tty {
         let (pi, mut conpty) = spawn_conpty_process_as_user(
-            h_token,
+            h_token.as_raw_handle() as HANDLE,
             command,
             cwd,
             env_map,
@@ -96,7 +98,7 @@ fn spawn_legacy_process(
         (pi, job, output_join, writer_handle, hpc, Some(conpty), None)
     } else {
         let pipe_handles = spawn_process_with_pipes(
-            h_token,
+            h_token.as_raw_handle() as HANDLE,
             command,
             cwd,
             env_map,
@@ -389,7 +391,7 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
         mut conpty_owner,
         token_handle,
         desktop,
-    } = match spawn_legacy_process(
+    } = spawn_legacy_process(
         security.h_token,
         &command,
         cwd,
@@ -401,15 +403,7 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
         stderr_rx.as_ref().map(|(tx, _rx)| tx.clone()),
         writer_rx,
         common.logs_base_dir.as_deref(),
-    ) {
-        Ok(handles) => handles,
-        Err(err) => {
-            unsafe {
-                CloseHandle(security.h_token);
-            }
-            return Err(err);
-        }
-    };
+    )?;
     let hpc_handle = hpc.map(|hpc| Arc::new(StdMutex::new(Some(hpc))));
 
     let process_handle = Arc::new(StdMutex::new(Some(pi.hProcess)));
@@ -436,11 +430,7 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
             let _ = guard.take();
         }
         drop(conpty_owner.take());
-        unsafe {
-            if token_handle != 0 && token_handle != INVALID_HANDLE_VALUE {
-                CloseHandle(token_handle);
-            }
-        }
+        drop(token_handle);
         finalize_exit(
             exit_tx,
             wait_handle,

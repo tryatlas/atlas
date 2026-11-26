@@ -18,6 +18,9 @@ interface KnowledgeGraphState {
 }
 
 let unlisten: UnlistenFn | null = null;
+/** Bumped by every `unbind`. A `bind` whose `listen` resolves after a newer
+ *  bind/unbind disposes its own listener instead of leaking it. */
+let bindingGeneration = 0;
 
 async function fetchGraph(projectPath: string): Promise<ProjectGraph> {
   try {
@@ -36,27 +39,34 @@ const store = create<KnowledgeGraphState>()((set, get) => ({
       // flashing "Loading…" on a tab re-open) but listen fresh.
       if (get().projectPath === projectPath && unlisten) return;
       get().actions.unbind();
+      const binding = bindingGeneration;
       set({ projectPath, graph: null });
+      const current = () => binding === bindingGeneration && get().projectPath === projectPath;
 
-      // Kick off the initial fetch + subscribe in parallel so the
-      // listener catches any save events that fire mid-load.
-      unlisten = await listen<{ projectPath: string }>(
+      // Subscribe before the initial fetch so the listener catches any
+      // save events that fire mid-load.
+      const off = await listen<{ projectPath: string }>(
         "atlas:knowledge:links-changed",
         async (event) => {
-          const current = get().projectPath;
-          if (!current || event.payload?.projectPath !== current) return;
-          const next = await fetchGraph(current);
+          if (!current() || event.payload?.projectPath !== projectPath) return;
+          const next = await fetchGraph(projectPath);
           // Bail if the project changed under us mid-fetch.
-          if (get().projectPath !== current) return;
+          if (!current()) return;
           set({ graph: next });
         },
-      );
+      ).catch(() => null);
+      if (binding !== bindingGeneration) {
+        off?.();
+        return;
+      }
+      unlisten = off;
 
       const initial = await fetchGraph(projectPath);
-      if (get().projectPath !== projectPath) return;
+      if (!current()) return;
       set({ graph: initial });
     },
     unbind: () => {
+      bindingGeneration += 1;
       if (unlisten) {
         unlisten();
         unlisten = null;

@@ -23,6 +23,11 @@ pub struct AcpSession {
     /// not necessarily the turn it was set for.
     pub cancel_signal: CancelSignal,
     pub session_modes: Option<Arc<Mutex<acp::SessionModeState>>>,
+    /// The config option the modes came from, when the agent expressed them
+    /// as a `category: "mode"` select rather than a `modes` field: a pick is
+    /// then applied the way the agent said it is set, with
+    /// `session/set_config_option` on this option (#35).
+    pub modes_from_config: Option<acp::SessionConfigId>,
     pub config_options: Option<ConfigOptions>,
     /// How many handles are open on this session. `close_session` only reaches
     /// the wire when this hits zero.
@@ -124,13 +129,67 @@ impl CancelProbe {
     }
 }
 
-/// A session whose `session/load` or `session/new` RPC is still in flight.
+/// A session whose `session/load` or `session/resume` RPC is still in flight.
 ///
 /// Its own ref count is the source of truth while the load runs, because the
 /// `sessions` entry is pre-registered before the RPC resolves and would
 /// otherwise be double-counted.
 pub struct PendingAcpSession {
     pub ref_count: usize,
+    /// How the load ended, for every open that joined it (#9). `None` while
+    /// it runs; a dropped sender is a load that was abandoned.
+    outcome: tokio::sync::watch::Sender<Option<LoadOutcome>>,
+}
+
+/// What a joined load hands its joiners: the thread, or why there is none.
+pub type LoadOutcome = Result<Arc<Mutex<AcpThread>>, Arc<str>>;
+
+/// Tells every open that joined a load how it ended. Dropped unused, the
+/// joiners hear that the load was abandoned.
+pub struct LoadAnnouncer(tokio::sync::watch::Sender<Option<LoadOutcome>>);
+
+impl LoadAnnouncer {
+    pub fn announce(self, outcome: LoadOutcome) {
+        self.0.send_replace(Some(outcome));
+    }
+}
+
+/// The most updates kept for sessions the agent named before its
+/// `session/new` answer arrived (#12). A bound, not a budget: an agent says a
+/// handful of things about a session before announcing it.
+const MAX_PARKED_UPDATES: usize = 256;
+
+/// Updates for a session Atlas does not know yet, kept while a `session/new`
+/// is in flight — the session they name may be the one it is about to answer
+/// with.
+#[derive(Default)]
+struct ParkedUpdates {
+    new_sessions_in_flight: usize,
+    updates: Vec<acp::SessionNotification>,
+}
+
+/// One `session/new` in flight; see [`SessionRegistry::new_session_in_flight`].
+pub struct NewSessionInFlight(Arc<SessionRegistry>);
+
+impl Drop for NewSessionInFlight {
+    fn drop(&mut self) {
+        let mut parked = self
+            .0
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        parked.new_sessions_in_flight = parked.new_sessions_in_flight.saturating_sub(1);
+        if parked.new_sessions_in_flight == 0 {
+            // Nobody is about to claim what is left: those sessions are
+            // unknown for good.
+            for update in parked.updates.drain(..) {
+                tracing::warn!(
+                    "dropped a session update for unknown session {:?}",
+                    update.session_id
+                );
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -221,6 +280,12 @@ impl SessionDirectories {
 pub struct SessionRegistry {
     sessions: Mutex<HashMap<acp::SessionId, AcpSession>>,
     pending: Mutex<HashMap<acp::SessionId, PendingAcpSession>>,
+    parked: Mutex<ParkedUpdates>,
+    /// Execute tool calls the agent asked the user about through
+    /// `session/request_permission` and was allowed, per session, with the
+    /// turn they were allowed in (#28). A `terminal/create` in that turn
+    /// spends one instead of asking the user a second time.
+    granted_executions: Mutex<HashMap<acp::SessionId, (u32, Vec<acp::ToolCallId>)>>,
 }
 
 impl SessionRegistry {
@@ -268,6 +333,10 @@ impl SessionRegistry {
     }
 
     pub fn remove(&self, session_id: &acp::SessionId) -> Option<AcpSession> {
+        self.granted_executions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
         self.sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -309,24 +378,45 @@ impl SessionRegistry {
     }
 
     pub fn pending_acquire(&self, session_id: &acp::SessionId) -> bool {
+        self.pending_join(session_id).is_some()
+    }
+
+    /// Joins the load in flight for this session, if there is one: adds a
+    /// handle to it and hands back where its outcome will be announced.
+    pub fn pending_join(
+        &self,
+        session_id: &acp::SessionId,
+    ) -> Option<tokio::sync::watch::Receiver<Option<LoadOutcome>>> {
         let mut pending = self
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match pending.get_mut(session_id) {
-            Some(entry) => {
-                entry.ref_count += 1;
-                true
-            }
-            None => false,
-        }
+        let entry = pending.get_mut(session_id)?;
+        entry.ref_count += 1;
+        Some(entry.outcome.subscribe())
     }
 
     pub fn pending_begin(&self, session_id: acp::SessionId) {
         self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(session_id, PendingAcpSession { ref_count: 1 });
+            .insert(
+                session_id,
+                PendingAcpSession {
+                    ref_count: 1,
+                    outcome: tokio::sync::watch::channel(None).0,
+                },
+            );
+    }
+
+    /// Ends the load in flight: its handle count, and the announcer its
+    /// joiners are waiting on.
+    pub fn pending_finish(&self, session_id: &acp::SessionId) -> Option<(usize, LoadAnnouncer)> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id)
+            .map(|pending| (pending.ref_count, LoadAnnouncer(pending.outcome)))
     }
 
     pub fn pending_take(&self, session_id: &acp::SessionId) -> Option<usize> {
@@ -335,6 +425,80 @@ impl SessionRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session_id)
             .map(|pending| pending.ref_count)
+    }
+
+    /// Counts a `session/new` in flight until the guard drops. While any is,
+    /// an update for a session nobody knows is parked rather than dropped: it
+    /// may name the session that request is about to answer with (#12).
+    pub fn new_session_in_flight(self: &Arc<Self>) -> NewSessionInFlight {
+        self.parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .new_sessions_in_flight += 1;
+        NewSessionInFlight(self.clone())
+    }
+
+    /// Keeps an update for a session not known yet: `false` (and the update
+    /// dropped) when no `session/new` is in flight, or the bound is reached.
+    pub fn park_update(&self, update: acp::SessionNotification) -> bool {
+        let mut parked = self
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if parked.new_sessions_in_flight == 0 || parked.updates.len() >= MAX_PARKED_UPDATES {
+            return false;
+        }
+        parked.updates.push(update);
+        true
+    }
+
+    /// The parked updates for one session, oldest first, taken.
+    pub fn take_parked(&self, session_id: &acp::SessionId) -> Vec<acp::SessionNotification> {
+        let mut parked = self
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (taken, kept) = std::mem::take(&mut parked.updates)
+            .into_iter()
+            .partition(|update| &update.session_id == session_id);
+        parked.updates = kept;
+        taken
+    }
+
+    /// Records that the user allowed an execute tool call the agent asked
+    /// about, in `turn`. A grant from an earlier turn is gone.
+    pub fn grant_execution(
+        &self,
+        session_id: &acp::SessionId,
+        turn: u32,
+        tool_call_id: acp::ToolCallId,
+    ) {
+        let mut granted = self
+            .granted_executions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = granted
+            .entry(session_id.clone())
+            .or_insert_with(|| (turn, Vec::new()));
+        if entry.0 != turn {
+            *entry = (turn, Vec::new());
+        }
+        entry.1.push(tool_call_id);
+    }
+
+    /// Spends one grant made in `turn`, oldest first: whether there was one.
+    pub fn spend_execution_grant(&self, session_id: &acp::SessionId, turn: u32) -> bool {
+        let mut granted = self
+            .granted_executions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match granted.get_mut(session_id) {
+            Some((granted_in, calls)) if *granted_in == turn && !calls.is_empty() => {
+                calls.remove(0);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// `Some(new_count)` when a load is in flight, after decrementing.

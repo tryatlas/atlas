@@ -4,7 +4,7 @@
  * `SessionProjectsContext` hands the chips the session id. Chip node views
  * render inside the editor's React tree, so a provider around the composer
  * reaches them. The list itself is in `session-projects-store`, kept current
- * by the composer's history read (`use-live-elsewhere-feed.ts`).
+ * by the composer's history read (`use-session-projects-feed.ts`).
  */
 
 import { createContext, useContext } from "react";

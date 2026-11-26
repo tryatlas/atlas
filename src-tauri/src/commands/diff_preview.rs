@@ -1176,7 +1176,12 @@ pub fn file_patch(
             .and_then(|b| merge_base(cwd, &b))
             // No base, or no common history: the range is the working tree,
             // as `git_diff_preview` reports it.
-            .unwrap_or_else(|| "HEAD".to_string()),
+            .map(Ok)
+            .unwrap_or_else(|| match resolve_head(cwd)? {
+                Head::Commit(sha) => Ok(sha),
+                Head::Unborn => empty_tree(cwd),
+                Head::NotARepo => Err("Not a git repository".into()),
+            })?,
     };
     let ws: &[&str] = if ignore_ws {
         &["--ignore-all-space"]
@@ -1702,14 +1707,11 @@ mod tests {
     }
 
     #[test]
-    fn a_file_patch_git_refuses_is_an_error_not_an_empty_diff() {
-        // No commit yet: the branch range falls back to HEAD, which does
-        // not resolve, so git exits non-zero with nothing on stdout.
+    fn a_branch_file_patch_in_an_unborn_repository_uses_the_empty_tree() {
         let r = Repo::new("file-patch-err");
         r.write("a.ts", "a\n");
-        let err = file_patch(&r.0, SourceKind::BranchRange, None, "a.ts", None, false)
-            .expect_err("a failed diff is not a clean file");
-        assert!(err.starts_with("git diff"), "{err}");
+        let patch = file_patch(&r.0, SourceKind::BranchRange, None, "a.ts", None, false).unwrap();
+        assert!(patch.patch.contains("+a\n"), "{}", patch.patch);
     }
 
     #[test]

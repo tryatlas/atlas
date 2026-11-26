@@ -246,49 +246,7 @@ function ensureGitStatusFreshListener(): void {
   // Streaming output from long git operations (commit hooks today; push/
   // pull progress later). Drives the commit busy state and the live output
   // strip under the commit box.
-  void listen<GitOpEvent>("atlas:git:op", (e) => {
-    const p = e.payload;
-    useGitStore.setState((s) => {
-      switch (p.phase) {
-        case "started":
-          s.activeOp = {
-            opId: p.opId,
-            kind: p.kind,
-            running: true,
-            lines: [],
-            progress: null,
-            error: null,
-          };
-          break;
-        case "output":
-          // One store update per batch, not per line: a pre-push hook's test
-          // run or a big pull's per-file stat is thousands of lines.
-          if (s.activeOp?.opId === p.opId) {
-            const prev = s.activeOp.lines;
-            let seq = prev.length ? prev[prev.length - 1].seq + 1 : 0;
-            const added = p.lines.map((l) => ({ seq: seq++, stream: l.stream, text: l.line }));
-            s.activeOp.lines = prev.concat(added).slice(-OP_LINES_CAP);
-          }
-          break;
-        case "progress":
-          if (s.activeOp?.opId === p.opId) {
-            s.activeOp.progress = { percent: p.percent, title: p.title };
-          }
-          break;
-        case "done":
-          if (s.activeOp?.opId === p.opId) {
-            if (p.ok) {
-              // Success: the refresh + cleared form already signal it.
-              s.activeOp = null;
-            } else {
-              s.activeOp.running = false;
-              s.activeOp.error = p.error ?? null;
-            }
-          }
-          break;
-      }
-    });
-  });
+  void listen<GitOpEvent>("atlas:git:op", (e) => applyGitOpEvent(e.payload));
 
   // Project edits Atlas didn't originate (terminal git, external editor).
   // Editor saves inside Atlas refresh directly (see editor-panel) and don't
@@ -305,6 +263,50 @@ function ensureGitStatusFreshListener(): void {
       const actions = useGitStore.getState().actions;
       void actions.refreshStatusNow(repoPath).catch(() => {});
     }, 120);
+  });
+}
+
+export function applyGitOpEvent(p: GitOpEvent): void {
+  useGitStore.setState((s) => {
+    switch (p.phase) {
+      case "started":
+        s.opsByRepo[p.repo] = {
+          opId: p.opId,
+          kind: p.kind,
+          running: true,
+          lines: [],
+          progress: null,
+          error: null,
+        };
+        break;
+      case "output":
+        // One store update per batch, not per line: a pre-push hook's test
+        // run or a big pull's per-file stat is thousands of lines.
+        if (s.opsByRepo[p.repo]?.opId === p.opId) {
+          const prev = s.opsByRepo[p.repo].lines;
+          let seq = prev.length ? prev[prev.length - 1].seq + 1 : 0;
+          const added = p.lines.map((l) => ({ seq: seq++, stream: l.stream, text: l.line }));
+          s.opsByRepo[p.repo].lines = prev.concat(added).slice(-OP_LINES_CAP);
+        }
+        break;
+      case "progress":
+        if (s.opsByRepo[p.repo]?.opId === p.opId) {
+          s.opsByRepo[p.repo].progress = { percent: p.percent, title: p.title };
+        }
+        break;
+      case "done":
+        if (s.opsByRepo[p.repo]?.opId === p.opId) {
+          if (p.ok) {
+            // Success: the refresh + cleared form already signal it.
+            delete s.opsByRepo[p.repo];
+          } else {
+            s.opsByRepo[p.repo].running = false;
+            s.opsByRepo[p.repo].error = p.error ?? null;
+          }
+        }
+        break;
+    }
+    if (s.repoPath === p.repo) s.activeOp = s.opsByRepo[p.repo] ?? null;
   });
 }
 
@@ -327,6 +329,7 @@ interface GitState {
   inProgress: InProgress | null;
   /** Live streaming git operation (commit with hooks, later push/pull). */
   activeOp: ActiveGitOp | null;
+  opsByRepo: Record<string, ActiveGitOp>;
   /** Typed git error currently shown in the error dialog. */
   errorDialog: GitErrorPayload | null;
   /** Open rebase-or-merge prompt for a diverged pull, if any. */
@@ -411,6 +414,12 @@ interface GitActions {
   };
 }
 
+/** Monotonic id per `git_snapshot` request, so only the newest answer for
+ *  a repository lands — an older snapshot resolving late must not overwrite
+ *  a newer one. */
+let snapshotSeq = 0;
+const latestSnapshot = new Map<string, number>();
+
 export const useGitStore = create<GitState & GitActions>()(
   immer((set, get) => {
     const repo = () => get().repoPath;
@@ -432,6 +441,7 @@ export const useGitStore = create<GitState & GitActions>()(
       tags: [],
       inProgress: null,
       activeOp: null,
+      opsByRepo: {},
       errorDialog: null,
       pullChoice: null,
       autoFetch: {},
@@ -439,25 +449,49 @@ export const useGitStore = create<GitState & GitActions>()(
         loadStatus: async (path) => {
           ensureGitStatusFreshListener();
           set((s) => {
+            if (s.repoPath !== path) {
+              // Switching repositories: drop the previous one's status so its
+              // files and branches are never shown (or acted on) under the new
+              // path, even if this repository's snapshot fails.
+              s.isRepo = false;
+              s.branch = "";
+              s.detached = false;
+              s.branches = [];
+              s.branchesFull = [];
+              s.files = [];
+              s.log = [];
+              s.ahead = 0;
+              s.behind = 0;
+              s.stashes = [];
+              s.remotes = [];
+              s.tags = [];
+              s.inProgress = null;
+            }
             s.loading = true;
             s.repoPath = path;
+            s.activeOp = s.opsByRepo[path] ?? null;
           });
           await get().actions.refresh(path);
           set((s) => {
-            s.loading = false;
+            if (s.repoPath === path) s.loading = false;
           });
         },
         refresh: async (path) => {
           ensureGitStatusFreshListener();
           const p = path ?? get().repoPath;
-          if (!p) return;
+          if (!p || (get().repoPath && get().repoPath !== p)) return;
           // No `loading = true` here — in-place patch, no flicker.
           set((s) => {
             s.repoPath = p;
+            s.activeOp = s.opsByRepo[p] ?? null;
           });
+          const seq = ++snapshotSeq;
+          latestSnapshot.set(p, seq);
           try {
             const snap = await invoke<GitSnapshotWire>("git_snapshot", { path: p });
+            if (latestSnapshot.get(p) !== seq) return;
             set((s) => {
+              if (s.repoPath !== p) return;
               s.isRepo = snap.isRepo;
               s.branch = snap.branch;
               s.detached = snap.detached;
@@ -505,6 +539,7 @@ export const useGitStore = create<GitState & GitActions>()(
           try {
             const entries = await invoke<GitLogEntry[]>("git_log", { path, limit: 100 });
             set((s) => {
+              if (s.repoPath !== path) return;
               s.log = entries;
             });
           } catch {
@@ -517,6 +552,7 @@ export const useGitStore = create<GitState & GitActions>()(
           try {
             const branches = await invoke<GitBranch[]>("git_list_branches", { path: p });
             set((s) => {
+              if (s.repoPath !== p) return;
               s.branches = branches;
             });
           } catch {
@@ -529,6 +565,7 @@ export const useGitStore = create<GitState & GitActions>()(
           try {
             const b = await invoke<BranchInfo[]>("git_branches_full", { path: p });
             set((s) => {
+              if (s.repoPath !== p) return;
               s.branchesFull = b;
             });
           } catch {
@@ -541,6 +578,7 @@ export const useGitStore = create<GitState & GitActions>()(
           try {
             const stashes = await invoke<StashEntry[]>("git_stash_list", { path: p });
             set((s) => {
+              if (s.repoPath !== p) return;
               s.stashes = stashes;
             });
           } catch {
@@ -553,6 +591,7 @@ export const useGitStore = create<GitState & GitActions>()(
           try {
             const remotes = await invoke<RemoteInfo[]>("git_remotes", { path: p });
             set((s) => {
+              if (s.repoPath !== p) return;
               s.remotes = remotes;
             });
           } catch {
@@ -565,6 +604,7 @@ export const useGitStore = create<GitState & GitActions>()(
           try {
             const tags = await invoke<string[]>("git_tags", { path: p });
             set((s) => {
+              if (s.repoPath !== p) return;
               s.tags = tags;
             });
           } catch {
@@ -577,6 +617,7 @@ export const useGitStore = create<GitState & GitActions>()(
           try {
             const ip = await invoke<InProgress>("git_inprogress", { path: p });
             set((s) => {
+              if (s.repoPath !== p) return;
               s.inProgress = ip.merge || ip.rebase || ip.cherryPick || ip.revert ? ip : null;
             });
           } catch {

@@ -1394,6 +1394,7 @@ async fn goal_first_live_thread_appears_in_state_db_thread_list() -> Result<()> 
 }
 
 #[tokio::test]
+#[ignore = "asserts on the upstream analytics uploader, which Atlas removed (tests/engine-no-phone-home.test.ts)"]
 async fn thread_resume_tracks_thread_initialized_analytics() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
@@ -1455,6 +1456,7 @@ async fn thread_resume_tracks_thread_initialized_analytics() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "asserts on the upstream analytics uploader, which Atlas removed (tests/engine-no-phone-home.test.ts)"]
 async fn thread_resume_running_thread_tracks_thread_originator_in_analytics() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
@@ -1956,7 +1958,7 @@ async fn thread_resume_rejects_archived_session_by_id() -> Result<()> {
     assert!(
         message.contains(&format!("session {conversation_id} is archived"))
             && message.contains(&format!(
-                "atlas-agent unarchive {conversation_id}` to unarchive it first"
+                "atlas_engine unarchive {conversation_id}` to unarchive it first"
             )),
         "unexpected resume error: {message}"
     );
@@ -2437,6 +2439,7 @@ async fn thread_goal_set_edits_objective_without_resetting_usage() -> Result<()>
 }
 
 #[tokio::test]
+#[ignore = "asserts on the upstream analytics uploader, which Atlas removed (tests/engine-no-phone-home.test.ts); the goal id it checks is read from the analytics events"]
 async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(vec![
         responses::sse(vec![

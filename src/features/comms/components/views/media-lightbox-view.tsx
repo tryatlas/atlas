@@ -31,6 +31,7 @@ export interface MediaLightboxViewProps {
   /** Ask for another index; the store clamps it. */
   onIndexChange: (index: number) => void;
   onClose: () => void;
+  onSave?: () => void;
 }
 
 /**
@@ -51,6 +52,7 @@ export function MediaLightboxView({
   failed,
   onIndexChange,
   onClose,
+  onSave,
 }: MediaLightboxViewProps) {
   const item = items[index] as LightboxViewItem | undefined;
   const count = items.length;
@@ -94,13 +96,7 @@ export function MediaLightboxView({
           <HintGroup>
             {src && item && (
               <HintItem label="Save a copy">
-                <IconButton
-                  icon={Download}
-                  label="Save a copy"
-                  size="sm"
-                  nativeButton={false}
-                  render={<a href={src} download={item.filename} />}
-                />
+                <IconButton icon={Download} label="Save a copy" size="sm" onClick={onSave} />
               </HintItem>
             )}
             <HintItem label="Close">

@@ -693,7 +693,7 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
                 && span_attr(span, "rpc.method") == Some("turn/start")
                 && span.span_context.trace_id() == remote_trace_id
         }) && spans.iter().any(|span| {
-            span_attr(span, "atlas_agent.op") == Some("turn_input")
+            span_attr(span, "atlas_engine.op") == Some("turn_input")
                 && span.span_context.trace_id() == remote_trace_id
         })
     })
@@ -704,8 +704,8 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
     let core_turn_span = find_span_with_trace(
         &spans,
         remote_trace_id,
-        "atlas-agent.op=turn_input",
-        |span| span_attr(span, "atlas_agent.op") == Some("turn_input"),
+        "atlas_engine.op=turn_input",
+        |span| span_attr(span, "atlas_engine.op") == Some("turn_input"),
     );
 
     assert_eq!(server_request_span.parent_span_id, remote_parent_span_id);

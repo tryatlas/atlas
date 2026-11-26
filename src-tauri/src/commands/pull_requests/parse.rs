@@ -884,6 +884,7 @@ fn to_remarks(comments: &[&Value], reviews: &[&Value]) -> Vec<PrComment> {
                 body: string_or_empty(c, "body"),
                 created_at: text(c, "createdAt")?,
                 edited_at: text(c, "lastEditedAt"),
+                published_at: text(c, "publishedAt"),
                 url: text(c, "url"),
                 path: None,
                 review_state: None,
@@ -907,6 +908,7 @@ fn to_remarks(comments: &[&Value], reviews: &[&Value]) -> Vec<PrComment> {
             body,
             created_at: submitted_at,
             edited_at: text(r, "lastEditedAt"),
+            published_at: text(r, "submittedAt"),
             url: text(r, "url"),
             path: None,
             review_state: state,
@@ -962,6 +964,7 @@ fn to_thread_comment(raw: &Value, viewer: Option<&str>) -> Option<PrThreadCommen
         body: string_or_empty(raw, "body"),
         created_at: text(raw, "createdAt")?,
         edited_at: text(raw, "lastEditedAt"),
+        published_at: text(raw, "publishedAt"),
         url: text(raw, "url"),
         reactions: to_reactions(raw.get("reactionGroups"), viewer),
         can_edit: boolean(raw, "viewerCanUpdate") == Some(true),
@@ -1253,6 +1256,7 @@ pub(crate) fn merge_activity(
                 body: c.body.clone(),
                 created_at: c.created_at.clone(),
                 edited_at: c.edited_at.clone(),
+                published_at: c.published_at.clone(),
                 url: c.url.clone(),
                 path: Some(thread.path.clone()),
                 review_state: None,
@@ -1439,13 +1443,10 @@ fn to_list_entry(node: &Value, viewer: Option<&str>) -> Option<PrListEntry> {
     let number = number(node, "number")?;
     let latest = nodes(node.get("latestReviews"));
     let mut review_logins = Vec::new();
-    let mut team_request = false;
     for request in nodes(node.get("reviewRequests")) {
         let reviewer = request.get("requestedReviewer");
         if let Some(login) = trimmed(reviewer.and_then(|r| r.get("login"))) {
             review_logins.push(login);
-        } else if trimmed(reviewer.and_then(|r| r.get("slug"))).is_some() {
-            team_request = true;
         }
     }
     // The head commit's rollup enum, dressed as a nameless check so it is
@@ -1478,9 +1479,8 @@ fn to_list_entry(node: &Value, viewer: Option<&str>) -> Option<PrListEntry> {
         created_at: string_or_empty(node, "createdAt"),
         updated_at: string_or_empty(node, "updatedAt"),
         merged_at: text(node, "mergedAt"),
-        viewer_review_requested: team_request
-            || viewer_lower
-                .is_some_and(|v| review_logins.iter().any(|l| l.to_ascii_lowercase() == v)),
+        viewer_review_requested: viewer_lower
+            .is_some_and(|v| review_logins.iter().any(|l| l.to_ascii_lowercase() == v)),
         labels: to_labels(node.get("labels")),
         review_decision: to_review_decision_with_reviews(node.get("reviewDecision"), &latest),
         checks_state: rollup_checks_state(&rollup_refs),

@@ -390,6 +390,8 @@ impl crate::FsmonitorProbeRunner for LocalFsmonitorProbeRunner<'_> {
         // worktree or index, so do not reduce the requested command's timeout.
         let mut command = Command::new(self.git);
         command
+            .env_clear()
+            .envs(atlas_engine_protocol::shell_environment::host_environment())
             .args(["-c", crate::SAFE_BARE_REPOSITORY_CONFIG])
             .args(args)
             .current_dir(self.cwd);
@@ -416,6 +418,8 @@ pub(crate) async fn run_git_command_with_timeout_from(
 ) -> Option<std::process::Output> {
     let mut command = Command::new(git);
     command
+        .env_clear()
+        .envs(atlas_engine_protocol::shell_environment::host_environment())
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(["-c", crate::SAFE_BARE_REPOSITORY_CONFIG])
         // Keep internal Git commands independent of repository-selected hooks
@@ -946,13 +950,13 @@ mod tests {
     #[test]
     fn canonicalize_git_remote_url_normalizes_github_variants() {
         for remote in [
-            "git@github.com:OpenAI/Atlas Agent.git",
+            "git@github.com:OpenAI/Atlas-Agent.git",
             "ssh://git@github.com/openai/atlas-agent.git",
-            "ssh://git@github.com:22/OpenAI/Atlas Agent.git",
-            "https://github.com/openai/codex.git",
-            "https://github.com:443/openai/codex.git",
-            "https://token@github.com/openai/codex/",
-            "github.com/OpenAI/Atlas Agent.git",
+            "ssh://git@github.com:22/OpenAI/Atlas-Agent.git",
+            "https://github.com/openai/atlas-agent.git",
+            "https://github.com:443/openai/atlas-agent.git",
+            "https://token@github.com/openai/atlas-agent/",
+            "github.com/OpenAI/Atlas-Agent.git",
         ] {
             assert_eq!(
                 canonicalize_git_remote_url(remote),

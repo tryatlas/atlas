@@ -4,6 +4,7 @@ import { DEFAULT_KEYBINDINGS_FILE } from "../lib/types";
 
 const api = vi.hoisted(() => ({
   exists: false,
+  writable: true,
   saved: [] as KeybindingsFile[],
 }));
 
@@ -13,6 +14,7 @@ vi.mock("../lib/keybindings-api", () => ({
     path: "/tmp/keybindings.json",
     exists: api.exists,
     warnings: [],
+    writable: api.writable,
   }),
   saveKeybindings: async (file: KeybindingsFile) => {
     api.saved.push(file);
@@ -27,10 +29,13 @@ const active = () => {
   return file.profiles.find((p) => p.id === file.activeProfileId)!;
 };
 
-beforeEach(() => {
+beforeEach(async () => {
+  await actions().retrySave();
   api.exists = false;
+  api.writable = true;
   api.saved = [];
-  useKeybindingsStore.setState({ file: DEFAULT_KEYBINDINGS_FILE, firstRun: false });
+  await actions().load();
+  useKeybindingsStore.setState({ file: DEFAULT_KEYBINDINGS_FILE, firstRun: false, writable: true });
 });
 
 describe("first run", () => {
@@ -119,5 +124,31 @@ describe("editing the built-in Default", () => {
     actions().setProfilePreset("default", "zed");
     expect(active().builtIn).toBeUndefined();
     expect(active().basedOn).toBe("zed");
+  });
+});
+
+describe("unreadable file recovery", () => {
+  it("never writes fallback defaults after an unreadable load, including forced onboarding", async () => {
+    api.writable = false;
+    api.exists = true;
+    await actions().load();
+    actions().setBinding("tabs.close", ["cmd+shift+w"]);
+    await actions().completeOnboarding("zed");
+    await actions().retrySave();
+    expect(api.saved).toEqual([]);
+    expect(useKeybindingsStore.getState().file).toBe(DEFAULT_KEYBINDINGS_FILE);
+    expect(useKeybindingsStore.getState().firstRun).toBe(false);
+    api.writable = true;
+    await actions().load();
+    actions().setBinding("tabs.close", ["cmd+shift+w"]);
+    await actions().retrySave();
+    expect(api.saved).toHaveLength(1);
+    expect(active().bindings["tabs.close"]).toEqual(["cmd+shift+w"]);
+  });
+
+  it("keeps the existing binding when a recorded key cannot round-trip", () => {
+    const previous = useKeybindingsStore.getState().file;
+    actions().setBinding("tabs.close", ["cmd+intlbackslash"]);
+    expect(useKeybindingsStore.getState().file).toBe(previous);
   });
 });

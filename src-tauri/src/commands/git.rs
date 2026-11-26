@@ -454,9 +454,18 @@ pub async fn git_branch_compare(path: String) -> Result<GitBranchCompare, String
 }
 
 #[tauri::command]
-pub async fn git_diff_file(path: String, file: String) -> Result<String, String> {
+pub async fn git_diff_file(
+    path: String,
+    file: String,
+    staged: Option<bool>,
+) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
-        let output = git_read(&path, &["diff", "HEAD", "--", &file]).map_err(|e| e.to_string())?;
+        let args = if staged.unwrap_or(false) {
+            vec!["diff", "--cached", "--", &file]
+        } else {
+            vec!["diff", "--", &file]
+        };
+        let output = git_read(&path, &args).map_err(|e| e.to_string())?;
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     })
     .await

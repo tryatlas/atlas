@@ -124,16 +124,43 @@ export interface SpaceEnvelope {
   ev: SpaceBridgeEvent;
 }
 
+export interface SpaceIdentity {
+  accountId: string;
+  orgId: string;
+}
+export interface SpaceOutboxScope extends SpaceIdentity {
+  convId: string;
+  pageId: string;
+}
+export interface SpaceOutboxEntry {
+  id: number;
+  accountId: string;
+  orgId: string;
+  conversationId: string;
+  pageId: string;
+  data: number[];
+}
+
 export const spacesApi = {
   connect: (convId: string) => invoke<void>("spaces_connect", { convId }),
   disconnect: (convId: string) => invoke<void>("spaces_disconnect", { convId }),
   /** The server's `error.detail.reconnect === true` instruction. */
   cycle: (convId: string) => invoke<void>("spaces_cycle", { convId }),
-  sendControl: (convId: string, message: SpaceClientMessage) =>
-    invoke<void>("spaces_send_control", { convId, frame: JSON.stringify(message) }),
+  sendControl: (convId: string, message: SpaceClientMessage, identity?: SpaceIdentity) =>
+    invoke<void>("spaces_send_control", { convId, frame: JSON.stringify(message), ...identity }),
   /** `data` is a base64 binary frame built by `space-wire`. */
-  sendBinary: (convId: string, data: string) =>
-    invoke<void>("spaces_send_binary", { convId, data }),
+  sendBinary: (convId: string, data: string, identity?: SpaceIdentity) =>
+    invoke<void>("spaces_send_binary", { convId, data, ...identity }),
+  outboxSaveSnapshot: (scope: SpaceOutboxScope, data: string) =>
+    invoke<void>("spaces_outbox_save_snapshot", { ...scope, data }),
+  outboxSnapshot: (scope: SpaceOutboxScope) =>
+    invoke<number[] | null>("spaces_outbox_snapshot", { ...scope }),
+  outboxEnqueue: (scope: SpaceOutboxScope, data: string) =>
+    invoke<number>("spaces_outbox_enqueue", { ...scope, data }),
+  outboxLoad: (scope: SpaceOutboxScope) =>
+    invoke<SpaceOutboxEntry[]>("spaces_outbox_load", { ...scope }),
+  outboxAcknowledge: (scope: SpaceOutboxScope, ids: number[]) =>
+    invoke<void>("spaces_outbox_acknowledge", { ...scope, ids }),
   /** REST pre-flight; lazily creates the Space + default page server-side. */
   summary: (convId: string) => invoke<SpaceSummary>("spaces_summary", { convId }),
   /** Hash → reserve → PUT. Resolves only when the object is stored; the

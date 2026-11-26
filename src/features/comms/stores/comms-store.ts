@@ -48,6 +48,7 @@ export interface ComposerState {
   draft: string;
   replyTo: string | null;
   editing: string | null;
+  editBackup?: { draft: string; replyTo: string | null };
   /** Files staged for this message. Server-side they are staged until a send
    *  claims them, so abandoning a draft leaks nothing. */
   attachments: PendingAttachment[];
@@ -87,6 +88,9 @@ let expectation: { orgId: string | null } | null = null;
 /** Monotonic id of the latest `hydrate()`; an older call's snapshot is
  *  discarded when it resolves late, instead of overwriting newer state. */
 let hydrateSeq = 0;
+let workGeneration = 0;
+const conversationRequests = new Map<string, object>();
+const readReceipts = new Map<string, number>();
 
 /** Test seam: the module-level switch state above, reset between cases. */
 export function resetCommsSwitchStateForTests(): void {
@@ -261,6 +265,10 @@ export const useCommsStore = create<CommsState>((set, get) => ({
       // survive this and fire `comms_open_conversation` for a foreign conv
       // id against the new org's socket, up to seven more times.
       cancelAllConvRetries();
+      workGeneration += 1;
+      hydrateSeq += 1;
+      conversationRequests.clear();
+      readReceipts.clear();
       set({
         ...serverOwned(),
         // Org-scoped, but deliberately NOT in serverOwned(): a same-org
@@ -314,6 +322,7 @@ export const useCommsStore = create<CommsState>((set, get) => ({
         // have gaps we cannot see from here.
         const tabs = get().tabs;
         for (const tab of tabs) {
+          if (seq !== hydrateSeq) return;
           if (!tab.convId) continue;
           // A conversation we have never fetched needs the REST page, not a
           // state snapshot: `conversationSnapshot` reads what Rust already
@@ -324,6 +333,7 @@ export const useCommsStore = create<CommsState>((set, get) => ({
           }
           try {
             const win = await comms.conversationSnapshot(tab.convId);
+            if (seq !== hydrateSeq) return;
             set((s) => ({
               messages: {
                 ...s.messages,
@@ -362,6 +372,11 @@ export const useCommsStore = create<CommsState>((set, get) => ({
       // and re-hydrate.
       const currentOrg = state.connection.orgId;
       if (envelope.org && !expectation && currentOrg && envelope.org !== currentOrg) {
+        workGeneration += 1;
+        hydrateSeq += 1;
+        cancelAllConvRetries();
+        conversationRequests.clear();
+        readReceipts.clear();
         activeOrganisationChanged({
           why: "boot-reconciliation",
           from: currentOrg,
@@ -682,15 +697,21 @@ export const useCommsStore = create<CommsState>((set, get) => ({
 
     beginEdit: (convId, messageId) =>
       set((s) => {
-        const body = (s.messages[convId] ?? []).find((m) => m.id === messageId)?.body ?? "";
+        const message = (s.messages[convId] ?? []).find((m) => m.id === messageId);
+        if (!message || message.author_id !== s.me || message.deleted) return {};
+        const composer = s.composers[convId] ?? emptyComposer();
         return {
           composers: {
             ...s.composers,
             // Attachments are preserved: editing rewrites the body only, and
             // dropping staged uploads here would silently abandon them.
             [convId]: {
-              ...(s.composers[convId] ?? emptyComposer()),
-              draft: body,
+              ...composer,
+              editBackup: composer.editBackup ?? {
+                draft: composer.draft,
+                replyTo: composer.replyTo,
+              },
+              draft: message.body,
               replyTo: null,
               editing: messageId,
             },
@@ -699,16 +720,15 @@ export const useCommsStore = create<CommsState>((set, get) => ({
       }),
 
     cancelComposerIntent: (convId) =>
-      set((s) => ({
-        composers: {
-          ...s.composers,
-          [convId]: { ...(s.composers[convId] ?? emptyComposer()), replyTo: null, editing: null },
-        },
-      })),
+      set((s) => {
+        const composer = s.composers[convId] ?? emptyComposer();
+        return { composers: { ...s.composers, [convId]: restoreAfterEdit(composer) } };
+      }),
 
     // The optimistic row comes back as `messageAppended`; nothing is built
     // here, so there is one place a message can be described.
     send: (convId) => {
+      const generation = workGeneration;
       const composer = get().composers[convId] ?? emptyComposer();
       const body = composer.draft.trim();
       const ready = composer.attachments
@@ -728,6 +748,7 @@ export const useCommsStore = create<CommsState>((set, get) => ({
       }
       set((s) => ({ composers: { ...s.composers, [convId]: emptyComposer() } }));
       void comms.send(convId, body, composer.replyTo, ready).catch((e) => {
+        if (generation !== workGeneration) return;
         console.warn("comms: send failed:", convId, e);
         // Give the draft back exactly as it was, so a refused send costs
         // a retry rather than a retype.
@@ -736,9 +757,9 @@ export const useCommsStore = create<CommsState>((set, get) => ({
             ...s.composers,
             [convId]: {
               ...(s.composers[convId] ?? emptyComposer()),
-              draft: composer.draft,
+              draft: [composer.draft, s.composers[convId]?.draft].filter(Boolean).join("\n"),
               replyTo: composer.replyTo,
-              attachments: composer.attachments,
+              attachments: [...composer.attachments, ...(s.composers[convId]?.attachments ?? [])],
             },
           },
         }));
@@ -752,7 +773,7 @@ export const useCommsStore = create<CommsState>((set, get) => ({
       if (room <= 0) return;
       for (const path of paths.slice(0, room)) {
         const uploadId = uid();
-        const filename = path.split("/").pop() || path;
+        const filename = path.split(/[\\/]/).pop() || path;
         set((s) => {
           const c = s.composers[convId] ?? emptyComposer();
           return {
@@ -805,16 +826,41 @@ export const useCommsStore = create<CommsState>((set, get) => ({
     },
 
     commitEdit: (convId) => {
+      const generation = workGeneration;
       const composer = get().composers[convId] ?? emptyComposer();
       const target = composer.editing;
       const body = composer.draft.trim();
       if (!target || !body) return;
-      set((s) => ({ composers: { ...s.composers, [convId]: emptyComposer() } }));
-      void comms.edit(target, body).catch(() => {});
+      if (get().connection.state !== "open") {
+        toast.error("Chat is reconnecting. Your edit is kept; try again when connected.");
+        return;
+      }
+      void comms
+        .edit(target, body)
+        .then(() => {
+          if (generation !== workGeneration) return;
+          set((s) =>
+            s.composers[convId] === composer
+              ? { composers: { ...s.composers, [convId]: restoreAfterEdit(composer) } }
+              : {},
+          );
+        })
+        .catch((e) => {
+          if (generation === workGeneration)
+            toast.error(`Could not save the edit: ${sendFailureMessage(e)}`);
+        });
     },
 
-    deleteMessage: (_convId, messageId) => {
-      void comms.delete(messageId).catch(() => {});
+    deleteMessage: (convId, messageId) => {
+      const message = get().messages[convId]?.find((m) => m.id === messageId);
+      if (!message || message.author_id !== get().me || message.deleted) return;
+      if (get().connection.state !== "open") {
+        toast.error("Chat is reconnecting. Try deleting the message when connected.");
+        return;
+      }
+      void comms
+        .delete(messageId)
+        .catch((e) => toast.error(`Could not delete the message: ${sendFailureMessage(e)}`));
     },
 
     react: (messageId, emoji, on) => {
@@ -841,8 +887,13 @@ export const useCommsStore = create<CommsState>((set, get) => ({
     markRead: (convId) => {
       const list = get().messages[convId] ?? [];
       const seq = list[list.length - 1]?.seq;
-      if (seq === undefined) return;
-      void comms.read(convId, seq).catch(() => {});
+      if (seq === undefined || (readReceipts.get(convId) ?? -1) >= seq) return;
+      const generation = workGeneration;
+      readReceipts.set(convId, seq);
+      void comms.read(convId, seq).catch(() => {
+        if (generation === workGeneration && readReceipts.get(convId) === seq)
+          readReceipts.delete(convId);
+      });
     },
 
     joinChannel: (convId) => {
@@ -852,10 +903,13 @@ export const useCommsStore = create<CommsState>((set, get) => ({
     setConvTab: (convId, tab) => set((s) => ({ convTab: { ...s.convTab, [convId]: tab } })),
 
     loadDrafts: async (convId) => {
+      const generation = workGeneration;
       try {
         const list = await comms.drafts(convId);
+        if (generation !== workGeneration) return;
         set((s) => ({ drafts: { ...s.drafts, [convId]: list } }));
       } catch (e) {
+        if (generation !== workGeneration) return;
         // A failed revalidation must not blank a good list — the cached
         // rows stay exactly as they were. Only a conversation that has
         // never loaded settles to an empty answer.
@@ -877,11 +931,13 @@ export const useCommsStore = create<CommsState>((set, get) => ({
     },
 
     loadOlder: async (convId) => {
+      const generation = workGeneration;
       const list = get().messages[convId] ?? [];
       const oldest = list[0]?.seq;
       if (oldest === undefined) return;
       try {
         const page = await comms.loadOlder(convId, oldest);
+        if (generation !== workGeneration) return;
         set((s) => {
           const current = s.messages[convId] ?? [];
           const seen = new Set(current.map((m) => m.id));
@@ -894,6 +950,11 @@ export const useCommsStore = create<CommsState>((set, get) => ({
     },
   },
 }));
+
+function restoreAfterEdit(composer: ComposerState): ComposerState {
+  const { editBackup, ...rest } = composer;
+  return { ...rest, ...(editBackup ?? { replyTo: null }), editing: null };
+}
 
 /**
  * Adopt a window snapshot WITHOUT letting it erase what we hold.
@@ -1015,6 +1076,11 @@ function loadConversation(
   convId: string,
   set: (fn: (s: CommsState) => Partial<CommsState>) => void,
 ): void {
+  const generation = workGeneration;
+  const request = {};
+  conversationRequests.set(convId, request);
+  const current = () =>
+    generation === workGeneration && conversationRequests.get(convId) === request;
   cancelConvRetry(convId);
   set((s) => {
     const { [convId]: _drop, ...rest } = s.loadError;
@@ -1024,6 +1090,7 @@ function loadConversation(
   void comms
     .openConversation(convId)
     .then((win) => {
+      if (!current()) return;
       convAttempts.delete(convId);
       set((s) => ({
         messages: { ...s.messages, [convId]: mergeWindow(s.messages[convId], win.messages ?? []) },
@@ -1034,6 +1101,7 @@ function loadConversation(
       }));
     })
     .catch((e) => {
+      if (!current()) return;
       // Never silent: a swallowed rejection here once hid the entire
       // messages-not-loading class of bug.
       console.warn("comms: open conversation failed:", convId, e);
@@ -1047,6 +1115,7 @@ function loadConversation(
           convId,
           window.setTimeout(
             () => {
+              if (!current()) return;
               convTimers.delete(convId);
               loadConversation(convId, set);
             },

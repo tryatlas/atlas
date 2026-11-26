@@ -80,7 +80,7 @@ fn topic(kind: EntryKind) -> Option<(&'static str, &'static str, &'static str)> 
 /// The mirror's files for the memory in `store`, as `(file, text)`.
 pub fn render_mirror(store: &RecordStore) -> Result<Vec<(&'static str, String)>, String> {
     let e = |e: anyhow::Error| format!("{e:#}");
-    let files = FileResolver::new(store.root());
+    let files = FileResolver::with_worktrees(store.root(), store.scope_dirs());
     let mut entries: Vec<(Entry, Vec<atlas_memory::citation::Citation>)> = Vec::new();
     for entry in store.durable_active().map_err(e)? {
         let checked: Vec<(Validity, atlas_memory::citation::Citation)> = entry

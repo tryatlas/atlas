@@ -94,8 +94,24 @@ impl Default for SharingFile {
 
 // ── Path helpers ─────────────────────────────────────────────────────────────
 
+fn sharing_root(project_path: &str) -> String {
+    static ROOTS: std::sync::LazyLock<Mutex<HashMap<String, String>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut roots = ROOTS.lock();
+    roots
+        .entry(project_path.to_owned())
+        .or_insert_with(|| {
+            let root = atlas_checkpoint::git::scope_root(Path::new(project_path));
+            dunce::canonicalize(&root)
+                .unwrap_or(root)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .clone()
+}
+
 fn atlas_dir(project_path: &str) -> PathBuf {
-    atlas_profile::dir_in(Path::new(project_path))
+    atlas_profile::dir_in(Path::new(&sharing_root(project_path)))
 }
 
 fn sharing_path(project_path: &str) -> PathBuf {
@@ -139,12 +155,11 @@ impl MemorySharingState {
 
     /// Both toggles for `project_path` (cache → file → defaults).
     fn toggles(&self, project_path: &str) -> SharingFile {
-        if let Some(v) = self.toggles.lock().get(project_path) {
-            return *v;
-        }
-        let v = read_sharing_file(project_path);
-        self.toggles.lock().insert(project_path.to_string(), v);
-        v
+        let project_path = sharing_root(project_path);
+        let mut toggles = self.toggles.lock();
+        *toggles
+            .entry(project_path.clone())
+            .or_insert_with(|| read_sharing_file(&project_path))
     }
 
     /// Whether sharing is enabled for `project_path` (default ON).
@@ -191,18 +206,20 @@ impl MemorySharingState {
         project_path: &str,
         change: impl FnOnce(&mut SharingFile),
     ) -> Result<(), String> {
-        let mut file = read_sharing_file(project_path);
+        let project_path = sharing_root(project_path);
+        let mut toggles = self.toggles.lock();
+        let mut file = read_sharing_file(&project_path);
         change(&mut file);
         let payload = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
-        atlas_fs::replace_file(sharing_path(project_path), &payload).map_err(|e| e.to_string())?;
-        self.toggles.lock().insert(project_path.to_string(), file);
+        atlas_fs::replace_file(sharing_path(&project_path), &payload).map_err(|e| e.to_string())?;
+        toggles.insert(project_path, file);
         Ok(())
     }
 }
 
 // ── Tauri commands ───────────────────────────────────────────────────────────
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn memory_sharing_get(
     project_path: String,
     state: State<'_, MemorySharingState>,
@@ -221,7 +238,7 @@ pub fn memory_sharing_set(
 
 /// Whether extraction also reads the sessions imported from outside Atlas
 /// (`.atlas/memory-sharing.json` → `fromExternalSessions`, default false).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn memory_from_external_sessions_get(
     project_path: String,
     state: State<'_, MemorySharingState>,
@@ -238,7 +255,7 @@ pub fn memory_from_external_sessions_set(
     state.set_from_external_sessions(&project_path, enabled)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn memory_summarizer_get(project_path: String) -> Result<SummarizerPref, String> {
     Ok(read_summarizer_pref(&project_path))
 }

@@ -40,7 +40,6 @@ use std::ffi::c_void;
 use std::path::Path;
 use std::path::PathBuf;
 use windows_sys::Win32::Foundation::CloseHandle;
-use windows_sys::Win32::Foundation::HANDLE;
 
 pub(crate) struct SpawnContext {
     pub(crate) permissions: ResolvedWindowsSandboxPermissions,
@@ -63,7 +62,7 @@ pub(crate) struct SpawnPrepOptions {
 }
 
 pub(crate) struct LegacySessionSecurity {
-    pub(crate) h_token: HANDLE,
+    pub(crate) h_token: std::os::windows::io::OwnedHandle,
     pub(crate) readonly_sid: Option<LocalSid>,
     pub(crate) readonly_sid_str: Option<String>,
     pub(crate) write_root_sids: Vec<RootCapabilitySid>,
@@ -175,7 +174,9 @@ pub(crate) fn prepare_legacy_session_security(
     };
 
     Ok(LegacySessionSecurity {
-        h_token,
+        h_token: unsafe {
+            <std::os::windows::io::OwnedHandle as std::os::windows::io::FromRawHandle>::from_raw_handle(h_token as _)
+        },
         readonly_sid,
         readonly_sid_str,
         write_root_sids,

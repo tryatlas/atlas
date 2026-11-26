@@ -272,18 +272,7 @@ function SessionMenuItems({
         Project settings
       </ContextMenuItem>
       <ContextMenuSeparator />
-      {/* ADR-0001 Rule 7: a session another process is still writing is not
-          Atlas's to delete. Say no before the click, not in a toast after. */}
-      <ContextMenuItem
-        variant="destructive"
-        disabled={session.liveElsewhere}
-        title={
-          session.liveElsewhere
-            ? "Still active in another process — close it there first"
-            : undefined
-        }
-        onClick={() => actions.delete(session)}
-      >
+      <ContextMenuItem variant="destructive" onClick={() => actions.delete(session)}>
         <Trash2 />
         Delete…
       </ContextMenuItem>

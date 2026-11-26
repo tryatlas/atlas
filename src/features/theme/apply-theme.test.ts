@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { BUILTIN_THEMES } from "@/dev/mock-backend/fixtures/builtin-themes";
-import { applyTheme, appearanceForMode, resolvedThemeCss } from "./apply-theme";
+import { applyTheme, appearanceForMode, beginThemePreview, resolvedThemeCss } from "./apply-theme";
 
 /** Pretend the OS is asking for a light appearance. */
 function osPrefersLight(light: boolean): void {
@@ -71,6 +71,21 @@ describe("applyTheme and the boot variables", () => {
   const themes = BUILTIN_THEMES;
   const rosePine = themes.find((t) => t.id === "rose-pine")!;
   const boot = () => document.documentElement.style;
+
+  it("keeps a draft visible across normal theme changes without caching the draft", () => {
+    const normal = themes.find((theme) => theme.id !== rosePine.id)!;
+    const release = beginThemePreview(rosePine, "dark");
+    try {
+      applyTheme(normal, "light");
+      expect(document.documentElement.dataset.theme).toBe(rosePine.id);
+      expect(document.documentElement.dataset.themeAppearance).toBe("dark");
+      expect(JSON.parse(localStorage.getItem("atlas:launch-theme")!).id).toBe(normal.id);
+    } finally {
+      release();
+    }
+    applyTheme(normal, "light");
+    expect(document.documentElement.dataset.theme).toBe(normal.id);
+  });
 
   it("refreshes them on every apply, appearance included", () => {
     const dark = applyTheme(rosePine, "dark");

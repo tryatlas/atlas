@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { GitChangedPayload } from "@/features/git/lib/git-changed-events";
+import { isUnderRoot } from "@/lib/file-links";
 
 export interface GitSummary {
   isRepo: boolean;
@@ -29,6 +30,7 @@ interface State {
 // unmounting and remounting (the whole point: don't recompute on every open).
 const fetched = new Set<string>();
 const inflight = new Set<string>();
+const queued = new Set<string>();
 let listenerReady = false;
 
 // Coalesce bursty working-tree edits (every keystroke-save fires the fs
@@ -74,14 +76,17 @@ export const useProjectGitStore = create<State>((set, get) => {
       }
       // Match each touched dir to the project whose root contains it.
       for (const p of fetched) {
-        const hit = e.payload.dirs.some((d) => d === p || d.startsWith(p + "/"));
+        const hit = e.payload.dirs.some((d) => isUnderRoot(d, p));
         if (hit) scheduleRefresh(p, refresh);
       }
     });
   }
 
   async function load(path: string) {
-    if (inflight.has(path)) return;
+    if (inflight.has(path)) {
+      queued.add(path);
+      return;
+    }
     inflight.add(path);
     try {
       const s = await invoke<GitSummary>("git_workspace_summary", { path });
@@ -91,6 +96,7 @@ export const useProjectGitStore = create<State>((set, get) => {
       // Leave it unfetched so a later `ensure` retries.
     } finally {
       inflight.delete(path);
+      if (queued.delete(path)) void load(path);
     }
   }
 

@@ -9,7 +9,6 @@
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { useChatStore, findTabByAcpSession } from "@/features/chat/stores/chat-store";
 import { switchAgentForTab } from "@/features/chat/lib/switch-agent";
-import { isSendHeldElsewhere } from "@/features/chat/stores/live-elsewhere-store";
 import { readArgs, refuse } from "./args";
 import { tabInScope } from "./scope";
 import type { UiActionRequest } from "./types";
@@ -47,16 +46,6 @@ export function performChat(request: UiActionRequest): unknown {
       "ui_chat: you may not send a message in your own chat; use prefill so the user sends it",
     );
   }
-  // ADR-0001 amendment, Rule 7: another process (likely a terminal) is still
-  // writing this session, and a send from here would fork it. Only the user
-  // can choose that ("Send anyway" in the composer). The chat would hold the
-  // message anyway; refusing tells the caller instead of leaving it queued.
-  if (op === "send" && isSendHeldElsewhere(sessions[tabId]?.acpSessionId)) {
-    return refuse(
-      `ui_chat: tab ${tabId}'s session is active in another process (likely a terminal); ` +
-        "sending would fork it. Use prefill and let the user choose Send anyway",
-    );
-  }
   if (isOwn && op === "switch_agent") {
     return refuse("ui_chat: you may not switch the agent of your own chat; ask the user");
   }
@@ -80,7 +69,7 @@ export function performChat(request: UiActionRequest): unknown {
       emitWindowEvent("atlas:chat-send", { tabId, text });
       break;
     case "jump":
-      emitWindowEvent("atlas:chat-jump", { index: index as number });
+      emitWindowEvent("atlas:chat-jump", { tabId, index: index as number });
       break;
     case "switch_agent":
       switchAgentForTab(tabId, agent as string);

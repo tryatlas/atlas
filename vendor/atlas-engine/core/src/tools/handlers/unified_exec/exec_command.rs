@@ -229,7 +229,6 @@ impl ExecCommandHandler {
                 )));
             }
         }
-        let process_id = manager.allocate_process_id().await;
         let resolved_command = get_command(
             &args,
             shell,
@@ -237,6 +236,7 @@ impl ExecCommandHandler {
             turn_environment.config.allow_login_shell,
         )
         .map_err(FunctionCallError::RespondToModel)?;
+        let process_id = manager.allocate_process_id().await;
         let command = resolved_command.command;
         let shell_type = resolved_command.shell_type;
         let command_for_display = atlas_engine_shell_command::parse_command::shlex_join(&command);

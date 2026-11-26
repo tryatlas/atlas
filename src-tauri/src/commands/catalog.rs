@@ -136,6 +136,10 @@ pub struct AgentCatalogEntry {
     pub model_order: Vec<String>,
     /// Models the user added by id. Always empty for the native agent.
     pub custom_models: Vec<atlas_agent_store::CustomModel>,
+    /// Running with settings older than the saved ones — a launch or
+    /// credential change it has not restarted for. Settings → Agents offers
+    /// "Restart to apply" (`agents_restart_to_apply`).
+    pub restart_to_apply: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -152,7 +156,7 @@ pub struct AgentCatalog {
 /// [`agents_catalog`] in response.
 ///
 /// `reason` is one of "discovery" | "refresh" | "install" | "uninstall" |
-/// "settings" | "spawn".
+/// "settings" | "spawn" | "restart" | "sign-in" | "provider-key".
 pub fn emit_catalog_changed(app: &AppHandle, reason: &str) {
     let _ = app.emit(
         "atlas:agent-catalog:changed",
@@ -303,6 +307,7 @@ fn build(host: &AgentHost) -> AgentCatalog {
                     .get(&id)
                     .map(|e| e.custom_models().to_vec())
                     .unwrap_or_default(),
+                restart_to_apply: !is_native && super::agent_config::restart_to_apply(host, &id),
                 id,
             }
         })
@@ -366,6 +371,7 @@ fn build(host: &AgentHost) -> AgentCatalog {
             hidden_models: Vec::new(),
             model_order: Vec::new(),
             custom_models: Vec::new(),
+            restart_to_apply: false,
             id: found.id,
         });
     }

@@ -561,6 +561,7 @@ async fn plugin_install_rejects_invalid_remote_plugin_name() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "asserts on the upstream analytics uploader, which Atlas removed (tests/engine-no-phone-home.test.ts)"]
 async fn plugin_install_tracks_analytics_when_remote_detail_fetch_fails() -> Result<()> {
     let atlas_agent_home = TempDir::new()?;
     let server = MockServer::start().await;
@@ -603,6 +604,7 @@ async fn plugin_install_tracks_analytics_when_remote_detail_fetch_fails() -> Res
 }
 
 #[tokio::test]
+#[ignore = "asserts on the upstream analytics uploader, which Atlas removed (tests/engine-no-phone-home.test.ts)"]
 async fn plugin_install_tracks_analytics_when_remote_install_is_rate_limited() -> Result<()> {
     let atlas_agent_home = TempDir::new()?;
     let server = MockServer::start().await;
@@ -730,16 +732,7 @@ async fn plugin_install_rejects_remote_plugin_disabled_by_admin_before_download(
             .join("plugins/cache/openai-curated-remote/linear")
             .exists()
     );
-    let payload = wait_for_plugin_analytics_payload(&server).await?;
-    let event_params = &payload["events"][0]["event_params"];
-    assert_eq!(
-        payload["events"][0]["event_type"],
-        "atlas_engine_plugin_install_failed"
-    );
-    assert_eq!(event_params["plugin_id"], "linear@openai-curated-remote");
-    assert_eq!(event_params["remote_plugin_id"], REMOTE_PLUGIN_ID);
-    assert_eq!(event_params["error_type"], "remote_plugin_not_available");
-    assert_eq!(event_params["sub_error_type"], "disabled_by_admin");
+    // Atlas: the analytics uploader is removed, so no analytics event is asserted here.
     Ok(())
 }
 
@@ -779,19 +772,7 @@ async fn plugin_install_rejects_remote_plugin_not_available() -> Result<()> {
         /*expected_count*/ 0,
     )
     .await?;
-    let payload = wait_for_plugin_analytics_payload(&server).await?;
-    let event_params = &payload["events"][0]["event_params"];
-    assert_eq!(
-        payload["events"][0]["event_type"],
-        "atlas_engine_plugin_install_failed"
-    );
-    assert_eq!(event_params["plugin_id"], "linear@openai-curated-remote");
-    assert_eq!(event_params["remote_plugin_id"], REMOTE_PLUGIN_ID);
-    assert_eq!(event_params["error_type"], "remote_plugin_not_available");
-    assert_eq!(
-        event_params["sub_error_type"],
-        "install_policy_not_available"
-    );
+    // Atlas: the analytics uploader is removed, so no analytics event is asserted here.
     Ok(())
 }
 
@@ -897,6 +878,7 @@ async fn plugin_install_returns_invalid_request_for_missing_marketplace_file() -
 }
 
 #[tokio::test]
+#[ignore = "asserts on the upstream analytics uploader, which Atlas removed (tests/engine-no-phone-home.test.ts)"]
 async fn plugin_install_tracks_analytics_when_marketplace_file_cannot_be_read() -> Result<()> {
     let analytics_server = start_analytics_events_server().await?;
     let atlas_agent_home = TempDir::new()?;
@@ -1049,6 +1031,7 @@ async fn plugin_install_returns_invalid_request_for_disallowed_product_plugin() 
 }
 
 #[tokio::test]
+#[ignore = "asserts on the upstream analytics uploader, which Atlas removed (tests/engine-no-phone-home.test.ts)"]
 async fn plugin_install_tracks_analytics_event() -> Result<()> {
     let analytics_server = start_analytics_events_server().await?;
     let atlas_agent_home = TempDir::new()?;
@@ -1115,6 +1098,7 @@ async fn plugin_install_tracks_analytics_event() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "asserts on the upstream analytics uploader, which Atlas removed (tests/engine-no-phone-home.test.ts)"]
 async fn plugin_install_failure_tracks_analytics_event() -> Result<()> {
     let analytics_server = start_analytics_events_server().await?;
     let atlas_agent_home = TempDir::new()?;
@@ -1180,6 +1164,7 @@ async fn plugin_install_failure_tracks_analytics_event() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "asserts on the upstream analytics uploader, which Atlas removed (tests/engine-no-phone-home.test.ts)"]
 async fn plugin_install_tracks_remote_plugin_analytics_event() -> Result<()> {
     let atlas_agent_home = TempDir::new()?;
     let server = MockServer::start().await;
@@ -1295,18 +1280,7 @@ async fn plugin_install_preserves_status_when_remote_bundle_error_body_is_too_la
         /*expected_count*/ 0,
     )
     .await?;
-    let payload = wait_for_plugin_analytics_payload(&server).await?;
-    let event_params = &payload["events"][0]["event_params"];
-    assert_eq!(
-        payload["events"][0]["event_type"],
-        "atlas_engine_plugin_install_failed"
-    );
-    assert_eq!(event_params["plugin_id"], "linear@openai-curated-remote");
-    assert_eq!(event_params["remote_plugin_id"], REMOTE_PLUGIN_ID);
-    assert_eq!(event_params["marketplace_name"], "openai-curated-remote");
-    assert_eq!(event_params["source"], "manual");
-    assert_eq!(event_params["error_type"], "remote_bundle_download_status");
-    assert_eq!(event_params["sub_error_type"], "http_5xx");
+    // Atlas: the analytics uploader is removed, so no analytics event is asserted here.
     assert!(
         !atlas_agent_home
             .path()
@@ -2465,7 +2439,7 @@ async fn start_apps_server(
         )
         .route("/ps/apps/batch", post(batch_apps))
         .with_state(state)
-        .nest_service("/api/atlas-agent/ps/mcp", mcp_service);
+        .nest_service("/api/codex/ps/mcp", mcp_service);
 
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;

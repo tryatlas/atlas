@@ -274,6 +274,10 @@ fn fetch(path: &Path) -> Result<(), GitErrorPayload> {
     )
     .env("GCM_INTERACTIVE", "never")
     .env("SSH_ASKPASS_REQUIRE", "never")
+    .env(
+        "GIT_SSH_COMMAND",
+        "ssh -o BatchMode=yes -o ConnectTimeout=15",
+    )
     .timeout(FETCH_TIMEOUT)
     .run()
     .map(|_| ())

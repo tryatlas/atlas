@@ -142,7 +142,7 @@ pub struct MemoryEngine {
     project_root: PathBuf,
     /// `<project_root>/.atlas/memory/`.
     memory_dir: PathBuf,
-    corpus: corpus::CorpusIndex,
+    corpus: std::sync::Arc<std::sync::Mutex<corpus::CorpusIndex>>,
 }
 
 /// What a corpus health pass did.
@@ -169,15 +169,19 @@ impl MemoryEngine {
                 "corpus index at {} unavailable ({e:#}); using a temp index",
                 memory_dir.display()
             );
-            let fallback =
-                std::env::temp_dir().join(format!("atlas-corpus-{}", std::process::id()));
-            corpus::CorpusIndex::open(&fallback).expect("a corpus index in the temp dir")
+            corpus::CorpusIndex::open_fallback().expect("a private corpus index in the temp dir")
         });
         Self {
             project_root,
             memory_dir,
-            corpus,
+            corpus: std::sync::Arc::new(std::sync::Mutex::new(corpus)),
         }
+    }
+
+    fn corpus(&self) -> std::sync::MutexGuard<'_, corpus::CorpusIndex> {
+        self.corpus
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// On-disk memory dir for this project (`<root>/.atlas/memory/`).
@@ -190,14 +194,15 @@ impl MemoryEngine {
     /// switched embedding models, so the index must move to the new one via
     /// [`reset_index`](Self::reset_index).
     pub fn index_params_match(&self, provider: &MiniLmProvider) -> bool {
-        self.corpus.model() == provider.name() && self.corpus.dims() == provider.dimensions()
+        let corpus = self.corpus();
+        corpus.model() == provider.name() && corpus.dims() == provider.dimensions()
     }
 
     /// Point the index at another embedding model. The docs stay; vectors the
     /// model already cached come back at once, the rest are embedded by the
     /// next pass. Switching back to an earlier model re-embeds nothing.
     pub fn reset_index(&mut self, provider_name: &str, dim: usize) -> anyhow::Result<()> {
-        self.corpus.switch_model(provider_name, dim)?;
+        self.corpus().switch_model(provider_name, dim)?;
         tracing::info!(provider_name, dim, "memory index on a new embedding model");
         Ok(())
     }
@@ -213,7 +218,7 @@ impl MemoryEngine {
     ///
     /// Returns whether the document was indexed at all.
     pub fn evict(&mut self, doc_id: &str) -> anyhow::Result<bool> {
-        self.corpus.evict(doc_id)
+        self.corpus().evict(doc_id)
     }
 
     /// Kept for callers of the file-based index: every write is transactional
@@ -236,14 +241,22 @@ impl MemoryEngine {
 
         // Safety net: the indexer moves the index when the model changes, so
         // this should already hold. Bail rather than mix vector spaces.
-        if provider.dimensions() != self.corpus.dims() {
+        if provider.dimensions() != self.corpus().dims() {
             anyhow::bail!(
                 "embedding dim {} != index dim {} (embedding model changed; reset_index required)",
                 provider.dimensions(),
-                self.corpus.dims()
+                self.corpus().dims()
             );
         }
-        let plan = self.corpus.plan(docs)?;
+        let corpus = self.corpus.clone();
+        let planning_docs = docs.to_vec();
+        let plan = tokio::task::spawn_blocking(move || {
+            corpus
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .plan(&planning_docs)
+        })
+        .await??;
         let by_id: HashMap<&str, &CorpusDoc> = docs.iter().map(|d| (d.id.as_str(), d)).collect();
         let ids: Vec<&String> = plan
             .need_embed
@@ -275,7 +288,15 @@ impl MemoryEngine {
                 ..IndexStats::default()
             });
         }
-        self.corpus.apply(&plan, docs, &fresh)
+        let corpus = self.corpus.clone();
+        let docs = docs.to_vec();
+        tokio::task::spawn_blocking(move || {
+            corpus
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .apply(&plan, &docs, &fresh)
+        })
+        .await?
     }
 
     /// The cached vector for `id` while its indexed content still hashes to
@@ -283,7 +304,7 @@ impl MemoryEngine {
     /// Lets Memory ▸ Graph and the Policy view reuse the index instead of
     /// re-embedding.
     pub fn cached_vector(&self, id: &str, content_hash: &str) -> Option<Vec<f32>> {
-        self.corpus.vector(id, content_hash)
+        self.corpus().vector(id, content_hash)
     }
 
     /// Add docs the caller has already embedded (Memory ▸ Graph embeds what the
@@ -294,11 +315,11 @@ impl MemoryEngine {
         let mut fresh = std::collections::HashMap::new();
         let mut upsert = Vec::with_capacity(docs.len());
         for (doc, vector) in docs {
-            if vector.len() != self.corpus.dims() {
+            if vector.len() != self.corpus().dims() {
                 anyhow::bail!(
                     "embedding dim {} != index dim {}",
                     vector.len(),
-                    self.corpus.dims()
+                    self.corpus().dims()
                 );
             }
             upsert.push(doc.id.clone());
@@ -311,7 +332,7 @@ impl MemoryEngine {
             unchanged: 0,
         };
         let docs: Vec<CorpusDoc> = docs.iter().map(|(d, _)| d.clone()).collect();
-        self.corpus.apply(&plan, &docs, &fresh)?;
+        self.corpus().apply(&plan, &docs, &fresh)?;
         Ok(())
     }
 
@@ -324,19 +345,19 @@ impl MemoryEngine {
         k: usize,
         exclude_corpora: &[&str],
     ) -> anyhow::Result<Vec<(String, f32)>> {
-        let total = self.corpus.len();
+        let corpus = self.corpus();
+        let total = corpus.len();
         // Excluded corpora can dominate the index, so widen the search until
         // `k` eligible hits survive the filter or the whole index has been
         // ranked — rather than always scanning everything.
         let mut fetch = (k * 4).max(32);
         loop {
             let fetch_now = fetch.min(total.max(1));
-            let hits: Vec<(String, f32)> = self
-                .corpus
+            let hits: Vec<(String, f32)> = corpus
                 .search_dense(query, fetch_now)
                 .into_iter()
                 .filter(|(id, _)| {
-                    self.corpus
+                    corpus
                         .corpus_of(id)
                         .is_none_or(|c| !exclude_corpora.contains(&c.as_str()))
                 })
@@ -352,10 +373,11 @@ impl MemoryEngine {
     /// The corpus side of the reconciler: the vector file against the cache,
     /// FTS against the docs, and whether the database was started again.
     pub fn heal(&mut self) -> anyhow::Result<CorpusHealth> {
+        let mut corpus = self.corpus();
         Ok(CorpusHealth {
-            rebuilt_vectors: self.corpus.heal()?,
-            rebuilt_fts: self.corpus.repair_fts()?,
-            recreated: std::mem::take(&mut self.corpus.recreated),
+            rebuilt_vectors: corpus.heal()?,
+            rebuilt_fts: corpus.repair_fts()?,
+            recreated: std::mem::take(&mut corpus.recreated),
         })
     }
 
@@ -446,6 +468,8 @@ mod index_corpus_tests {
         assert_eq!(reopened.cached_vector("note:a", "h_a"), Some(axis(3)));
         let plan = reopened
             .corpus
+            .lock()
+            .unwrap()
             .plan(&[doc("note:a", "Title\n\nbody a", "h_a")])
             .unwrap();
         assert!(plan.upsert.is_empty() && plan.need_embed.is_empty());
@@ -477,18 +501,18 @@ mod index_corpus_tests {
             !engine.evict("shared:fact:45").unwrap(),
             "a second evict has nothing to remove"
         );
-        assert!(engine.corpus.doc("shared:fact:45").is_none());
-        assert!(engine.corpus.search_bm25("QUOKKA", 5).unwrap().is_empty());
+        assert!(engine.corpus().doc("shared:fact:45").is_none());
+        assert!(engine.corpus().search_bm25("QUOKKA", 5).unwrap().is_empty());
         assert!(
-            engine.corpus.doc("shared:fact:44").is_some(),
+            engine.corpus().doc("shared:fact:44").is_some(),
             "the neighbour is untouched"
         );
 
         // And it stays gone, rather than coming back from disk on reopen.
         drop(engine);
         let reopened = MemoryEngine::open(root);
-        assert!(reopened.corpus.doc("shared:fact:45").is_none());
-        assert!(reopened.corpus.doc("shared:fact:44").is_some());
+        assert!(reopened.corpus().doc("shared:fact:45").is_none());
+        assert!(reopened.corpus().doc("shared:fact:44").is_some());
         assert!(reopened
             .search_ids(&axis(2), 1, &[])
             .unwrap()
@@ -519,7 +543,7 @@ mod index_corpus_tests {
             .add_embedded(&[(doc("note:b", "b2", "h3"), axis(9))])
             .unwrap();
         assert_eq!(engine.cached_vector("note:b", "h3"), Some(axis(9)));
-        assert_eq!(engine.corpus.len(), 2);
+        assert_eq!(engine.corpus().len(), 2);
     }
 
     /// Natural-language query over the indexed memory: best first, by doc id,
@@ -596,7 +620,7 @@ mod index_corpus_tests {
                 .is_empty(),
             "no vectors for the new model yet"
         );
-        assert_eq!(engine.corpus.len(), 2, "the docs stay");
+        assert_eq!(engine.corpus().len(), 2, "the docs stay");
         engine.reset_index(PROVIDER_NAME, DIM).unwrap();
         assert_eq!(
             engine.search_ids(&axis(2), 1, &[]).unwrap()[0].0,
@@ -636,7 +660,7 @@ mod index_corpus_tests {
         let stats = rt.block_on(engine.index_corpus(&docs, &provider)).unwrap();
         assert_eq!(stats.added, 2);
         assert_eq!(stats.updated, 0);
-        assert_eq!(engine.corpus.len(), 2);
+        assert_eq!(engine.corpus().len(), 2);
 
         // Re-run unchanged → no add/update, nothing re-embedded.
         let stats2 = rt.block_on(engine.index_corpus(&docs, &provider)).unwrap();
@@ -649,6 +673,6 @@ mod index_corpus_tests {
         let stats3 = rt.block_on(engine.index_corpus(&docs3, &provider)).unwrap();
         assert_eq!(stats3.updated, 1);
         assert_eq!(stats3.deleted, 1);
-        assert_eq!(engine.corpus.len(), 1);
+        assert_eq!(engine.corpus().len(), 1);
     }
 }

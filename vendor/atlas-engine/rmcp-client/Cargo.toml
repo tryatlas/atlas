@@ -50,6 +50,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 sse-stream = "0.2.5"
 thiserror = { workspace = true }
+tempfile = { workspace = true }
 tiny_http = { workspace = true }
 tokio = { workspace = true, features = [
     "io-util",
@@ -71,7 +72,6 @@ atlas-engine-http-client = { workspace = true }
 atlas-engine-utils-cargo-bin = { workspace = true }
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }
-tempfile = { workspace = true }
 wiremock = { workspace = true }
 
 # This test is compiled through `#[path]` inside the inline `oauth::tests` module. Cargo-shear

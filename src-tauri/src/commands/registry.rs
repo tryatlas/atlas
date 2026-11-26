@@ -226,15 +226,27 @@ pub async fn acp_registry_update(agent_id: String, app: AppHandle) -> Result<(),
     while host.agent_turn_running(&agent_id) {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    host.restart_for_update(&agent_id, &version)
-        .map_err(|e| e.to_string())?;
+    if let Err(error) = host.restart_for_update(&agent_id, &version) {
+        let error = error.to_string();
+        emit_agent_update(&app, &agent_id, &version, AgentUpdatePhase::Failed(&error));
+        return Err(error);
+    }
     emit_agent_update(&app, &agent_id, &version, AgentUpdatePhase::Restarting);
     emit_agent_update(&app, &agent_id, &version, AgentUpdatePhase::Installing);
 
     let id = atlas_acp_thread::AgentId::new(agent_id.as_str());
-    let result = host.store().prefetch_update(&id).await;
+    let result = host
+        .store()
+        .prefetch_update(&id)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("{e:#}"));
+    match &result {
+        Ok(()) => emit_agent_update(&app, &agent_id, &version, AgentUpdatePhase::Ready),
+        Err(error) => emit_agent_update(&app, &agent_id, &version, AgentUpdatePhase::Failed(error)),
+    }
     super::catalog::emit_catalog_changed(&app, "update");
-    result.map(|_| ()).map_err(|e| format!("{e:#}"))
+    result
 }
 
 /// Install an agent: write its entry in the installed map.
@@ -281,9 +293,18 @@ async fn install(host: &Arc<AgentHost>, app: &AppHandle, agent_id: &str) -> Resu
             total: None,
         },
     );
-    let entry = AgentServerSettings::registry();
-    let settings = with_entry(host, agent_id, entry);
-    persist(host, &app_data_dir(app), settings).await
+    let _write = settings_write().await;
+    let data_dir = app_data_dir(app);
+    let settings = with_entry(
+        installed_settings(&data_dir).await?,
+        agent_id,
+        with_launch_defaults(
+            agent_id,
+            AgentServerSettings::registry(),
+            seed_conditions(app),
+        ),
+    );
+    persist(host, &data_dir, settings).await
 }
 
 /// Accept a detection: install the copy of the agent the user already has.
@@ -324,17 +345,74 @@ async fn install_detected(
         .into_iter()
         .find(|agent| agent.id == agent_id)
         .ok_or_else(|| format!("{agent_id} was not found on your PATH"))?;
-    let settings = with_entry(host, agent_id, found.install_entry());
-    persist(host, &app_data_dir(app), settings).await
+    let _write = settings_write().await;
+    let data_dir = app_data_dir(app);
+    let settings = with_entry(
+        installed_settings(&data_dir).await?,
+        agent_id,
+        with_launch_defaults(agent_id, found.install_entry(), seed_conditions(app)),
+    );
+    persist(host, &data_dir, settings).await
+}
+
+/// A new entry with its launch defaults written into its Variables, where
+/// the user sees and can change them (`atlas_agent_store::launch_defaults`).
+fn with_launch_defaults(
+    agent_id: &str,
+    mut entry: AgentServerSettings,
+    conditions: atlas_agent_store::SeedConditions,
+) -> AgentServerSettings {
+    atlas_agent_store::launch_defaults::seed(agent_id, &mut entry, conditions);
+    entry
+}
+
+/// The Atlas settings a launch default can be conditional on, as they stand.
+/// Read from the config itself rather than the process-wide mirror, which
+/// may not have been set yet when the boot migration runs.
+pub(crate) fn seed_conditions<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> atlas_agent_store::SeedConditions {
+    let atlas_only_memory = app
+        .try_state::<crate::state::atlas_config::AtlasConfigHandle>()
+        .map_or_else(atlas_agent_servers::atlas_only_memory, |config| {
+            config.lock().effective().atlas_only_memory
+        });
+    atlas_agent_store::SeedConditions { atlas_only_memory }
+}
+
+/// The boot migration: write the launch defaults an installed entry hasn't
+/// had yet (agents installed before defaults were written at install), and
+/// save the map if that changed it. Idempotent, and a default the user has
+/// since deleted stays deleted: each entry records what it was seeded with.
+/// The caller holds a `settings_write` permit.
+pub(crate) async fn seed_installed_launch_defaults(
+    data_dir: &std::path::Path,
+    mut settings: atlas_agent_store::AllAgentServersSettings,
+    conditions: atlas_agent_store::SeedConditions,
+) -> atlas_agent_store::AllAgentServersSettings {
+    if !atlas_agent_store::launch_defaults::seed_all(&mut settings, conditions) {
+        return settings;
+    }
+    let dir = data_dir.to_path_buf();
+    let saved = settings.clone();
+    let written = tauri::async_runtime::spawn_blocking(move || {
+        super::agent_host::save_installed(&dir, &saved)
+    })
+    .await;
+    match written {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(target: "atlas::agents", "saving launch defaults: {e}"),
+        Err(e) => tracing::warn!(target: "atlas::agents", "saving launch defaults: {e}"),
+    }
+    settings
 }
 
 /// The installed map with one entry added or replaced.
 fn with_entry(
-    host: &Arc<AgentHost>,
+    mut settings: atlas_agent_store::AllAgentServersSettings,
     agent_id: &str,
     entry: AgentServerSettings,
 ) -> atlas_agent_store::AllAgentServersSettings {
-    let mut settings = host.store().settings();
     settings.0.insert(agent_id.to_string(), entry);
     settings
 }
@@ -351,11 +429,15 @@ pub async fn acp_registry_uninstall(
     app: AppHandle,
 ) -> Result<(), String> {
     let host = app.state::<Arc<AgentHost>>().inner().clone();
-    let mut settings = host.store().settings();
+    let _write = settings_write().await;
+    let data_dir = app_data_dir(&app);
+    let mut settings = installed_settings(&data_dir).await?;
     let Some(removed) = settings.0.remove(&agent_id) else {
         return Ok(());
     };
-    persist(&host, &app_data_dir(&app), settings).await?;
+    // While it is still installed: the host stops an agent by its entry.
+    stop_for_uninstall(&host, &agent_id);
+    persist(&host, &data_dir, settings).await?;
 
     // Its sensitive variables go with it: a reinstall starts clean, and the
     // keychain keeps nothing for an agent that is gone.
@@ -392,13 +474,17 @@ pub async fn acp_registry_uninstall(
             registry_dir.join(atlas_agent_store::sanitize_path_component(&agent_id)),
             atlas_agent_store::npx_install_dir(&registry_dir, &agent_id),
         ];
-        for dir in dirs {
-            if let Err(e) = std::fs::remove_dir_all(&dir) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(target: "atlas::agents", "purging {}: {e}", dir.display());
+        tauri::async_runtime::spawn_blocking(move || {
+            for dir in dirs {
+                if let Err(e) = std::fs::remove_dir_all(&dir) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(target: "atlas::agents", "purging {}: {e}", dir.display());
+                    }
                 }
             }
-        }
+        })
+        .await
+        .map_err(|e| e.to_string())?;
     }
 
     app.state::<Arc<crate::telemetry::TelemetryClient>>()
@@ -408,6 +494,21 @@ pub async fn acp_registry_uninstall(
         );
     super::catalog::emit_catalog_changed(&app, "uninstall");
     Ok(())
+}
+
+/// End the agent's running turns and its process before it is uninstalled.
+///
+/// Dropping the connection alone left a turn running (audit #68): the
+/// manager forgets its sessions without telling the agent, so the process
+/// worked on headless and the tab kept saying "Working" for an agent the
+/// user had removed. The host's stop cancels every open session's turn
+/// first, tells each tab, and then drops the connection — the same stop a
+/// chat's Stop button makes. An agent that is not running has nothing to
+/// stop.
+fn stop_for_uninstall(host: &AgentHost, agent_id: &str) {
+    if let Err(e) = host.kill_plugin(agent_id) {
+        tracing::warn!(target: "atlas::agents", agent = %agent_id, "stopping before uninstall: {e}");
+    }
 }
 
 /// Metadata for any id the registry knows — the timeline/memory fallback for
@@ -424,7 +525,28 @@ pub fn acp_registry_metadata(
         .map(|agent| entry_view(&agent, &host, &registry_dir))
 }
 
-/// Write the map to disk and push it into the store, in that order.
+static SETTINGS_WRITES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Admit one complete read-modify-persist operation, including async disk I/O.
+pub(crate) async fn settings_write() -> tokio::sync::SemaphorePermit<'static> {
+    SETTINGS_WRITES
+        .acquire()
+        .await
+        .expect("the private settings-write semaphore is never closed")
+}
+
+pub(crate) async fn installed_settings(
+    data_dir: &std::path::Path,
+) -> Result<atlas_agent_store::AllAgentServersSettings, String> {
+    let data_dir = data_dir.to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || super::agent_host::read_installed(&data_dir))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("reading the installed map: {e}"))
+}
+
+/// Write the map to disk and push it into the store, in that order. The caller
+/// holds a settings_write permit from before reading the current settings.
 ///
 /// Disk first: the store rebuild is what makes the agent spawnable, and an
 /// agent that is spawnable now but gone after a restart is worse than one that
@@ -434,8 +556,14 @@ pub(crate) async fn persist(
     data_dir: &std::path::Path,
     settings: atlas_agent_store::AllAgentServersSettings,
 ) -> Result<(), String> {
-    super::agent_host::save_installed(data_dir, &settings)
-        .map_err(|e| format!("writing the installed map: {e}"))?;
+    let data_dir = data_dir.to_path_buf();
+    let saved = settings.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        super::agent_host::save_installed(&data_dir, &saved)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("writing the installed map: {e}"))?;
     host.store().set_settings(settings).await;
     Ok(())
 }
@@ -449,7 +577,7 @@ fn app_data_dir(app: &AppHandle) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::agent_host::{load_installed, test_support::fresh_host};
+    use crate::commands::agent_host::{read_installed, test_support::fresh_host};
 
     fn detected(id: &str, program: &str) -> atlas_agent_store::DetectedAgent {
         atlas_agent_store::DetectedAgent {
@@ -468,7 +596,11 @@ mod tests {
         let (host, dir) = fresh_host();
         host.set_detected_for_tests(vec![detected("found-agent", "/usr/local/bin/found-agent")]);
 
-        let settings = with_entry(&host, "found-agent", host.detected()[0].install_entry());
+        let settings = with_entry(
+            host.store().settings(),
+            "found-agent",
+            host.detected()[0].install_entry(),
+        );
         persist(&host, &dir, settings).await.expect("it installs");
 
         match host.store().settings().0.get("found-agent") {
@@ -490,14 +622,18 @@ mod tests {
     async fn an_install_is_written_to_disk_not_just_to_memory() {
         let (host, dir) = fresh_host();
         assert!(
-            load_installed(&dir).0.is_empty(),
+            read_installed(&dir).unwrap().0.is_empty(),
             "a fresh profile has none"
         );
 
-        let settings = with_entry(&host, "some-agent", AgentServerSettings::registry());
+        let settings = with_entry(
+            host.store().settings(),
+            "some-agent",
+            AgentServerSettings::registry(),
+        );
         persist(&host, &dir, settings).await.expect("it installs");
 
-        let on_disk = load_installed(&dir);
+        let on_disk = read_installed(&dir).unwrap();
         assert!(on_disk.0.contains_key("some-agent"));
         assert!(on_disk.has_registry_agents());
 
@@ -505,8 +641,66 @@ mod tests {
         let mut settings = host.store().settings();
         settings.0.remove("some-agent");
         persist(&host, &dir, settings).await.expect("it uninstalls");
-        assert!(load_installed(&dir).0.is_empty());
+        assert!(read_installed(&dir).unwrap().0.is_empty());
         assert!(host.agent_for("some-agent").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const MEMORY_ON: atlas_agent_store::SeedConditions = atlas_agent_store::SeedConditions {
+        atlas_only_memory: true,
+    };
+
+    /// An install writes the agent's launch defaults into its Variables, keyed
+    /// on the id the install actually has; an agent without any gets none.
+    #[test]
+    fn an_install_writes_the_agents_launch_defaults() {
+        let entry = with_launch_defaults("claude-acp", AgentServerSettings::registry(), MEMORY_ON);
+        assert_eq!(
+            entry.env().get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            super::super::agent_config::AgentLaunch::of(&entry)
+                .variables
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect::<Vec<_>>(),
+            ["ANTHROPIC_API_KEY", "CLAUDE_CODE_DISABLE_AUTO_MEMORY"],
+            "they are ordinary Variables in Settings → Agents"
+        );
+        let entry = with_launch_defaults("some-agent", AgentServerSettings::registry(), MEMORY_ON);
+        assert_eq!(entry, AgentServerSettings::registry());
+    }
+
+    /// The boot migration seeds an existing install once, saves it, and
+    /// leaves a default the user deleted afterwards deleted.
+    #[tokio::test]
+    async fn the_boot_migration_is_idempotent_and_respects_a_deletion() {
+        let (_host, dir) = fresh_host();
+        let old = atlas_agent_store::AllAgentServersSettings(std::collections::HashMap::from([(
+            "claude-acp".to_string(),
+            AgentServerSettings::registry(),
+        )]));
+        super::super::agent_host::save_installed(&dir, &old).unwrap();
+
+        let seeded = seed_installed_launch_defaults(&dir, old, MEMORY_ON).await;
+        assert_eq!(read_installed(&dir).unwrap(), seeded, "it is saved");
+        assert!(seeded["claude-acp"].env().contains_key("ANTHROPIC_API_KEY"));
+
+        let mut edited = seeded.clone();
+        edited
+            .0
+            .get_mut("claude-acp")
+            .unwrap()
+            .user_settings_mut()
+            .env
+            .remove("ANTHROPIC_API_KEY");
+        super::super::agent_host::save_installed(&dir, &edited).unwrap();
+
+        let again = seed_installed_launch_defaults(&dir, edited.clone(), MEMORY_ON).await;
+        assert_eq!(again, edited);
+        assert_eq!(read_installed(&dir).unwrap(), edited);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -517,17 +711,21 @@ mod tests {
     #[tokio::test]
     async fn installing_twice_replaces_the_entry() {
         let (host, dir) = fresh_host();
-        let settings = with_entry(&host, "some-agent", AgentServerSettings::registry());
+        let settings = with_entry(
+            host.store().settings(),
+            "some-agent",
+            AgentServerSettings::registry(),
+        );
         persist(&host, &dir, settings).await.unwrap();
 
         let settings = with_entry(
-            &host,
+            host.store().settings(),
             "some-agent",
             AgentServerSettings::custom("/opt/some-agent", vec![]),
         );
         persist(&host, &dir, settings).await.unwrap();
 
-        let map = load_installed(&dir);
+        let map = read_installed(&dir).unwrap();
         assert_eq!(map.0.len(), 1);
         assert!(matches!(
             map.0.get("some-agent"),
@@ -555,6 +753,69 @@ mod tests {
         assert!(found.is_none());
         assert!(host.agent_for("found-agent").is_err());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit #68: uninstalling an agent dropped its connection and nothing
+    /// else, so a turn running on it was never told to stop: the process kept
+    /// working with nobody left to answer it. The uninstall now cancels it
+    /// first, the way a chat's Stop does.
+    #[tokio::test]
+    async fn uninstalling_cancels_a_running_turn_before_dropping_the_agent() {
+        use crate::commands::agent_host::test_support::ScriptedServer;
+        use crate::commands::agent_host::{Origin, Prompt, SubmitPolicy};
+        use atlas_acp_thread::test_support::FakeConnection;
+
+        let (host, dir) = fresh_host();
+        let agent = ScriptedServer::new(
+            FakeConnection::builder()
+                .agent("some-agent")
+                .session_id("s-running")
+                .hold_prompts()
+                .handle(),
+        );
+        let mut settings = atlas_agent_store::AllAgentServersSettings::default();
+        settings.0.insert(
+            "some-agent".into(),
+            AgentServerSettings::custom("/bin/echo", vec!["acp".into()]),
+        );
+        host.store().set_settings(settings).await;
+        let key = atlas_agent_manager::Agent::Custom {
+            id: atlas_acp_thread::AgentId::new("some-agent"),
+        };
+        let entry = host
+            .manager()
+            .request_connection(key.clone(), agent.clone());
+        let connecting = entry.lock().unwrap().wait_for_connection();
+        connecting.await.expect("the scripted agent connects");
+        let agent_id = host.spawn("some-agent").await.expect("spawn").agent_id;
+        let init = host
+            .new_session(agent_id, std::path::PathBuf::from("/tmp/atlas"), Vec::new())
+            .await
+            .expect("a session opens");
+        host.submit(
+            &init.key,
+            Prompt::default(),
+            Origin::Local,
+            SubmitPolicy::Now,
+        )
+        .expect("send");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !host.agent_turn_running("some-agent") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the turn never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        stop_for_uninstall(&host, "some-agent");
+
+        assert!(agent.fake.cancels() >= 1, "the running turn is cancelled");
+        assert!(
+            host.manager().connected(&key).is_none(),
+            "and the connection is gone"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

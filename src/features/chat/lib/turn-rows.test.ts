@@ -402,6 +402,40 @@ describe("the icon a marker leads with", () => {
   });
 });
 
+describe("the agent's own bookkeeping is recognised by its declared kind (ADR-0002)", () => {
+  // Hidden by the ACP tool kind, never by a title: a title is the agent's
+  // prose, so another agent's "Plan" that ran a command used to vanish.
+  it("hides a call the agent declared `switch_mode`", () => {
+    expect(
+      markers(turn(toolCall({ id: "b", kind: "switch_mode", toolName: "Ready to code?" }))),
+    ).toEqual([]);
+  });
+
+  it("keeps a call whose title merely reads like bookkeeping", () => {
+    const m = markers(
+      turn(toolCall({ kind: "execute", toolName: "Plan", arguments: { command: "make plan" } })),
+    );
+    expect(m).toHaveLength(1);
+    expect(m[0].detail).toBe("make plan");
+    expect(markers(turn(toolCall({ kind: "other", toolName: "TodoWrite" })))).toHaveLength(1);
+  });
+
+  it("keeps a `think` call: a subagent launch detection missed still shows", () => {
+    expect(markers(turn(toolCall({ kind: "think", toolName: "Task" })))).toHaveLength(1);
+  });
+});
+
+describe("an execute call that sent no command", () => {
+  // Its title is prose, not a shell line: parsed, "grep for TODOs" read as a
+  // search for "for" in a folder called "TODOs".
+  it("reads its title verbatim after Ran, unparsed", () => {
+    for (const title of ["grep for TODOs", "head of the log", "find unused exports"]) {
+      const m = markers(turn(toolCall({ kind: "execute", toolName: title, arguments: {} })))[0];
+      expect([m.verb, m.tool, m.detail]).toEqual(["Ran", "run", title]);
+    }
+  });
+});
+
 describe("a shell call is classified by its command, not its tool name", () => {
   // Every one of these is the same `execute` tool. Before the command was
   // parsed they all rendered "Ran" behind one terminal glyph, which is the

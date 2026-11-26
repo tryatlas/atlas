@@ -12,6 +12,7 @@ vi.mock("@tauri-apps/api/core", () => import("@/test/tauri-core"));
 vi.mock("@tauri-apps/api/event", () => import("@/test/tauri-event"));
 
 import type { AgentDelta, SessionMessage } from "@/types/agents";
+import { tauri } from "@/test/tauri-fake";
 import { useChatStore } from "./chat-store";
 
 const TAB = "tab-1";
@@ -43,8 +44,10 @@ beforeEach(() => {
     pendingPermissions: {},
     queues: {},
     queueIds: {},
+    queueContent: {},
     activeSessionId: null,
   });
+  tauri.reset();
   const { actions } = useChatStore.getState();
   actions.createSession(TAB, "atlas-agent");
   actions.setAcpBinding(TAB, AGENT, SESSION, "/tmp/project");
@@ -129,6 +132,69 @@ describe("queue_changed", () => {
     expect(s.queueIds[TAB]).toEqual(["q-1", "q-2", null]);
   });
 
+  it("never trades the whole text it holds for the delta's cut head (ACP audit finding 78)", () => {
+    const long = "y".repeat(3000);
+    const image = { mimeType: "image/png", dataBase64: "iVBO" };
+    // On its way to Rust: the delta lands before the add's id comes back.
+    useChatStore.getState().actions.enqueueMessage(TAB, long, [], "pending:1", [image]);
+    const cut = {
+      id: "q-1",
+      text: long.slice(0, 2048),
+      origin: { kind: "local" as const },
+      truncated: true,
+    };
+    apply({ kind: "queue_changed", ...route, queue: [cut] });
+
+    let s = useChatStore.getState();
+    expect(s.queues[TAB]).toEqual([long]);
+    expect(s.queueIds[TAB]).toEqual(["q-1"]);
+    expect(s.queueContent[TAB]).toEqual([{ text: long, mentions: [], attachments: [image] }]);
+
+    // Every later delta repeats the head; the strip keeps the whole.
+    apply({ kind: "queue_changed", ...route, queue: [cut] });
+    s = useChatStore.getState();
+    expect(s.queues[TAB]).toEqual([long]);
+    // The add's own answer, arriving late, does not double the item.
+    s.actions.setQueueItemId(TAB, "pending:1", "q-1");
+    expect(useChatStore.getState().queues[TAB]).toEqual([long]);
+  });
+
+  it("an add Rust does not list yet stays in the strip", () => {
+    const { actions } = useChatStore.getState();
+    actions.enqueueMessage(TAB, "first", [], "pending:1");
+    actions.enqueueMessage(TAB, "second", [], "pending:2");
+    apply({
+      kind: "queue_changed",
+      ...route,
+      queue: [{ id: "q-1", text: "first", origin: { kind: "local" } }],
+    });
+    const s = useChatStore.getState();
+    expect(s.queues[TAB]).toEqual(["first", "second"]);
+    expect(s.queueIds[TAB]).toEqual(["q-1", "pending:2"]);
+  });
+
+  it("an item only a cut delta told it about is read whole from a snapshot", async () => {
+    const long = "z".repeat(3000);
+    tauri.handleRaw({
+      agents_snapshot_meta: () => ({
+        queue: [{ id: "q-9", text: long, origin: { kind: "remote", id: "user-7" } }],
+      }),
+    });
+    apply({
+      kind: "queue_changed",
+      ...route,
+      queue: [
+        {
+          id: "q-9",
+          text: long.slice(0, 2048),
+          origin: { kind: "remote", id: "user-7" },
+          truncated: true,
+        },
+      ],
+    });
+    await vi.waitFor(() => expect(useChatStore.getState().queues[TAB]).toEqual([long]));
+  });
+
   it("an empty queue clears the strip", () => {
     useChatStore.getState().actions.enqueueMessage(TAB, "x", [], "q-9");
     apply({ kind: "queue_changed", ...route, queue: [] });
@@ -176,5 +242,72 @@ describe("hold_changed and the snapshot's live state", () => {
       pendingPermissions: [{ request_id: "req-1", tool_call: {}, options: [] }],
     });
     expect(useChatStore.getState().pendingPermissions[SESSION]).toHaveLength(1);
+  });
+});
+
+// ACP audit finding 77: Rust's turn controller halts a non-empty queue behind
+// a failed turn. The halt is not on the wire; the window derives it.
+describe("a failed turn's queue halt", () => {
+  const queued = () =>
+    apply({
+      kind: "queue_changed",
+      ...route,
+      queue: [{ id: "q-1", text: "next", origin: { kind: "local" } }],
+    });
+  const running = (turn_seq: number) =>
+    apply({ kind: "status", ...route, status: "running", turn_seq } as AgentDelta);
+  const finished = (stop_reason: string, turn_seq = 1) =>
+    apply({
+      kind: "turn_finished",
+      ...route,
+      stop_reason,
+      turn_seq,
+      started_at_ms: 1,
+    } as AgentDelta);
+  const failed = (turn_seq = 1) =>
+    apply({
+      kind: "turn_failed",
+      ...route,
+      error: "HTTP 429",
+      error_kind: "fatal",
+      turn_seq,
+    } as AgentDelta);
+
+  it("is held after an error with prompts queued, until a turn starts", () => {
+    running(1);
+    queued();
+    failed();
+    expect(session().queueHalted).toBe(true);
+    running(2);
+    expect(session().queueHalted).toBeUndefined();
+  });
+
+  it("is held after a refusal or a cap, but not after a turn that ended well", () => {
+    let seq = 0;
+    for (const reason of ["refusal", "max_tokens", "max_turn_requests"]) {
+      running(++seq);
+      queued();
+      finished(reason, seq);
+      expect(session().queueHalted, reason).toBe(true);
+      apply({ kind: "queue_changed", ...route, queue: [] });
+    }
+    running(++seq);
+    queued();
+    finished("end_turn", seq);
+    expect(session().queueHalted).toBeUndefined();
+  });
+
+  it("is not held when nothing was queued behind the failed turn", () => {
+    running(1);
+    failed();
+    expect(session().queueHalted).toBeUndefined();
+  });
+
+  it("goes when the queue empties", () => {
+    running(1);
+    queued();
+    failed();
+    apply({ kind: "queue_changed", ...route, queue: [] });
+    expect(session().queueHalted).toBeUndefined();
   });
 });

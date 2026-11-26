@@ -99,16 +99,16 @@ pub(crate) fn install_alias(engine_home: &Path, target: &Path) -> io::Result<Pat
 ///
 /// Spawns a process: call it off the async runtime.
 pub(crate) fn bubblewrap_problem() -> Option<String> {
-    let Some(bwrap) = atlas_engine_sandboxing::find_system_bwrap_in_path() else {
+    let Some(bwrap) = atlas_engine_linux_sandbox::preferred_bwrap_path() else {
         return Some(
-            "bubblewrap (bwrap) is not on PATH; the native agent cannot run commands until it \
+            "bubblewrap (bwrap) is unavailable on PATH and in the app bundle; the native agent cannot run commands until it \
              is installed (the distro package is `bubblewrap`)"
                 .to_string(),
         );
     };
     // The same probe CI runs before the sandbox suites: every namespace the
     // sandbox can ask for, networking included.
-    let output = std::process::Command::new(&bwrap)
+    let output = atlas_process::command(&bwrap)
         .args(["--unshare-all", "--ro-bind", "/", "/", "true"])
         .stdin(std::process::Stdio::null())
         .output();

@@ -168,6 +168,63 @@ fn session_touched(
 // ── The core rule ───────────────────────────────────────────────────────────
 
 #[test]
+fn amending_an_old_human_commit_does_not_claim_current_agent_touches() {
+    let fixture = Fixture::new();
+    fixture.write("src/lib.rs", "original");
+    fixture.commit_all_at("base", "2000-01-01T00:00:00Z");
+    fixture.write("src/lib.rs", "human change");
+    fixture.commit_all_at("old human change", "2000-01-02T00:00:00Z");
+    let mut store = fixture.store();
+    fixture.walk(&store);
+    session_wrote(
+        &fixture,
+        &mut store,
+        "current",
+        "src/lib.rs",
+        "agent change",
+        true,
+    );
+    fixture.git(&["commit", "--amend", "--no-edit"]);
+    assert_eq!(fixture.walk(&store).checkpoints_created, 0);
+
+    // The historical amend must not consume the current touch either.
+    fixture.write("src/lib.rs", "agent change");
+    fixture.commit_all("actual agent work");
+    assert_eq!(fixture.walk(&store).checkpoints_created, 1);
+}
+
+#[test]
+fn switching_back_to_an_examined_branch_cannot_claim_new_touches() {
+    let fixture = Fixture::new();
+    fixture.write("src/lib.rs", "base");
+    let base = fixture.commit_all("base");
+    fixture.write("src/lib.rs", "human change");
+    // A future-dated commit makes the test independent of wall-clock seconds:
+    // only the observed ledger, not the timestamp guard, can exclude it.
+    let future = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+    fixture.commit_all_at("human change", &future);
+    let mut store = fixture.store();
+    fixture.walk(&store);
+    fixture.git(&["checkout", "-b", "side", &base]);
+    fixture.write("side.txt", "side");
+    fixture.commit_all_at("side", &future);
+    fixture.walk(&store);
+    session_wrote(
+        &fixture,
+        &mut store,
+        "current",
+        "src/lib.rs",
+        "agent work",
+        true,
+    );
+    fixture.git(&["checkout", "main"]);
+    assert_eq!(fixture.walk(&store).checkpoints_created, 0);
+    fixture.write("src/lib.rs", "agent work");
+    fixture.commit_all("actual agent work");
+    assert_eq!(fixture.walk(&store).checkpoints_created, 1);
+}
+
+#[test]
 fn committing_after_the_agent_modified_an_existing_file_produces_a_checkpoint() {
     let fixture = Fixture::new();
     fixture.write("src/lib.rs", "original");
@@ -1279,6 +1336,7 @@ fn a_commit_the_cursor_already_passed_links_when_evaluated_directly() {
     // turn start. (The link rule refuses commits that predate the Session, so
     // ordering here mirrors production, not convenience.)
     let session_id = session_started(&mut store, "native-late");
+    let unrelated_session = session_started(&mut store, "unrelated-late");
 
     // The agent's command writes and commits in one shell call…
     fixture.write("made.txt", "made by the agent");
@@ -1287,11 +1345,23 @@ fn a_commit_the_cursor_already_passed_links_when_evaluated_directly() {
     let outcome = fixture.walk(&store);
     assert_eq!(outcome.checkpoints_created, 0, "nothing to link yet");
 
+    // Force capture beyond git's one-second timestamp precision. A slow
+    // command or a busy capture worker must not lose the agent's own commit.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
     // Now the touches land (the shell window noticed the moved HEAD)…
     session_touched_existing(
         &mut store,
         fixture.path(),
         &session_id,
+        "made.txt",
+        "made by the agent",
+        false,
+    );
+    session_touched_existing(
+        &mut store,
+        fixture.path(),
+        &unrelated_session,
         "made.txt",
         "made by the agent",
         false,
@@ -1308,6 +1378,7 @@ fn a_commit_the_cursor_already_passed_links_when_evaluated_directly() {
     let created = atlas_checkpoint::link_commits(
         &store,
         WORKSPACE,
+        &session_id,
         fixture.path(),
         std::slice::from_ref(&sha),
         ProjectMode::Local,
@@ -1318,6 +1389,10 @@ fn a_commit_the_cursor_already_passed_links_when_evaluated_directly() {
     let checkpoints = store.checkpoints_for_session(&session_id).expect("query");
     assert_eq!(checkpoints.len(), 1);
     assert_eq!(checkpoints[0].commit_sha, sha);
+    assert!(store
+        .checkpoints_for_session(&unrelated_session)
+        .unwrap()
+        .is_empty());
 }
 
 /// Evaluating a commit twice must not double-link: the first evaluation
@@ -1347,6 +1422,7 @@ fn re_evaluating_the_same_commit_is_idempotent() {
         atlas_checkpoint::link_commits(
             &store,
             WORKSPACE,
+            &session_id,
             fixture.path(),
             std::slice::from_ref(&sha),
             ProjectMode::Local,

@@ -33,7 +33,6 @@ vi.mock("@/features/projects/lib/project-snapshot", () => ({
   restoreSnapshot: () => {},
   evictSnapshot: () => {},
   clearPanelStores: () => {},
-  persistHashOf: () => "",
 }));
 vi.mock("@/features/projects/lib/project-revalidate", () => ({ revalidateProject: () => {} }));
 vi.mock("@/features/projects/lib/agent-activity", () => ({ isProjectRunning: () => false }));

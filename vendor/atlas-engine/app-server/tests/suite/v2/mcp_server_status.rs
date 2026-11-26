@@ -228,8 +228,8 @@ fn assert_dynamic_status(response: &ListMcpServerStatusResponse, process_label: 
 }
 
 #[tokio::test]
-async fn oauth_login_automatically_selects_callback_specific_cimd_without_metadata_issuer()
--> Result<()> {
+async fn oauth_login_registers_atlas_when_cimd_is_advertised_without_metadata_issuer() -> Result<()>
+{
     let responses_server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let base_url = format!("http://{}", listener.local_addr()?);
@@ -285,11 +285,14 @@ async fn oauth_login_automatically_selects_callback_specific_cimd_without_metada
         )
         .route(
             "/register",
-            post(move || {
+            post(move |Json(mut registration): Json<serde_json::Value>| {
                 let registrations = Arc::clone(&registration_count);
                 async move {
                     registrations.fetch_add(1, Ordering::SeqCst);
-                    Json(json!({"client_id": "unexpected-dcr-client"}))
+                    // A registration response includes the accepted metadata,
+                    // notably the redirect URIs used by the token exchange.
+                    registration["client_id"] = json!("atlas-dcr-client");
+                    Json(registration)
                 }
             }),
         )
@@ -356,17 +359,13 @@ async fn oauth_login_automatically_selects_callback_specific_cimd_without_metada
         .collect::<BTreeMap<String, String>>();
     let redirect_uri = parameters["redirect_uri"].clone();
     let mut callback_url = reqwest::Url::parse(&redirect_uri)?;
-    let callback_id = callback_url
-        .path()
-        .strip_prefix("/callback/")
-        .expect("issuerless CIMD should use a resource-specific callback");
-    let client_id = format!("https://chatgpt.com/oauth/codex/{callback_id}/client.json");
+    let client_id = "atlas-dcr-client".to_string();
     assert_eq!(parameters.get("client_id"), Some(&client_id));
     assert_eq!(
         parameters.get("code_challenge_method").map(String::as_str),
         Some("S256")
     );
-    assert_eq!(registrations.load(Ordering::SeqCst), 0);
+    assert_eq!(registrations.load(Ordering::SeqCst), 1);
 
     callback_url
         .query_pairs_mut()
@@ -404,7 +403,7 @@ async fn oauth_login_automatically_selects_callback_specific_cimd_without_metada
             error: None,
         }
     );
-    assert_eq!(registrations.load(Ordering::SeqCst), 0);
+    assert_eq!(registrations.load(Ordering::SeqCst), 1);
 
     let request_id = app_server
         .send_raw_request("config/mcpServer/reload", /*params*/ None)
@@ -449,7 +448,7 @@ async fn oauth_login_automatically_selects_callback_specific_cimd_without_metada
             .expect("MCP startup should use the refreshed token"),
         "Bearer refreshed-cimd-access-token"
     );
-    assert_eq!(registrations.load(Ordering::SeqCst), 0);
+    assert_eq!(registrations.load(Ordering::SeqCst), 1);
 
     oauth_server_handle.abort();
     let _ = oauth_server_handle.await;

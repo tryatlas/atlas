@@ -251,6 +251,10 @@ fn selected_mcp_attribution_does_not_join_an_unrelated_local_summary() {
 #[test]
 fn atlas_apps_mcp_url_for_base_url_uses_plugin_service_paths() {
     assert_eq!(
+        atlas_apps_mcp_url_for_base_url("http://localhost:8080/api/atlas-agent"),
+        "http://localhost:8080/api/atlas-agent/ps/mcp"
+    );
+    assert_eq!(
         atlas_apps_mcp_url_for_base_url("https://chatgpt.com/backend-api"),
         "https://chatgpt.com/backend-api/ps/mcp"
     );

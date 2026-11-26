@@ -430,7 +430,8 @@ async fn classify(status: u16, response: reqwest::Response, what: &str) -> RestE
         409 if code == "limit_reached" => RestError::LimitReached(message),
         409 if code == "rc_no_scope" => RestError::NoScope,
         409 if code == "rc_scope_set" => RestError::ScopeSet,
-        409 => RestError::Closed,
+        409 if code == "rc_closed" => RestError::Closed,
+        409 => RestError::BadRequest(message),
         400 => RestError::BadRequest(message),
         429 => RestError::RateLimited { retry_after },
         _ => RestError::Transport(format!("{what}: the server answered {status}")),
@@ -440,6 +441,40 @@ async fn classify(status: u16, response: reqwest::Response, what: &str) -> RestE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_reconnect_conflict_is_not_reported_as_an_ended_room() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (code, closed) in [("rc_closed", true), ("host_still_connected", false)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let serving = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut chunk = [0; 1024];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0, "request ended before its headers");
+                    head.extend_from_slice(&chunk[..read]);
+                    assert!(head.len() <= 8192, "request headers are bounded");
+                }
+                let body =
+                    serde_json::json!({"error": {"code": code, "message": "try again shortly"}})
+                        .to_string();
+                socket.write_all(format!("HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let response = reqwest::get(url).await.unwrap();
+            let error = classify(409, response, "create room").await;
+            if closed {
+                assert!(matches!(error, RestError::Closed));
+            } else {
+                assert!(
+                    matches!(error, RestError::BadRequest(message) if message == "try again shortly")
+                );
+            }
+            serving.await.unwrap();
+        }
+    }
 
     #[test]
     fn a_create_body_carries_exactly_the_keys_the_server_accepts() {

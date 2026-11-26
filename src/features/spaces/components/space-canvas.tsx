@@ -15,6 +15,9 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { toast } from "sonner";
+import { isLinux } from "@/lib/platform";
+import { clipboardPastePaths } from "@/lib/clipboard-api";
+import { editSpacePage } from "../lib/space-page-edit";
 import { useComposerFileDrop } from "@/features/chat/hooks/use-composer-file-drop";
 import { filesFromClipboard, hasFiles, scratchPathForFile } from "@/lib/scratch-file";
 import {
@@ -319,6 +322,7 @@ function SpaceSurface({
 
   const overlayDown = useCallback(
     (e: React.PointerEvent) => {
+      if (e.button !== 0) return;
       const wrap = wrapperRef.current;
       if (!wrap) return;
       const r = wrap.getBoundingClientRect();
@@ -352,6 +356,7 @@ function SpaceSurface({
 
   const overlayUp = useCallback(
     (e: React.PointerEvent) => {
+      if (e.button !== 0) return;
       const st = dragStart.current;
       dragStart.current = null;
       setPreview(null);
@@ -428,6 +433,8 @@ function SpaceSurface({
   const uploadAndPlace = useCallback(
     async (paths: string[], at: { x: number; y: number }) => {
       if (!editable) return;
+      const target = session.pageTarget();
+      if (!target) return;
       const accepted = paths.filter(isMediaPath);
       if (accepted.length < paths.length) {
         toast(
@@ -443,18 +450,18 @@ function SpaceSurface({
         for (const path of accepted) {
           try {
             const up = await spacesApi.mediaUpload(convId, path);
-            const doc = session.doc.current;
-            if (!doc) return;
-            docAddNode(doc, {
-              kind: "media",
-              x: at.x - MEDIA_SIZE.width / 2 + placed * DROP_STEP,
-              y: at.y - MEDIA_SIZE.height / 2 + placed * DROP_STEP,
-              width: MEDIA_SIZE.width,
-              height: MEDIA_SIZE.height,
-              mediaKind: up.mediaKind,
-              contentHash: up.contentHash,
-              mime: up.mime,
-            });
+            await editSpacePage(target, (doc) =>
+              docAddNode(doc, {
+                kind: "media",
+                x: at.x - MEDIA_SIZE.width / 2 + placed * DROP_STEP,
+                y: at.y - MEDIA_SIZE.height / 2 + placed * DROP_STEP,
+                width: MEDIA_SIZE.width,
+                height: MEDIA_SIZE.height,
+                mediaKind: up.mediaKind,
+                contentHash: up.contentHash,
+                mime: up.mime,
+              }),
+            );
             placed += 1;
           } catch (e) {
             console.error("spaces: media upload failed:", e);
@@ -517,10 +524,9 @@ function SpaceSurface({
           });
         return;
       }
-      if (hasFiles(dt)) {
+      if (isLinux || hasFiles(dt)) {
         e.preventDefault();
-        void spacesApi
-          .clipboardFilePaths()
+        void (isLinux ? clipboardPastePaths() : spacesApi.clipboardFilePaths())
           .then((paths) => {
             if (paths.length > 0) return uploadAndPlace(paths, viewportCentre());
           })
@@ -560,7 +566,7 @@ function SpaceSurface({
   // One glyph for the socket: live, catching up, or refused. `unavailable`
   // is the only state retrying cannot fix.
   const connection = session.meta?.connection ?? "disconnected";
-  const status = linkStatus(connection, ready);
+  const status = linkStatus(connection, ready && !session.pendingUpdates && !session.syncError);
 
   const clearSelection = useCallback(() => {
     setSelectedIds([]);
@@ -626,6 +632,10 @@ function SpaceSurface({
             onPointerDown={overlayDown}
             onPointerMove={overlayMove}
             onPointerUp={overlayUp}
+            onPointerCancel={() => {
+              dragStart.current = null;
+              setPreview(null);
+            }}
           >
             {preview && (
               <div

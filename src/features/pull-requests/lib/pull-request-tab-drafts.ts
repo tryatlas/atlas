@@ -17,6 +17,15 @@ export function watchPullRequestTabDrafts(): void {
     lastTabs = state.tabs;
     const drafts = usePullRequestTabDraftStore.getState();
     if (Object.keys(drafts.drafts).length === 0) return;
-    drafts.actions.prune(new Set(state.tabs.map((tab) => tab.id)));
+    drafts.actions.prune(
+      new Set(
+        [
+          ...state.tabs,
+          ...Object.entries(state.viewsByWs)
+            .filter(([id]) => id !== state.currentViewWsId)
+            .flatMap(([, view]) => view.tabs),
+        ].map((tab) => tab.id),
+      ),
+    );
   });
 }

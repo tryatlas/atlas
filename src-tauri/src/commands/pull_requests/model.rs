@@ -306,6 +306,9 @@ pub struct PrComment {
     pub body: String,
     pub created_at: String,
     pub edited_at: Option<String>,
+    /// When a draft review comment became visible to other reviewers.
+    #[serde(default)]
+    pub published_at: Option<String>,
     pub url: Option<String>,
     pub path: Option<String>,
     /// A review's state (`APPROVED`, `CHANGES_REQUESTED`, …) as the host
@@ -345,6 +348,9 @@ pub struct PrThreadComment {
     pub body: String,
     pub created_at: String,
     pub edited_at: Option<String>,
+    /// When a draft review comment became visible to other reviewers.
+    #[serde(default)]
+    pub published_at: Option<String>,
     pub url: Option<String>,
     pub reactions: Vec<PrReaction>,
     #[serde(default)]

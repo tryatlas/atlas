@@ -423,6 +423,7 @@ export function ArtifactsPanel() {
                             <div style={{ width: CHAT_WIDTH }} className="atlas-split-in h-full">
                               <SessionChatPanel
                                 detail={detail}
+                                entriesReady={!entriesPending && !entriesStreaming}
                                 projectPath={open.projectPath}
                                 remoteProjectId={open.remoteProjectId ?? null}
                                 onClose={() => setChatOpen(false)}

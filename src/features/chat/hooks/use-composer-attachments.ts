@@ -228,7 +228,7 @@ export function useComposerAttachments({
           repo.full_name.replace(/\//g, "-"),
           metaFromSearch(repo),
         );
-        const folderName = dest.split("/").pop() || repo.full_name.replace(/\//g, "-");
+        const folderName = dest.split(/[\\/]/).pop() || repo.full_name.replace(/\//g, "-");
         const mention: MentionRepo = {
           kind: "repo",
           id: dest,

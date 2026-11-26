@@ -7,7 +7,7 @@
 //! request's node id (which never changes), so a burst of writes — ticking
 //! files viewed — does not pay a lookup per press.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::LazyLock;
 
 use parking_lot::Mutex;
@@ -25,7 +25,7 @@ use super::queries as q;
 /// how long either goes unnoticed.
 const REPO_CONTEXT_TTL_MS: i64 = 10 * 60_000;
 const NODE_ID_CACHE_CAPACITY: usize = 128;
-/// Pages walked for review threads, activity remarks and check contexts
+/// Pages walked for review threads and check contexts
 /// before the answer is reported truncated.
 const MAX_PAGES: usize = 10;
 const FILES_VIEWED_MAX_PAGES: usize = 5;
@@ -270,7 +270,8 @@ impl GitHub {
                 json!({ "q": search, "first": rows, "after": query.cursor }),
             )
             .await?;
-        let (entries, next_cursor) = parse::to_list_page(&data, self.ctx.viewer.as_deref());
+        let (mut entries, next_cursor) = parse::to_list_page(&data, self.ctx.viewer.as_deref());
+        self.mark_team_requests(&data, &mut entries).await;
         Ok(PrListResult {
             provider: self.provider(),
             entries,
@@ -337,11 +338,86 @@ impl GitHub {
                 READ_TIMEOUT,
             )
             .await?;
-        Ok(parse::to_entries_by_alias(
-            &data,
-            numbers.len(),
-            self.ctx.viewer.as_deref(),
-        ))
+        let mut entries =
+            parse::to_entries_by_alias(&data, numbers.len(), self.ctx.viewer.as_deref());
+        self.mark_team_requests(&data, &mut entries).await;
+        Ok(entries)
+    }
+
+    /// A team request is not a request of every reader. Verify exact, active
+    /// membership through the host; unavailable membership never grants a badge.
+    async fn mark_team_requests(&self, data: &Value, entries: &mut [PrListEntry]) {
+        let Some(viewer) = self.ctx.viewer.as_deref() else {
+            return;
+        };
+        let mut requests: HashMap<(String, String), HashSet<u64>> = HashMap::new();
+        let rows: Vec<&Value> =
+            if let Some(rows) = data.pointer("/search/nodes").and_then(Value::as_array) {
+                rows.iter().collect()
+            } else {
+                data.get("repository")
+                    .and_then(Value::as_object)
+                    .map(|repo| repo.values().collect())
+                    .unwrap_or_default()
+            };
+        for row in rows {
+            let Some(number) = row.get("number").and_then(Value::as_u64) else {
+                continue;
+            };
+            let Some(reviewers) = row
+                .pointer("/reviewRequests/nodes")
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for reviewer in reviewers {
+                let reviewer = &reviewer["requestedReviewer"];
+                if let (Some(org), Some(slug)) = (
+                    reviewer
+                        .pointer("/organization/login")
+                        .and_then(Value::as_str),
+                    reviewer.get("slug").and_then(Value::as_str),
+                ) {
+                    requests
+                        .entry((org.to_string(), slug.to_string()))
+                        .or_default()
+                        .insert(number);
+                }
+            }
+        }
+        for ((org, slug), numbers) in requests {
+            let mut url = url::Url::parse("https://api.github.com/").expect("fixed URL");
+            url.path_segments_mut().expect("base URL").extend([
+                "orgs",
+                &org,
+                "teams",
+                &slug,
+                "memberships",
+                viewer,
+            ]);
+            let answer = self
+                .gh
+                .rest_get(
+                    url.path().trim_start_matches('/'),
+                    None,
+                    Some(&scope_of(&self.ctx)),
+                    self.allow_reserve(),
+                    READ_TIMEOUT,
+                )
+                .await;
+            let active = answer
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_some_and(|body| body.get("state").and_then(Value::as_str) == Some("active"));
+            if active {
+                for entry in entries
+                    .iter_mut()
+                    .filter(|entry| numbers.contains(&entry.number))
+                {
+                    entry.viewer_review_requested = true;
+                }
+            }
+        }
     }
 
     pub async fn detail(&self, number: u64) -> Result<PrDetail, PrError> {
@@ -443,17 +519,16 @@ impl GitHub {
         let (mut comments_after, mut reviews_after): (Option<String>, Option<String>) =
             (None, None);
         let (mut with_comments, mut with_reviews) = (true, true);
-        for page in 0..MAX_PAGES {
-            if !(with_comments || with_reviews) {
-                break;
-            }
+        let (mut comments_seen, mut reviews_seen) = (HashSet::new(), HashSet::new());
+        let mut first_page = true;
+        while with_comments || with_reviews {
             let data = self
                 .read(
                     q::PULL_REQUEST_ACTIVITY,
                     self.vars(
                         number,
                         json!({
-                            "head": page == 0,
+                            "head": first_page,
                             "withComments": with_comments,
                             "commentsAfter": comments_after,
                             "withReviews": with_reviews,
@@ -463,9 +538,22 @@ impl GitHub {
                 )
                 .await?;
             let read = not_found_or(parse::to_activity_page(&data))?;
-            if page == 0 {
+            if first_page {
                 author = read.author;
                 commits = read.commits;
+            }
+            first_page = false;
+            for (next, seen) in [
+                (&read.next_comments_cursor, &mut comments_seen),
+                (&read.next_reviews_cursor, &mut reviews_seen),
+            ] {
+                if let Some(cursor) = next {
+                    if !seen.insert(cursor.clone()) {
+                        return Err(PrError::failed(
+                            "GitHub repeated a conversation cursor; retry the read.",
+                        ));
+                    }
+                }
             }
             remarks.extend(read.remarks);
             with_comments = with_comments && read.next_comments_cursor.is_some();

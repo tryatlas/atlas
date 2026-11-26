@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Modified by Atlas from upstream OpenAI Codex (Apache-2.0). See CONTEXT.md.
-"""Install a skill from a GitHub repo path into $ATLAS_AGENT_HOME/skills."""
+"""Install a skill from a GitHub repo path into ~/.agents/skills."""
 
 from __future__ import annotations
 
@@ -41,10 +41,6 @@ class Source:
 
 class InstallError(Exception):
     pass
-
-
-def _atlas_agent_home() -> str:
-    return os.environ.get("ATLAS_AGENT_HOME", os.path.expanduser("~/.atlas-agent"))
 
 
 def _tmp_root() -> str:
@@ -242,7 +238,7 @@ def _resolve_source(args: Args) -> Source:
 
 
 def _default_dest() -> str:
-    return os.path.join(_atlas_agent_home(), "skills")
+    return os.path.expanduser("~/.agents/skills")
 
 
 def _parse_args(argv: list[str]) -> Args:

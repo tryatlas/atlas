@@ -77,7 +77,6 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   const { session, variant, handlers, isRenaming } = props;
   const status: SessionRowStatus = resolveSessionRowStatus({
     live: props.live,
-    liveElsewhere: session.liveElsewhere,
     heldWorking: session.heldWorking,
     watching: session.pullRequests.some((p) => p.watching),
   });

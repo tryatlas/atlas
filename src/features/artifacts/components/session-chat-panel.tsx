@@ -31,6 +31,7 @@ export function SessionChatPanel({
   detail,
   projectPath,
   remoteProjectId,
+  entriesReady = true,
   onClose,
 }: {
   detail: Detail;
@@ -38,6 +39,7 @@ export function SessionChatPanel({
   /** The server Project of a shared Session, so a question about a Session
    *  that is not on this machine is grounded on the server's copy. */
   remoteProjectId: string | null;
+  entriesReady?: boolean;
   onClose: () => void;
 }) {
   const sessionId = detail.summary.id;
@@ -80,8 +82,9 @@ export function SessionChatPanel({
   }, [init, byokLoaded, loadByok]);
 
   useEffect(() => {
+    if (!entriesReady) return;
     void open(sessionId, projectPath, defaultScope(detail.entries), remoteProjectId);
-  }, [open, sessionId, projectPath, remoteProjectId]);
+  }, [open, sessionId, projectPath, remoteProjectId, entriesReady]);
 
   /** Only used to decide whether any provider is set up at all — the picker
    *  resolves which one on its own. */
@@ -138,8 +141,9 @@ export function SessionChatPanel({
     updatedLabel: timeAgo(m.updatedAt),
   }));
 
-  const state =
-    configured.length === 0
+  const state = !entriesReady
+    ? "loading"
+    : configured.length === 0
       ? byokLoaded
         ? "needs-key"
         : "loading"
@@ -169,7 +173,7 @@ export function SessionChatPanel({
       ))}
       error={error ?? null}
       composer={
-        configured.length > 0 && thread ? (
+        entriesReady && configured.length > 0 && thread ? (
           <Composer
             thread={thread}
             entries={detail.entries}
@@ -186,9 +190,9 @@ export function SessionChatPanel({
       contentRef={contentRef}
       onScroll={onScroll}
       onSelect={(id) => void select(sessionId, id)}
-      onNew={() => create(sessionId, projectPath, newThreadScope())}
-      onDelete={(id) => void remove(sessionId, id, newThreadScope())}
-      onPickStarter={(q) => thread && void send(thread.id, q)}
+      onNew={() => entriesReady && create(sessionId, projectPath, newThreadScope())}
+      onDelete={(id) => entriesReady && void remove(sessionId, id, newThreadScope())}
+      onPickStarter={(q) => entriesReady && thread && void send(thread.id, q)}
       onOpenSettings={openProviderSettings}
       onClose={onClose}
     />

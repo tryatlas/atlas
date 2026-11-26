@@ -223,10 +223,15 @@ pub(crate) fn detect(input: &str) -> Vec<Region> {
         };
         // A bare `:` after a lone credential word is usually prose — unless the
         // value is quoted, which is the YAML spelling (`password: "hunter2"`);
-        // prose does not quote what follows its colon.
+        // prose does not quote what follows its colon. Two unquoted shapes are
+        // still config rather than prose: a `key: value` line on its own (YAML,
+        // a pasted header block), and a value no sentence would contain, one
+        // mixing letters with digits or symbols (`password: hunter2hunter2`).
         if separator.as_str() == ":"
             && !is_identifier_shaped(key.as_str())
             && !is_quoted(&input[start..end])
+            && !is_config_line(input, key.start(), end)
+            && !mixes_letters_and_symbols(&input[start..end])
         {
             continue;
         }
@@ -247,7 +252,103 @@ pub(crate) fn detect(input: &str) -> Vec<Region> {
         };
         regions.extend(value_region(input, start, end));
     }
+    regions.extend(detect_authorization(input));
     regions
+}
+
+/// Shortest credential taken after a bare `Bearer` outside an `Authorization`
+/// header. Long enough that prose ("the bearer of bad news") never reaches it.
+const MIN_BARE_BEARER_LEN: usize = 16;
+
+/// Shortest credential taken from an `Authorization` header value.
+const MIN_AUTHORIZATION_LEN: usize = 8;
+
+/// The token68 alphabet of RFC 7235, which covers JWTs, base64 and opaque keys.
+const TOKEN68: &str = r"[A-Za-z0-9\-._~+/]+=*";
+
+/// `Authorization: Bearer <token>`, `authorization="Basic <b64>"` and friends.
+/// The header's name is not a credential word and a JWT's dots defeat the
+/// entropy layer, so without this the commonest credential in an agent
+/// transcript, a `curl -H` line, survived whole.
+fn authorization_header() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(&format!(
+            r#"(?i)\b(?:proxy-)?authorization["']?[ \t]*[:=][ \t]*["']?(?:(bearer|basic|token|digest|negotiate)[ \t]+)?({TOKEN68})"#
+        ))
+        .expect("static pattern")
+    })
+}
+
+/// A `Bearer <token>` pair anywhere else: a header split across lines, a log
+/// line, an SDK's debug print.
+fn bearer_scheme() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(&format!(r"(?i)\b(bearer)[ \t]+({TOKEN68})")).expect("static pattern")
+    })
+}
+
+/// The credential half of an HTTP authorization value: the whole token, dots
+/// included, so no fragment of a JWT survives.
+fn detect_authorization(input: &str) -> Vec<Region> {
+    let mut regions = Vec::new();
+    for (pattern, min_len) in [
+        (authorization_header(), MIN_AUTHORIZATION_LEN),
+        (bearer_scheme(), MIN_BARE_BEARER_LEN),
+    ] {
+        for captures in pattern.captures_iter(input) {
+            let Some(value) = captures.get(2) else {
+                continue;
+            };
+            let raw = value.as_str();
+            if raw.len() < min_len || is_numeric(raw) || !is_real_secret_value(raw) {
+                continue;
+            }
+            // Without a scheme the header's value could be prose
+            // ("authorization: required for every route"), so it must look
+            // like a credential on its own.
+            if captures.get(1).is_none() && !mixes_letters_and_symbols(raw) && raw.len() < 20 {
+                continue;
+            }
+            regions.push(Region::new(
+                value.start(),
+                value.end(),
+                Category::CredentialValue,
+            ));
+        }
+    }
+    regions
+}
+
+/// Is `key: value` the whole of its line? Only indentation (or a YAML list
+/// dash) before the key, only whitespace after the value. That is a config
+/// file or a header block; a sentence keeps going.
+fn is_config_line(input: &str, key_start: usize, value_end: usize) -> bool {
+    let line_start = input[..key_start].rfind('\n').map_or(0, |i| i + 1);
+    let before = &input[line_start..key_start];
+    let before_ok = before
+        .trim_start()
+        .trim_start_matches('-')
+        .trim()
+        .is_empty();
+    let rest = &input[value_end..];
+    let line_rest = rest.split('\n').next().unwrap_or("");
+    before_ok && line_rest.trim().is_empty()
+}
+
+/// Does the value mix letters with digits or symbols? A word in a sentence
+/// does not; `hunter2hunter2` and `p@ssw0rd!` do.
+fn mixes_letters_and_symbols(value: &str) -> bool {
+    value.chars().any(|c| c.is_ascii_alphabetic())
+        && value.chars().any(|c| {
+            c.is_ascii_digit()
+                || (c.is_ascii_punctuation()
+                    && !matches!(
+                        c,
+                        '.' | ',' | ';' | '!' | '?' | '-' | '(' | ')' | '\'' | '"'
+                    ))
+        })
 }
 
 /// Vet a matched value and turn it into a region, or decline: too short, purely
@@ -466,6 +567,56 @@ mod tests {
             "max_tokens=4096",
             r#""tokens": 51234"#,
             "request_tokens: 8192.5",
+        ] {
+            assert!(spans(input).is_empty(), "over-redacted: {input}");
+        }
+    }
+
+    #[test]
+    fn a_lone_credential_word_on_its_own_config_line_is_caught() {
+        assert_eq!(spans("password: hunter2hunter2"), vec!["hunter2hunter2"]);
+        assert_eq!(
+            spans("database:\n  user: app\n  password: hunter2hunter2\n"),
+            vec!["hunter2hunter2"]
+        );
+        assert_eq!(spans("  - secret: correcthorse\n"), vec!["correcthorse"]);
+    }
+
+    #[test]
+    fn a_lone_credential_word_before_a_symbol_mixed_value_is_caught_mid_sentence() {
+        assert_eq!(
+            spans("log in with password: hunter2hunter2 and retry"),
+            vec!["hunter2hunter2"]
+        );
+    }
+
+    #[test]
+    fn an_authorization_header_loses_its_whole_token() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJl";
+        for input in [
+            format!("Authorization: Bearer {jwt}"),
+            format!(r#"curl -H "Authorization: Bearer {jwt}" https://x"#),
+            format!("authorization=bearer {jwt}"),
+            format!("sent Bearer {jwt} upstream"),
+        ] {
+            let found = spans(&input);
+            assert!(found.contains(&jwt), "missed: {input} -> {found:?}");
+        }
+        assert_eq!(
+            spans("Authorization: Basic dXNlcjpodW50ZXIy"),
+            vec!["dXNlcjpodW50ZXIy"]
+        );
+    }
+
+    #[test]
+    fn authorization_prose_and_placeholders_are_left_alone() {
+        for input in [
+            "Authorization: Bearer $TOKEN",
+            "Authorization: Bearer <token>",
+            "Authorization: Negotiate ${TICKET}",
+            "authorization: required for every route",
+            "the bearer of bad news",
+            "a bearer token is sent on every call",
         ] {
             assert!(spans(input).is_empty(), "over-redacted: {input}");
         }

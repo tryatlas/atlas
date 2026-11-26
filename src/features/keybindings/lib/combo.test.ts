@@ -159,3 +159,24 @@ describe("ariaKeyShortcut", () => {
     expect(ariaKeyShortcut(label)).toBe(aria);
   });
 });
+
+it("matches and records the typed letter on AZERTY and QWERTZ", () => {
+  const azerty = key({ key: "z", code: "KeyW", ctrlKey: true });
+  expect(matchesCombo(azerty, parseCombo("cmd+z")!, false)).toBe(true);
+  expect(matchesCombo(azerty, parseCombo("cmd+w")!, false)).toBe(false);
+  expect(serializeCombo(comboFromEvent(azerty, false)!)).toBe("cmd+z");
+  expect(
+    matchesCombo(key({ key: "y", code: "KeyZ", ctrlKey: true }), parseCombo("cmd+y")!, false),
+  ).toBe(true);
+});
+it("leaves AltGr and candidate-confirming keys to text input", () => {
+  const altGr = {
+    ...key({ key: "ż", code: "KeyZ", ctrlKey: true, altKey: true }),
+    getModifierState: (name: string) => name === "AltGraph",
+  };
+  expect(matchesCombo(altGr, parseCombo("cmd+alt+z")!, false)).toBe(false);
+  expect(comboFromEvent(altGr, false)).toBeNull();
+  expect(
+    matchesCombo({ ...key({ key: "Enter", code: "Enter" }), keyCode: 229 }, parseCombo("enter")!),
+  ).toBe(false);
+});

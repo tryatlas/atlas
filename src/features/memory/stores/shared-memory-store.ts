@@ -80,7 +80,7 @@ interface SharedMemoryStore {
     previewClaudeImport: () => Promise<ClaudeImportPreview | null>;
     /** Import the previewed lines in `ids`; returns how many were written.
      *  Throws on failure. */
-    importClaude: (ids: string[]) => Promise<number>;
+    importClaude: (ids: string[], offeredIds: string[]) => Promise<number>;
   };
 }
 
@@ -260,10 +260,10 @@ export const useSharedMemoryStore = create<SharedMemoryStore>((set, get) => ({
       if (!projectPath) return null;
       return sharedMemory.previewClaudeImport(projectPath);
     },
-    importClaude: async (ids) => {
+    importClaude: async (ids, offeredIds) => {
       const { projectPath } = get();
       if (!projectPath) return 0;
-      const written = await sharedMemory.confirmClaudeImport(projectPath, ids);
+      const written = await sharedMemory.confirmClaudeImport(projectPath, ids, offeredIds);
       await get().actions.refresh();
       return written;
     },

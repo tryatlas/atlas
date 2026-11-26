@@ -125,6 +125,7 @@ pub fn walk_new_commits(
         // [`RECOVERY_SCAN_LIMIT`] commits would spawn git subprocesses per
         // commit to conclude nothing, on the command path of the enable click.
         // Just start the cursor at HEAD.
+        store.mark_commit_examined(workspace_id, &head)?;
         store.set_commit_cursor(workspace_id, &head, false)?;
         return Ok(WalkOutcome::default());
     }
@@ -141,6 +142,12 @@ pub fn walk_new_commits(
     }
 
     let branch = git::current_branch(repo);
+    let context = LinkContext {
+        branch: branch.as_deref(),
+        mode,
+        walked_workspace: Some(workspace_id),
+        captured_at: None,
+    };
     let mut outcome = WalkOutcome {
         commits_seen: commits.len(),
         cursor_recovered: recovered,
@@ -148,18 +155,16 @@ pub fn walk_new_commits(
     };
 
     for commit in &commits {
-        outcome.checkpoints_created += link_commit(
-            store,
-            repo,
-            commit,
-            &mut candidates,
-            branch.as_deref(),
-            mode,
-        )?;
+        if store.commit_was_examined(workspace_id, commit)? {
+            store.set_commit_cursor(workspace_id, commit, recovered)?;
+            continue;
+        }
+        outcome.checkpoints_created += link_commit(store, repo, commit, &mut candidates, &context)?;
 
         // Advance per commit rather than once at the end: a crash mid-walk then
         // resumes from the last commit whose Checkpoints are durably written,
         // re-processing at most one commit instead of skipping the remainder.
+        store.mark_commit_examined(workspace_id, commit)?;
         store.set_commit_cursor(workspace_id, commit, recovered)?;
     }
 
@@ -197,13 +202,15 @@ fn resolve_range(repo: &Path, cursor: Option<&str>, head: &str) -> (Vec<String>,
 /// can consume that commit before the call's touches are recorded; when the
 /// touches then land, the walk cannot help. Whoever recorded them names the
 /// commits the window saw HEAD move across, and this evaluates exactly those —
-/// same rule, same consumption, no cursor movement.
+/// same rule, same consumption, no cursor movement. Only the Session whose
+/// shell call observed these commits is eligible for this late capture.
 ///
 /// Idempotent by construction: the first evaluation consumes the touches it
 /// settled, so a re-run finds no candidates.
 pub fn link_commits(
     store: &Store,
     workspace_id: &str,
+    session_id: &str,
     repo: &Path,
     commits: &[String],
     mode: ProjectMode,
@@ -212,19 +219,29 @@ pub fn link_commits(
         return Ok(0);
     }
     let mut candidates = store.link_candidates(workspace_id)?;
+    candidates.retain(|candidate| candidate.session_id == session_id);
     let branch = git::current_branch(repo);
+    let context = LinkContext {
+        branch: branch.as_deref(),
+        mode,
+        walked_workspace: None,
+        // The shell can commit before its completion event records the writes.
+        // Their capture timestamp is not the time the files were changed.
+        captured_at: Some(Utc::now()),
+    };
     let mut created = 0;
     for commit in commits {
-        created += link_commit(
-            store,
-            repo,
-            commit,
-            &mut candidates,
-            branch.as_deref(),
-            mode,
-        )?;
+        created += link_commit(store, repo, commit, &mut candidates, &context)?;
     }
     Ok(created)
+}
+
+struct LinkContext<'a> {
+    branch: Option<&'a str>,
+    mode: ProjectMode,
+    walked_workspace: Option<&'a str>,
+    /// Explicit shell capture may arrive after the commit's timestamp.
+    captured_at: Option<chrono::DateTime<Utc>>,
 }
 
 /// Evaluate one commit against every candidate Session.
@@ -238,8 +255,7 @@ fn link_commit(
     repo: &Path,
     commit_sha: &str,
     candidates: &mut [LinkCandidate],
-    branch: Option<&str>,
-    mode: ProjectMode,
+    context: &LinkContext<'_>,
 ) -> Result<usize> {
     if candidates.is_empty() {
         // Nothing can link and nothing can be consumed. Skipping the git reads
@@ -255,8 +271,8 @@ fn link_commit(
     // — which the first-parent walk deliberately skipped — are evaluated here
     // instead, so work committed on a side branch while Atlas was closed and
     // then merged still links, exactly once, at the commit that produced it.
-    // Touch consumption and the `(Session, commit)` key make re-seeing an
-    // already-walked side branch harmless.
+    // Side commits share the same observed ledger as the first-parent walk.
+    // Later touches must not make an already-seen human commit eligible again.
     if info.is_merge() {
         let mut created = 0;
         let first_parent = &info.parents[0];
@@ -265,15 +281,22 @@ fn link_commit(
                 git::merge_side_commits(repo, first_parent, side_parent, RECOVERY_SCAN_LIMIT)
                     .map_err(git_unavailable)?;
             for side in sides {
+                if let Some(workspace) = context.walked_workspace {
+                    if store.commit_was_examined(workspace, &side)? {
+                        continue;
+                    }
+                }
                 let side_info = git::commit_info(repo, &side).map_err(git_unavailable)?;
-                created +=
-                    evaluate_commit(store, repo, &side, &side_info, candidates, branch, mode)?;
+                created += evaluate_commit(store, repo, &side, &side_info, candidates, context)?;
+                if let Some(workspace) = context.walked_workspace {
+                    store.mark_commit_examined(workspace, &side)?;
+                }
             }
         }
         return Ok(created);
     }
 
-    evaluate_commit(store, repo, commit_sha, &info, candidates, branch, mode)
+    evaluate_commit(store, repo, commit_sha, &info, candidates, context)
 }
 
 /// Run the link rule for one non-merge commit, and consume what it settled.
@@ -283,8 +306,7 @@ fn evaluate_commit(
     commit_sha: &str,
     info: &git::CommitInfo,
     candidates: &mut [LinkCandidate],
-    branch: Option<&str>,
-    mode: ProjectMode,
+    context: &LinkContext<'_>,
 ) -> Result<usize> {
     let changed = git::changed_paths(repo, commit_sha).map_err(git_unavailable)?;
     if changed.is_empty() {
@@ -303,11 +325,24 @@ fn evaluate_commit(
         // (`>=` at second granularity: git timestamps have one-second
         // resolution, and a commit made within the Session's starting second is
         // legitimately its work.)
-        if info.commit_time < candidate.started_at.timestamp() {
+        if info.author_time.min(info.commit_time) < candidate.started_at.timestamp() {
             continue;
         }
 
-        let matches = matching_paths(repo, commit_sha, &changed, &candidate.touches);
+        let up_to = context.captured_at.unwrap_or_else(|| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp(
+                info.author_time.min(info.commit_time).saturating_add(1),
+                0,
+            )
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+        });
+        let eligible: Vec<_> = candidate
+            .touches
+            .iter()
+            .filter(|touch| touch.created_at <= up_to)
+            .cloned()
+            .collect();
+        let matches = matching_paths(repo, commit_sha, &changed, &eligible);
         if matches.touched.is_empty() {
             continue;
         }
@@ -324,13 +359,13 @@ fn evaluate_commit(
                 session_id: &candidate.session_id,
                 commit_sha,
                 patch_id: patch.as_deref(),
-                branch,
+                branch: context.branch,
                 git_author_name: Some(info.author_name.as_str()),
                 git_author_email: Some(info.author_email.as_str()),
                 files_touched: &matches.linked,
                 insertions,
                 deletions,
-                sync_state: mode.initial_sync_state(),
+                sync_state: context.mode.initial_sync_state(),
             })?;
             created += 1;
         }
@@ -346,14 +381,14 @@ fn evaluate_commit(
         // commit is later work the commit cannot have settled, and it stays
         // live for the next commit — which is exactly how one Session spanning
         // several commits produces one Checkpoint each. One second of slack
-        // covers git's second-resolution timestamps.
+        // covers git's second-resolution timestamps. A shell call's explicit
+        // capture uses its observation time instead, scoped to that Session,
+        // because the completion event records touches after the commit.
         //
         // Pruned from the in-memory candidate too: this walk's remaining
         // commits share the candidate list, and a backlog walked in one batch
         // (Atlas reopened after days away) must see the same consumption a
         // commit-at-a-time walk would.
-        let up_to = chrono::DateTime::<chrono::Utc>::from_timestamp(info.commit_time + 1, 0)
-            .unwrap_or_else(chrono::Utc::now);
         store.consume_touches(&candidate.session_id, commit_sha, &matches.touched, up_to)?;
         candidate
             .touches

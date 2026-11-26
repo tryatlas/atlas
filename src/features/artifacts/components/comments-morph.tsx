@@ -101,15 +101,19 @@ export const CommentsMorph = memo(function CommentsMorph({
       ...Object.entries(comments.byAnchor).flatMap(([anchorId, list]) =>
         list.map((c) => ({ c, anchorKind: c.anchorKind as string, anchorId })),
       ),
-    ].filter(({ c }) => !c.deletedAt);
+    ];
 
-    const roots = all.filter(({ c }) => !c.parentId);
+    const roots = all.filter(
+      ({ c }) =>
+        !c.parentId &&
+        (!c.deletedAt || all.some(({ c: reply }) => reply.parentId === c.id && !reply.deletedAt)),
+    );
     const q = query.trim().toLowerCase();
     return roots
       .filter(({ c }) => (filter === "open" ? !c.resolvedAt : true))
       .map((row) => ({
         ...row,
-        replies: all.filter(({ c }) => c.parentId === row.c.id),
+        replies: all.filter(({ c }) => c.parentId === row.c.id && !c.deletedAt),
       }))
       .filter(({ c, replies }) => {
         if (!q) return true;
@@ -264,7 +268,7 @@ export const CommentsMorph = memo(function CommentsMorph({
                         </span>
                       </span>
                       <span className="line-clamp-2 text-xs leading-snug text-secondary-foreground">
-                        {c.body ?? ""}
+                        {c.deletedAt ? "Comment deleted" : (c.body ?? "")}
                       </span>
                       <span className="flex items-center justify-between gap-2 text-2xs text-muted-foreground">
                         <span className="flex min-w-0 items-center gap-1">

@@ -10,21 +10,24 @@ import { sessionBind, type BindControl } from "../lib/session-bind";
 export type { BindControl };
 
 /**
- * Give this tab its agent session the first time the tab is on screen.
+ * Give this tab its agent session when its user starts one: by writing in its
+ * composer, or by sending to it.
  *
  * The thin caller of `lib/session-bind.ts`, which is where a bind is carried
  * out and where its rules are argued. This decides only WHEN: while the tab
- * has a chat session and no agent session, it holds the tab's bind, starts it
- * once the tab is shown, and lets a composer focus or a send ask again.
+ * has a chat session and no agent session, it holds the tab's bind, warms it
+ * (connects the agent, starts no session) once the tab is shown, and starts
+ * it when the composer stops being blank or a message waits on it.
  *
  * A chat panel stays mounted behind whichever tab is showing, and every one
- * of them used to start its session on mount. A launch with six chat tabs
- * therefore spawned six agent sessions in the same 10 ms, each a process of
- * its own for an external agent: most of the machine's cores for a second or
- * two, and memory held for tabs nobody opened. A tab nobody is looking at now
- * waits. Showing it starts the session (1-3 s, behind the empty chat as
- * before), and so does sending to it, which is how a tab opened in the
- * background for a prompt still gets one.
+ * of them used to start its session on mount: six chat tabs, six agent
+ * sessions in the same 10 ms. Then only the tab on screen did, which still
+ * meant a session per launch and per project switched to that nobody asked
+ * for, and an agent that stores every session it opens (opencode) listed each
+ * as an untitled session of its own. Showing a tab is not asking for a
+ * session. Writing is, and it comes before `/`, so the agent's commands are
+ * on their way by the time the slash picker wants them; the connect done on
+ * show leaves that start only `session/new` to wait for.
  *
  * A tab saved with a conversation (`ChatSession.pendingRestore`) gets that
  * conversation back instead of a new session, on the same two triggers
@@ -43,18 +46,18 @@ export function useAgentBind(
   // How many messages wait on this tab's session: a first message held for
   // the bind, and those queued behind it. Someone sent to the tab, shown or
   // not. A count rather than a flag, so that every new one asks again: a start
-  // or restore that failed is retried by the next send, not only by showing
-  // the tab or focusing its composer (audit #57).
+  // or restore that failed is retried by the next send, not only by writing
+  // in its composer (audit #57).
   const waiting = useChatStore(
     (s) => (s.sessions[tabId]?.pendingSend ? 1 : 0) + (s.queues[tabId]?.length ?? 0),
   );
   const pendingRestore = session?.pendingRestore;
   // The agent spawn takes 1–3 s warm and up to 30 s on a cold `npx` cache,
-  // so kicking it off in parallel with the user reading the empty chat
-  // hides the latency. If the user hits Send before the bind lands, the
-  // submit handler queues the message and the drain effect flushes
-  // it once `acpSessionId` is set. Skipped when a session is already bound
-  // (sidebar resume, or a tab re-mount).
+  // so it is started (warmed) while the user reads the empty chat, and the
+  // session itself while they write. If the user hits Send before the bind
+  // lands, the submit handler holds the message and the drain effect
+  // flushes it once `acpSessionId` is set. Skipped when a session is already
+  // bound (sidebar resume, or a tab re-mount).
   useEffect(() => {
     if (!session) return;
     if (session.acpSessionId) return;
@@ -65,7 +68,7 @@ export function useAgentBind(
     if (session.resumePending) return;
     if (pendingRestore) {
       const restore = () => void restoreTabSession(tabId);
-      bindControlRef.current = { retry: restore, abandon: () => {}, kick: restore };
+      bindControlRef.current = { retry: restore, abandon: () => {}, kick: restore, warm: restore };
       // As below: a composer focus asks again after a load that could not start.
       const offFocused = onWindowEvent("atlas:chat-input-focused", (detail) => {
         if (detail?.tabId === tabId) restore();
@@ -76,11 +79,19 @@ export function useAgentBind(
       };
     }
     const bind = sessionBind.attach(tabId);
-    bindControlRef.current = { retry: bind.retry, abandon: bind.abandon, kick: bind.kick };
-    // Focus event acts as a retry — if the initial bind threw (e.g. the
-    // agent process couldn't spawn yet because Claude Code finished
-    // installing mid-session), refocusing the composer will try again.
-    const offChatInputFocused = onWindowEvent("atlas:chat-input-focused", (detail) => {
+    bindControlRef.current = {
+      retry: bind.retry,
+      abandon: bind.abandon,
+      kick: bind.kick,
+      warm: bind.warm,
+    };
+    // Asked for before this attach (the tab switched agent while its start
+    // was under way): carry it on, for the agent the tab is on now.
+    if (bind.wanted()) bind.kick();
+    // The user is writing: the session is wanted now. Also the retry after a
+    // bind that failed (the agent was still installing, say): whatever is
+    // written next asks again (`useChatInputStartedSignal`).
+    const offInputStarted = onWindowEvent("atlas:chat-input-started", (detail) => {
       if (!detail || detail.tabId !== tabId) return;
       if (useChatStore.getState().sessions[tabId]?.acpSessionId) return;
       bind.kick();
@@ -88,7 +99,7 @@ export function useAgentBind(
     return () => {
       bind.detach();
       bindControlRef.current = null;
-      offChatInputFocused();
+      offInputStarted();
     };
     // `!!session` is in the dep list so the bind effect actually
     // fires after the parallel `createSession` effect (chat-panel) flips
@@ -112,16 +123,17 @@ export function useAgentBind(
     pendingRestore,
   ]);
 
-  // Start whatever the effect above holds, once the tab is on screen or has a
-  // message waiting: on the mount of a tab that is showing, when a hidden one
-  // is switched to, and when a hidden one is sent to. The last is not left to
-  // the send's own kick, which finds nothing to kick when the message arrives
-  // before the panel has mounted (a tab opened in the background for a prompt).
+  // Start whatever the effect above holds once a message waits on it, shown
+  // or not: the send's own kick finds nothing to kick when the message
+  // arrives before the panel has mounted (a tab opened in the background for
+  // a prompt). Short of that, a tab on screen is only warmed: its agent is
+  // connected and a saved conversation reloaded, but no new session starts.
   // Declared second so it runs after the hold exists, and on the same
-  // conditions, so a hold that is replaced (an agent switch) is started too.
+  // conditions, so a hold that is replaced (an agent switch) is warmed too.
   // A no-op for a bound tab, and for an attempt already running.
   useEffect(() => {
-    if (shown || waiting > 0) bindControlRef.current?.kick();
+    if (waiting > 0) bindControlRef.current?.kick();
+    else if (shown) bindControlRef.current?.warm();
   }, [
     shown,
     waiting,

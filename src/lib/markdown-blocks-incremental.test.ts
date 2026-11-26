@@ -39,10 +39,12 @@ const DOCS: Record<string, string> = {
 describe("splitIncremental equals a full split at every prefix", () => {
   for (const [name, doc] of Object.entries(DOCS)) {
     it(name, () => {
+      // Carry each prefix forward once. Replaying every earlier prefix inside
+      // this loop is quadratic and checks the identical deterministic states.
+      let carry = EMPTY_SPLIT;
       for (let i = 1; i <= doc.length; i++) {
         const prefix = doc.slice(0, i);
-        let carry = EMPTY_SPLIT;
-        for (let j = 1; j <= i; j++) carry = splitIncremental(doc.slice(0, j), carry);
+        carry = splitIncremental(prefix, carry);
         expect(carry.blocks, `prefix length ${i}: ${JSON.stringify(prefix)}`).toEqual(
           splitTopLevelBlocks(prefix),
         );

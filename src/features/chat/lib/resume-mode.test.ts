@@ -79,8 +79,8 @@ describe("resolveEffectiveMode", () => {
     expect(resolveEffectiveMode(undefined, "default", MODES)).toBe("default");
   });
 
-  it("trusts the pick when the agent advertises no modes at all", () => {
-    expect(resolveEffectiveMode("bypass", null, [])).toBe("bypass");
+  it("drops the pick when the agent advertises no modes at all: it has none to be put in", () => {
+    expect(resolveEffectiveMode("bypass", null, [])).toBeNull();
   });
 });
 
@@ -140,6 +140,26 @@ describe("applyModeOnResume: an agent that advertises no modes", () => {
     // Nothing was advertised, so there was nothing to validate against and
     // nothing to seed from. The stored pick still stands.
     expect(useChatStore.getState().sessions[TAB]?.acpCurrentMode).toBe(before);
+  });
+
+  // #36: the remembered pick was pushed with `session/set_mode` to a session
+  // that offers no modes, the agent refused it, and the resume put up
+  // "Couldn't restore … · choose a mode to send" with no mode to choose, so
+  // every send was held for good.
+  it("pushes no mode, and holds no send", async () => {
+    tabWithPref("bypass");
+    invoke.mockImplementation(async (...args: unknown[]) => {
+      if (args[0] === "agents_set_mode") throw new Error("Method not found");
+      return undefined;
+    });
+
+    await applyModeOnResume(TAB, KEY, snapshot({ available_modes: [], current_mode: null }));
+
+    expect(setModeCalls()).toHaveLength(0);
+    expect(useChatStore.getState().sessions[TAB]?.unrestoredModeId).toBeUndefined();
+    // Nothing was refused, so the pick is still there for an agent that
+    // offers it.
+    expect(loadLastModePref("codex")).toBe("bypass");
   });
 });
 

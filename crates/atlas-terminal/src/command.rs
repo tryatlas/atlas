@@ -275,6 +275,10 @@ impl CommandTerminal {
         })?;
 
         let mut cmd = CommandBuilder::new(command);
+        cmd.env_clear();
+        for (key, value) in atlas_process::host_environment() {
+            cmd.env(key, value);
+        }
         for arg in args {
             cmd.arg(arg);
         }
@@ -301,6 +305,38 @@ impl CommandTerminal {
 
         let mut reader = pair.master.try_clone_reader()?;
         let child = Arc::new(Mutex::new(child));
+        #[cfg(unix)]
+        let retained_master = pair.master;
+        #[cfg(not(unix))]
+        {
+            let retained_master = pair.master;
+            let exit_child = child.clone();
+            let exit_inner = inner.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let status = exit_child
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .try_wait();
+                    match status {
+                        Ok(Some(status)) => {
+                            *exit_inner
+                                .ended
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(exit_from(Some(status)));
+                            break;
+                        }
+                        Err(_) => break,
+                        Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                    }
+                }
+                // ClosePseudoConsole must run while a separate reader drains
+                // output. Keeping it until here also prevents spawn() from
+                // destroying the command's console before it has run.
+                drop(retained_master);
+            });
+        }
 
         // Reader thread: blocking reads off the PTY master until EOF, which
         // arrives when the child exits and the last slave fd closes.
@@ -324,6 +360,8 @@ impl CommandTerminal {
             // blocked until its tty output is read; with the master closed
             // that wait ends, and the reap below cannot deadlock against it.
             drop(reader);
+            #[cfg(unix)]
+            drop(retained_master);
             // EOF — reap the child so the exit status is real rather than
             // inferred from the pipe closing. The exit is recorded before the
             // child's lock is let go: `kill` signals the pid only while it
@@ -464,7 +502,15 @@ impl CommandTerminal {
         }
         #[cfg(unix)]
         if let Some(pid) = child.process_id() {
-            terminate(pid);
+            // Hang up now; the grace period and the SIGKILL that may follow
+            // run on their own thread. Callers kill from inside the ACP
+            // dispatch drain with the thread or registry lock held, and the
+            // grace sleeps (up to 200 ms per terminal) used to run there.
+            hang_up(pid);
+            drop(child);
+            let child = self.child.clone();
+            let inner = self.inner.clone();
+            std::thread::spawn(move || escalate_kill(pid, &child, &inner));
             return Ok(());
         }
         let _ = child.kill();
@@ -591,8 +637,21 @@ fn signal_name(signal: libc::c_int) -> String {
     name.to_string()
 }
 
-/// What portable-pty's kill does — hang up, give the command a moment to go,
-/// then kill it outright — without reaping the child.
+/// The first half of what portable-pty's kill does: hang up.
+///
+/// The caller holds the child's lock and has seen no exit recorded, so `pid`
+/// is not reaped and still names this command.
+#[cfg(unix)]
+fn hang_up(pid: u32) {
+    let Ok(target) = libc::pid_t::try_from(pid) else {
+        return;
+    };
+    // SAFETY: a plain signal send to our own unreaped child.
+    unsafe { libc::kill(target, libc::SIGHUP) };
+}
+
+/// The second half: give the command a moment to go, then kill it outright —
+/// without reaping the child, and without blocking whoever asked for the kill.
 ///
 /// portable-pty's grace loop polls with `try_wait`, which reaps the child the
 /// moment it is gone, and a reaped child can no longer be asked how it ended:
@@ -600,25 +659,43 @@ fn signal_name(signal: libc::c_int) -> String {
 /// killed command had exited with code 1 (#31). Polled with `WNOWAIT` here, the
 /// child stays for that wait to read and for the reader thread to reap.
 ///
-/// The caller holds the child's lock and has seen no exit recorded, so `pid`
-/// is not reaped and still names this command.
+/// Sleeps with no lock held. Each check takes the child's lock and looks for a
+/// recorded exit first: the reader thread reaps only under that lock and
+/// records the exit before letting go, so while it is held an exit not yet
+/// recorded means `pid` is unreaped and cannot have been reused.
 #[cfg(unix)]
-fn terminate(pid: u32) {
+fn escalate_kill(
+    pid: u32,
+    child: &Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
+    inner: &Inner,
+) {
     let Ok(target) = libc::pid_t::try_from(pid) else {
         return;
     };
-    // SAFETY: plain signal sends to our own unreaped child.
-    unsafe { libc::kill(target, libc::SIGHUP) };
-    for attempt in 0..5 {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        if has_exited(pid) {
+    let gone = || {
+        inner
+            .exit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+            || has_exited(pid)
+    };
+    for _ in 0..4 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _held = child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if gone() {
             return;
         }
     }
-    // SAFETY: as above.
-    unsafe { libc::kill(target, libc::SIGKILL) };
+    let _held = child
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !gone() {
+        // SAFETY: as in `hang_up`; the lock is held and no exit is recorded.
+        unsafe { libc::kill(target, libc::SIGKILL) };
+    }
 }
 
 /// Whether `pid` has ended, asked without reaping it.
@@ -806,6 +883,7 @@ mod tests {
     }
 
     /// Park until `term` has printed `marker`.
+    #[cfg(unix)]
     async fn printed(term: &CommandTerminal, marker: &str) {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
@@ -878,6 +956,27 @@ mod tests {
                 signal: Some("SIGKILL".to_string()),
             }
         );
+    }
+
+    /// R4: kill is called with the AcpThread or registry lock held, inside the
+    /// ACP dispatch drain. It must hang up and return, not sit out the grace
+    /// period (it used to sleep up to 200 ms there per terminal).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_returns_without_waiting_out_the_grace_period() {
+        let term = run("/bin/sh", &["-c", "trap '' HUP; echo ready; exec sleep 30"]);
+        printed(&term, "ready").await;
+        let started = std::time::Instant::now();
+        term.kill().expect("kill");
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(40),
+            "kill blocked its caller for {took:?}"
+        );
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(10), term.wait_for_exit())
+            .await
+            .expect("the escalation must still kill it");
+        assert_eq!(exit.signal.as_deref(), Some("SIGKILL"));
     }
 
     /// And a command that exits on its own still has its code, and no signal.

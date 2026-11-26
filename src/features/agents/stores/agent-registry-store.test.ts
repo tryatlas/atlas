@@ -282,3 +282,12 @@ describe("registry listing status", () => {
     expect(api.refreshCalls).toBe(1);
   });
 });
+
+it("clears backend refresh progress when the finished listing arrives", async () => {
+  api.isFetching = true;
+  await hydrateAgentRegistry();
+  expect(useAgentRegistryStore.getState().registryRefreshing).toBe(true);
+  api.isFetching = false;
+  await hydrateAgentRegistry();
+  expect(useAgentRegistryStore.getState().registryRefreshing).toBe(false);
+});

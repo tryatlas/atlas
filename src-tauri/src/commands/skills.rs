@@ -94,7 +94,7 @@ pub async fn skills_set_enabled(
     project_path: Option<String>,
 ) -> Result<(), String> {
     let store = store(&scope, project_path.as_deref())?;
-    let (name_ev, agent_ev) = (name.clone(), agent.clone());
+    let agent_ev = agent.clone();
     let res = blocking(move || store.set_enabled(&name, &agent, enabled)).await;
     if res.is_ok() {
         app.state::<Arc<crate::telemetry::TelemetryClient>>()
@@ -104,21 +104,16 @@ pub async fn skills_set_enabled(
                 } else {
                     "skill_disabled"
                 },
-                serde_json::json!({ "skill": telemetry_skill_id(&name_ev), "agent": agent_ev }),
+                serde_json::json!({ "agent": agent_ev }),
             );
     }
     res
 }
 
-/// A skill name is user-authored for project-scoped skills, so the analytics
-/// event carries a stable hash instead — enough to count and correlate,
-/// nothing to read.
-fn telemetry_skill_id(name: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    name.hash(&mut h);
-    format!("sk_{:016x}", h.finish())
-}
+/// The source kind a skill or pack came from, for telemetry: the coarse
+/// category, never the `owner/repo` itself. TELEMETRY.md promises "no
+/// repository names or remotes", and a pack's repo is one.
+const TELEMETRY_SOURCE_KIND_GITHUB: &str = "github";
 
 /// Delete a skill: remove every agent symlink, then the canonical dir.
 #[tauri::command]
@@ -129,14 +124,11 @@ pub async fn skills_delete(
     project_path: Option<String>,
 ) -> Result<(), String> {
     let store = store(&scope, project_path.as_deref())?;
-    let (name_ev, scope_ev) = (name.clone(), scope.clone());
+    let scope_ev = scope.clone();
     let res = blocking(move || store.delete(&name)).await;
     if res.is_ok() {
         app.state::<Arc<crate::telemetry::TelemetryClient>>()
-            .capture(
-                "skill_deleted",
-                serde_json::json!({ "skill": telemetry_skill_id(&name_ev), "scope": scope_ev }),
-            );
+            .capture("skill_deleted", serde_json::json!({ "scope": scope_ev }));
     }
     res
 }
@@ -253,7 +245,11 @@ pub async fn pack_search(query: String) -> Result<Vec<PackSearchHit>, String> {
     if q.is_empty() {
         return Ok(Vec::new());
     }
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("search request failed: {e}"))?;
     let resp = client
         .get(atlas_skills::PACK_SEARCH_URL)
         .query(&[("q", q.as_str())])
@@ -278,6 +274,23 @@ pub async fn pack_remote_preview(source: String) -> Result<Pack, String> {
     blocking(move || atlas_skills::preview_pack(&GitHub, &source)).await
 }
 
+/// `pack_installed`'s properties: the source kind, scope and size only.
+fn pack_installed_properties(scope: &str, skill_count: usize) -> serde_json::Value {
+    serde_json::json!({
+        "source_kind": TELEMETRY_SOURCE_KIND_GITHUB,
+        "scope": scope,
+        "skill_count": skill_count,
+    })
+}
+
+/// `skill_downloaded`'s properties: the source kind and scope only.
+fn skill_downloaded_properties(scope: &str) -> serde_json::Value {
+    serde_json::json!({
+        "source_kind": TELEMETRY_SOURCE_KIND_GITHUB,
+        "scope": scope,
+    })
+}
+
 /// Install a pack from its GitHub source repo into the store. Fetches the whole
 /// repo, dedups against the lock, writes `skills-lock.json`. No projection
 /// (Phase 3) and no script execution.
@@ -291,18 +304,13 @@ pub async fn pack_install_remote(
 ) -> Result<PackInstallResult, String> {
     let store = store(&scope, project_path.as_deref())?;
     let force = force.unwrap_or(false);
-    let source_ev = source.clone();
     let scope_ev = scope.clone();
     let res = blocking(move || store.install_pack(&GitHub, &source, force)).await;
     if let Ok(result) = &res {
         app.state::<Arc<crate::telemetry::TelemetryClient>>()
             .capture(
                 "pack_installed",
-                serde_json::json!({
-                    "source": source_ev,
-                    "scope": scope_ev,
-                    "skill_count": result.pack.components.len(),
-                }),
+                pack_installed_properties(&scope_ev, result.pack.components.len()),
             );
     }
     res
@@ -319,27 +327,14 @@ pub async fn pack_install_skill(
     project_path: Option<String>,
 ) -> Result<SkillMeta, String> {
     let store = store(&scope, project_path.as_deref())?;
-    // Cloned for the telemetry event (the closure moves the originals). `source`
-    // is a public GitHub `owner/repo` slug; `scope` is "global"/"project".
-    let source_ev = source.clone();
+    // Cloned for the telemetry event (the closure moves the original); `scope`
+    // is "global"/"project". The skill, its registry id and the `owner/repo` it
+    // came from are not sent: they name a repository.
     let scope_ev = scope.clone();
-    // The REGISTRY id, which `skill` (the installed SKILL.md's frontmatter name)
-    // is not: the two can differ, so a per-skill install rollup keyed on `skill`
-    // could not be joined back to the registry row the Discover table renders.
-    // `(source, skill_id)` is that row's identity.
-    let skill_id_ev = skill_id.clone();
     let res = blocking(move || store.install_skill(&GitHub, &source, &skill_id)).await;
-    if let Ok(meta) = &res {
+    if res.is_ok() {
         app.state::<Arc<crate::telemetry::TelemetryClient>>()
-            .capture(
-                "skill_downloaded",
-                serde_json::json!({
-                    "skill": meta.name,
-                    "skill_id": skill_id_ev,
-                    "source": source_ev,
-                    "scope": scope_ev,
-                }),
-            );
+            .capture("skill_downloaded", skill_downloaded_properties(&scope_ev));
     }
     res
 }
@@ -435,15 +430,21 @@ pub async fn pack_components_list(
 mod tests {
     use super::*;
 
-    /// A project skill's name is the user's own text: the analytics event
-    /// carries a stable hash of it and never the name.
+    /// The install events name no repository and no skill: the pack's
+    /// `owner/repo` is a repository name, which TELEMETRY.md says is never
+    /// sent, and a skill name (or an unsalted hash of one) can be read back.
     #[test]
-    fn the_telemetry_skill_id_is_stable_and_does_not_carry_the_name() {
-        let id = telemetry_skill_id("my-private-skill");
-        assert_eq!(id, telemetry_skill_id("my-private-skill"));
-        assert_ne!(id, telemetry_skill_id("another-skill"));
-        assert!(id.starts_with("sk_") && id.len() == 3 + 16, "{id}");
-        assert!(!id.contains("private"));
+    fn the_install_events_carry_no_repository_or_skill_name() {
+        let pack = pack_installed_properties("project", 3);
+        assert_eq!(
+            pack,
+            serde_json::json!({ "source_kind": "github", "scope": "project", "skill_count": 3 })
+        );
+        let skill = skill_downloaded_properties("global");
+        assert_eq!(
+            skill,
+            serde_json::json!({ "source_kind": "github", "scope": "global" })
+        );
     }
 
     /// A command's scope and path are refused before any thread is spawned,

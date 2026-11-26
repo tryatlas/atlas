@@ -135,6 +135,10 @@ fn parse_catalog(v: &serde_json::Value) -> BTreeMap<String, ModelPrice> {
 async fn fetch_catalog() -> Result<serde_json::Value, String> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("Atlas/", env!("CARGO_PKG_VERSION"), " (pricing)"))
+        // Fetched on every launch: an unreachable or stalled models.dev must
+        // fail, not leave the request parked for the life of the app.
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client
@@ -196,7 +200,7 @@ pub fn refresh_in_background(app: &AppHandle) {
 }
 
 /// Cached pricing map (read-only). Empty until the first successful fetch.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn models_pricing_get(app: AppHandle) -> BTreeMap<String, ModelPrice> {
     read_cache(&app).prices
 }

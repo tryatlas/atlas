@@ -210,9 +210,9 @@ impl MemoryEngine {
         qvec: &[f32],
         pool: usize,
     ) -> (Vec<Ranked>, Option<HashSet<String>>) {
-        let embedded = self.corpus.len();
+        let embedded = self.corpus().len();
         if embedded < MIN_BACKGROUND_DOCS {
-            let hits = self.corpus.search_dense(qvec, pool);
+            let hits = self.corpus().search_dense(qvec, pool);
             let ranked = apply_cosine_floor(hits, COSINE_FLOOR)
                 .into_iter()
                 .filter_map(|(id, _sim)| self.ranked(id))
@@ -220,7 +220,7 @@ impl MemoryEngine {
             return (ranked, None);
         }
         let mut all = self
-            .corpus
+            .corpus()
             .search_dense(qvec, embedded.min(BACKGROUND_SAMPLE_MAX));
         let outliers = dense_outliers(&all, DENSE_OUTLIER_Z);
         all.truncate(pool);
@@ -233,9 +233,9 @@ impl MemoryEngine {
 
     /// The query's terms, weighted by their rarity in the corpus.
     fn query_terms(&self, query: &str) -> QueryTerms {
-        let docs = self.corpus.len();
+        let docs = self.corpus().len();
         QueryTerms::new(query).weighted(docs, |word| {
-            self.corpus
+            self.corpus()
                 .search_bm25(word, docs)
                 .map_or(0, |ids| ids.len())
         })
@@ -243,7 +243,8 @@ impl MemoryEngine {
 
     /// Docs whose words match the query (BM25), best first.
     fn bm25_candidates(&self, query: &str, pool: usize) -> Vec<Ranked> {
-        match self.corpus.search_bm25(query, pool) {
+        let found = self.corpus().search_bm25(query, pool);
+        match found {
             Ok(ids) => ids.into_iter().filter_map(|id| self.ranked(id)).collect(),
             Err(e) => {
                 tracing::debug!(target: "atlas_memory::retrieve", "keyword recall failed: {e}");
@@ -254,7 +255,7 @@ impl MemoryEngine {
 
     /// Doc `id` as a ranked candidate, when the index still holds it.
     fn ranked(&self, id: String) -> Option<Ranked> {
-        let dt = self.corpus.doc(&id)?;
+        let dt = self.corpus().doc(&id)?;
         Some(Ranked {
             doc: RetrievedDoc {
                 id: id.clone(),
@@ -617,7 +618,7 @@ impl QueryTerms {
                 worth += self.weights[i];
             }
             counts[i] += 1;
-            while end - hits[left].0 > room {
+            while left <= right && end - hits[left].0 > room {
                 let j = hits[left].2;
                 counts[j] -= 1;
                 if counts[j] == 0 {
@@ -625,7 +626,7 @@ impl QueryTerms {
                 }
                 left += 1;
             }
-            if worth > best {
+            if left <= right && worth > best {
                 best = worth;
                 let span = end - hits[left].0;
                 let start = hits[left].0.saturating_sub((room - span) / 2);
@@ -749,6 +750,17 @@ mod tests {
             id: id.into(),
             doc: doc(id, title, text),
         }
+    }
+
+    #[test]
+    fn a_matching_word_longer_than_the_excerpt_is_bounded() {
+        let word = "x".repeat(4096);
+        let terms = QueryTerms::new(&word);
+        let text = format!("before {word} after");
+        let (from, to) = terms.best_window(&text, 80);
+        assert!(from <= to && to <= text.len());
+        let excerpt = terms.excerpt(&text, 80).unwrap();
+        assert!(!excerpt.is_empty());
     }
 
     #[test]

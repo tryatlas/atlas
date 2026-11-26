@@ -75,7 +75,10 @@ mod tests {
         let prompt =
             prepare_realtime_backend_prompt(/*prompt*/ None, /*config_prompt*/ None);
 
-        assert!(prompt.starts_with("## Identity, tone, and role"));
+        let body = prompt
+            .strip_prefix("<!-- Modified by Atlas from upstream OpenAI Codex (Apache-2.0). See CONTEXT.md. -->\n")
+            .expect("the bundled prompt retains its modification notice");
+        assert!(body.starts_with("## Identity, tone, and role"));
         assert!(prompt.contains("You are Atlas Agent, a general-purpose agentic assistant"));
         assert!(prompt.contains("The user's name is "));
         assert!(!prompt.contains("{{ user_first_name }}"));

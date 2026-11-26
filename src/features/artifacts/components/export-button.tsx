@@ -13,17 +13,17 @@ import { useState } from "react";
 import { toast } from "sonner";
 
 import type { SessionDetail as Detail } from "../types";
-import { exportSession, type ExportFormat } from "../lib/export";
+import { exportSession, type ExportFormat, type ExportSource } from "../lib/export";
 import { ExportButtonView } from "./views/export-button-view";
 
-export function ExportButton({ detail }: { detail: Detail }) {
+export function ExportButton({ detail, ...source }: { detail: Detail } & ExportSource) {
   const [busy, setBusy] = useState<ExportFormat | null>(null);
 
   const run = async (format: ExportFormat) => {
     setBusy(format);
     try {
       // A dismissed save dialog resolves `false`, which is not a failure.
-      await exportSession(detail, format);
+      await exportSession(detail, format, source);
     } catch (e) {
       toast.error("Couldn't export the session", {
         description: e instanceof Error ? e.message : String(e),
@@ -33,5 +33,11 @@ export function ExportButton({ detail }: { detail: Detail }) {
     }
   };
 
-  return <ExportButtonView busy={busy} onPick={(format) => void run(format)} />;
+  return (
+    <ExportButtonView
+      busy={busy}
+      disabled={!source.entriesReady}
+      onPick={(format) => void run(format)}
+    />
+  );
 }

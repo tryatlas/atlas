@@ -7,8 +7,8 @@ import type { ConflictState } from "../components/git-manager/conflicts-view";
 import type { hunkWireLines } from "./diff";
 
 /** The file's unified diff against the index. */
-export function gitDiffFile(path: string, file: string): Promise<string> {
-  return invoke<string>("git_diff_file", { path, file });
+export function gitDiffFile(path: string, file: string, staged = false): Promise<string> {
+  return invoke<string>("git_diff_file", { path, file, staged });
 }
 
 /** A hunk, as Rust takes it: its wire lines, and which of them are picked. */

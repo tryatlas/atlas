@@ -75,7 +75,7 @@ pub(super) fn tools() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "enum": ["file", "diff", "settings", "tab", "thread", "new_chat", "timeline", "url", "knowledge", "space_page"] },
+                    "target": { "type": "string", "enum": ["file", "diff", "settings", "tab", "thread", "new_chat", "timeline", "knowledge", "space_page"] },
                     "path": { "type": "string" },
                     "line": { "type": "integer" },
                     "column": { "type": "integer" },
@@ -85,10 +85,9 @@ pub(super) fn tools() -> Vec<Tool> {
                     "staged": { "type": "boolean" },
                     "commit": { "type": "string" },
                     "section": { "type": "string", "enum": ["general", "appearance", "chat", "memory", "notifications", "source-control", "pull-requests", "privacy", "keybindings", "updates", "agents", "skills", "layouts", "about"] },
-                    "type": { "type": "string", "enum": ["canvas", "browser", "tasks", "knowledge", "knowledge-graph", "memory", "log", "usage", "artifacts"] },
+                    "type": { "type": "string", "enum": ["canvas", "tasks", "knowledge", "knowledge-graph", "memory", "log", "usage", "artifacts"] },
                     "sessionId": { "type": "string" },
                     "agent": { "type": "string" },
-                    "url": { "type": "string" },
                     "noteId": { "type": "string" },
                     "conversationId": { "type": "string" },
                     "pageId": { "type": "string" }
@@ -264,6 +263,7 @@ impl ServerHandler for UiTools {
 pub fn tenant(tools: UiTools) -> Tenant {
     let gate = tools.gate.clone();
     Tenant::new(UI_SERVER_NAME, UI_PATH, tools)
+        .advertising(crate::commands::tool_servers::tool_names(&tools_list()))
         .only_for(Audience::UiControl)
         .admitted_by(move |cwd, grant| {
             if !gate(cwd) {

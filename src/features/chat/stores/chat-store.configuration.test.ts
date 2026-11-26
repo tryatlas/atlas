@@ -401,3 +401,60 @@ describe.each([
     expect(loadCachedAcpConfigOptions("codex")).toBeNull();
   });
 });
+
+// ACP audit finding 45: the plan-approval mapping used to apply only to an
+// agent whose id was `claude-code`, so the registry's Claude (`claude-acp`),
+// which advertises its modes, stayed on "plan" after the user approved a plan
+// with "accept edits". It is keyed on the prompt's option ids now, and the
+// mode lands in the record the session holds.
+describe("a plan-approval choice", () => {
+  const CLAUDE_ACP_MODES = [
+    { id: "default", name: "Default" },
+    { id: "acceptEdits", name: "Accept Edits" },
+    { id: "plan", name: "Plan Mode" },
+    { id: "bypassPermissions", name: "Bypass Permissions" },
+  ];
+  const bound = (agent: AgentType) => {
+    actions().createSession(TAB, agent);
+    actions().setAcpBinding(TAB, KEY.agent_id, KEY.session_id, "/tmp");
+    actions().setAcpModes(TAB, "plan", CLAUDE_ACP_MODES, agent);
+    tauri.invoke.mockClear();
+  };
+
+  it("moves an agent that advertises its modes, whatever its id, off plan", async () => {
+    bound("claude-acp");
+    actions().applyExitPlanSelection(TAB, "exit-plan-accept-edits");
+    await flush();
+    expect(session().acpCurrentMode).toBe("acceptEdits");
+    expect(tauri.calls("agents_set_mode").map((c) => c.args)).toEqual([
+      { key: KEY, modeId: "acceptEdits" },
+    ]);
+    // Not the user's pick: nothing is remembered for the next session.
+    expect(loadLastModePref("claude-acp")).toBeNull();
+  });
+
+  it("applies the card's bypass override on the same shape", async () => {
+    bound("claude-acp");
+    actions().applyExitPlanSelection(TAB, "exit-plan-auto", "bypassPermissions");
+    await flush();
+    expect(session().acpCurrentMode).toBe("bypassPermissions");
+  });
+
+  it("does nothing for an option that is not a plan approval", async () => {
+    bound("claude-acp");
+    actions().applyExitPlanSelection(TAB, "allow_once", "bypassPermissions");
+    await flush();
+    expect(session().acpCurrentMode).toBe("plan");
+    expect(tauri.calls("agents_set_mode")).toEqual([]);
+  });
+
+  it("does not put an agent on a mode it does not advertise", async () => {
+    bound("codex");
+    actions().setAcpModes(TAB, "auto", ACP_MODES, "codex");
+    tauri.invoke.mockClear();
+    actions().applyExitPlanSelection(TAB, "exit-plan-accept-edits");
+    await flush();
+    expect(session().acpCurrentMode).toBe("auto");
+    expect(tauri.calls("agents_set_mode")).toEqual([]);
+  });
+});

@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { toast } from "sonner";
+import { useLocalMedia } from "@/features/media/lib/use-local-media";
 import { timeAgo } from "@/lib/time-ago";
 import { AudioPlayer } from "./audio-player";
 import { FileRowView, FilesTabView, MediaTile } from "./views/files-tab-view";
@@ -111,13 +112,14 @@ function MediaThumb({
     };
   }, [attachment.id, attachment.filename, path, failed]);
 
-  if (failed) return null;
+  const media = useLocalMedia(path, isVideo ? "video" : "image");
+  if (failed || media.error) return null;
   return (
     <MediaTile
       filename={attachment.filename}
       title={`${attachment.filename} · ${timeAgo(new Date(message.created_at).toISOString(), { suffix: true })}`}
       kind={isVideo ? "video" : "image"}
-      src={path ? convertFileSrc(path) : null}
+      src={media.url}
       onOpen={() => openMediaList(gallery, attachment.id)}
     />
   );
@@ -133,6 +135,15 @@ function AudioEntry({
   const [path, setPath] = useState<string | null>(
     () => cachedAttachmentPath(attachment.id) ?? null,
   );
+  const [buffering, setBuffering] = useState(false);
+  const request = useCallback(() => {
+    if (buffering) return;
+    setBuffering(true);
+    void attachmentPath(attachment.id, attachment.filename)
+      .then(setPath)
+      .catch(() => toast.error("Could not load that audio. Press Play to retry."))
+      .finally(() => setBuffering(false));
+  }, [attachment.id, attachment.filename, buffering]);
 
   useEffect(() => {
     if (path) return;
@@ -145,11 +156,14 @@ function AudioEntry({
     };
   }, [attachment.id, attachment.filename, path]);
 
+  const media = useLocalMedia(path, "audio");
   return (
     <AudioPlayer
-      src={path ? convertFileSrc(path) : null}
+      src={media.url}
       filename={attachment.filename}
       subtitle={`${author?.name ?? "Unknown"} · ${formatBytes(attachment.bytes)}`}
+      buffering={buffering}
+      onRequestSrc={request}
       onDownload={() => void saveAttachment(attachment)}
     />
   );

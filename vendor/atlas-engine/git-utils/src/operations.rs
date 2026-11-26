@@ -116,6 +116,9 @@ where
     }
     let command_string = build_command_string(&args_vec);
     let mut command = Command::new("git");
+    command
+        .env_clear()
+        .envs(atlas_engine_protocol::shell_environment::host_environment());
     command.current_dir(dir);
     if let Some(envs) = env {
         for (key, value) in envs {

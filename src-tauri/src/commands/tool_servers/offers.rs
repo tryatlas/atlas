@@ -26,6 +26,38 @@ use crate::commands::memory_bridge::TokenFiles;
 /// The argument that makes the Atlas binary the stdio bridge.
 pub const BRIDGE_ARG: &str = "mcp-bridge";
 
+/// How often a running bridge checks that its session is still alive.
+pub const BRIDGE_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Resolves once `token_file` is gone. The file goes when the session it was
+/// written for ends ([`TokenFiles::session_ended`]), or when the offer is
+/// released unbound, so its absence is the bridge's signal that nothing will
+/// ever use it again. An error other than "not found" counts as present: a
+/// bridge is never reaped on a guess.
+pub async fn token_file_removed(token_file: &std::path::Path, every: std::time::Duration) {
+    loop {
+        if matches!(tokio::fs::try_exists(token_file).await, Ok(false)) {
+            return;
+        }
+        tokio::time::sleep(every).await;
+    }
+}
+
+/// Runs `bridge` until it ends, or until its session does
+/// ([`token_file_removed`]). An agent that never sends `session/close`, or
+/// keeps its MCP children alive past it, would otherwise hold one bridge
+/// process per ended session for as long as the agent itself runs.
+pub async fn bridge_until_session_ends(
+    bridge: impl std::future::Future<Output = anyhow::Result<()>>,
+    token_file: &std::path::Path,
+    every: std::time::Duration,
+) -> anyhow::Result<()> {
+    tokio::select! {
+        result = bridge => result,
+        () = token_file_removed(token_file, every) => Ok(()),
+    }
+}
+
 /// `name` at `url` as a stdio server: `<this binary> mcp-bridge <url> <token
 /// file>`. Nothing in the entry is secret: an adapter may put all of it,
 /// `env` included, on a command line (ADR-0020).
@@ -238,13 +270,16 @@ impl SessionMcpServers for SessionOffers {
             .collect();
         let token_file = bridge.map(|(_, file)| file);
         let token_files = self.token_files.clone();
+        // Bound per agent: the token table and the token files key a session
+        // by its agent and id, since two agents can share an id (#86).
+        let agent = grant.agent;
         SessionMcpOffer::new(servers, move |session| match session {
             Some(id) => {
                 let id = id.to_string();
                 tokens.bind(&token, &id);
                 // Its file goes when the session ends.
                 if let Some(file) = &token_file {
-                    token_files.bind(file, &id);
+                    token_files.bind(file, &agent, &id);
                 }
             }
             None => {
@@ -288,4 +323,45 @@ pub fn offered_entries(offer: &SessionMcpOffer) -> Vec<(String, String, String)>
             other => panic!("{other:?}"),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod reap_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_bridge_whose_session_ended_exits_with_its_input_still_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("token");
+        std::fs::write(&file, "t").unwrap();
+        // A bridge whose agent never closes its stdin: it would run forever.
+        let forever = std::future::pending::<anyhow::Result<()>>();
+        let removed = file.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            std::fs::remove_file(removed).unwrap();
+        });
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            bridge_until_session_ends(forever, &file, Duration::from_millis(10)),
+        )
+        .await
+        .expect("the bridge is reaped once its session's token file is gone")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_live_session_leaves_the_bridge_to_finish_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("token");
+        std::fs::write(&file, "t").unwrap();
+        let ends = async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Err(anyhow::anyhow!("its own ending"))
+        };
+        let result = bridge_until_session_ends(ends, &file, Duration::from_millis(5)).await;
+        assert_eq!(result.unwrap_err().to_string(), "its own ending");
+        assert!(file.exists());
+    }
 }

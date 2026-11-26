@@ -97,6 +97,8 @@ pub(crate) struct ThreadState {
     pub(crate) pending_rollbacks: Option<ConnectionRequestId>,
     pub(crate) turn_summary: TurnSummary,
     pub(crate) last_terminal_turn_id: Option<String>,
+    /// Accepted by core, before the listener has observed TurnStarted.
+    pub(crate) pending_started_turn_id: Option<String>,
     /// Lets an internal runtime replacement wait until the old listener has processed Core's
     /// `ShutdownComplete` event before that listener is superseded.
     shutdown_drain_waiter: Option<oneshot::Sender<()>>,
@@ -144,6 +146,7 @@ impl ThreadState {
         self.shutdown_drain_waiter = None;
         self.listener_command_tx = None;
         self.current_turn_history.reset();
+        self.pending_started_turn_id = None;
         self.listener_thread = None;
         self.watch_registration = WatchRegistration::default();
     }
@@ -173,6 +176,13 @@ impl ThreadState {
     }
 
     pub(crate) fn track_current_turn_event(&mut self, event_turn_id: &str, event: &EventMsg) {
+        if matches!(
+            event,
+            EventMsg::TurnStarted(_) | EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)
+        ) && self.pending_started_turn_id.as_deref() == Some(event_turn_id)
+        {
+            self.pending_started_turn_id = None;
+        }
         if let EventMsg::TurnStarted(payload) = event {
             self.turn_summary.started_at = payload.started_at;
         }

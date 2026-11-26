@@ -1,7 +1,7 @@
 import { CAPTION, Card, EstTag, VALUE } from "@/components/usage-primitives";
 import { useAgentMetaResolver } from "@/features/agents/lib/agent-meta-context";
 import { fmtCost, fmtPct, fmtTokens } from "@/features/monitor/lib/usage-format";
-import type { DailyBucket, GroupBy, SessionRow, UsageDashboard } from "../types";
+import type { DailyBucket, GroupBy, SessionIdentity, UsageDashboard } from "../types";
 import { deltaPct, efficiency, keyOf, rankBy, type Efficiency } from "../lib/derive";
 import { DeltaChip, SegmentMeter } from "@tryatlas/design";
 
@@ -25,7 +25,7 @@ export function EfficiencyCard({
   eff: Efficiency;
   prevEff: Efficiency | null;
   rows: DailyBucket[];
-  sessions: SessionRow[];
+  sessions: SessionIdentity[];
   groupBy: GroupBy;
   data: UsageDashboard | null;
 }) {

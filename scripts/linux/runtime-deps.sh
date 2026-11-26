@@ -47,6 +47,9 @@ DEB_LINKED_VIA_DEPENDS=(
   libsoup-3.0-0
 )
 # shellcheck disable=SC2034
+# Enterprise Linux 10: webkit2gtk4.1 and libayatana-appindicator-gtk3 require
+# EPEL + CRB. docs/reference/linux-support.md documents the prerequisite;
+# verify-linux-release.sh installs on Rocky 10 with it explicitly enabled.
 RPM_REQUIRES=(
   webkit2gtk4.1
   gtk3

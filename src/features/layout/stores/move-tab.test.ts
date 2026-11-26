@@ -40,7 +40,7 @@ beforeEach(() => {
       tab("chat-1", "chat", "main"),
       tab("a", "terminal", "g2"),
       tab("chat-2", "chat", "main"),
-      tab("b", "browser", "g2"),
+      tab("b", "log", "g2"),
       tab("c", "source-control", "g2"),
     ],
     groupOrder: ["main", "g2"],

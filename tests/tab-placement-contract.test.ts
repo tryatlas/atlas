@@ -35,7 +35,7 @@ import { useLayoutStore, type Tab } from "@/features/layout/stores/layout-store"
  *
  * Three of those are registry data now, so this suite reads the data: a
  * type's launcher row and its mount policy sit in the same entry as its
- * placement. Zen builds its columns in the layout store by hand, so that one
+ * placement. Zen rearranges columns in the layout store by hand, so that one
  * is checked by running it. Nothing here reads source text.
  *
  * A full page squeezed into a column is what this ADR exists to stop. If you
@@ -136,23 +136,31 @@ describe("tab placement (ADR-0024)", () => {
     }
   });
 
-  it("zen builds its columns from surfaces only", () => {
-    // From a window holding only the session, so zen has to make every tab
-    // it wants beside it.
+  it("zen shows the session alone and opens nothing", () => {
+    // A window with a session and a terminal beside it.
+    useLayoutStore.setState((s) => ({
+      tabs: [...s.tabs, { ...sessionTab("term"), type: "terminal", closable: true, groupId: "g2" }],
+      groupOrder: ["main", "g2"],
+      activeByGroup: { main: "welcome", g2: "term" },
+    }));
+    const before = useLayoutStore.getState().tabs.map((t) => t.id);
     useLayoutStore.getState().actions.toggleZenMode();
-    const { zen, tabs, groupOrder, activeByGroup, destination } = useLayoutStore.getState();
+    const { zen, tabs, groupOrder, activeByGroup, surfaces, destination } =
+      useLayoutStore.getState();
     expect(zen).toBe(true);
-    expect(groupOrder.length).toBeGreaterThanOrEqual(2);
-    expect(tabs.length).toBeGreaterThanOrEqual(2);
+    expect(tabs.map((t) => t.id)).toEqual(before);
     for (const t of tabs) expect(kindOf(t.type), t.type).not.toBe("destination");
-    // Every column shows one of them, and the main column shows the session.
-    for (const group of groupOrder) {
-      const active = tabs.find((t) => t.id === activeByGroup[group]);
-      expect(active, group).toBeDefined();
-      expect(kindOf(active!.type), group).not.toBe("destination");
-    }
     expect(tabs.find((t) => t.id === activeByGroup[groupOrder[0]])?.type).toBe("chat");
+    // The terminal keeps running in its column, out of sight.
+    expect(surfaces).toBe("hidden");
     expect(destination).toBeNull();
+
+    useLayoutStore.getState().actions.toggleZenMode();
+    const after = useLayoutStore.getState();
+    expect(after.zen).toBe(false);
+    expect(after.surfaces).toBe("shown");
+    expect(after.groupOrder).toEqual(["main", "g2"]);
+    expect(after.activeByGroup).toEqual({ main: "welcome", g2: "term" });
   });
 
   it("the column renderer keeps no destination mounted", () => {

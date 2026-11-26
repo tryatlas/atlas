@@ -1,3 +1,4 @@
+import { shortcutLabel } from "@/features/keybindings/lib/combo";
 import { Fragment, type ReactNode } from "react";
 import {
   ArrowUp,
@@ -120,11 +121,11 @@ export function MentionPopup({
 }
 
 const FORMATS: { kind: ComposerFormat; title: string; icon: typeof Bold }[] = [
-  { kind: "bold", title: "Bold  ⌘B", icon: Bold },
-  { kind: "italic", title: "Italic  ⌘I", icon: Italic },
+  { kind: "bold", title: `Bold  ${shortcutLabel("cmd+b")}`, icon: Bold },
+  { kind: "italic", title: `Italic  ${shortcutLabel("cmd+i")}`, icon: Italic },
   { kind: "strike", title: "Strikethrough", icon: Strikethrough },
   { kind: "code", title: "Code", icon: Code },
-  { kind: "link", title: "Link  ⌘K", icon: Link2 },
+  { kind: "link", title: `Link  ${shortcutLabel("cmd+k")}`, icon: Link2 },
   { kind: "bullet", title: "Bulleted list", icon: List },
   { kind: "number", title: "Numbered list", icon: ListOrdered },
   { kind: "quote", title: "Quote", icon: Quote },

@@ -67,13 +67,15 @@ fn python() -> Option<PathBuf> {
 }
 
 fn thread_events() -> ThreadEventSink {
-    Arc::new(|_session_id: &acp::SessionId| {
-        let (tx, rx) = event_channel();
-        // Nothing consumes thread events in this crate; keep the receiver alive
-        // so sends do not fail for a reason unrelated to the test.
-        Box::leak(Box::new(rx));
-        tx
-    })
+    Arc::new(
+        |_agent: &atlas_acp_thread::AgentId, _session_id: &acp::SessionId| {
+            let (tx, rx) = event_channel();
+            // Nothing consumes thread events in this crate; keep the receiver alive
+            // so sends do not fail for a reason unrelated to the test.
+            Box::leak(Box::new(rx));
+            tx
+        },
+    )
 }
 
 fn request_elicitation_events() -> RequestElicitationSink {
@@ -298,6 +300,95 @@ async fn dropping_the_connection_kills_the_agent_process() {
 
     let _ = std::fs::remove_file(&pid_file);
     panic!("agent process {pid} outlived its connection");
+}
+
+/// An agent that answers `initialize`, then handles SIGTERM as told: `trap`
+/// writes `term` to MARK_FILE and exits, `ignore` carries on regardless.
+const TERM_AGENT: &str = r#"
+import sys, json, os, signal
+def on_term(*_):
+    open(MARK_FILE, "w").write("term")
+    os._exit(0)
+signal.signal(signal.SIGTERM, on_term if MODE == "trap" else signal.SIG_IGN)
+open(PID_FILE, "w").write(str(os.getpid()))
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("method") == "initialize":
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {
+            "protocolVersion": 1, "agentCapabilities": {}, "authMethods": []}}) + "\n")
+        sys.stdout.flush()
+while True:
+    signal.pause()
+"#;
+
+/// Spawns [`TERM_AGENT`] in `mode`, waits for its pid, and drops the
+/// connection: the pid and the mark file the agent writes on SIGTERM.
+async fn drop_a_term_agent(mode: &str) -> Option<(i32, PathBuf)> {
+    let dir = std::env::temp_dir().join(format!("atlas-term-agent-{mode}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create the agent's directory");
+    let (pid_file, mark_file) = (dir.join("pid"), dir.join("mark"));
+    let script = TERM_AGENT
+        .replace(
+            "MARK_FILE",
+            &format!("{:?}", mark_file.display().to_string()),
+        )
+        .replace("PID_FILE", &format!("{:?}", pid_file.display().to_string()))
+        .replace("MODE", &format!("{mode:?}"));
+    let command = AgentServerCommand {
+        path: python()?,
+        args: vec!["-c".to_string(), script],
+        env: Some(HashMap::new()),
+    };
+    let connection = connect(command).await.expect("handshake failed");
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .expect("agent did not report its pid")
+        .trim()
+        .parse()
+        .expect("unparsable pid");
+    drop(connection);
+    Some((pid, mark_file))
+}
+
+/// #91: an agent is asked to stop before it is made to — SIGTERM first, so
+/// it can write out the session it was saving.
+#[tokio::test]
+async fn dropping_the_connection_sends_sigterm_first() {
+    let Some((pid, mark_file)) = drop_a_term_agent("trap").await else {
+        eprintln!("skipping: no python3 on this machine");
+        return;
+    };
+    for _ in 0..100 {
+        if !process_is_alive(pid) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        std::fs::read_to_string(&mark_file).ok().as_deref(),
+        Some("term"),
+        "the agent heard SIGTERM before it died"
+    );
+    let _ = std::fs::remove_dir_all(mark_file.parent().expect("the agent's directory"));
+}
+
+/// #91: and one that ignores SIGTERM is killed anyway, after a short grace.
+#[tokio::test]
+async fn an_agent_that_ignores_sigterm_is_killed_after_the_grace() {
+    let Some((pid, mark_file)) = drop_a_term_agent("ignore").await else {
+        eprintln!("skipping: no python3 on this machine");
+        return;
+    };
+    let mut died = false;
+    for _ in 0..200 {
+        if !process_is_alive(pid) {
+            died = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let _ = std::fs::remove_dir_all(mark_file.parent().expect("the agent's directory"));
+    assert!(died, "agent {pid} ignored SIGTERM and outlived the grace");
 }
 
 /// `kill -0`: signal 0 checks for existence without delivering anything.
@@ -1328,6 +1419,15 @@ async fn run_client_requests(
     project: &std::path::Path,
     steps: &serde_json::Value,
 ) -> Option<(Vec<serde_json::Value>, atlas_acp_thread::AcpThreadHandle)> {
+    run_client_requests_with_turn(base, project, steps, true).await
+}
+
+async fn run_client_requests_with_turn(
+    base: &std::path::Path,
+    project: &std::path::Path,
+    steps: &serde_json::Value,
+    begin_turn: bool,
+) -> Option<(Vec<serde_json::Value>, atlas_acp_thread::AcpThreadHandle)> {
     use atlas_acp_thread::{AgentConnection as _, AgentThreadEntry, ToolCallStatus};
 
     let steps_file = base.join("steps.json");
@@ -1359,6 +1459,10 @@ async fn run_client_requests(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .session_id()
         .clone();
+    if begin_turn {
+        // The real host opens the turn before invoking session/prompt.
+        thread.lock().unwrap().begin_turn();
+    }
 
     let approver = tokio::spawn({
         let thread = thread.clone();
@@ -1416,6 +1520,28 @@ async fn run_client_requests(
     )
     .expect("outcomes are json");
     Some((outcomes, thread))
+}
+
+#[tokio::test]
+async fn a_terminal_request_crossing_stop_neither_asks_nor_spawns() {
+    let (base, project) = scripted_dirs("terminal-after-stop");
+    let marker = project.join("must-not-exist");
+    let steps = serde_json::json!([{
+        "method": "terminal/create",
+        "params": {"command": "sh", "args": ["-c", format!("touch '{}'", marker.display())]},
+    }]);
+    let Some((outcomes, thread)) =
+        run_client_requests_with_turn(&base, &project, &steps, false).await
+    else {
+        return;
+    };
+    assert!(outcomes[0].get("error").is_some(), "{outcomes:?}");
+    assert!(
+        thread.lock().unwrap().entries().is_empty(),
+        "an idle session was asked to approve"
+    );
+    assert!(!marker.exists());
+    let _ = std::fs::remove_dir_all(base);
 }
 
 /// What `pwd` printed, from a `terminal/output` answer.

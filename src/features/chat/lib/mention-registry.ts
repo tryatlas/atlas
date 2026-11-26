@@ -87,17 +87,10 @@ export function isUnderProject(path: string, projectPath: string | null): boolea
   return path === root || path.startsWith(`${root}/`);
 }
 
-/** The mention minted under exactly this token in this project, if any. A
- *  path outside the project is not given back. */
+/** The exact user-picked mention minted in this project, including external files. */
 export function knownMention(raw: string, projectPath: string | null): MentionData | null {
   const mention = minted.get(keyOf(raw, projectPath))?.mention ?? null;
   if (!mention) return null;
-  if (
-    (mention.kind === "file" || mention.kind === "folder") &&
-    !isUnderProject(mention.absPath, projectPath)
-  ) {
-    return null;
-  }
   return mention;
 }
 

@@ -258,6 +258,19 @@ pub trait AgentConnection: Send + Sync {
         false
     }
 
+    /// Release Atlas's local handle even when the agent has no session/close
+    /// RPC. Transports with a session registry override this to prune it.
+    fn release_session(
+        self: Arc<Self>,
+        session_id: acp::SessionId,
+    ) -> BoxFuture<'static, Result<()>> {
+        if self.supports_close_session() {
+            self.close_session(session_id)
+        } else {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     /// Close an existing session. Allows the agent to free the session from memory.
     fn close_session(
         self: Arc<Self>,
@@ -327,6 +340,11 @@ pub trait AgentConnection: Send + Sync {
     }
 
     fn authenticate(&self, method: acp::AuthMethodId) -> BoxFuture<'static, Result<()>>;
+
+    /// The user dismissed a sign-in: end the [`Self::authenticate`] in
+    /// flight, which has no deadline of its own. A no-op where there is
+    /// nothing to end.
+    fn cancel_authentication(&self) {}
 
     fn supports_logout(&self) -> bool {
         false

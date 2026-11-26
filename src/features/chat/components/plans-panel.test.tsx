@@ -54,7 +54,8 @@ describe("PlansPanel", () => {
     expect(screen.queryByText("Plan a")).toBeNull();
 
     await userEvent.click(screen.getByText("Fix the race"));
-    expect(await screen.findByText("Plan a")).toBeTruthy();
+    // The markdown renderer is lazy-loaded; its first import can outlast the 1s default.
+    expect(await screen.findByText("Plan a", undefined, { timeout: 5000 })).toBeTruthy();
 
     act(() => {
       emitWindowEvent("atlas:plan-saved");
@@ -75,5 +76,31 @@ describe("PlansPanel", () => {
     render(<PlansPanel onClose={() => {}} />);
     expect(screen.getByText(/No plans yet/)).toBeTruthy();
     expect(loadPlans).not.toHaveBeenCalled();
+  });
+
+  it("never lists the previous project's plans after a switch", async () => {
+    let releaseOld!: (plans: PlanRecord[]) => void;
+    loadPlans.mockImplementation((path: string) =>
+      path === "/repo"
+        ? new Promise((done) => {
+            releaseOld = done;
+          })
+        : new Promise(() => {}),
+    );
+    render(<PlansPanel onClose={() => {}} />);
+    act(() => setProject("/other"));
+    await waitFor(() => expect(loadPlans).toHaveBeenCalledWith("/other"));
+    await act(async () => releaseOld([PLAN("a", "Old project plan")]));
+    expect(screen.queryByText("Old project plan")).toBeNull();
+  });
+
+  it("hides the previous project's plans while the new project's load is pending", async () => {
+    loadPlans.mockImplementation((path: string) =>
+      path === "/repo" ? Promise.resolve([PLAN("a", "Old project plan")]) : new Promise(() => {}),
+    );
+    render(<PlansPanel onClose={() => {}} />);
+    await screen.findByText("Old project plan");
+    act(() => setProject("/other"));
+    expect(screen.queryByText("Old project plan")).toBeNull();
   });
 });

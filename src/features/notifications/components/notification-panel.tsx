@@ -93,7 +93,7 @@ export function NotificationPanel() {
         close();
         void runNotificationAction(a.id, { kind: n.kind, target, args: a.args });
       }}
-      onClearAll={clearAll}
+      onClearAll={() => clearAll(items.map((item) => item.id))}
     />
   );
 }

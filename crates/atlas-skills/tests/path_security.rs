@@ -196,12 +196,11 @@ fn a_symlinked_skill_dir_is_read_through_and_deleted_as_a_link() {
     assert!(outside.join("SKILL.md").is_file(), "its target is not");
 }
 
-/// As the code stands (`copy_dir_all` documents it): a symlinked *file* inside
-/// a skill is copied by content, so promoting a project's skill copies
-/// whatever its links point at into the global store.
+/// Promotion must not copy private content from outside the skill through
+/// a symlink, or leave a partial installation after refusing that link.
 #[cfg(unix)]
 #[test]
-fn promoting_a_skill_copies_the_content_its_file_links_point_at() {
+fn promoting_a_skill_refuses_external_file_links() {
     let (tmp, store) = root_with_a_neighbour();
     let private = tmp.path().join("private.txt");
     fs::write(&private, "not part of the skill").unwrap();
@@ -211,30 +210,28 @@ fn promoting_a_skill_copies_the_content_its_file_links_point_at() {
     )
     .unwrap();
 
-    store.promote("kept").unwrap();
-
-    let copied = tmp.path().join("home/.agents/skills/kept/notes.txt");
-    assert!(!copied.symlink_metadata().unwrap().file_type().is_symlink());
-    assert_eq!(fs::read_to_string(copied).unwrap(), "not part of the skill");
+    let error = store.promote("kept").unwrap_err();
+    assert!(error.contains("absolute symlink cannot be installed"));
+    assert!(!tmp.path().join("home/.agents/skills/kept").exists());
+    assert!(tmp
+        .path()
+        .join("root/.agents/skills/kept/SKILL.md")
+        .is_file());
+    assert_eq!(
+        fs::read_to_string(private).unwrap(),
+        "not part of the skill"
+    );
 }
 
-/// GAP, not fixed here (this change moves code and keeps its behaviour).
-///
 /// The pack-projection ledger (`<root>/.atlas/packs/.pack-projections.json`)
-/// records where each projection landed as `targetRel`, and un-projecting
-/// removes whatever is at `<root>/<targetRel>` without checking that it is
-/// under the root. At project scope that file is part of the project, so a
-/// repository can ship one: un-projecting or uninstalling the pack it names
-/// then deletes a directory outside the project. An absolute `targetRel`
-/// behaves the same way, and is also what the store itself writes when an
-/// environment variable relocates a tool's directory, so the fix has to decide
-/// which absolute targets are legitimate.
-///
-/// Run it with `cargo test -p atlas-skills --test path_security -- --ignored`:
-/// it fails today on the assertion below.
+/// records where each projection landed as `targetRel`. At project scope that
+/// file is part of the project, so a repository can ship a forged one. Un-
+/// projecting must not delete `<root>/<targetRel>` on the ledger's word: it
+/// recomputes the destination from the tool registry and acts only on an exact
+/// match, so `../victim` (or any absolute path the registry would not produce)
+/// is dropped from the ledger without touching the disk.
 #[cfg(unix)]
 #[test]
-#[ignore = "known gap: a pack ledger entry can point un-projection outside the root"]
 fn a_pack_ledger_entry_cannot_point_unprojection_outside_the_root() {
     let (tmp, store) = root_with_a_neighbour();
     let victim = tmp.path().join("victim");

@@ -215,6 +215,58 @@ pub fn asset_allow_dir(
         .map_err(|e| e.to_string())
 }
 
+/// Resolve a selected media file against the same grants and denials as the
+/// asset protocol. Explicit project files can include hidden path components.
+pub(super) async fn resolve_media_file(
+    app: &tauri::AppHandle,
+    path: String,
+) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager;
+    let roots = {
+        let state = app.state::<crate::AppStateHandle>();
+        let state = state.lock();
+        state
+            .workspaces
+            .iter()
+            .map(|w| std::path::PathBuf::from(&w.path))
+            .collect::<Vec<_>>()
+    };
+    let scope = app.asset_protocol_scope();
+    tokio::task::spawn_blocking(move || {
+        let requested = std::path::Path::new(&path);
+        if !requested.is_absolute() {
+            return Err("media path must be absolute".into());
+        }
+        let canonical = dunce::canonicalize(requested).map_err(|e| e.to_string())?;
+        if scope.is_forbidden(&canonical)
+            || !(scope.is_allowed(&canonical)
+                || canonical.parent().is_some_and(|parent| {
+                    asset_grant_allowed(parent, &roots, dirs::home_dir().as_deref())
+                }))
+        {
+            return Err("that file is outside what the media viewer may serve".into());
+        }
+        if !std::fs::metadata(&canonical)
+            .map_err(|e| e.to_string())?
+            .is_file()
+        {
+            return Err("media path must name a regular file".into());
+        }
+        Ok(canonical)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn asset_allow_file(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    use tauri::Manager;
+    let canonical = resolve_media_file(&app, path).await?;
+    app.asset_protocol_scope()
+        .allow_file(canonical)
+        .map_err(|e| e.to_string())
+}
+
 /// The asset-grant policy, pure so it is testable: a canonical directory may
 /// be granted when it sits under a known project root, or when it is a
 /// VISIBLE directory under `$HOME` — hidden dirs (`~/.ssh`), `~/Library`, and
@@ -266,13 +318,50 @@ pub async fn file_mtime_ms(path: String) -> Result<i64, String> {
     .map_err(|e| e.to_string())?
 }
 
+/// Save `bytes` over `path` the way an editor must: atomically
+/// (`atlas_fs`: temp file, fsync, rename), so a crash or a full disk mid-save
+/// leaves the old file whole instead of empty or cut short. `fs::write`
+/// truncated the file first.
+///
+/// What an in-place write kept for free is kept on purpose: a symlink stays
+/// a symlink (its target is replaced), the replaced file's permission bits
+/// carry over, and a read-only file is still refused rather than replaced.
+/// A new file gets the platform's default permissions.
+fn save_file_atomically(path: &str, bytes: &[u8]) -> Result<(), String> {
+    let failed = |e: std::io::Error| format!("Failed to write {path}: {e}");
+    match fs::metadata(path) {
+        Ok(meta) => {
+            if meta.permissions().readonly() {
+                return Err(failed(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "the file is read-only",
+                )));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = meta.permissions().mode() & 0o7777;
+                atlas_fs::replace_file_follow_symlink_with_mode(path, bytes, mode).map_err(failed)
+            }
+            #[cfg(not(unix))]
+            {
+                atlas_fs::replace_file_follow_symlink(path, bytes).map_err(failed)
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // A dangling symlink: `replace_file_follow_symlink` refuses it
+            // rather than replacing the link with a regular file.
+            atlas_fs::replace_file_follow_symlink(path, bytes).map_err(failed)
+        }
+        Err(e) => Err(failed(e)),
+    }
+}
+
 #[tauri::command]
 pub async fn write_file_content(path: String, content: String) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || {
-        fs::write(&path, &content).map_err(|e| format!("Failed to write {path}: {e}"))
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    tokio::task::spawn_blocking(move || save_file_atomically(&path, content.as_bytes()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Write a binary file from standard base64. Counterpart of `read_file_base64`
@@ -285,7 +374,7 @@ pub async fn write_file_base64(path: String, contents: String) -> Result<(), Str
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(contents.as_bytes())
             .map_err(|e| format!("bad base64: {e}"))?;
-        fs::write(&path, &bytes).map_err(|e| format!("Failed to write {path}: {e}"))
+        save_file_atomically(&path, &bytes)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -367,10 +456,9 @@ fn is_case_only_rename(from: &Path, to: &Path) -> bool {
 /// which: `Ok(false)` when `to` already exists. Atomic where the platform has
 /// a no-replace rename (macOS `renamex_np(RENAME_EXCL)`, glibc Linux
 /// `renameat2(RENAME_NOREPLACE)`), so nothing can appear at `to` between a
-/// check and the rename. Elsewhere (Windows, musl, a filesystem that refuses
-/// the flag) it falls back to check-then-rename, which leaves that window:
-/// std's Windows rename passes `MOVEFILE_REPLACE_EXISTING`, and calling
-/// `MoveFileExW` without it would mean another direct dependency.
+/// check and the rename. Windows uses MoveFileExW without REPLACE_EXISTING.
+/// On a Unix filesystem that refuses the flag, check-then-rename remains the
+/// fallback; supported Linux packages use glibc's renameat2 path above it.
 fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<bool> {
     #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
     {
@@ -406,10 +494,49 @@ fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<bool> {
             _ => return Err(err),
         }
     }
-    if to.exists() {
-        return Ok(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::{HRESULT, PCWSTR};
+        use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+        use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS};
+        let wide = |path: &Path| -> std::io::Result<Vec<u16>> {
+            let mut value: Vec<u16> = path.as_os_str().encode_wide().collect();
+            if value.contains(&0) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path contains NUL",
+                ));
+            }
+            value.push(0);
+            Ok(value)
+        };
+        let (src, dst) = (wide(from)?, wide(to)?);
+        // SAFETY: the NUL-terminated path buffers outlive the synchronous call.
+        return match unsafe {
+            MoveFileExW(
+                PCWSTR(src.as_ptr()),
+                PCWSTR(dst.as_ptr()),
+                MOVE_FILE_FLAGS(0),
+            )
+        } {
+            Ok(()) => Ok(true),
+            Err(error)
+                if error.code() == HRESULT::from_win32(ERROR_ALREADY_EXISTS.0)
+                    || error.code() == HRESULT::from_win32(ERROR_FILE_EXISTS.0) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(std::io::Error::other(error)),
+        };
     }
-    fs::rename(from, to).map(|()| true)
+    #[cfg(not(windows))]
+    {
+        if fs::symlink_metadata(to).is_ok() {
+            return Ok(false);
+        }
+        fs::rename(from, to).map(|()| true)
+    }
 }
 
 /// `fs_rename`'s work: never onto another entry, but a case-only rename of the
@@ -472,10 +599,11 @@ pub async fn fs_rename(from: String, to: String) -> Result<(), String> {
 pub async fn fs_delete(path: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
         let p = Path::new(&path);
-        if !p.exists() {
-            return Ok(());
-        }
-        let meta = fs::symlink_metadata(p).map_err(|e| e.to_string())?;
+        let meta = match fs::symlink_metadata(p) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.to_string()),
+        };
         if meta.is_dir() {
             fs::remove_dir_all(p).map_err(|e| format!("Failed to delete dir: {e}"))
         } else {
@@ -491,38 +619,67 @@ pub async fn fs_copy(from: String, to: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
         let src = Path::new(&from);
         let dst = Path::new(&to);
-        if dst.exists() {
-            return Err(format!("Target already exists: {to}"));
-        }
-        if src.is_dir() {
-            copy_dir_recursive(src, dst)
-        } else {
-            if let Some(parent) = dst.parent() {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            fs::copy(src, dst)
-                .map(|_| ())
-                .map_err(|e| format!("Failed to copy: {e}"))
-        }
+        copy_new_entry(src, dst)
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
-    fs::create_dir_all(dst).map_err(|e| e.to_string())?;
-    for entry in fs::read_dir(src).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        let ty = entry.file_type().map_err(|e| e.to_string())?;
-        if ty.is_dir() {
-            copy_dir_recursive(&from, &to)?;
+/// Copy into a private sibling then publish. Unsupported links or I/O errors
+/// leave the requested destination absent, with no half-copied tree.
+fn copy_new_entry(src: &Path, dst: &Path) -> Result<(), String> {
+    if fs::symlink_metadata(dst).is_ok() {
+        return Err(format!("Target already exists: {}", dst.display()));
+    }
+    let parent = dst.parent().ok_or("No parent dir")?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let staging = parent.join(format!(".atlas-copy-{}", uuid::Uuid::new_v4()));
+    let result = copy_entry(src, &staging).and_then(|()| {
+        match rename_no_replace(&staging, dst).map_err(|e| e.to_string())? {
+            true => Ok(()),
+            false => Err("Target already exists".into()),
+        }
+    });
+    if result.is_err() {
+        if fs::symlink_metadata(&staging).is_ok_and(|m| m.is_dir()) {
+            let _ = fs::remove_dir_all(&staging);
         } else {
-            fs::copy(&from, &to).map_err(|e| e.to_string())?;
+            let _ = fs::remove_file(&staging);
         }
     }
-    Ok(())
+    result
+}
+
+fn copy_entry(src: &Path, dst: &Path) -> Result<(), String> {
+    let meta = fs::symlink_metadata(src).map_err(|e| e.to_string())?;
+    if meta.file_type().is_symlink() {
+        let target = fs::read_link(src).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, dst).map_err(|e| e.to_string())
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileTypeExt;
+            if meta.file_type().is_symlink_dir() {
+                std::os::windows::fs::symlink_dir(target, dst)
+            } else {
+                std::os::windows::fs::symlink_file(target, dst)
+            }
+            .map_err(|e| e.to_string())
+        }
+    } else if meta.is_dir() {
+        fs::create_dir(dst).map_err(|e| e.to_string())?;
+        for entry in fs::read_dir(src).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            copy_entry(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else if meta.is_file() {
+        fs::copy(src, dst).map(|_| ()).map_err(|e| e.to_string())
+    } else {
+        Err("Only files, folders and symbolic links can be copied".into())
+    }
 }
 
 /// Produce `<stem> copy<.ext>`, `<stem> copy 2<.ext>`, … picking the
@@ -532,9 +689,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
 pub async fn fs_duplicate(path: String) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
         let src = Path::new(&path);
-        if !src.exists() {
-            return Err(format!("Not found: {path}"));
-        }
+        fs::symlink_metadata(src).map_err(|e| format!("Not found: {path}: {e}"))?;
         let parent = src.parent().ok_or("No parent dir")?;
         let stem = src
             .file_stem()
@@ -550,12 +705,8 @@ pub async fn fs_duplicate(path: String) -> Result<String, String> {
                 (n, None) => format!("{stem} copy {n}"),
             };
             let candidate = parent.join(&name);
-            if !candidate.exists() {
-                if src.is_dir() {
-                    copy_dir_recursive(src, &candidate)?;
-                } else {
-                    fs::copy(src, &candidate).map_err(|e| e.to_string())?;
-                }
+            if fs::symlink_metadata(&candidate).is_err() {
+                copy_new_entry(src, &candidate)?;
                 return Ok(candidate.to_string_lossy().to_string());
             }
         }
@@ -585,9 +736,11 @@ pub async fn fs_open_in_terminal(path: String) -> Result<(), String> {
         {
             use std::process::Command;
             Command::new("open")
+                .env_clear()
+                .envs(atlas_process::host_environment())
                 .args(["-a", "Terminal", &path])
                 .spawn()
-                .map(|_| ())
+                .map(reap_terminal_launcher)
                 .map_err(|e| format!("Failed to open Terminal: {e}"))
         }
         #[cfg(target_os = "linux")]
@@ -609,12 +762,14 @@ pub async fn fs_open_in_terminal(path: String) -> Result<(), String> {
                 .as_deref()
                 .and_then(parse_terminal_env)
             {
-                if Command::new(bin)
+                if let Ok(child) = Command::new(bin)
+                    .env_clear()
+                    .envs(atlas_process::host_environment())
                     .args(&args)
                     .current_dir(target_dir)
                     .spawn()
-                    .is_ok()
                 {
+                    reap_terminal_launcher(child);
                     return Ok(());
                 }
             }
@@ -636,18 +791,47 @@ pub async fn fs_open_in_terminal(path: String) -> Result<(), String> {
             ];
 
             for (term, args) in terminals {
-                if Command::new(term)
+                if let Ok(child) = Command::new(term)
+                    .env_clear()
+                    .envs(atlas_process::host_environment())
                     .args(*args)
                     .current_dir(target_dir)
                     .spawn()
-                    .is_ok()
                 {
+                    reap_terminal_launcher(child);
                     return Ok(());
                 }
             }
             Err("No supported terminal emulator found".to_string())
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_os = "windows")]
+        {
+            let target = Path::new(&path);
+            let dir = if target.is_dir() {
+                target
+            } else {
+                target.parent().ok_or("No parent dir")?
+            };
+            // Windows Terminal opens a tab in this directory. Command Prompt
+            // is available on older Windows installations without wt.exe.
+            for (program, args) in [("wt.exe", vec!["-d", "."]), ("cmd.exe", vec!["/K"])] {
+                let mut cmd = std::process::Command::new(program);
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x00000010); // CREATE_NEW_CONSOLE
+                if let Ok(child) = cmd
+                    .env_clear()
+                    .envs(atlas_process::host_environment())
+                    .current_dir(dir)
+                    .args(args)
+                    .spawn()
+                {
+                    reap_terminal_launcher(child);
+                    return Ok(());
+                }
+            }
+            Err("No terminal could be launched".to_string())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             let _ = path;
             Err::<(), String>("unsupported".to_string())
@@ -655,6 +839,12 @@ pub async fn fs_open_in_terminal(path: String) -> Result<(), String> {
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+fn reap_terminal_launcher(mut child: std::process::Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 /// Append an arbitrary pattern to the project's `.gitignore`, sharing
@@ -692,7 +882,8 @@ fn append_to_gitignore_sync(project_path: &str, pattern: &str) -> Result<(), Str
     }
     next.push_str(trimmed);
     next.push('\n');
-    fs::write(&gitignore, next).map_err(|e| format!("could not write .gitignore: {e}"))?;
+    save_file_atomically(&gitignore.to_string_lossy(), next.as_bytes())
+        .map_err(|e| format!("could not write .gitignore: {e}"))?;
     Ok(())
 }
 
@@ -843,7 +1034,8 @@ fn ensure_listed(file: &Path, dir_name: &str) -> Result<EnsureAtlasGitignoreResu
     next.push_str(&pattern);
     next.push('\n');
 
-    fs::write(file, next).map_err(|e| format!("could not write {shown}: {e}"))?;
+    save_file_atomically(&file.to_string_lossy(), next.as_bytes())
+        .map_err(|e| format!("could not write {shown}: {e}"))?;
     tracing::info!(target: "atlas::gitignore", "appended {pattern} to {shown}");
     Ok(EnsureAtlasGitignoreResult::Added)
 }
@@ -1251,5 +1443,101 @@ mod tree_op_tests {
             fs::write(&b, "y").unwrap();
             assert!(!is_case_only_rename(&a, &b));
         }
+    }
+}
+
+/// D3: a save replaces the file atomically (temp + rename) rather than
+/// truncating it in place, keeps a symlink as a symlink, and keeps the
+/// replaced file's permission bits.
+#[cfg(test)]
+mod atomic_save_tests {
+    use super::{write_file_base64, write_file_content};
+    use std::io::Read;
+
+    /// `fs::write` truncates the inode a reader already holds open, which is
+    /// exactly the window in which a crash leaves the file empty. An atomic
+    /// replace leaves that inode, and its complete old content, alone.
+    #[tokio::test]
+    async fn a_save_never_truncates_the_file_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.rs");
+        std::fs::write(&path, "old complete contents").unwrap();
+        let mut held = std::fs::File::open(&path).unwrap();
+
+        write_file_content(path.to_string_lossy().into(), "new".into())
+            .await
+            .unwrap();
+
+        let mut seen = String::new();
+        held.read_to_string(&mut seen).unwrap();
+        assert_eq!(
+            seen, "old complete contents",
+            "the old inode was rewritten in place"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    }
+
+    #[tokio::test]
+    async fn a_base64_save_never_truncates_the_file_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.pdf");
+        std::fs::write(&path, b"old pdf").unwrap();
+        let mut held = std::fs::File::open(&path).unwrap();
+
+        // "bmV3" is base64 for "new".
+        write_file_base64(path.to_string_lossy().into(), "bmV3".into())
+            .await
+            .unwrap();
+
+        let mut seen = Vec::new();
+        held.read_to_end(&mut seen).unwrap();
+        assert_eq!(seen, b"old pdf");
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_save_through_a_symlink_keeps_the_link_and_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.sh");
+        std::fs::write(&target, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let link = dir.path().join("link.sh");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        write_file_content(link.to_string_lossy().into(), "#!/bin/sh\necho hi\n".into())
+            .await
+            .unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "#!/bin/sh\necho hi\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_read_only_file_is_still_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.txt");
+        std::fs::write(&path, "keep").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        assert!(
+            write_file_content(path.to_string_lossy().into(), "x".into())
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep");
     }
 }

@@ -79,28 +79,22 @@ export interface Projection {
 }
 
 /**
- * Tool calls that are the agent talking to ITSELF — planning, task bookkeeping,
- * scheduling. They produce no artifact the reader can inspect and no change to
- * the project, so a run of five `TaskUpdate` lines is pure noise between two
- * paragraphs of prose. Dropped at projection time so they never cost a row.
+ * Tool calls that are the agent talking to ITSELF: switching its own mode.
+ * They produce no artifact the reader can inspect and no change to the
+ * project — the mode pill and the plan review already say what happened — so
+ * they never cost a row.
+ *
+ * Recognised by the ACP tool kind the agent declared, never by a title or a
+ * tool name (ADR-0002): `switch_mode` is the protocol's "switching the current
+ * session mode". A title is the agent's prose, so a call another agent
+ * happened to call "Plan" was hidden while it ran a command.
+ *
+ * `think` is deliberately NOT here. Claude Code declares its `Task` launches
+ * `think`, and subagent detection is conservative (`subagent.rs`): a launch it
+ * misses must still show as a marker, not vanish.
  */
-const INTERNAL_TOOLS = new Set([
-  "exitplanmode",
-  "todowrite",
-  "taskcreate",
-  "taskupdate",
-  "taskget",
-  "tasklist",
-  "taskoutput",
-  "taskstop",
-  "schedulewakeup",
-  "reportfindings",
-  "updateplan",
-  "plan",
-]);
-
 function isInternalTool(tc: ToolCallDisplay): boolean {
-  return INTERNAL_TOOLS.has(tc.toolName.trim().toLowerCase());
+  return tc.kind === "switch_mode";
 }
 
 // ── Marker labelling ───────────────────────────────────────────────────────
@@ -205,11 +199,21 @@ function markerFor(tc: ToolCallDisplay, turnId: string, first: boolean): MarkerR
     // `cargo test` is the command itself, so that is what gets read — see
     // `parse-shell-command.ts` for why this is a port and not a wire field.
     // A command it cannot reduce to one action stays "Ran", verbatim.
-    const command = bashCommandOf(args) || (tc.kind === "execute" ? tc.toolName : "");
+    //
+    // Only a command from the arguments is parsed. An `execute` call that sent
+    // none is named by its title, which is the agent's prose ("Run the test
+    // suite"), not a shell line: parsed, "grep for TODOs" became a search for
+    // "for" in a folder called "TODOs". It reads verbatim after "Ran".
+    const command = bashCommandOf(args);
     opens = "output";
     cmd = command;
-    const parsed = parseShellCommand(command);
-    if (parsed.kind === "read") {
+    const parsed = command ? parseShellCommand(command) : null;
+    if (!parsed) {
+      verb = "Ran";
+      tool = "run";
+      detail = tc.kind === "execute" ? tc.toolName : "";
+      cmd = undefined;
+    } else if (parsed.kind === "read") {
       verb = "Read";
       tool = "read";
       detail = shortPath(parsed.path);

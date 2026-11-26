@@ -14,6 +14,24 @@ fn test_utf8_shell_output() {
 }
 
 #[test]
+fn truncated_utf8_shell_output_keeps_the_valid_prefix() {
+    let mut text = "résumé Привет 世界\n".repeat(60_000).into_bytes();
+    text.truncate(1024 * 1024);
+    // Ensure this models a capture byte cap inside a character, not an encoding error.
+    while std::str::from_utf8(&text).is_ok() {
+        text.pop();
+    }
+    let error = std::str::from_utf8(&text).unwrap_err();
+    assert!(error.error_len().is_none());
+    let actual = decode_shell_output(&text);
+    assert!(
+        actual == String::from_utf8_lossy(&text),
+        "decoded prefix: {:?}",
+        actual.chars().take(80).collect::<String>()
+    );
+}
+
+#[test]
 fn test_cp1251_shell_output() {
     // VS Code shells on Windows frequently surface CP1251 bytes for Cyrillic text.
     assert_eq!(decode_shell_output(b"\xEF\xF0\xE8\xEC\xE5\xF0"), "пример");

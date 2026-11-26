@@ -96,7 +96,7 @@ impl LastWriter {
 /// `entrypoint` and no conversation, so they move the file time without
 /// saying anything about who is in the session or whether it is still
 /// running. Read by time alone, every one of them looked like "another
-/// process", which is what made the live-elsewhere banner look random.
+/// process", which is what made a liveness read by time look random.
 ///
 /// `None` when the tail holds no conversation line (unknown writer), so the
 /// caller falls back to the file time rather than hiding a real terminal. A

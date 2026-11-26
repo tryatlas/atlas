@@ -9,6 +9,9 @@ import {
 import { IconPicker } from "@/features/knowledge/components/icon-picker";
 import { ensureKnowledgeMentionCache } from "@/features/chat/lib/mentions";
 import { HintGroup, HintItem } from "@tryatlas/design";
+import { deleteDocument, documentKey } from "@/features/editor-notion/lib/document-saves";
+import { dropCachedDoc } from "@/features/editor-notion/lib/blocks-cache";
+import { toast } from "sonner";
 
 interface NoteEditorPanelProps {
   noteId: string;
@@ -26,7 +29,9 @@ interface NoteEditorPanelProps {
  */
 export function NoteEditorPanel({ noteId, projectPath, onClose }: NoteEditorPanelProps) {
   const nodes = useCanvasStore((s) => s.nodes);
-  const { updateNote, deleteNote } = useCanvasStore((s) => s.actions);
+  const pageId = useCanvasStore((s) => s.activePageId);
+  const { updateNote, deleteNote, saveNoteBody, flush } = useCanvasStore((s) => s.actions);
+  const key = documentKey(projectPath, "canvas-note", pageId ?? "", noteId);
   const note = nodes.find((n) => n.id === noteId) ?? null;
 
   const editorRef = useRef<TiptapEditorHandle>(null);
@@ -37,28 +42,26 @@ export function NoteEditorPanel({ noteId, projectPath, onClose }: NoteEditorPane
     void ensureKnowledgeMentionCache(projectPath);
   }, [projectPath]);
 
-  const flushBody = useCallback(() => {
-    const ed = editorRef.current;
-    if (!ed || !ed.isDirty()) return;
-    void ed.flush().then((md) => {
-      if (md !== null) updateNote(noteId, { body: md });
-    });
-  }, [noteId, updateNote]);
+  const flushBody = useCallback(async () => {
+    try {
+      await editorRef.current?.save();
+      return true;
+    } catch (error) {
+      toast.error(`Note could not be saved: ${String(error)}`);
+      return false;
+    }
+  }, []);
 
-  // Flush on app blur + on unmount (e.g. switching to a connected note remounts
-  // this panel via its `key`, so the outgoing note's body is saved first).
   useEffect(() => {
-    const onBlur = () => flushBody();
+    const onBlur = () => void flushBody();
     window.addEventListener("blur", onBlur);
-    return () => {
-      window.removeEventListener("blur", onBlur);
-      flushBody();
-    };
+    return () => window.removeEventListener("blur", onBlur);
   }, [flushBody]);
 
   const close = useCallback(() => {
-    flushBody();
-    onClose();
+    void flushBody().then((saved) => {
+      if (saved) onClose();
+    });
   }, [flushBody, onClose]);
 
   useEffect(() => {
@@ -119,8 +122,15 @@ export function NoteEditorPanel({ noteId, projectPath, onClose }: NoteEditorPane
               <button
                 type="button"
                 onClick={() => {
-                  deleteNote(noteId);
-                  onClose();
+                  void deleteDocument(key, async () => {
+                    deleteNote(noteId);
+                  })
+                    .then(async () => {
+                      dropCachedDoc(key);
+                      await flush(projectPath);
+                      onClose();
+                    })
+                    .catch((error) => toast.error(`Note could not be deleted: ${String(error)}`));
                 }}
                 className="p-1 rounded hover:bg-element-hover text-muted-foreground hover:text-error cursor-pointer transition-colors"
               >
@@ -145,7 +155,12 @@ export function NoteEditorPanel({ noteId, projectPath, onClose }: NoteEditorPane
         <div className="flex-1 min-h-0 overflow-y-auto hide-scrollbar px-5">
           <TiptapEditor
             ref={editorRef}
-            documentId={`canvas:${noteId}`}
+            documentId={key}
+            projectPath={projectPath}
+            onSave={(markdown) => {
+              if (!pageId) return Promise.reject(new Error("No canvas page is selected."));
+              return saveNoteBody(projectPath, pageId, noteId, markdown);
+            }}
             initialMarkdown={note.body}
             label={note.title || "Untitled note"}
             placeholder="Write… use @ to reference a note or repo"

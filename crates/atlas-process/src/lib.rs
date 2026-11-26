@@ -45,6 +45,7 @@ impl NoWindow for tokio::process::Command {
 /// A `std` command that already carries [`NoWindow::no_window`].
 pub fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     let mut cmd = std::process::Command::new(program);
+    cmd.env_clear().envs(host_environment());
     cmd.no_window();
     cmd
 }
@@ -52,6 +53,136 @@ pub fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
 /// A `tokio` command that already carries [`NoWindow::no_window`].
 pub fn async_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(program);
+    cmd.env_clear().envs(host_environment());
     cmd.no_window();
     cmd
+}
+
+/// Environment for programs installed on the host. An AppImage's private
+/// loader/GTK paths belong to Atlas itself; passing them to host binaries can
+/// load incompatible libc/GTK modules. Explicit per-command values may be
+/// added after this snapshot (for example an agent's managed Node PATH).
+pub fn host_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    sanitize_environment(std::env::vars_os().collect())
+        .into_iter()
+        .collect()
+}
+
+fn sanitize_environment(
+    mut env: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+) -> std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> {
+    use std::ffi::OsStr;
+    use std::path::Path;
+    let Some(app_dir) = env.get(OsStr::new("APPDIR")).cloned() else {
+        return env;
+    };
+    let app_dir = Path::new(&app_dir);
+    if !app_dir.is_absolute() {
+        return env;
+    }
+    for key in [
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "GTK_PATH",
+        "GIO_EXTRA_MODULES",
+        "GIO_MODULE_DIR",
+        "GI_TYPELIB_PATH",
+        "GSETTINGS_SCHEMA_DIR",
+    ] {
+        let Some(value) = env.get(OsStr::new(key)).cloned() else {
+            continue;
+        };
+        let kept: Vec<_> = loader_paths(key, &value)
+            .into_iter()
+            .filter(|p| !p.starts_with(app_dir))
+            .collect();
+        if kept.is_empty() {
+            env.remove(OsStr::new(key));
+        } else if let Ok(value) = std::env::join_paths(kept) {
+            env.insert(key.into(), value);
+        }
+    }
+    // A launcher can preserve an explicit user override before choosing the
+    // bundled app's theme. Without one, let each host application choose its
+    // own desktop theme instead of forcing the AppImage's Adwaita choice.
+    match env.remove(OsStr::new("ATLAS_HOST_GTK_THEME")) {
+        Some(value) if !value.is_empty() => {
+            env.insert("GTK_THEME".into(), value);
+        }
+        _ => {
+            env.remove(OsStr::new("GTK_THEME"));
+        }
+    }
+    env
+}
+
+fn loader_paths(key: &str, value: &std::ffi::OsStr) -> Vec<std::path::PathBuf> {
+    #[cfg(unix)]
+    if matches!(key, "LD_LIBRARY_PATH" | "LD_PRELOAD") {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        return value
+            .as_bytes()
+            .split(|byte| {
+                *byte == b':'
+                    || (key == "LD_LIBRARY_PATH" && *byte == b';')
+                    || (key == "LD_PRELOAD" && *byte == b' ')
+            })
+            .map(|bytes| std::ffi::OsString::from_vec(bytes.to_vec()).into())
+            .collect();
+    }
+    #[cfg(not(unix))]
+    let _ = key;
+    std::env::split_paths(value).collect()
+}
+
+#[cfg(all(test, unix))]
+mod environment_tests {
+    #[test]
+    fn host_paths_survive_but_appimage_paths_do_not() {
+        let input = [
+            ("APPDIR", "/tmp/.mount_atlas"),
+            ("LD_LIBRARY_PATH", "/tmp/.mount_atlas/usr/lib:/opt/host/lib"),
+            ("GTK_PATH", "/tmp/.mount_atlas/usr/lib/gtk"),
+            ("GTK_THEME", "Adwaita:dark"),
+            ("PATH", "/home/me/bin:/usr/bin"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+        let clean = super::sanitize_environment(input);
+        assert_eq!(
+            clean.get(std::ffi::OsStr::new("LD_LIBRARY_PATH")).unwrap(),
+            "/opt/host/lib"
+        );
+        assert!(!clean.contains_key(std::ffi::OsStr::new("GTK_PATH")));
+        assert!(!clean.contains_key(std::ffi::OsStr::new("GTK_THEME")));
+        assert_eq!(
+            clean.get(std::ffi::OsStr::new("PATH")).unwrap(),
+            "/home/me/bin:/usr/bin"
+        );
+    }
+
+    #[test]
+    fn loader_specific_separators_preserve_host_entries() {
+        let input = [
+            ("APPDIR", "/tmp/.mount_atlas"),
+            ("LD_LIBRARY_PATH", "/tmp/.mount_atlas/usr/lib;/opt/host/lib"),
+            (
+                "LD_PRELOAD",
+                "/tmp/.mount_atlas/libhack.so /opt/host/a.so:/opt/host/b.so",
+            ),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect();
+        let clean = super::sanitize_environment(input);
+        assert_eq!(
+            clean.get(std::ffi::OsStr::new("LD_LIBRARY_PATH")).unwrap(),
+            "/opt/host/lib"
+        );
+        assert_eq!(
+            clean.get(std::ffi::OsStr::new("LD_PRELOAD")).unwrap(),
+            "/opt/host/a.so:/opt/host/b.so"
+        );
+    }
 }

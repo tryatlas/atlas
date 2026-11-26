@@ -16,6 +16,7 @@ vi.mock("@tauri-apps/api/event", () => import("@/test/tauri-event"));
 import { tauri } from "@/test/tauri-fake";
 
 import { useLayoutStore, type Tab } from "./layout-store";
+import { useTerminalStore } from "@/features/terminal/stores/terminal-store";
 
 const PROJECT = "/Users/dev/atlas";
 
@@ -141,5 +142,76 @@ describe("a project's layout across a restart", () => {
     expect(ids).not.toContain("x-1");
     // The unknown key is not carried: the next save writes this build's shape.
     expect(await save()).not.toHaveProperty("fromANewerBuild");
+  });
+});
+
+describe("what reaches the layout file", () => {
+  it("brings the welcome chat's conversation back", async () => {
+    useLayoutStore.setState({
+      tabs: [{ ...WELCOME, data: { sessionId: "session-7" } }],
+    });
+    expect((await save()).welcomeChat).toEqual({ sessionId: "session-7" });
+
+    freshLayout();
+    await actions().loadEditorState(PROJECT);
+
+    expect(useLayoutStore.getState().tabs.find((t) => t.id === "welcome-chat")?.data).toEqual({
+      sessionId: "session-7",
+    });
+  });
+
+  it("does not replace a conversation the welcome chat started before the file loaded", async () => {
+    useLayoutStore.setState({ tabs: [{ ...WELCOME, data: { sessionId: "saved" } }] });
+    await save();
+    useLayoutStore.setState({ tabs: [{ ...WELCOME, data: { sessionId: "live" } }] });
+    await actions().loadEditorState(PROJECT);
+    expect(useLayoutStore.getState().tabs[0].data).toEqual({ sessionId: "live" });
+  });
+
+  it("writes a change to a terminal's split panes alone", async () => {
+    const terminals = () => useTerminalStore.getState().actions;
+    useLayoutStore.setState({
+      tabs: [WELCOME, tab("terminal-1", "terminal", "main")],
+    });
+    terminals().initTab("terminal-1", "project-1", PROJECT);
+    await save();
+    const writes = tauri.calls("save_editor_state").length;
+
+    const pane = useTerminalStore.getState().tabs["terminal-1"].activePaneId!;
+    terminals().splitPane("terminal-1", pane, "horizontal");
+    await save();
+
+    expect(tauri.calls("save_editor_state").length).toBe(writes + 1);
+    const tree = (JSON.parse(onDisk!) as { terminalTrees: Record<string, { root: unknown }> })
+      .terminalTrees["terminal-1"].root as { type: string };
+    expect(tree.type).toBe("split");
+  });
+
+  it("skips a byte-identical write, and retries one that failed", async () => {
+    useLayoutStore.setState({ tabs: [WELCOME, tab("editor-1", "editor", "main")] });
+    await save();
+    const writes = () => tauri.calls("save_editor_state").length;
+    const before = writes();
+    await actions().flushEditorState(PROJECT);
+    expect(writes()).toBe(before);
+
+    tauri.handleRaw({
+      save_editor_state: () => {
+        throw new Error("disk full");
+      },
+    });
+    useLayoutStore.setState({ tabs: [WELCOME, tab("editor-2", "editor", "main")] });
+    await actions().flushEditorState(PROJECT);
+    expect(writes()).toBe(before + 1);
+
+    tauri.handleRaw({
+      save_editor_state: (args) => {
+        onDisk = (args as { stateJson: string }).stateJson;
+        return null;
+      },
+    });
+    await actions().flushEditorState(PROJECT);
+    expect(writes()).toBe(before + 2);
+    expect(onDisk).toContain("editor-2");
   });
 });

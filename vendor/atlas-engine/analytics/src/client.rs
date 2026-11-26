@@ -315,6 +315,10 @@ impl AnalyticsEventsClient {
         request_id: RequestId,
         request: &ClientRequest,
     ) {
+        if self.queue.is_none() {
+            return;
+        }
+
         if let ClientRequest::TurnInterrupt { params, .. } = request {
             if params.turn_id.is_empty() {
                 return;
@@ -533,6 +537,10 @@ impl AnalyticsEventsClient {
         response: &ClientResponsePayload,
         thread_originator: Option<String>,
     ) {
+        if self.queue.is_none() {
+            return;
+        }
+
         if !matches!(
             response,
             ClientResponsePayload::ThreadStart(_)
@@ -606,6 +614,10 @@ impl AnalyticsEventsClient {
 
     /// Records analytics-relevant notifications without cloning ignored variants.
     pub fn track_notification(&self, notification: &ServerNotification) {
+        if self.queue.is_none() {
+            return;
+        }
+
         if !matches!(
             notification,
             ServerNotification::ThreadArchived(_)

@@ -109,6 +109,7 @@ fn remark(login: &str, created_at: &str, body: &str) -> PrComment {
         body: body.into(),
         created_at: created_at.into(),
         edited_at: None,
+        published_at: None,
         url: Some(format!("https://github.com/o/r/pull/1#{login}")),
         path: Some("src/index.ts".into()),
         review_state: None,

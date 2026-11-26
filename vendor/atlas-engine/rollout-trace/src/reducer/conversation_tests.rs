@@ -25,6 +25,20 @@ use crate::reducer::test_support::trace_context;
 use crate::replay_bundle;
 
 #[test]
+fn structured_tool_payload_summaries_truncate_on_unicode_boundaries() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let writer = create_started_writer(&temp)?;
+    start_turn(&writer, "turn-1")?;
+    let request = writer.write_json_payload(RawPayloadKind::InferenceRequest, &json!({
+        "input": [{"type": "function_call", "call_id": "unicode", "name": "inspect", "arguments": {"value": "界".repeat(100)}}]
+    }))?;
+    append_inference_start(&writer, "inference-1", "turn-1", request)?;
+    let rollout = replay_bundle(temp.path())?;
+    assert_eq!(rollout.conversation_items.len(), 1);
+    Ok(())
+}
+
+#[test]
 fn request_snapshots_reuse_history_without_deduping_new_identical_items() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let writer = create_started_writer(&temp)?;

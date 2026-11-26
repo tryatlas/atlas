@@ -27,6 +27,13 @@ mod proxy_routing;
 #[cfg(target_os = "linux")]
 pub const BUNDLED_BWRAP_DIGEST_VERIFICATION_FAILURE_EXIT_CODE: i32 = 8;
 
+/// The exact bubblewrap executable selected by the Linux sandbox launcher,
+/// including its capability check and bundled fallback. Call from a blocking thread.
+#[cfg(target_os = "linux")]
+pub fn preferred_bwrap_path() -> Option<std::path::PathBuf> {
+    launcher::preferred_bwrap_path()
+}
+
 #[cfg(target_os = "linux")]
 pub fn run_main() -> ! {
     linux_run_main::run_main();

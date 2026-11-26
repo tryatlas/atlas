@@ -5,8 +5,9 @@
 //! exists because the user installed it, and this layer only knows how to start
 //! whatever command the store resolves for it.
 //!
-//! The only per-agent knowledge here is [`env_quirks`], and it is deliberately
-//! not a registry — see the note there.
+//! It has no per-agent knowledge at all: what one agent needs set to behave
+//! well in Atlas is written into that agent's Variables at install
+//! (`atlas_agent_store::launch_defaults`).
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -199,16 +200,17 @@ impl AgentServer for CustomAgentServer {
     ) -> BoxFuture<'static, Result<Arc<dyn AgentConnection>>> {
         let agent_id = self.id.clone();
         Box::pin(async move {
-            let mut extra_env = load_proxy_env();
-            extra_env.extend(env_quirks(&agent_id));
-            let (memory_env, memory_args) = memory_quirks(&agent_id, atlas_only_memory());
-            extra_env.extend(memory_env);
+            // Nothing here is per agent (ADR-0002): what an agent needs set
+            // to behave well in Atlas is written into its Variables when it
+            // is installed (`atlas_agent_store::launch_defaults`), and those
+            // are the store's settings layer.
+            let extra_env = load_proxy_env();
 
             let server = delegate
                 .server
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("no command resolver for agent `{agent_id}`"))?;
-            let command = server.get_command(memory_args, extra_env).await?;
+            let command = server.get_command(Vec::new(), extra_env).await?;
 
             let connection = AcpConnection::stdio(
                 agent_id,
@@ -267,8 +269,9 @@ pub fn load_proxy_env() -> HashMap<String, String> {
 }
 
 /// Whether Atlas's shared memory is the only memory in Atlas sessions (the
-/// `atlasOnlyMemory` setting, default on). Read when an agent starts, so a
-/// change applies to the next session.
+/// `atlasOnlyMemory` setting, default on). Mirrors the setting for code
+/// that has no app handle; the launch defaults that turn an agent's own
+/// memory off are conditional on it (`atlas_agent_store::launch_defaults`).
 static ATLAS_ONLY_MEMORY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Set from the app's settings at startup and whenever they change.
@@ -281,120 +284,24 @@ pub fn atlas_only_memory() -> bool {
     ATLAS_ONLY_MEMORY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// What turns an agent's own memory off when Atlas's is the only one:
-/// Claude Code's auto memory by `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`
-/// (code.claude.com/docs/en/memory), Codex's memories by the
-/// `memories.use_memories` / `memories.generate_memories` config keys passed
-/// as `-c` overrides. Nothing when `atlas_only` is off, or for another agent.
-pub fn memory_quirks(
-    agent_id: &AgentId,
-    atlas_only: bool,
-) -> (HashMap<String, String>, Vec<String>) {
-    let mut env = HashMap::new();
-    let mut args = Vec::new();
-    if atlas_only {
-        match agent_id.as_str() {
-            CLAUDE_AGENT_ID => {
-                env.insert("CLAUDE_CODE_DISABLE_AUTO_MEMORY".to_owned(), "1".to_owned());
-            }
-            CODEX_AGENT_ID => {
-                for key in [
-                    "memories.use_memories=false",
-                    "memories.generate_memories=false",
-                ] {
-                    args.push("-c".to_owned());
-                    args.push(key.to_owned());
-                }
-            }
-            _ => {}
-        }
-    }
-    (env, args)
-}
-
-// Agent ids that need an environment workaround. These are NOT a list of agents
-// Atlas ships, offers, or knows how to install — an agent reaches this function
-// only because the user already installed it and asked to run it. Nothing here
-// creates an agent, and adding an id here must never become the way one appears.
-const CLAUDE_AGENT_ID: &str = "claude-code";
-const CODEX_AGENT_ID: &str = "codex";
-const GEMINI_AGENT_ID: &str = "gemini";
-
-/// Per-agent environment workarounds.
-///
-/// Each is a fix for how that CLI behaves, not a capability decision — capability
-/// questions are answered by what the agent advertises at `initialize`.
-pub fn env_quirks(agent_id: &AgentId) -> HashMap<String, String> {
-    env_quirks_from(agent_id, |key| std::env::var(key).ok())
-}
-
-/// [`env_quirks`] against an explicit environment, so the pass-through can be
-/// tested without mutating the process's own.
-pub fn env_quirks_from(
-    agent_id: &AgentId,
-    host_env: impl Fn(&str) -> Option<String>,
-) -> HashMap<String, String> {
-    let mut env = HashMap::new();
-
-    match agent_id.as_str() {
-        // Blanked, not unset: with a key present the CLI bills the key instead
-        // of the subscription the user signed in with.
-        CLAUDE_AGENT_ID => {
-            env.insert("ANTHROPIC_API_KEY".to_owned(), String::new());
-        }
-        // Passed through explicitly because the CLI reads them from its own
-        // environment. The spawn inherits the host's today, so this is what
-        // keeps them there if it ever stops doing so. These are the two names
-        // codex's auth reads (`CODEX_API_KEY_ENV_VAR`, `OPENAI_API_KEY_ENV_VAR`
-        // in `vendor/atlas-engine/login/src/auth/manager.rs`). Note the spelling
-        // `OPENAI_API_KEY`; `OPEN_AI_API_KEY` is read by nothing.
-        CODEX_AGENT_ID => {
-            for key in ["CODEX_API_KEY", "OPENAI_API_KEY"] {
-                if let Some(value) = host_env(key) {
-                    env.insert(key.to_owned(), value);
-                }
-            }
-        }
-        // Identifies the host to Gemini's telemetry.
-        GEMINI_AGENT_ID => {
-            env.insert("SURFACE".to_owned(), "atlas".to_owned());
-        }
-        _ => {}
-    }
-
-    env
-}
-
 #[cfg(test)]
-mod memory_quirk_tests {
-    use super::*;
-
+mod launcher_tests {
+    /// The launcher treats every agent alike (ADR-0002): it once branched on
+    /// two ids no install has, so the workarounds never
+    /// ran. What an agent needs now lives in its Variables, seeded at install
+    /// from `atlas_agent_store::launch_defaults`. The ids are assembled here
+    /// so this test doesn't trip on itself.
     #[test]
-    fn atlas_only_memory_turns_each_agents_own_memory_off() {
-        let (env, args) = memory_quirks(&AgentId::new(CLAUDE_AGENT_ID), true);
-        assert_eq!(
-            env.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY")
-                .map(String::as_str),
-            Some("1")
-        );
-        assert!(args.is_empty());
-        let (env, args) = memory_quirks(&AgentId::new(CODEX_AGENT_ID), true);
-        assert!(env.is_empty());
-        assert_eq!(
-            args,
-            [
-                "-c",
-                "memories.use_memories=false",
-                "-c",
-                "memories.generate_memories=false"
-            ]
-        );
-        for agent in [CLAUDE_AGENT_ID, CODEX_AGENT_ID, GEMINI_AGENT_ID] {
-            let (env, args) = memory_quirks(&AgentId::new(agent), false);
-            assert!(
-                env.is_empty() && args.is_empty(),
-                "{agent}: off is today's launch"
-            );
+    fn the_launcher_names_no_agent() {
+        let source = include_str!("server.rs");
+        for id in [
+            ["claude", "-code"].concat(),
+            ["claude", "-acp"].concat(),
+            format!("{q}codex{q}", q = '"'),
+            ["co", "dex-acp"].concat(),
+            format!("{q}gemini{q}", q = '"'),
+        ] {
+            assert!(!source.contains(&id), "server.rs names {id}");
         }
     }
 }

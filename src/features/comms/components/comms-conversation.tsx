@@ -27,6 +27,7 @@ import {
 } from "../lib/derive";
 import type { ChatCall, ChatConversation } from "../types";
 import { useWindowEvent } from "@/lib/window-events";
+import { isWindowFocused, onWindowFocusChange } from "@/lib/window-focus";
 
 type Item =
   | {
@@ -53,7 +54,8 @@ export const CommsConversation = memo(function CommsConversation({
   const memberList = useCommsStore((s) => s.members);
   const online = useCommsStore((s) => s.online);
   const messages = useCommsStore((s) => s.messages[conv.id]) ?? EMPTY_MESSAGES;
-  const pinned = useCommsStore((s) => s.pinned);
+  const pinnedCount = useCommsStore((s) => s.pinnedByConv[conv.id]?.length ?? 0);
+  const connection = useCommsStore((s) => s.connection.state);
   const typingRoom = useCommsStore((s) => s.typing[conv.id]);
   const calls = useCommsStore((s) => s.calls);
   const loading = useCommsStore((s) => s.loading[conv.id] === true);
@@ -155,10 +157,25 @@ export const CommsConversation = memo(function CommsConversation({
   // window, page history in (bounded) until it appears — the store's
   // `loadOlder` merges through the same dedupe as everything else.
   const jumpSeqRef = useRef(0);
+  useEffect(
+    () => () => {
+      jumpSeqRef.current += 1;
+    },
+    [conv.id],
+  );
   const jumpToMessage = useCallback(
     async (messageId: string) => {
       const seq = ++jumpSeqRef.current;
       const store = useCommsStore.getState();
+      store.actions.setConvTab(conv.id, "messages");
+      if (!store.hydrated[conv.id]) {
+        const loaded = await waitForConversation(conv.id);
+        if (jumpSeqRef.current !== seq) return;
+        if (!loaded) {
+          toast.error("The conversation is still loading. Try jumping again when it is ready.");
+          return;
+        }
+      }
       const present = () =>
         (useCommsStore.getState().messages[conv.id] ?? []).some((m) => m.id === messageId);
 
@@ -198,12 +215,32 @@ export const CommsConversation = memo(function CommsConversation({
   // itself comes back from the server, never from here. (The transcript lands
   // at the live edge on its own, keyed on the conversation.)
   useEffect(() => {
-    actions.markRead(conv.id);
     // Warm the drafts cache in the background so the FIRST visit to that tab
     // paints instantly too, not just returns to it. Cheap (a small list) and
     // silent — nothing renders until the user goes looking.
     void actions.loadDrafts(conv.id);
   }, [conv.id, actions]);
+
+  const latestSeq = messages[messages.length - 1]?.seq;
+  useEffect(() => {
+    const mark = () => {
+      if (
+        hydrated &&
+        subTab === "messages" &&
+        connection === "open" &&
+        isWindowFocused() &&
+        document.visibilityState === "visible"
+      )
+        actions.markRead(conv.id);
+    };
+    mark();
+    const off = onWindowFocusChange(mark);
+    document.addEventListener("visibilitychange", mark);
+    return () => {
+      off();
+      document.removeEventListener("visibilitychange", mark);
+    };
+  }, [conv.id, actions, hydrated, latestSeq, subTab, connection]);
 
   // Last-resort self-heal: any path that renders a conversation without going
   // through `openConversation` (a restored tab, a retarget, a view swapped in
@@ -223,10 +260,6 @@ export const CommsConversation = memo(function CommsConversation({
   const isGroup = conv.kind === "group_dm";
   const title = conversationTitle(conv, members, me);
   const counterpart = dmCounterpart(conv, members, me);
-  const pinnedCount = useMemo(
-    () => messages.reduce((n, m) => n + (pinned.includes(m.id) ? 1 : 0), 0),
-    [messages, pinned],
-  );
   const otherMembers = useMemo(() => memberList.filter((m) => m.id !== me), [memberList, me]);
   const others = useMemo(
     () => (conv.member_ids ?? []).filter((id) => id !== me),
@@ -376,6 +409,24 @@ export const CommsConversation = memo(function CommsConversation({
 });
 
 const EMPTY_MESSAGES: never[] = [];
+
+function waitForConversation(convId: string): Promise<boolean> {
+  const current = useCommsStore.getState();
+  if (current.hydrated[convId]) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const finish = (loaded: boolean) => {
+      clearTimeout(timer);
+      off();
+      resolve(loaded);
+    };
+    const off = useCommsStore.subscribe((state) => {
+      if (state.hydrated[convId]) finish(true);
+      else if (state.loadError[convId] || !state.tabs.some((tab) => tab.convId === convId))
+        finish(false);
+    });
+    const timer = setTimeout(() => finish(false), 10_000);
+  });
+}
 
 function containsMessage(item: Item, messageId: string): boolean {
   return item.kind === "group" && item.group.messages.some((m) => m.id === messageId);

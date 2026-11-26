@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 import type { ReactNode, Ref } from "react";
 import { FilePlus2, Loader2, Plus } from "lucide-react";
 import { Hint, Skeleton, Tooltip, TooltipContent, TooltipTrigger } from "@tryatlas/design";
@@ -52,7 +53,7 @@ export function DraftsTabView({
           maxLength={titleMax}
           onChange={(e) => onTitleChange(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") {
+            if (e.key === "Enter" && !isComposingKey(e)) {
               e.preventDefault();
               onCreate();
             }

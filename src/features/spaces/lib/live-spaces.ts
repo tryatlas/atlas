@@ -13,7 +13,9 @@
  */
 import type * as Y from "yjs";
 
-import { spacesApi } from "./spaces-api";
+import { spacesApi, type SpaceIdentity } from "./spaces-api";
+import { useAuthStore } from "@/features/auth/stores/auth-store";
+import { spaceOutbox } from "./space-outbox";
 import { spaceBusReady, spaceConnection, subscribeSpaceBus } from "./spaces-bus";
 import type { SpacePageTransport } from "./space-page-write";
 
@@ -66,6 +68,7 @@ interface OpenPage {
   doc: Y.Doc;
   /** Why the Space will not take this page's edits, or `null`. */
   readOnly: string | null;
+  identity?: SpaceIdentity;
 }
 
 const openPages = new Map<string, OpenPage>();
@@ -78,9 +81,10 @@ export function registerOpenPage(
   pageId: string,
   doc: Y.Doc,
   readOnly: string | null,
+  identity?: SpaceIdentity,
 ): () => void {
   const k = key(convId, pageId);
-  const entry = { doc, readOnly };
+  const entry = { doc, readOnly, ...(identity ? { identity } : {}) };
   openPages.set(k, entry);
   return () => {
     if (openPages.get(k) === entry) openPages.delete(k);
@@ -94,6 +98,37 @@ export function openPage(convId: string, pageId: string): OpenPage | null {
 
 /** The Space as a page write reaches it from this window. */
 export const appSpaceTransport: SpacePageTransport = {
+  capture: () => {
+    const auth = useAuthStore.getState().snapshot;
+    if (auth.status !== "signed-in" || !auth.user || !auth.commsOrgId)
+      throw new Error("Sign in to the Space's organisation before drawing.");
+    const identity = { accountId: auth.user.id, orgId: auth.commsOrgId };
+    const outbox = (convId: string, pageId: string) => spaceOutbox({ ...identity, convId, pageId });
+    return {
+      ...appSpaceTransport,
+      capture: undefined,
+      openPage: (convId, pageId) => {
+        const page = openPage(convId, pageId);
+        return page?.identity?.accountId === identity.accountId &&
+          page.identity.orgId === identity.orgId
+          ? page
+          : null;
+      },
+      preparePage: async (convId, pageId, doc) => {
+        const journal = outbox(convId, pageId);
+        await journal.hydrate();
+        journal.applyTo(doc);
+      },
+      persistPage: async (convId, pageId, update, snapshot) => {
+        const journal = outbox(convId, pageId);
+        journal.record(update, () => snapshot);
+        await journal.flush();
+      },
+      pendingPageUpdates: (convId, pageId) => [...outbox(convId, pageId).data],
+      sendControl: (convId, message) => spacesApi.sendControl(convId, message, identity),
+      sendBinary: (convId, data) => spacesApi.sendBinary(convId, data, identity),
+    };
+  },
   summary: (convId) => spacesApi.summary(convId),
   openPage,
   acquire: acquireSpaceSocket,

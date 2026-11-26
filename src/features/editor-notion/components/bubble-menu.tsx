@@ -1,3 +1,5 @@
+import { shortcutLabel } from "@/features/keybindings/lib/combo";
+import { isComposingKey } from "@/lib/keyboard-event";
 import { useEffect, useState } from "react";
 import { useEditorState } from "@tiptap/react";
 import { BubbleMenu } from "@tiptap/react/menus";
@@ -119,7 +121,7 @@ export function AtlasBubbleMenu({ editor }: AtlasBubbleMenuProps) {
               autoFocus
               onChange={(e) => setLinkUrl(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") {
+                if (e.key === "Enter" && !isComposingKey(e)) {
                   if (linkUrl.trim()) {
                     editor
                       .chain()
@@ -161,13 +163,13 @@ export function AtlasBubbleMenu({ editor }: AtlasBubbleMenuProps) {
               onClick: () => editor.chain().focus().toggleBold().run(),
             })}
             {tool({
-              title: "Italic (⌘I)",
+              title: `Italic (${shortcutLabel("cmd+i")})`,
               icon: Italic,
               isActive: active.italic,
               onClick: () => editor.chain().focus().toggleItalic().run(),
             })}
             {tool({
-              title: "Underline (⌘U)",
+              title: `Underline (${shortcutLabel("cmd+u")})`,
               icon: Underline,
               isActive: active.underline,
               onClick: () => editor.chain().focus().toggleUnderline().run(),

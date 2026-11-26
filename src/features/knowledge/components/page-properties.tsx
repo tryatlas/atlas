@@ -11,7 +11,7 @@ interface PagePropertiesProps {
 
 /**
  * The page-properties strip. Every row is editable inline; changes flow
- * through Rust's `knowledge_meta_patch` (debounced 300ms) and persist to
+ * through Rust's durable `knowledge_meta_patch` and persist to
  * `.atlas/knowledge/_meta.json`. Not keyed on the page: the strip's open
  * state survives a page switch.
  */
@@ -33,7 +33,7 @@ export function PageProperties({
         updatedAt: meta.updatedAt ?? fallbackUpdatedAt ?? null,
       }}
       referencesLabel={referencesLabel}
-      onPatch={(p) => void patch(entryId, p)}
+      onPatch={(p) => void patch(entryId, p).catch(() => {})}
     />
   );
 }

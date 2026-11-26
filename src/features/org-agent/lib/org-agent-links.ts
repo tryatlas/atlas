@@ -54,13 +54,14 @@ export const HANDLE_PATTERN =
 export function routeTarget(route: string): OrgAgentTarget | null {
   if (!isAtlasRoute(route)) return null;
   let url: URL;
+  let parts: string[];
   try {
     url = new URL(route, "https://app.tryatlas.cc");
+    parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
   } catch {
     return null;
   }
   const p = url.searchParams;
-  const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
   switch (parts[0]) {
     case "timeline": {
       const workspaceId = p.get("workspace");

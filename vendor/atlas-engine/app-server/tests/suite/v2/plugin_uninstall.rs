@@ -65,6 +65,7 @@ enabled = true
 }
 
 #[tokio::test]
+#[ignore = "asserts on the upstream analytics uploader, which Atlas removed (tests/engine-no-phone-home.test.ts)"]
 async fn plugin_uninstall_tracks_analytics_event() -> Result<()> {
     let analytics_server = start_analytics_events_server().await?;
     let atlas_agent_home = TempDir::new()?;
@@ -242,25 +243,7 @@ async fn plugin_uninstall_writes_remote_plugin_to_cloud_when_remote_plugin_enabl
     .await?;
     assert!(!remote_plugin_cache_root.exists());
     assert!(!legacy_remote_plugin_cache_root.exists());
-    let payload = wait_for_plugin_analytics_payload(&server).await?;
-    assert_eq!(
-        payload,
-        json!({
-            "events": [{
-                "event_type": "atlas_engine_plugin_uninstalled",
-                "event_params": {
-                    "plugin_id": "linear@openai-curated-remote",
-                    "remote_plugin_id": REMOTE_PLUGIN_ID,
-                    "plugin_name": "linear",
-                    "marketplace_name": "openai-curated-remote",
-                    "has_skills": true,
-                    "mcp_server_count": 0,
-                    "connector_ids": [],
-                    "product_client_id": DEFAULT_CLIENT_NAME,
-                }
-            }]
-        })
-    );
+    // Atlas: the analytics uploader is removed, so no analytics event is asserted here.
     Ok(())
 }
 
@@ -663,29 +646,6 @@ async fn mount_remote_plugin_detail_with_name(
         .respond_with(ResponseTemplate::new(200).set_body_string(detail_body))
         .mount(server)
         .await;
-}
-
-async fn wait_for_plugin_analytics_payload(server: &MockServer) -> Result<serde_json::Value> {
-    timeout(DEFAULT_TIMEOUT, async {
-        loop {
-            let Some(requests) = server.received_requests().await else {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                continue;
-            };
-            if let Some(request) = requests.iter().find(|request| {
-                request.method == "POST"
-                    && request
-                        .url
-                        .path()
-                        .ends_with("/atlas-agent/analytics-events/events")
-            }) {
-                return serde_json::from_slice(&request.body)
-                    .map_err(|err| anyhow::anyhow!("invalid analytics payload: {err}"));
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await?
 }
 
 async fn wait_for_remote_plugin_request_count(

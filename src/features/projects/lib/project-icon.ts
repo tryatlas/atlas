@@ -12,7 +12,9 @@ import { invoke } from "@tauri-apps/api/core";
 
 /** `undefined`: not asked yet or in flight; `null`: the project has none. */
 const icons = new Map<string, string | null>();
-const inFlight = new Set<string>();
+const inFlight = new Map<string, object>();
+const expiry = new Map<string, ReturnType<typeof setTimeout>>();
+const MISS_TTL_MS = 30_000;
 const listeners = new Set<() => void>();
 
 function subscribe(listener: () => void): () => void {
@@ -22,12 +24,19 @@ function subscribe(listener: () => void): () => void {
 
 function request(path: string): void {
   if (icons.has(path) || inFlight.has(path)) return;
-  inFlight.add(path);
+  const token = {};
+  inFlight.set(path, token);
   invoke<string | null>("project_icon", { projectPath: path })
     .catch(() => null)
     .then((icon) => {
+      if (inFlight.get(path) !== token) return;
       inFlight.delete(path);
       icons.set(path, icon ?? null);
+      if (!icon)
+        expiry.set(
+          path,
+          setTimeout(() => invalidateProjectIcon(path), MISS_TTL_MS),
+        );
       for (const listener of listeners) listener();
     });
 }
@@ -35,7 +44,10 @@ function request(path: string): void {
 /** Forget a project's icon, so the next badge asks again (a clone finished,
  *  a favicon was added). */
 export function invalidateProjectIcon(path: string): void {
-  if (!icons.delete(path)) return;
+  clearTimeout(expiry.get(path));
+  expiry.delete(path);
+  inFlight.delete(path);
+  icons.delete(path);
   for (const listener of listeners) listener();
 }
 

@@ -1,6 +1,6 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { NodeResizer, type NodeProps } from "@xyflow/react";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { useLocalMedia } from "@/features/media/lib/use-local-media";
 import {
   CANVAS_FIELD_CLASS,
   CanvasFrame,
@@ -11,7 +11,8 @@ import {
 } from "@tryatlas/design";
 import { cn } from "@/lib/utils";
 import { NodeHandles } from "@/features/canvas/components/node-handles";
-import { moveNode, nodesMap, resizeNode, writeField, type SpaceShapeType } from "../lib/space-doc";
+import { moveNode, nodesMap, resizeNode, type SpaceShapeType } from "../lib/space-doc";
+import { bindTextField } from "../lib/bind-text-field";
 import { spacesApi } from "../lib/spaces-api";
 import { useSpaceCanvas } from "./space-canvas-ctx";
 
@@ -32,33 +33,18 @@ export interface SpaceNodeCommonData extends Record<string, unknown> {
   mime: string | null;
 }
 
-/**
- * An editable prose field bound to a node's Y.Text.
- *
- * Uncontrolled while focused: a remote update re-renders the node with new
- * `value`, and a controlled input would throw the local caret to the end on
- * every peer keystroke. While THIS client is focused its element owns the
- * text; remote values are only synced in when it is not.
- */
-function useMergedField(nodeId: string, field: "title" | "body" | "text", value: string) {
+/** Keep focused inputs, their selections, and IME composition in the CRDT. */
+function useMergedField(nodeId: string, field: "title" | "body" | "text", _value: string) {
   const { doc, readOnly } = useSpaceCanvas();
   const ref = useRef<HTMLTextAreaElement & HTMLInputElement>(null);
-
+  const current = doc();
   useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    if (document.activeElement !== el && el.value !== value) el.value = value;
-  }, [value]);
-
-  const onChange = () => {
-    const el = ref.current;
-    if (!el || readOnly) return;
-    const d = doc();
-    if (!d) return;
-    writeField(d, nodesMap(d).get(nodeId), field, el.value);
-  };
-
-  return { ref, onChange, readOnly };
+    const element = ref.current;
+    const node = current ? nodesMap(current).get(nodeId) : undefined;
+    if (!element || !current || !node) return;
+    return bindTextField(element, current, node, field, readOnly);
+  }, [current, nodeId, field, readOnly]);
+  return { ref, readOnly };
 }
 
 // ---------------------------------------------------------------------------
@@ -77,7 +63,6 @@ export const SpaceNoteNode = memo(function SpaceNoteNode({ id, data, selected }:
             <input
               ref={title.ref}
               defaultValue={d.title}
-              onChange={title.onChange}
               readOnly={title.readOnly}
               placeholder="Untitled"
               className={cn("nodrag", CANVAS_FIELD_CLASS.noteTitle)}
@@ -87,7 +72,6 @@ export const SpaceNoteNode = memo(function SpaceNoteNode({ id, data, selected }:
             <textarea
               ref={body.ref}
               defaultValue={d.body}
-              onChange={body.onChange}
               readOnly={body.readOnly}
               placeholder="Write something…"
               className={cn("nodrag flex-1", CANVAS_FIELD_CLASS.noteBody)}
@@ -119,7 +103,6 @@ export const SpaceTextNode = memo(function SpaceTextNode({ id, data, selected }:
         <textarea
           ref={text.ref}
           defaultValue={d.text}
-          onChange={text.onChange}
           readOnly={text.readOnly}
           placeholder="Text"
           className={cn(
@@ -151,7 +134,6 @@ export const SpaceShapeNode = memo(function SpaceShapeNode({ id, data, selected 
             <textarea
               ref={title.ref}
               defaultValue={d.title}
-              onChange={title.onChange}
               readOnly={title.readOnly}
               rows={1}
               className={cn(
@@ -183,7 +165,6 @@ export const SpaceGroupNode = memo(function SpaceGroupNode({ id, data, selected 
             <input
               ref={title.ref}
               defaultValue={d.title}
-              onChange={title.onChange}
               readOnly={title.readOnly}
               placeholder="Group"
               className={cn("nodrag", CANVAS_FIELD_CLASS.frameLabel)}
@@ -205,7 +186,7 @@ const mediaPathCache = new Map<string, Promise<string>>();
 export const SpaceMediaNode = memo(function SpaceMediaNode({ id, data, selected }: NodeProps) {
   const d = data as SpaceNodeCommonData;
   const { convId } = useSpaceCanvas();
-  const [url, setUrl] = useState<string | null>(null);
+  const [path, setPath] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
 
   const hash = d.contentHash;
@@ -215,6 +196,7 @@ export const SpaceMediaNode = memo(function SpaceMediaNode({ id, data, selected 
     if (!hash) return;
     let alive = true;
     setFailed(false);
+    setPath(null);
     let fetching = mediaPathCache.get(hash);
     if (!fetching) {
       fetching = spacesApi.mediaFetch(convId, hash, mime);
@@ -222,20 +204,19 @@ export const SpaceMediaNode = memo(function SpaceMediaNode({ id, data, selected 
       // A failed fetch must not poison the cache — the ticket path can 502.
       fetching.catch(() => mediaPathCache.delete(hash));
     }
-    fetching
-      .then((path) => alive && setUrl(convertFileSrc(path)))
-      .catch(() => alive && setFailed(true));
+    fetching.then((path) => alive && setPath(path)).catch(() => alive && setFailed(true));
     return () => {
       alive = false;
     };
   }, [convId, hash, mime]);
+  const { url, error } = useLocalMedia(path, d.mediaKind === "video" ? "video" : "image");
 
   return (
     <div className="group relative h-full w-full">
       <NodeHandles selected={selected} />
       <CanvasNodeFrame kind="media" selected={selected}>
         <CanvasMedia
-          state={failed ? "error" : url === null ? "loading" : "ready"}
+          state={failed || error ? "error" : url === null ? "loading" : "ready"}
           src={url ?? undefined}
           kind={d.mediaKind === "video" ? "video" : "image"}
           alt=""

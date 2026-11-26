@@ -110,7 +110,12 @@ fn matches(input: &str) -> Vec<(usize, Region)> {
         };
         for captures in regex.captures_iter(input) {
             let group = match rule.secret_group {
-                0 => captures.get(1).or_else(|| captures.get(0)),
+                0 => captures
+                    .iter()
+                    .skip(1)
+                    .flatten()
+                    .next()
+                    .or_else(|| (captures.len() == 1).then(|| captures.get(0)).flatten()),
                 n => captures.get(n),
             };
             let Some(secret) = group else { continue };

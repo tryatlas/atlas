@@ -16,7 +16,9 @@ export interface TimeAgoOptions {
 export function timeAgo(iso: string | null | undefined, opts: TimeAgoOptions = {}): string {
   if (!iso) return "";
   const t = new Date(iso).getTime();
-  if (Number.isNaN(t)) return "";
+  // The epoch (or earlier) is not a time: it is what an import stamps on a
+  // row whose real age is unknown, so it reads as no time, not "1 Jan 1970".
+  if (Number.isNaN(t) || t <= 0) return "";
   const { suffix = false, seconds = false, noDateFallback = false } = opts;
   const ago = suffix ? " ago" : "";
   const diff = Date.now() - t;

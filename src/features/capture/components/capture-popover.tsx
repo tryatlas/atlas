@@ -190,6 +190,7 @@ export function CapturePopover({
             />
           ) : (
             <UnboundState
+              run={run}
               projectPath={projectPath}
               detection={detection}
               gitAvailable={gitAvailable}
@@ -197,7 +198,6 @@ export function CapturePopover({
               cloudReason={cloudReason}
               cloudOrgs={cloudOrgs}
               busy={busy}
-              run={run}
               onRetryPreview={() => void retryPreview()}
               onCancel={onClose}
               onCloudEnable={(draft) => {
@@ -206,8 +206,32 @@ export function CapturePopover({
                 if (!importPreview) return;
                 setView({ kind: "cloud-confirm", draft, preview: importPreview });
               }}
+              onConnect={(pick) => {
+                if (importPreview)
+                  setView({ kind: "connect-confirm", pick, preview: importPreview });
+                else void retryPreview();
+              }}
             />
           ))}
+
+        {view.kind === "connect-confirm" && (
+          <DisclosureStep
+            title={`Share this Project's history with “${view.pick.slug}”?`}
+            lines={disclosureLines(view.preview)}
+            confirmLabel="Connect and share history"
+            busy={busy}
+            onCancel={() => setView({ kind: "main" })}
+            onConfirm={async () => {
+              const ok = await run(async () => {
+                await captureEnableLocal(projectPath);
+                const result = await captureConnect({ projectPath, ...view.pick });
+                if (!result.matched) throw new Error(connectRefusal(result.candidates));
+                await captureImportConfirm(projectPath);
+              });
+              if (ok) setView({ kind: "main" });
+            }}
+          />
+        )}
 
         {view.kind === "cloud-confirm" && (
           <DisclosureStep
@@ -260,7 +284,6 @@ export function CapturePopover({
             tab={view.tab}
             onTabChange={(tab) => setView({ kind: "promote-form", tab })}
             busy={busy}
-            run={run}
             onCancel={() => setView({ kind: "main" })}
             onContinue={async (draft) => {
               const preview = await loadPromotionPreview();
@@ -306,7 +329,6 @@ export function CapturePopover({
             cloudOrgs={cloudOrgs}
             cloudReason={cloudReason}
             busy={busy}
-            run={run}
             onCancel={() => setView({ kind: "main" })}
             onContinue={async (pick) => {
               const preview = await loadPromotionPreview();
@@ -358,6 +380,7 @@ export function CapturePopover({
                   slug: view.draft.slug,
                   name: null,
                   visibility: view.draft.restricted ? "restricted" : "org",
+                  gitUrl: view.draft.gitUrl,
                 }),
               );
               if (ok) setView({ kind: "main" });

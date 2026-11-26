@@ -122,12 +122,6 @@ function SessionHoverCardBody({
             </div>
           </div>
         ) : null}
-        {session.liveElsewhere ? (
-          <div className="flex min-w-0 items-center gap-2 text-info">
-            <CircleAlert aria-hidden className="size-3 shrink-0" />
-            <div className="min-w-0 truncate">Active in another process</div>
-          </div>
-        ) : null}
         {status === "failed" ? (
           <div className="flex min-w-0 items-center gap-2 text-error">
             <CircleAlert aria-hidden className="size-3 shrink-0" />

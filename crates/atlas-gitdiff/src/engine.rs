@@ -39,9 +39,9 @@ pub fn line_status(diff: &str) -> LineStatus {
 
     // A removal with no added line beside it has no new-file line of its own:
     // it waits for the next one, which the gutter draws a wedge above.
-    let mut pending_delete = false;
     for hunk in &parsed.hunks {
-        let mut new_ln = hunk.new_start;
+        let mut pending_delete = false;
+        let mut new_ln = hunk.new_start + u32::from(hunk.new_count == 0);
         let lines = &hunk.lines;
         let mut i = 0;
         while i < lines.len() {
@@ -81,6 +81,9 @@ pub fn line_status(diff: &str) -> LineStatus {
                     (false, false) => {}
                 }
             }
+        }
+        if pending_delete {
+            out.deleted_before.push(new_ln.max(1));
         }
     }
     out

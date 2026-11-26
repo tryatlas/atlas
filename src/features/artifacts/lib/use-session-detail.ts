@@ -281,6 +281,12 @@ export function useSessionDetail({
   // to — resetting on the raw keystroke scrolled to top a beat before the list
   // changed.
   useEffect(() => {
+    // A jump owns window growth until it lands. Resetting here after revealing
+    // a filtered kind unmounted the target during its scroll animation.
+    if (pendingJump) {
+      invalidate();
+      return;
+    }
     setRenderCount(FIRST_PAINT);
     scrollRef.current?.scrollTo({ top: 0 });
     // The list was swapped wholesale; a same-height replacement would not trip

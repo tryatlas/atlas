@@ -16,6 +16,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { Dialog } from "@base-ui/react/dialog";
 import { StickyNote } from "lucide-react";
+import { toast } from "sonner";
 import {
   CANVAS_EXPORT_FORMATS,
   CanvasActionPill,
@@ -106,11 +107,14 @@ function CanvasSurface({
   const activePageId = useCanvasStore((s) => s.activePageId);
   const selectedIds = useCanvasStore((s) => s.selectedIds);
   const loaded = useCanvasStore((s) => s.loaded);
+  const loadError = useCanvasStore((s) => s.error);
+  const saveError = useCanvasStore((s) => s.saveError);
   const activeTool = useCanvasStore((s) => s.activeTool);
   const canUndo = useCanvasStore((s) => s.canUndo);
   const canRedo = useCanvasStore((s) => s.canRedo);
   const {
     loadProject,
+    flush,
     addNote,
     addText,
     addMedia,
@@ -159,7 +163,9 @@ function CanvasSurface({
   useEffect(() => {
     if (!projectPath) return;
     if (storeProjectPath !== projectPath) {
-      loadProject(projectPath).catch(() => {});
+      void loadProject(projectPath).catch((error) =>
+        toast.error(`Board could not be opened: ${String(error)}`),
+      );
     }
   }, [projectPath, storeProjectPath, loadProject]);
 
@@ -280,6 +286,7 @@ function CanvasSurface({
 
   const overlayDown = useCallback(
     (e: React.PointerEvent) => {
+      if (e.button !== 0) return;
       const wrap = wrapperRef.current;
       if (!wrap) return;
       const r = wrap.getBoundingClientRect();
@@ -313,6 +320,7 @@ function CanvasSurface({
 
   const overlayUp = useCallback(
     (e: React.PointerEvent) => {
+      if (e.button !== 0) return;
       const st = dragStart.current;
       dragStart.current = null;
       setPreview(null);
@@ -433,6 +441,30 @@ function CanvasSurface({
     );
   }
 
+  if (loadError && storeProjectPath === projectPath) {
+    return (
+      <div
+        role="alert"
+        className="flex h-full flex-col items-center justify-center gap-3 p-6 text-sm"
+      >
+        <p>Board could not be opened: {loadError}</p>
+        <p className="text-muted-foreground">{projectPath}/.atlas/canvas.json</p>
+        <button
+          type="button"
+          onClick={() => void loadProject(projectPath).catch((error) => toast.error(String(error)))}
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
+  if (!loaded || storeProjectPath !== projectPath)
+    return (
+      <div role="status" className="p-6 text-sm text-muted-foreground">
+        Loading board…
+      </div>
+    );
+
   return (
     <div className="flex h-full min-h-0">
       {pagesOpen && <PagesPanel />}
@@ -446,7 +478,23 @@ function CanvasSurface({
           </div>
         )}
 
+        {saveError && (
+          <div
+            role="alert"
+            className="absolute top-12 left-3 z-panel rounded border border-error bg-background p-3 text-sm"
+          >
+            <p>Board edits could not be saved: {saveError}</p>
+            <button
+              type="button"
+              onClick={() => void flush(projectPath).catch((error) => toast.error(String(error)))}
+            >
+              Retry save
+            </button>
+          </div>
+        )}
         <ReactFlow
+          key={`${projectPath}:${activePageId}`}
+          onInit={(instance) => void instance.setViewport(useCanvasStore.getState().viewport)}
           nodes={allNodes}
           edges={rfEdges}
           style={EDGE_INK}
@@ -497,6 +545,10 @@ function CanvasSurface({
             onPointerDown={overlayDown}
             onPointerMove={overlayMove}
             onPointerUp={overlayUp}
+            onPointerCancel={() => {
+              dragStart.current = null;
+              setPreview(null);
+            }}
           >
             {preview && (
               <CanvasDraftBox
@@ -541,7 +593,7 @@ function CanvasSurface({
 
         {editingId && (
           <NoteEditorPanel
-            key={editingId}
+            key={`${projectPath}:${activePageId}:${editingId}`}
             noteId={editingId}
             projectPath={projectPath}
             onClose={() => setEditingId(null)}

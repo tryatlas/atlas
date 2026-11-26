@@ -830,8 +830,14 @@ impl NetworkProxyState {
                 .map_err(NetworkProxyConstraintError::into_anyhow)
                 .with_context(|| format!("{constraint_field} constrained by managed config"))?;
 
-            let mut new_state = build_config_state(candidate.clone(), constraints.clone())
-                .with_context(|| format!("failed to compile updated network {list_name}"))?;
+            let candidate_for_build = candidate.clone();
+            let constraints_for_build = constraints.clone();
+            let mut new_state = tokio::task::spawn_blocking(move || {
+                build_config_state(candidate_for_build, constraints_for_build)
+            })
+            .await
+            .context("network policy compilation task failed")?
+            .with_context(|| format!("failed to compile updated network {list_name}"))?;
             new_state.blocked = blocked;
             new_state.blocked_total = blocked_total;
 

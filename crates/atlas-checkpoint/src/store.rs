@@ -1301,7 +1301,8 @@ impl Store {
                             arguments_ref = COALESCE(?8, arguments_ref),
                             result = COALESCE(?9, result),
                             result_ref = COALESCE(?10, result_ref),
-                            result_binary = CASE WHEN ?11 = 1 THEN 1 ELSE result_binary END
+                            result_binary = CASE WHEN ?11 = 1 THEN 1 ELSE result_binary END,
+                            sync_state = CASE WHEN sync_state = 'sent' THEN 'pending' ELSE sync_state END
                       WHERE id = ?1",
                     rusqlite::params![
                         id,
@@ -1552,6 +1553,32 @@ impl Store {
             .optional()?)
     }
 
+    /// Refresh git evidence without changing capture permission or cloud routing.
+    pub fn refresh_binding_detection(
+        &self,
+        detection: &crate::model::ProjectDetection,
+    ) -> Result<()> {
+        self.require_writer()?;
+        self.conn.execute(
+            "UPDATE binding SET root = ?1, root_commit_sha = ?2, fingerprint_is_shallow = ?3, git_url = ?4, updated_at = ?5 WHERE id = 1",
+            rusqlite::params![detection.root, detection.root_commit_sha, detection.is_shallow, detection.git_url, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn commit_was_examined(&self, workspace_id: &str, sha: &str) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM examined_commit WHERE workspace_id = ?1 AND commit_sha = ?2)", rusqlite::params![workspace_id, sha], |r| r.get(0))?)
+    }
+
+    pub(crate) fn mark_commit_examined(&self, workspace_id: &str, sha: &str) -> Result<()> {
+        self.require_writer()?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO examined_commit (workspace_id, commit_sha) VALUES (?1, ?2)",
+            rusqlite::params![workspace_id, sha],
+        )?;
+        Ok(())
+    }
+
     /// Bind, or refresh an existing binding's detected signals.
     ///
     /// Idempotent by construction — the singleton row is upserted rather than
@@ -1768,17 +1795,16 @@ impl Store {
         // Sessions first: a Message referencing a Session the server has not
         // seen is a dangling reference of a different kind.
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {SESSION_COLUMNS} FROM agent_session
+            "SELECT {SESSION_COLUMNS}, sync_revision FROM agent_session
               WHERE workspace_id = ?1 AND sync_state = 'pending'
               ORDER BY started_at LIMIT ?2"
         ))?;
         let sessions = stmt
-            .query_map(
-                rusqlite::params![workspace_id, max_count as i64],
-                row_to_session,
-            )?
+            .query_map(rusqlite::params![workspace_id, max_count as i64], |row| {
+                Ok((row_to_session(row)?, row.get::<_, i64>("sync_revision")?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for session in sessions {
+        for (session, sync_revision) in sessions {
             // The hash covers the fields that can change after a first send —
             // title, totals, model — so a mutated Session re-sends as new
             // content instead of being dropped by the server's replay dedupe.
@@ -1797,6 +1823,7 @@ impl Store {
             );
             push_or_stop!(AtlasArtifact::AgentSession(SessionArtifact {
                 base: ArtifactBase {
+                    sync_revision,
                     row_id: session.id.clone(),
                     org_id: org_id.to_string(),
                     workspace_id: wire_workspace_id.to_string(),
@@ -1820,21 +1847,21 @@ impl Store {
         // to the Organisation as finished work. The abort verdict lives only in
         // the local `turn` table, so the server could never learn otherwise.
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {MESSAGE_COLUMNS} FROM agent_message x
+            "SELECT {MESSAGE_COLUMNS}, sync_revision FROM agent_message x
               WHERE sync_state = 'pending'
                 AND session_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)
                 {NOT_IN_ABORTED_TURN}
               ORDER BY seq LIMIT ?2"
         ))?;
         let messages = stmt
-            .query_map(
-                rusqlite::params![workspace_id, max_count as i64],
-                row_to_message,
-            )?
+            .query_map(rusqlite::params![workspace_id, max_count as i64], |row| {
+                Ok((row_to_message(row)?, row.get::<_, i64>("sync_revision")?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for message in messages {
+        for (message, sync_revision) in messages {
             push_or_stop!(AtlasArtifact::AgentMessage(MessageArtifact {
                 base: ArtifactBase {
+                    sync_revision,
                     row_id: message.id.clone(),
                     org_id: org_id.to_string(),
                     workspace_id: wire_workspace_id.to_string(),
@@ -1853,33 +1880,41 @@ impl Store {
         }
 
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {TOOL_CALL_COLUMNS} FROM tool_call x
+            "SELECT {TOOL_CALL_COLUMNS}, sync_revision FROM tool_call x
               WHERE sync_state = 'pending'
                 AND session_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)
                 {NOT_IN_ABORTED_TURN}
               ORDER BY seq LIMIT ?2"
         ))?;
         let calls = stmt
-            .query_map(
-                rusqlite::params![workspace_id, max_count as i64],
-                row_to_tool_call,
-            )?
+            .query_map(rusqlite::params![workspace_id, max_count as i64], |row| {
+                Ok((row_to_tool_call(row)?, row.get::<_, i64>("sync_revision")?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for call in calls {
-            // Status and payload refs change across a call's lifetime; hash them
-            // so a completed call re-sends over its earlier pending sighting.
+        for (call, sync_revision) in calls {
+            // Every mutable wire field participates: a title repair or argument
+            // update must supersede the server's previous version too.
             let content_hash = blobs::key_for(
-                format!(
-                    "{}:{}:{}:{}",
+                serde_json::json!([
                     call.id,
+                    call.turn_seq,
+                    call.tool_name.as_str(),
+                    call.title,
+                    call.kind,
                     call.status.as_str(),
-                    call.result_ref.as_deref().unwrap_or(""),
-                    call.result.as_deref().unwrap_or("")
-                )
+                    call.locations,
+                    call.arguments,
+                    call.arguments_ref,
+                    call.result,
+                    call.result_ref,
+                    call.result_binary,
+                ])
+                .to_string()
                 .as_bytes(),
             );
             push_or_stop!(AtlasArtifact::ToolCall(ToolCallArtifact {
                 base: ArtifactBase {
+                    sync_revision,
                     row_id: call.id.clone(),
                     org_id: org_id.to_string(),
                     workspace_id: wire_workspace_id.to_string(),
@@ -1903,20 +1938,20 @@ impl Store {
         }
 
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {CHECKPOINT_COLUMNS} FROM checkpoint
+            "SELECT {CHECKPOINT_COLUMNS}, sync_revision FROM checkpoint
               WHERE sync_state = 'pending'
                 AND session_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)
               ORDER BY created_at LIMIT ?2"
         ))?;
         let checkpoints = stmt
-            .query_map(
-                rusqlite::params![workspace_id, max_count as i64],
-                row_to_checkpoint,
-            )?
+            .query_map(rusqlite::params![workspace_id, max_count as i64], |row| {
+                Ok((row_to_checkpoint(row)?, row.get::<_, i64>("sync_revision")?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for checkpoint in checkpoints {
+        for (checkpoint, sync_revision) in checkpoints {
             let artifact = AtlasArtifact::Checkpoint(CheckpointArtifact {
                 base: ArtifactBase {
+                    sync_revision,
                     row_id: checkpoint.id.clone(),
                     org_id: org_id.to_string(),
                     workspace_id: wire_workspace_id.to_string(),
@@ -2043,8 +2078,29 @@ impl Store {
     ///
     /// The row id identifies its table by prefix, so one call handles every
     /// artifact kind without the caller tracking which is which.
-    pub fn mark_sent(&self, row_id: &str) -> Result<()> {
-        self.set_row_sync_state(row_id, SyncState::Sent)
+    pub fn mark_sent(&self, artifact: &crate::artifacts::AtlasArtifact) -> Result<()> {
+        self.set_artifact_sync_state(artifact, SyncState::Sent)
+    }
+
+    /// A rejection, like acceptance, applies only to the payload that was sent.
+    pub fn mark_artifact_failed(&self, artifact: &crate::artifacts::AtlasArtifact) -> Result<()> {
+        self.set_artifact_sync_state(artifact, SyncState::Failed)
+    }
+
+    fn set_artifact_sync_state(
+        &self,
+        artifact: &crate::artifacts::AtlasArtifact,
+        state: SyncState,
+    ) -> Result<()> {
+        self.require_writer()?;
+        let Some(table) = table_for(artifact.row_id()) else {
+            return Ok(());
+        };
+        self.conn.execute(
+            &format!("UPDATE {table} SET sync_state = ?2 WHERE id = ?1 AND sync_revision = ?3 AND sync_state = 'pending'"),
+            rusqlite::params![artifact.row_id(), state.as_str(), artifact.sync_revision()],
+        )?;
+        Ok(())
     }
 
     /// Mark a row as permanently rejected — skipped, never retried at the head

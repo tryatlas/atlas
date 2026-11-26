@@ -33,8 +33,10 @@ export default defineConfig(() => ({
   // `reportDiagnostics: true` lists the skipped ones.
   plugins: [react({ compiler: true }), tailwindcss(), mockBackend],
   resolve: {
-    alias: {
-      "@": path.resolve(import.meta.dirname, "./src"),
+    alias: [
+      { find: "@", replacement: path.resolve(import.meta.dirname, "./src") },
+      // react-pdf and all callers must share the polyfilled PDF.js entry.
+      { find: /^pdfjs-dist$/, replacement: path.resolve(import.meta.dirname, "node_modules/pdfjs-dist/legacy/build/pdf.mjs") },
       // Force the DOM-free build of `decode-named-character-reference`. Its
       // package `browser` condition points at `index.dom.js`, which calls
       // `document.createElement` at module scope. That module is a transitive
@@ -45,11 +47,11 @@ export default defineConfig(() => ({
       // fallback in markdown-cache.tsx). That congested the main thread during
       // agent streaming + project switches. `index.js` is a table-based,
       // DOM-free build with identical output.
-      "decode-named-character-reference": path.resolve(
+      { find: "decode-named-character-reference", replacement: path.resolve(
         import.meta.dirname,
         "node_modules/decode-named-character-reference/index.js",
-      ),
-    },
+      ) },
+    ],
     // Dedupe CodeMirror + Lezer (the file editor and the team-chat draft
     // editor). lang-markdown and
     // the grammars it nests (html, css, javascript) each transitively import
@@ -167,7 +169,7 @@ export default defineConfig(() => ({
     ],
     // The worker is a separate ESM entry loaded via `?url`; pre-bundling it
     // would rewrite its imports and break worker instantiation.
-    exclude: ["pdfjs-dist/build/pdf.worker.min.mjs"],
+    exclude: ["pdfjs-dist/legacy/build/pdf.worker.min.mjs"],
     // Serve pre-bundled deps as soon as the scanner finishes instead of
     // holding every request until the whole crawl ends. Only matters on a
     // cold `node_modules/.vite` (first run, lockfile or config change).

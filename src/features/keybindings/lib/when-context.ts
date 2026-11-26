@@ -24,7 +24,6 @@ const TAB_SURFACE: Partial<Record<TabType, string>> = {
   pdf: "pdfFocus",
   canvas: "canvasFocus",
   spaces: "canvasFocus",
-  browser: "browserFocus",
   diff: "diffFocus",
   "session-changes": "diffFocus",
   "pull-request": "pullRequestFocus",

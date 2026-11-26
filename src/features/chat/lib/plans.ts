@@ -12,12 +12,18 @@ export interface PlanRecord {
 }
 
 /**
- * Pull the plan markdown out of a permission tool call. Claude Code's
- * ExitPlanMode tool carries `{ plan: "<markdown>" }` in its input; the ACP
- * bridge surfaces that under `rawInput` (or `input`). Returns the markdown
- * string when present and non-empty, else null.
+ * Pull the plan markdown out of a permission tool call: a call the agent
+ * declared `switch_mode` (ACP's kind for leaving a mode — plan mode's exit is
+ * one) whose input carries `{ plan: "<markdown>" }` under `rawInput` (or
+ * `input`). Returns the markdown string when present and non-empty, else null.
+ *
+ * Both halves, by kind and structure, never by a tool name (ADR-0002). The
+ * kind is what keeps any other call whose arguments happen to hold a `plan`
+ * string — a command, an edit — from being drawn as a plan review that hides
+ * what the call actually does.
  */
 export function extractPlanMarkdown(tc: ToolCallRef): string | null {
+  if (tc.kind !== "switch_mode") return null;
   const record = tc as Record<string, unknown>;
   const input = (record.rawInput ?? record.input) as unknown;
   if (input && typeof input === "object") {

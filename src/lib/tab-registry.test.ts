@@ -54,7 +54,6 @@ import { tabIcons } from "@/features/layout/components/pane-tab";
 const TYPES = [
   "chat",
   "canvas",
-  "browser",
   "tasks",
   "editor",
   "files",
@@ -90,7 +89,6 @@ const PLACEMENT: Record<(typeof TYPES)[number], string> = {
   editor: "surface 320",
   files: "surface 240",
   terminal: "surface 280",
-  browser: "surface 360",
   diff: "surface 360",
   commit: "surface 360",
   "session-changes": "surface 320",
@@ -130,15 +128,14 @@ const PROJECTLESS = [
 ];
 const WINDOW = ["agent-panel", "team-chat"];
 const ORG_SCOPED = ["usage", "comms-draft", "spaces"];
-const PERSISTENT = ["chat", "browser", "editor", "terminal", "pdf", "agent-panel", "team-chat"];
-const IDLE_EXPENSIVE = ["browser", "terminal", "pdf"];
+const PERSISTENT = ["chat", "editor", "terminal", "pdf", "agent-panel", "team-chat"];
+const IDLE_EXPENSIVE = ["terminal", "pdf"];
 const FILE_BACKED = ["editor", "media", "svg", "pdf", "notebook", "unsupported"];
 
 /** The ⌘T list, in the order it is offered. */
 const LAUNCHER = [
   ["chat", "Agent", "A"],
   ["terminal", "Terminal", "T"],
-  ["browser", "Browser", "B"],
   ["editor", "New file", "N"],
   ["files", "Files", "F"],
   ["source-control", "Source control", "G"],
@@ -222,7 +219,7 @@ describe("every registry entry", () => {
   ] as const satisfies readonly (keyof TabTypeEntry)[];
 
   it("has every fact, and nothing else", () => {
-    expect(TAB_TYPES.length).toBeGreaterThanOrEqual(31);
+    expect(TAB_TYPES.length).toBeGreaterThanOrEqual(30);
     for (const type of TAB_TYPES) {
       expect(Object.keys(tabEntry(type)).sort(), type).toEqual([...FACTS].sort());
     }
@@ -307,9 +304,6 @@ describe("tab data", () => {
     switch (t.type) {
       case "commit":
         read = `${t.data.repoPath}@${t.data.sha}`;
-        break;
-      case "browser":
-        read = t.data.url ?? "";
         break;
       default:
         break;

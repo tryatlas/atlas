@@ -55,7 +55,9 @@ function pendingAboveComposer(toolName: string, title: string, options = OPTIONS
   render(
     <div data-chat-composer-stack>
       <PermissionModal tabId="chat-1" />
-      <textarea aria-label="composer" />
+      <div className="atlas-composer">
+        <textarea aria-label="composer" />
+      </div>
     </div>,
   );
   const composer = screen.getByLabelText("composer");
@@ -201,11 +203,15 @@ function twoCards(requests: Record<string, ReturnType<typeof request>[]>) {
     <>
       <div data-chat-composer-stack>
         <PermissionModal tabId="chat-1" />
-        <textarea aria-label="composer 1" />
+        <div className="atlas-composer">
+          <textarea aria-label="composer 1" />
+        </div>
       </div>
       <div data-chat-composer-stack>
         <PermissionModal tabId="chat-2" />
-        <textarea aria-label="composer 2" />
+        <div className="atlas-composer">
+          <textarea aria-label="composer 2" />
+        </div>
       </div>
     </>,
   );
@@ -307,7 +313,7 @@ describe("a key answers only the card someone is looking at", () => {
             toolCall: {
               toolCallId: "call-plan",
               title: "Ready to code?",
-              kind: "other",
+              kind: "switch_mode",
               toolName: "ExitPlanMode",
               rawInput: { plan: "1. Do the thing" },
             },
@@ -395,7 +401,7 @@ function pendingPlan() {
           toolCall: {
             toolCallId: "call-plan",
             title: "Ready to code?",
-            kind: "other",
+            kind: "switch_mode",
             toolName: "ExitPlanMode",
             rawInput: { plan: "1. Do the thing" },
           },
@@ -406,3 +412,17 @@ function pendingPlan() {
   });
   render(<PermissionModal tabId="chat-1" />);
 }
+
+it("does not turn model search input or modified digits into permission answers", () => {
+  pendingAboveComposer("Bash", "npm test");
+  const search = document.createElement("input");
+  screen.getByLabelText("composer").closest("[data-chat-composer-stack]")!.appendChild(search);
+  search.focus();
+  for (const key of ["1", "Enter", "Escape"]) fireEvent.keyDown(search, { key });
+  expect(respondPermission).not.toHaveBeenCalled();
+  screen.getByLabelText("composer").focus();
+  fireEvent.keyDown(window, { key: "1", metaKey: true });
+  fireEvent.keyDown(window, { key: "1", ctrlKey: true });
+  fireEvent.keyDown(window, { key: "Enter", keyCode: 229 });
+  expect(respondPermission).not.toHaveBeenCalled();
+});

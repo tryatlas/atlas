@@ -49,8 +49,8 @@ use wiremock::matchers::path;
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(not(any(target_os = "macos", windows)))]
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
-const COMMIT_ATTRIBUTION: &str = "Co-authored-by: Atlas Agent <noreply@openai.com>";
-const PR_ATTRIBUTION: &str = "Generated with [Atlas Agent](https://openai.com/codex/).";
+const COMMIT_ATTRIBUTION: &str = "Co-authored-by: AtlasEngine <noreply@openai.com>";
+const PR_ATTRIBUTION: &str = "Generated with [AtlasEngine](https://openai.com/codex/).";
 const ATTRIBUTION_DISABLED: &str = "attribution is disabled for the current workspace";
 const LEGACY_COMMIT_ATTRIBUTION_INSTRUCTIONS: &str = "\
 When you write or edit a git commit message, ensure the message ends with this trailer exactly once:
@@ -347,7 +347,7 @@ fn replace_attribution_fragment_with_legacy(
                                 LEGACY_COMMIT_ATTRIBUTION_INSTRUCTIONS.to_string()
                             }
                             LegacyAttribution::UnlinkedPullRequest => {
-                                text.replace(PR_ATTRIBUTION, "Generated with Atlas Agent.")
+                                text.replace(PR_ATTRIBUTION, "Generated with AtlasEngine.")
                             }
                         };
                         replaced = true;

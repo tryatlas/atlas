@@ -77,6 +77,9 @@ const ENV: AuthEnvStatus[] = [
   },
 ];
 
+/** Rejects the sign-in left hanging, once. */
+let cancelHanging: (() => void) | null = null;
+
 async function prompt(next: Mode, reason?: string): Promise<void> {
   mode = next;
   const { promptSignIn } = await import("@/features/chat/lib/agent-signin");
@@ -92,13 +95,22 @@ export const agentSignin: Scenario = {
     agents_auth_env_status: (): AuthEnvStatus[] => ENV,
     agents_authenticate: () =>
       new Promise<null>((resolve, reject) => {
-        if (mode === "hang") return;
+        if (mode === "hang") {
+          cancelHanging = () => reject("Sign-in was cancelled.");
+          return;
+        }
         setTimeout(() => {
           if (mode === "fail") reject("Sign-in was refused by the agent.");
           else resolve(null);
         }, 2500);
       }),
     agents_logout: () => null,
+    // Ends the sign-in that hangs, as the real one ends the agent's request.
+    agents_cancel_authentication: () => {
+      cancelHanging?.();
+      cancelHanging = null;
+      return null;
+    },
   },
   actions: {
     signInChoose: () => prompt("ok"),

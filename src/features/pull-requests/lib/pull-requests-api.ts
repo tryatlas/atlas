@@ -352,7 +352,7 @@ export function prGuideWrite(repository: string, number: number, guide: unknown)
 /** A detached checkout of the head for a guide run, and the change it makes. */
 export function prGuidePrepare(
   path: string,
-  detail: Pick<PrDetail, "number" | "headSha" | "headBranch" | "baseBranch">,
+  detail: Pick<PrDetail, "number" | "headSha" | "headBranch" | "baseBranch" | "url">,
 ): Promise<GuideCheckout> {
   return invoke<GuideCheckout>("pr_guide_prepare", {
     path,
@@ -360,6 +360,7 @@ export function prGuidePrepare(
     headSha: detail.headSha ?? "",
     headBranch: detail.headBranch,
     baseBranch: detail.baseBranch,
+    prUrl: detail.url,
   }).catch((raw: unknown) => {
     throw classifyPrError(raw);
   });

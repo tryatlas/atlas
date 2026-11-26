@@ -11,11 +11,36 @@
 // user's own interactive shell once it exists.
 
 import { groupOf, useLayoutStore } from "@/features/layout/stores/layout-store";
+import { isWindows } from "@/lib/platform";
 import { useTerminalStore } from "../stores/terminal-store";
+
+/** Which shell a line is written for. Atlas's own terminal runs PowerShell on
+ *  Windows (`detect_shell` in `crates/atlas-terminal`) and the user's login
+ *  shell elsewhere; `cmd` is for a line the user pastes into a Command
+ *  Prompt. A POSIX line typed into PowerShell does not run: `NAME=value cmd`
+ *  is not an assignment there, and `'\''` is not an escaped quote. */
+export type ShellDialect = "posix" | "powershell" | "cmd";
+
+/** The dialect of the shell Atlas's terminal runs on this platform. */
+export const hostShellDialect: ShellDialect = isWindows ? "powershell" : "posix";
 
 /** POSIX-quote a token so a path with spaces survives reaching a shell. */
 export function shellQuote(token: string): string {
   return /^[A-Za-z0-9_./:@%+=-]+$/.test(token) ? token : `'${token.replace(/'/g, `'\\''`)}'`;
+}
+
+/** PowerShell-quote a token. Inside single quotes nothing expands (`$`,
+ *  backtick, `;` are literal) and a quote is escaped by doubling it. A bare
+ *  token keeps to characters PowerShell reads literally in argument mode. */
+export function powerShellQuote(token: string): string {
+  return /^[A-Za-z0-9_./\\:=+-]+$/.test(token) ? token : `'${token.replace(/'/g, "''")}'`;
+}
+
+/** cmd.exe-quote a token: double quotes, an embedded quote backslashed the
+ *  way the C runtime's argument parser reads it. cmd has no way to keep `%`
+ *  from expanding on an interactive line, so a `%NAME%` stays a variable. */
+export function cmdQuote(token: string): string {
+  return /^[A-Za-z0-9_./\\:=+-]+$/.test(token) ? token : `"${token.replace(/"/g, '\\"')}"`;
 }
 
 /** A name that can appear to the left of `=` in a shell assignment.
@@ -27,24 +52,39 @@ export function shellQuote(token: string): string {
  *  identifier is dropped. */
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-/** Render a program, its arguments and its environment as one shell line.
+/** Render a program, its arguments and its environment as one shell line, in
+ *  the syntax of `dialect` — by default the shell Atlas's terminal runs here.
  *
- *  The environment here is only what the AGENT DECLARED for this login, never
- *  the environment the agent is spawned with — that one carries the user's
- *  whole environment and their BYOK keys, and this string is displayed, copied
- *  and typed into a shell that records its history. See `TerminalAuthCommand`.
+ *  The environment here is only what the AGENT DECLARED for this login and
+ *  the Variables the user set for the agent, never the environment the agent
+ *  is spawned with — that one carries the user's whole environment and their
+ *  BYOK keys, and this string is displayed, copied and typed into a shell that
+ *  records its history. See `TerminalAuthCommand`.
+ *
+ *  PowerShell and cmd have no per-command prefix assignment, so there the
+ *  variables are set in the shell first and stay set in it afterwards.
  */
 export function shellLine(
   command: string,
   args: string[] = [],
   env: [string, string][] = [],
+  dialect: ShellDialect = hostShellDialect,
 ): string {
-  const assignments = env
-    .filter(([name]) => ENV_NAME.test(name))
-    .map(([name, value]) => `${name}=${shellQuote(value)}`);
-  return [...assignments, command, ...args]
-    .map((part, i) => (i < assignments.length ? part : shellQuote(part)))
-    .join(" ");
+  const vars = env.filter(([name]) => ENV_NAME.test(name));
+  if (dialect === "powershell") {
+    const assignments = vars.map(([name, value]) => `$env:${name}=${powerShellQuote(value)}; `);
+    const program = powerShellQuote(command);
+    // A quoted program is a string to PowerShell, not a command: `&` runs it.
+    const call = program === command ? program : `& ${program}`;
+    return assignments.join("") + [call, ...args.map(powerShellQuote)].join(" ");
+  }
+  if (dialect === "cmd") {
+    // `set "NAME=value"` keeps a trailing space or `&` out of the line's syntax.
+    const assignments = vars.map(([name, value]) => `set "${name}=${value}" && `);
+    return assignments.join("") + [command, ...args].map(cmdQuote).join(" ");
+  }
+  const assignments = vars.map(([name, value]) => `${name}=${shellQuote(value)}`);
+  return [...assignments, ...[command, ...args].map(shellQuote)].join(" ");
 }
 
 /** A terminal opened to run one command, and enough to take it away again. */

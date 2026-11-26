@@ -268,7 +268,15 @@ function shortLabel(service: LinkService, url: URL): Pick<LinkFacts, "short" | "
     default: {
       // The forge's own host: its pull request reads short.
       const pull = parseChangeRequestUrl(url);
-      if (pull) return { short: `PR #${pull.number}`, commit: false };
+      if (pull) {
+        const forge = service === "gitlab" || service === "bitbucket" || service === "forgejo";
+        return {
+          short: forge
+            ? `PR #${pull.number}`
+            : `${pull.host} · ${pull.repository} PR #${pull.number}`,
+          commit: false,
+        };
+      }
       const gitlabIssue = /^\/[^/]+(?:\/[^/]+)+\/-\/issues\/([1-9]\d*)\/?$/u.exec(url.pathname);
       return service === "gitlab" && gitlabIssue
         ? { short: `#${gitlabIssue[1]}`, commit: false }

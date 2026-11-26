@@ -31,7 +31,45 @@ pub fn guard_save_dest(dest: &str) -> Result<(), String> {
         return Err("save destination must not contain '..'".into());
     }
 
-    const SYSTEM_ROOTS: &[&str] = &[
+    guard_path(
+        path,
+        dirs::home_dir().as_deref(),
+        cfg!(any(target_os = "macos", target_os = "windows")),
+    )
+}
+
+fn guard_path(path: &Path, home: Option<&Path>, case_insensitive: bool) -> Result<(), String> {
+    let parts = |path: &Path| {
+        path.components()
+            .map(|c| {
+                let value = c.as_os_str().to_string_lossy().into_owned();
+                if case_insensitive {
+                    value.to_lowercase()
+                } else {
+                    value
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let target = parts(path);
+    if let Some(home) = home {
+        let home = parts(home);
+        if let Some(rel) = target.strip_prefix(home.as_slice()) {
+            let first = rel
+                .first()
+                .ok_or("refusing to overwrite your home directory")?;
+            if first.starts_with('.') {
+                return Err("refusing to write into a hidden directory in your home".into());
+            }
+            if first.eq_ignore_ascii_case("Library") {
+                return Err("refusing to write into ~/Library".into());
+            }
+            // Silverblue's home is /var/home; visible files there are user
+            // destinations even though other /var trees remain protected.
+            return Ok(());
+        }
+    }
+    for root in [
         "/etc",
         "/usr",
         "/bin",
@@ -42,28 +80,9 @@ pub fn guard_save_dest(dest: &str) -> Result<(), String> {
         "/Applications",
         "/private/etc",
         "/private/var",
-    ];
-    for root in SYSTEM_ROOTS {
-        if path.starts_with(root) {
+    ] {
+        if target.starts_with(&parts(Path::new(root))) {
             return Err(format!("refusing to write under {root}"));
-        }
-    }
-
-    if let Some(home) = dirs::home_dir() {
-        if let Ok(rel) = path.strip_prefix(&home) {
-            let mut components = rel.components();
-            if let Some(Component::Normal(first)) = components.next() {
-                let first = first.to_string_lossy();
-                if first.starts_with('.') {
-                    return Err("refusing to write into a hidden directory in your home".into());
-                }
-                if first == "Library" {
-                    return Err("refusing to write into ~/Library".into());
-                }
-            } else {
-                // `dest == $HOME` itself, or something stranger. Refuse.
-                return Err("refusing to overwrite your home directory".into());
-            }
         }
     }
     Ok(())
@@ -71,7 +90,23 @@ pub fn guard_save_dest(dest: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::guard_save_dest;
+    use super::{guard_path, guard_save_dest};
+    use std::path::Path;
+
+    #[test]
+    fn visible_home_saves_precede_system_roots_and_case_folding_protects_settings() {
+        let home = Path::new("/var/home/me");
+        assert!(guard_path(Path::new("/var/home/me/Downloads/a.pdf"), Some(home), false).is_ok());
+        assert!(guard_path(Path::new("/var/home/me/.ssh/id"), Some(home), false).is_err());
+        assert!(guard_path(Path::new("/var/lib/a"), Some(home), false).is_err());
+        assert!(guard_path(
+            Path::new("/users/me/library/LaunchAgents/a"),
+            Some(Path::new("/Users/Me")),
+            true
+        )
+        .is_err());
+        assert!(guard_path(Path::new("/applications/a"), None, true).is_err());
+    }
 
     #[test]
     fn ordinary_save_targets_pass() {

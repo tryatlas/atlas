@@ -278,6 +278,15 @@ impl PathRules {
                     .then_some(Refusal::Settings);
             }
         }
+        // udisks2 mounts removable drives below /run/media/<user>/<drive>.
+        // Runtime state and the mount-container ancestors stay protected.
+        if self.style == PathStyle::Posix
+            && path.len() >= 4
+            && path[0] == "run"
+            && path[1] == "media"
+        {
+            return None;
+        }
         // A drive root (`C:\`) or a UNC share (`\\server\share`) is a single
         // component on Windows. The POSIX root is no components, and listed.
         let drive_root = self.style == PathStyle::Windows && path.len() <= 1;

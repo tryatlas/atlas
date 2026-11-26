@@ -13,7 +13,9 @@
 //!   surviving operation. Never memory: an accepted proposal is re-checked
 //!   and applied through the ordinary write paths, with source `dream`.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use atlas_memory::dream::{self, DreamInput, DreamMemory, DreamOp};
@@ -31,6 +33,17 @@ const DREAM_TIMEOUT: Duration = Duration::from_secs(60);
 /// The provenance of every entry an accepted proposal writes.
 pub const DREAM_SOURCE: &str = "dream";
 const DAY_MS: i64 = 24 * 3600 * 1000;
+
+static DREAMS_RUNNING: LazyLock<parking_lot::Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashSet::new()));
+
+struct DreamPermit(PathBuf);
+
+impl Drop for DreamPermit {
+    fn drop(&mut self) {
+        DREAMS_RUNNING.lock().remove(&self.0);
+    }
+}
 
 /// One dream for `cwd` if it is due. Returns the dream id, or `None` when it
 /// was not due, not allowed, or there was nothing new to read.
@@ -77,21 +90,35 @@ pub async fn dream(
     let prepared = tokio::task::spawn_blocking(move || prepare(&r, &c, now))
         .await
         .map_err(|e| e.to_string())??;
-    let Some((input, episodes_to)) = prepared else {
+    let Some((input, episodes_to, _permit)) = prepared else {
         return Ok(None);
     };
     let prompt = dream::build_prompt(&input);
-    let answer =
-        match tokio::time::timeout(DREAM_TIMEOUT, model.complete(route.clone(), prompt)).await {
-            Ok(Ok(answer)) => answer,
-            Ok(Err(e)) => return Err(format!("dream not run: {e}")),
-            Err(_) => {
-                return Err(format!(
-                    "dream not run: no answer in {}s",
-                    DREAM_TIMEOUT.as_secs()
-                ))
-            }
-        };
+    let completion =
+        tokio::time::timeout(DREAM_TIMEOUT, model.complete(route.clone(), prompt)).await;
+    // A refused admission sent no prompt and remains due. Actual failures or
+    // timeouts count as attempts, so an unavailable provider is not hammered.
+    let admitted = !matches!(&completion, Ok(Err(error)) if error.starts_with(super::memory_extract::GATEWAY_PAUSED));
+    if admitted {
+        let cwd = cwd.clone();
+        tokio::task::spawn_blocking(move || {
+            store_for(&cwd)?
+                .record_dream_attempt(now)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+    }
+    let answer = match completion {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(e)) => return Err(format!("dream not run: {e}")),
+        Err(_) => {
+            return Err(format!(
+                "dream not run: no answer in {}s",
+                DREAM_TIMEOUT.as_secs()
+            ))
+        }
+    };
     let (kept, dropped) = dream::validate(dream::parse_ops(&answer), &input);
     // The revision each memory was at when the prompt was built: an entry
     // that moved during the model call is then obsolete at accept.
@@ -122,8 +149,13 @@ fn prepare(
     reader: &CaptureReader,
     cwd: &str,
     now: i64,
-) -> Result<Option<(DreamInput, i64)>, String> {
+) -> Result<Option<(DreamInput, i64, DreamPermit)>, String> {
     let store = store_for(cwd)?;
+    let root = store.root().to_path_buf();
+    if !DREAMS_RUNNING.lock().insert(root.clone()) {
+        return Ok(None);
+    }
+    let permit = DreamPermit(root);
     let e = |e: anyhow::Error| format!("{e:#}");
     let last = store.last_dream().map_err(e)?;
     // An attempt that failed or timed out counts: its prompt was sent.
@@ -153,10 +185,11 @@ fn prepare(
         note.title = None;
     }
     let memories = dream_memories(&store, now).map_err(e)?;
-    // Noted before the model is called, so a failing route is not asked
-    // again on every health pass.
-    store.record_dream_attempt(now).map_err(e)?;
-    Ok(Some((DreamInput { episodes, memories }, episodes_to)))
+    Ok(Some((
+        DreamInput { episodes, memories },
+        episodes_to,
+        permit,
+    )))
 }
 
 /// The active and candidate entries a dream sees, by id, at most
@@ -168,7 +201,8 @@ fn dream_memories(store: &RecordStore, now: i64) -> anyhow::Result<Vec<DreamMemo
     entries.sort_by_key(|e| e.id);
     entries.dedup_by_key(|e| e.id);
     entries.truncate(dream::MAX_MEMORIES);
-    let files = atlas_memory::citation::FileResolver::new(store.root());
+    let files =
+        atlas_memory::citation::FileResolver::with_worktrees(store.root(), store.scope_dirs());
     let mut out = Vec::with_capacity(entries.len());
     for e in entries {
         let validity = {
@@ -627,6 +661,86 @@ mod tests {
         assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
         assert!(attempt(1_000 + DREAM_EVERY_MS).await.is_err());
         assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    #[tokio::test]
+    async fn a_busy_gateway_leaves_the_dream_due_for_the_next_pass() {
+        let p = scratch_project("dream-busy-retry");
+        let memory = SharedMemoryStore::new();
+        let fake = Fake::answering(Err(format!(
+            "{}native agent is busy",
+            crate::commands::memory_extract::GATEWAY_PAUSED
+        )));
+        store_for(&p)
+            .unwrap()
+            .record_episode(&note("s-a", 900, "Use EdDSA"))
+            .unwrap();
+        for now in [1_000, 2_000] {
+            assert!(dream(
+                memory.clone(),
+                fake.clone(),
+                Route::Gateway,
+                CaptureReader::default(),
+                p.clone(),
+                now,
+            )
+            .await
+            .is_err());
+        }
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    #[tokio::test]
+    async fn overlapping_dreams_share_one_admission_and_release_it_after_refusal() {
+        struct HeldAdmission {
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        impl ExtractionModel for HeldAdmission {
+            fn signed_in(&self) -> bool {
+                true
+            }
+            fn complete(&self, _: Route, _: String) -> Completion<'_> {
+                Box::pin(async move {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                    Err(format!(
+                        "{}native agent is busy",
+                        crate::commands::memory_extract::GATEWAY_PAUSED
+                    ))
+                })
+            }
+        }
+        let p = scratch_project("dream-overlap");
+        let memory = SharedMemoryStore::new();
+        store_for(&p)
+            .unwrap()
+            .record_episode(&note("s-a", 900, "Use EdDSA"))
+            .unwrap();
+        let held = Arc::new(HeldAdmission {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let first = tokio::spawn(dream(
+            memory.clone(),
+            held.clone(),
+            Route::Gateway,
+            CaptureReader::default(),
+            p.clone(),
+            1_000,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), held.entered.notified())
+            .await
+            .expect("the first dream reached admission");
+        let next = Fake::new("{\"ops\":[]}");
+        assert_eq!(run(&memory, &next, &p, 2_000).await, None);
+        assert_eq!(next.calls.load(Ordering::SeqCst), 0);
+        held.release.notify_one();
+        assert!(first.await.unwrap().is_err());
+        assert!(run(&memory, &next, &p, 3_000).await.is_some());
+        assert_eq!(next.calls.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&p);
     }
 

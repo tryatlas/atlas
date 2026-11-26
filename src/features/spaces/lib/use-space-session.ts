@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as Y from "yjs";
-
 import { toBase64, fromBase64 } from "@/features/comms/lib/draft-sync";
 import { useCommsStore } from "@/features/comms/stores/comms-store";
+import { useAuthStore } from "@/features/auth/stores/auth-store";
 import {
   parseServerMessage,
   spacesApi,
@@ -19,7 +19,6 @@ import {
   SPACE_DOC_VERSION,
   frameAwareness,
   hasNewcomer,
-  HELD_MERGE_AT,
   SPACE_FLUSH_TICK_MS,
   SPACE_FRAME_AWARENESS,
   SPACE_FRAME_UPDATE,
@@ -27,87 +26,195 @@ import {
   type SpaceAwarenessState,
 } from "./space-wire";
 import { applyPageContent, applyRelayed, frameUpdate, localUndo, REMOTE } from "./space-doc";
+import {
+  authoritativePage,
+  rememberSpacePage,
+  savedSpacePages,
+  spaceOutbox,
+  updateBatches,
+  type SpaceOutbox,
+} from "./space-outbox";
+import type { SpacePageTarget } from "./space-page-edit";
 import { useSpacesStore } from "../stores/spaces-store";
 
-/**
- * One live Space session for one conversation: the socket lifecycle, the
- * Y.Doc for the open page, slots, resume, awareness and the roster.
- *
- * Web parity, verbatim, on every reliability decision:
- * - the Y.Doc is recreated ONLY on page switch, never on reconnect;
- * - `since` advances on `page.opened` and NOTHING else — a relayed frame
- *   never moves it, so a reconnect re-receives a little and the CRDT
- *   absorbs the overlap;
- * - local updates are sent one frame each, unthrottled (the server's 50ms
- *   tick is the throttle); while unsendable they are held and merged at 64;
- * - held updates flush AFTER the `page.opened` catch-up is applied, so the
- *   server log stays replayable;
- * - frames for a slot other than the current one are dropped (there is no
- *   `page.close` — stale subscriptions keep sending);
- * - `page.closed{evicted}` re-opens; `{deleted}` never does;
- * - `actor_ceiling` mutes ALL outgoing awareness; `archived` does not.
- */
+type EditingReason = SpaceReadOnlyReason | "unavailable" | "recovering";
+
+/** A view of one page; durable unsent edits live in the scoped outbox, not this hook. */
 export function useSpaceSession(convId: string) {
   const patch = useSpacesStore.getState().actions.patch;
-
+  const accountId = useAuthStore((s) =>
+    s.snapshot.status === "signed-in" ? (s.snapshot.user?.id ?? null) : null,
+  );
+  const orgId = useAuthStore((s) =>
+    s.snapshot.status === "signed-in" ? s.snapshot.commsOrgId : null,
+  );
+  const identity = useMemo(
+    () => (accountId && orgId ? { accountId, orgId } : null),
+    [accountId, orgId],
+  );
+  const identityKey = JSON.stringify(identity);
+  const ownerRef = useRef(identityKey);
   const [pageId, setPageId] = useState<string | null>(null);
-  const [readOnly, setReadOnly] = useState<SpaceReadOnlyReason | null>(null);
+  const [readOnly, setReadOnly] = useState<EditingReason | null>(null);
   const [ready, setReady] = useState(false);
-  /** Bumped on every doc change — the canvas re-reads nodes/edges off it. */
   const [revision, setRevision] = useState(0);
   const [actors, setActors] = useState<ReadonlyMap<string, SpaceActor>>(new Map());
   const [banner, setBanner] = useState<string | null>(null);
-  /** Whose camera we ride, if anyone's. The web's model: a peer's viewport
-   *  is data to render, applied to the local canvas by exactly one thing —
-   *  a deliberate follow. Rides the awareness frame so the followee knows. */
+  const [syncError, setSyncError] = useState<string | null>(null);
+  const [pendingUpdates, setPendingUpdates] = useState(false);
   const [following, setFollowing] = useState<string | null>(null);
   const followingRef = useRef<string | null>(null);
-
-  // One doc per open page. Replaced only by openPage(); reconnects keep it.
   const docRef = useRef<Y.Doc | null>(null);
   const undoRef = useRef<Y.UndoManager | null>(null);
   const pageIdRef = useRef<string | null>(null);
   const slotRef = useRef<number | null>(null);
-  const sinceRef = useRef<Map<string, number>>(new Map());
-  const heldRef = useRef<Uint8Array[]>([]);
+  const sinceRef = useRef(new Map<string, number>());
   const connRef = useRef<SpaceConnState>("disconnected");
-  const readOnlyRef = useRef<SpaceReadOnlyReason | null>(null);
+  const readOnlyRef = useRef<EditingReason | null>(null);
+  const seatReadOnlyRef = useRef(false);
+  const archivedRef = useRef(false);
+  const recoveryRef = useRef(false);
+  const generationRef = useRef(0);
+  const sentRef = useRef(new Set<number>());
+  const journalRef = useRef<SpaceOutbox | null>(null);
+  const unsubscribeJournalRef = useRef<(() => void) | null>(null);
   const actorsRef = useRef<ReadonlyMap<string, SpaceActor>>(new Map());
-  /** Unregisters the open page from `live-spaces`, so a write from outside
-   *  the canvas (Atlas Agent drawing on it) goes into this doc. */
   const unregisterPageRef = useRef<(() => void) | null>(null);
-
-  // ---- awareness publisher: 50ms trailing, patch-merged -------------------
   const mineRef = useRef<SpaceAwarenessState>({});
-  const awarenessTimer = useRef<number | undefined>(undefined);
+  const awarenessTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const outboundTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const proofTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const proofRef = useRef<{ pageId: string; generation: number; ids: Set<number> } | null>(null);
+  const sendingRef = useRef(false);
+
+  const updateAccess = useCallback(
+    (reason: EditingReason | null) => {
+      readOnlyRef.current = reason;
+      setReadOnly(reason);
+      unregisterPageRef.current?.();
+      unregisterPageRef.current = null;
+      if (pageIdRef.current && docRef.current)
+        unregisterPageRef.current = registerOpenPage(
+          convId,
+          pageIdRef.current,
+          docRef.current,
+          reason,
+          identity ?? undefined,
+        );
+    },
+    [convId, identity],
+  );
+
+  const requestPage = useCallback(
+    (id: string, proof = false) => {
+      if (!identity || recoveryRef.current || connRef.current !== "open") return;
+      if (proof)
+        proofRef.current = {
+          pageId: id,
+          generation: generationRef.current,
+          ids: new Set(sentRef.current),
+        };
+      const since = proof ? undefined : sinceRef.current.get(id);
+      void spacesApi
+        .sendControl(
+          convId,
+          { t: "page.open", page_id: id, ...(since === undefined ? {} : { since }) },
+          identity,
+        )
+        .catch((error) => setBanner(String(error)));
+    },
+    [convId, identity],
+  );
+
+  const flushOutbound = useCallback(async () => {
+    outboundTimer.current = undefined;
+    const journal = journalRef.current;
+    if (!journal) return;
+    let ownsSend = false;
+    try {
+      await journal.flush();
+      if (
+        journal !== journalRef.current ||
+        ownerRef.current !== identityKey ||
+        sendingRef.current ||
+        !identity ||
+        recoveryRef.current ||
+        slotRef.current === null ||
+        connRef.current !== "open" ||
+        readOnlyRef.current !== null
+      )
+        return;
+      sendingRef.current = true;
+      ownsSend = true;
+      const generation = generationRef.current;
+      const slot = slotRef.current;
+      const target = pageIdRef.current;
+      const records = journal.records.filter((record) => !sentRef.current.has(record.id));
+      for (const batch of updateBatches(records.map((record) => record.data))) {
+        if (
+          generation !== generationRef.current ||
+          journal !== journalRef.current ||
+          slot !== slotRef.current ||
+          readOnlyRef.current !== null
+        )
+          return;
+        await spacesApi.sendBinary(convId, toBase64(frameUpdate(slot, batch)), identity);
+      }
+      if (generation !== generationRef.current || journal !== journalRef.current) return;
+      for (const record of records) sentRef.current.add(record.id);
+      if (records.length && target && proofTimer.current === undefined) {
+        proofTimer.current = setTimeout(() => {
+          proofTimer.current = undefined;
+          if (generation === generationRef.current && target === pageIdRef.current)
+            requestPage(target, true);
+        }, 750);
+      }
+    } catch (error) {
+      setSyncError(journal.error ?? String(error));
+    } finally {
+      if (ownsSend) sendingRef.current = false;
+    }
+  }, [convId, identity, identityKey, requestPage]);
+
+  const scheduleOutbound = useCallback(() => {
+    if (outboundTimer.current === undefined)
+      outboundTimer.current = setTimeout(() => {
+        void flushOutbound();
+      }, 33);
+  }, [flushOutbound]);
 
   const sendAwarenessNow = useCallback(() => {
     awarenessTimer.current = undefined;
     const slot = slotRef.current;
-    if (slot === null || connRef.current !== "open") return;
-    // The silence rule: a view-only seat sends NO awareness at all.
-    if (readOnlyRef.current === "actor_ceiling") return;
-    const s = useCommsStore.getState();
-    const meId = s.me;
-    const name = s.members.find((m) => m.id === meId)?.name;
-    const state: SpaceAwarenessState = { ...mineRef.current };
-    if (name) state.name = name;
-    void spacesApi.sendBinary(convId, toBase64(frameAwareness(slot, state))).catch(() => {});
-  }, [convId]);
-
+    if (
+      !identity ||
+      recoveryRef.current ||
+      slot === null ||
+      connRef.current !== "open" ||
+      seatReadOnlyRef.current ||
+      readOnlyRef.current === "unavailable"
+    )
+      return;
+    const state = useCommsStore.getState();
+    const name = state.members.find((member) => member.id === state.me)?.name;
+    void spacesApi
+      .sendBinary(
+        convId,
+        toBase64(frameAwareness(slot, { ...mineRef.current, ...(name ? { name } : {}) })),
+        identity,
+      )
+      .catch(() => {});
+  }, [convId, identity]);
   const publishAwareness = useCallback(
-    (patchState: Partial<SpaceAwarenessState>) => {
-      mineRef.current = { ...mineRef.current, ...patchState };
-      if (awarenessTimer.current === undefined) {
-        awarenessTimer.current = window.setTimeout(sendAwarenessNow, SPACE_FLUSH_TICK_MS);
-      }
+    (state: Partial<SpaceAwarenessState>) => {
+      mineRef.current = { ...mineRef.current, ...state };
+      if (awarenessTimer.current === undefined)
+        awarenessTimer.current = setTimeout(sendAwarenessNow, SPACE_FLUSH_TICK_MS);
     },
     [sendAwarenessNow],
   );
-
   const follow = useCallback(
     (id: string | null) => {
-      if (followingRef.current === id) return;
       followingRef.current = id;
       setFollowing(id);
       publishAwareness({ following: id });
@@ -115,357 +222,395 @@ export function useSpaceSession(convId: string) {
     [publishAwareness],
   );
 
-  // ---- outbound doc updates ----------------------------------------------
-  // Batched on a short timer, MERGED: a local drag produces one Y update per
-  // pointermove, and an invoke per mousemove is a bridge round-trip the web
-  // client (raw ws.send) never pays. ~33ms keeps a drag visually live for
-  // peers (the server fans out on its own 50ms tick anyway) at a fraction of
-  // the IPC. Yjs merge keeps it one frame on the wire.
-  const outboundRef = useRef<Uint8Array[]>([]);
-  const outboundTimer = useRef<number | undefined>(undefined);
-
-  const flushOutbound = useCallback(() => {
-    outboundTimer.current = undefined;
-    const batch = outboundRef.current;
-    if (batch.length === 0) return;
-    outboundRef.current = [];
-    const merged = batch.length === 1 ? batch[0] : Y.mergeUpdates(batch);
-    const slot = slotRef.current;
-    if (slot !== null && connRef.current === "open") {
-      void spacesApi.sendBinary(convId, toBase64(frameUpdate(slot, merged))).catch(() => {});
-    } else {
-      // The socket went away between enqueue and flush: hold, merged.
-      heldRef.current.push(merged);
-      if (heldRef.current.length >= HELD_MERGE_AT) {
-        heldRef.current = [Y.mergeUpdates(heldRef.current)];
-      }
-    }
-  }, [convId]);
-
-  const relayUpdate = useCallback(
-    (update: Uint8Array, origin: unknown) => {
-      if (origin === REMOTE) return;
-      if (slotRef.current !== null && connRef.current === "open") {
-        outboundRef.current.push(update);
-        if (outboundTimer.current === undefined) {
-          outboundTimer.current = window.setTimeout(flushOutbound, 33);
-        }
-        return;
-      }
-      // Offline: hold, and collapse at the web's threshold so a long
-      // disconnect stays one catch-up update.
-      heldRef.current.push(update);
-      if (heldRef.current.length >= HELD_MERGE_AT) {
-        heldRef.current = [Y.mergeUpdates(heldRef.current)];
-      }
-    },
-    [flushOutbound],
-  );
-
-  // One repaint per animation frame, however many updates land inside it —
-  // a remote drag delivers batches at ~20Hz and a local one at pointermove
-  // rate, and each `revision` bump re-reads the whole doc in the canvas.
-  // The timeout backstop covers a hidden window, where rAF never fires.
-  const repaintScheduled = useRef(false);
+  const repaintRef = useRef<ReturnType<typeof setTimeout> | number | null>(null);
   const scheduleRepaint = useCallback(() => {
-    if (repaintScheduled.current) return;
-    repaintScheduled.current = true;
-    const bump = () => {
-      repaintScheduled.current = false;
-      setRevision((r) => r + 1);
-    };
-    if (document.visibilityState === "visible") requestAnimationFrame(bump);
-    else window.setTimeout(bump, 100);
+    if (repaintRef.current !== null) return;
+    repaintRef.current = setTimeout(() => {
+      repaintRef.current = null;
+      setRevision((value) => value + 1);
+    }, 16);
   }, []);
 
   const attachDoc = useCallback(
-    (doc: Y.Doc) => {
+    (doc: Y.Doc, journal: SpaceOutbox) => {
+      // Old listeners close over their own page and account, including teardown edits.
       docRef.current?.destroy();
       undoRef.current?.destroy();
       docRef.current = doc;
       undoRef.current = localUndo(doc);
       doc.on("update", (update: Uint8Array, origin: unknown) => {
-        relayUpdate(update, origin);
+        if (origin !== REMOTE) {
+          journal.record(update, () => Y.encodeStateAsUpdate(doc));
+          scheduleOutbound();
+        } else journal.captureSnapshot(() => Y.encodeStateAsUpdate(doc));
         scheduleRepaint();
       });
     },
-    [relayUpdate, scheduleRepaint],
+    [scheduleOutbound, scheduleRepaint],
   );
 
-  const requestPage = useCallback(
-    (id: string) => {
-      const since = sinceRef.current.get(id);
-      const frame: SpaceClientMessage =
-        since === undefined
-          ? { t: "page.open", page_id: id }
-          : { t: "page.open", page_id: id, since };
-      void spacesApi.sendControl(convId, frame).catch(() => {});
-    },
-    [convId],
-  );
-
-  /** Switch pages: fresh doc, fresh roster, tell the server. */
   const openPage = useCallback(
-    (id: string) => {
-      if (pageIdRef.current === id) return;
-      // The tail of an edit must go out on the OLD page's slot.
-      flushOutbound();
-      unregisterPageRef.current?.();
-      unregisterPageRef.current = null;
-      pageIdRef.current = id;
+    (id: string, recover = false) => {
+      if (!identity || (pageIdRef.current === id && recoveryRef.current === recover)) return;
+      void journalRef.current?.flush().catch((error) => setSyncError(String(error)));
+      generationRef.current += 1;
+      ownerRef.current = identityKey;
+      recoveryRef.current = recover;
       slotRef.current = null;
-      heldRef.current = [];
-      sinceRef.current.delete(id); // fresh doc ⇒ a stale `since` would gap it
+      proofRef.current = null;
+      sentRef.current = new Set();
+      sinceRef.current.delete(id);
+      pageIdRef.current = id;
       setPageId(id);
       setReady(false);
       setActors(new Map());
       actorsRef.current = new Map();
       followingRef.current = null;
       setFollowing(null);
-      mineRef.current = { ...mineRef.current, following: null };
-      attachDoc(new Y.Doc());
-      requestPage(id);
-      void spacesApi.sendControl(convId, { t: "page.active", page_id: id }).catch(() => {});
+      mineRef.current = {};
+      unsubscribeJournalRef.current?.();
+      const journal = spaceOutbox({ ...identity, convId, pageId: id });
+      journalRef.current = journal;
+      const doc = new Y.Doc();
+      attachDoc(doc, journal);
+      updateAccess(recover ? "unavailable" : "recovering");
+      const changed = () => {
+        setSyncError(journal.error);
+        setPendingUpdates(journal.pending);
+        if (journal.records.some((record) => !sentRef.current.has(record.id)) && !recover)
+          scheduleOutbound();
+      };
+      unsubscribeJournalRef.current = journal.subscribe(changed);
+      changed();
+      const page = useSpacesStore.getState().byConv[convId]?.pages.find((page) => page.id === id);
+      rememberSpacePage({ ...journal.scope, name: page?.name ?? id });
+      void journal
+        .hydrate()
+        .then(() => {
+          if (docRef.current !== doc || journalRef.current !== journal) return;
+          if (journal.savedSnapshot) {
+            Y.applyUpdate(doc, journal.savedSnapshot, REMOTE);
+            journal.applyTo(doc);
+            setReady(true);
+            if (!recover && connRef.current !== "unavailable")
+              updateAccess(archivedRef.current ? "archived" : null);
+          }
+        })
+        .catch((error) => setSyncError(String(error)));
+      if (!recover) {
+        requestPage(id);
+        if (connRef.current === "open")
+          void spacesApi
+            .sendControl(convId, { t: "page.active", page_id: id }, identity)
+            .catch((error) => setBanner(String(error)));
+      }
     },
-    [attachDoc, convId, flushOutbound, requestPage],
+    [attachDoc, convId, identity, identityKey, requestPage, scheduleOutbound, updateAccess],
   );
 
-  // ---- inbound ------------------------------------------------------------
   useEffect(() => {
-    const off = subscribeSpaceBus(convId, (ev) => {
-      if (ev.kind === "connection") {
-        connRef.current = ev.state;
-        patch(convId, { connection: ev.state });
-        if (ev.state !== "open") {
-          // Presence is the socket; a dead socket is an empty room.
+    if (!identity) return;
+    return subscribeSpaceBus(convId, (event) => {
+      if (ownerRef.current !== identityKey && pageIdRef.current !== null) return;
+      if (event.kind === "connection") {
+        if (event.state !== "open" || connRef.current !== "open") {
+          generationRef.current += 1;
+          slotRef.current = null;
+          sentRef.current = new Set();
+          proofRef.current = null;
+        }
+        connRef.current = event.state;
+        patch(convId, { connection: event.state });
+        if (event.state !== "open") {
           setActors(new Map());
           actorsRef.current = new Map();
           followingRef.current = null;
           setFollowing(null);
           mineRef.current = { ...mineRef.current, following: null };
+          if (event.state === "unavailable") updateAccess("unavailable");
         }
         return;
       }
-
-      if (ev.kind === "control") {
-        const msg = parseServerMessage(ev.frame);
-        if (msg === null) return; // a newer server's frame — dropped, not fatal
-        switch (msg.t) {
+      if (event.kind === "control") {
+        const message = parseServerMessage(event.frame);
+        if (!message) return;
+        switch (message.t) {
           case "space.hello": {
+            slotRef.current = null;
+            archivedRef.current = message.archived;
             patch(convId, {
-              pages: msg.pages,
-              archived: msg.archived,
-              stale: msg.doc_version > SPACE_DOC_VERSION,
+              pages: message.pages,
+              archived: message.archived,
+              stale: message.doc_version > SPACE_DOC_VERSION,
               error: null,
             });
-            // Reconnect: re-open the page we were on (fresh slot). First
-            // hello: land on the page asked for from outside the canvas,
-            // else the remembered page, else the first real page.
+            if (recoveryRef.current) break;
             const current = pageIdRef.current;
-            if (current !== null && msg.pages.some((p) => p.id === current)) {
-              requestPage(current);
-            } else {
+            if (current && message.pages.some((page) => page.id === current)) requestPage(current);
+            else {
               const asked = useSpacesStore.getState().actions.takeRequestedPage(convId);
-              const landing = landingPage(msg.pages, msg.active_page_id, asked);
-              if (landing !== null) openPage(landing);
+              const landing = landingPage(message.pages, message.active_page_id, asked);
+              if (landing) openPage(landing);
             }
             break;
           }
           case "page.opened": {
-            if (msg.page_id !== pageIdRef.current) break;
-            slotRef.current = msg.slot;
-            sinceRef.current.set(msg.page_id, msg.index);
-            readOnlyRef.current = msg.read_only;
-            setReadOnly(msg.read_only);
-            const doc = docRef.current;
-            if (doc) {
-              applyPageContent(doc, msg);
-              unregisterPageRef.current?.();
-              unregisterPageRef.current = registerOpenPage(convId, msg.page_id, doc, msg.read_only);
-              // The reconnect catch-up: held edits go AFTER the server's,
-              // so its log stays replayable.
-              if (heldRef.current.length > 0 && msg.read_only === null) {
-                const merged = Y.mergeUpdates(heldRef.current);
-                heldRef.current = [];
-                void spacesApi
-                  .sendBinary(convId, toBase64(frameUpdate(msg.slot, merged)))
-                  .catch(() => {});
-              }
+            if (
+              message.page_id !== pageIdRef.current ||
+              connRef.current !== "open" ||
+              recoveryRef.current
+            )
+              break;
+            const generation = generationRef.current;
+            const journal = journalRef.current;
+            if (!journal) break;
+            const proof =
+              proofRef.current?.pageId === message.page_id &&
+              proofRef.current.generation === generation
+                ? proofRef.current
+                : null;
+            proofRef.current = null;
+            let authoritative: Y.Doc;
+            try {
+              authoritative = authoritativePage(message);
+            } catch (error) {
+              setSyncError(String(error));
+              break;
             }
-            setReady(true);
-            // Awareness is never replayed: announce ourselves.
-            if (msg.read_only !== "actor_ceiling") publishAwareness({});
+            if (!message.resume && !proof) {
+              void journal.flush().catch((error) => setSyncError(String(error)));
+              attachDoc(new Y.Doc(), journal);
+            }
+            const doc = docRef.current!;
+            applyPageContent(doc, message);
+            slotRef.current = message.slot;
+            sinceRef.current.set(message.page_id, message.index);
+            seatReadOnlyRef.current = message.read_only === "actor_ceiling";
+            updateAccess(
+              seatReadOnlyRef.current
+                ? "actor_ceiling"
+                : archivedRef.current || message.read_only === "archived"
+                  ? "archived"
+                  : null,
+            );
+            void journal
+              .hydrate()
+              .then(async () => {
+                // A full reply can acknowledge; a resume contains only a suffix.
+                if (!message.resume) await journal.acknowledge(authoritative);
+                if (generation !== generationRef.current || doc !== docRef.current) return;
+                journal.applyTo(doc);
+                if (proof) for (const id of proof.ids) sentRef.current.delete(id);
+                setReady(true);
+                setSyncError(journal.error);
+                setPendingUpdates(journal.pending);
+                scheduleOutbound();
+                if (!seatReadOnlyRef.current) publishAwareness({});
+                journal.captureSnapshot(() => Y.encodeStateAsUpdate(doc));
+              })
+              .catch((error) => setSyncError(String(error)))
+              .finally(() => authoritative.destroy());
             break;
           }
           case "page.tree": {
-            patch(convId, { pages: msg.pages });
-            // The open page can vanish under us (deleted elsewhere).
+            patch(convId, { pages: message.pages });
             const current = pageIdRef.current;
-            if (current !== null && !msg.pages.some((p) => p.id === current)) {
-              const fallback = msg.pages.find((p) => p.kind === "page")?.id ?? null;
-              if (fallback !== null) openPage(fallback);
+            if (
+              current &&
+              !recoveryRef.current &&
+              !message.pages.some((page) => page.id === current)
+            ) {
+              // Retain the deleted page as a readable local recovery copy.
+              openPage(current, true);
+              setBanner("This page was removed. Your saved copy is available to export.");
             }
             break;
           }
-          case "page.created":
-            break; // the accompanying page.tree carries the row
           case "page.closed": {
-            // Only the LRU eviction re-opens; a deletion is final and the
-            // page.tree handler already moved us.
-            if (msg.reason === "evicted" && msg.page_id === pageIdRef.current) {
-              slotRef.current = null;
-              requestPage(msg.page_id);
+            if (message.page_id !== pageIdRef.current) break;
+            slotRef.current = null;
+            sentRef.current = new Set();
+            if (message.reason === "evicted") requestPage(message.page_id);
+            else {
+              updateAccess("unavailable");
+              setBanner("This page was removed. Your saved copy is available to export.");
             }
             break;
           }
           case "space.access": {
-            patch(convId, { archived: msg.archived });
+            archivedRef.current = message.archived;
+            patch(convId, { archived: message.archived });
+            updateAccess(
+              seatReadOnlyRef.current
+                ? "actor_ceiling"
+                : message.archived
+                  ? "archived"
+                  : "recovering",
+            );
+            if (!message.archived && pageIdRef.current) requestPage(pageIdRef.current);
             break;
           }
           case "error": {
-            const detail = msg.error.detail as { reconnect?: boolean } | undefined;
-            if (detail?.reconnect === true) {
-              // Fresh slots by instruction: drop the socket and redial.
+            const detail = message.error.detail as { reconnect?: boolean } | undefined;
+            if (detail?.reconnect) {
               slotRef.current = null;
-              void spacesApi.cycle(convId).catch(() => {});
-            } else {
-              setBanner(msg.error.message || msg.error.code);
-            }
+              void spacesApi.cycle(convId).catch((error) => setBanner(String(error)));
+            } else setBanner(message.error.message || message.error.code);
             break;
           }
+          case "page.created":
+            break;
         }
         return;
       }
-
-      // Binary. Route by slot — a frame for a stale slot is dropped.
-      const bytes = fromBase64(ev.data);
-      if (bytes === null) return;
-      const frame = decodeSpaceFrame(bytes);
-      if (frame === null || frame.slot !== slotRef.current) return;
+      const bytes = fromBase64(event.data);
+      const frame = bytes ? decodeSpaceFrame(bytes) : null;
+      if (!frame || frame.slot !== slotRef.current) return;
       if (frame.type === SPACE_FRAME_UPDATE) {
-        const doc = docRef.current;
-        if (doc) applyRelayed(doc, frame.payload);
+        if (docRef.current) applyRelayed(docRef.current, frame.payload);
       } else if (frame.type === SPACE_FRAME_AWARENESS) {
         const before = actorsRef.current;
         const after = applyAwareness(before, frame.payload);
-        if (after !== before) {
-          actorsRef.current = after;
-          setActors(after);
-          // The subject left: control comes back, and the room is told.
-          const f = followingRef.current;
-          if (f !== null && !after.has(f)) {
-            followingRef.current = null;
-            setFollowing(null);
-            mineRef.current = { ...mineRef.current, following: null };
-            if (readOnlyRef.current !== "actor_ceiling") publishAwareness({});
-          }
-          // Answer an arrival with a state of one's own — a still mouse
-          // would otherwise be invisible indefinitely.
-          if (hasNewcomer(before, after) && readOnlyRef.current !== "actor_ceiling") {
-            publishAwareness({});
-          }
-        }
+        if (before === after) return;
+        actorsRef.current = after;
+        setActors(after);
+        const followed = followingRef.current;
+        if (followed && !after.has(followed)) follow(null);
+        if (hasNewcomer(before, after) && !seatReadOnlyRef.current) publishAwareness({});
       }
     });
-    return off;
-  }, [convId, openPage, patch, publishAwareness, requestPage]);
+  }, [
+    attachDoc,
+    convId,
+    follow,
+    identity,
+    identityKey,
+    openPage,
+    patch,
+    publishAwareness,
+    requestPage,
+    scheduleOutbound,
+    updateAccess,
+  ]);
 
-  // A page asked for from outside the canvas (`openSpaceOnPage`) while it is
-  // already showing this Space: switch to it at once. Before the first
-  // hello has landed on a page, the hello takes the request instead.
-  const requested = useSpacesStore((s) => s.requestedPages[convId] ?? null);
+  const requested = useSpacesStore((state) => state.requestedPages[convId] ?? null);
   useEffect(() => {
-    if (requested === null || pageIdRef.current === null) return;
-    const store = useSpacesStore.getState();
-    const asked = store.actions.takeRequestedPage(convId);
-    const pages = store.byConv[convId]?.pages ?? [];
-    if (asked !== null && landingPage(pages, null, asked) === asked) openPage(asked);
+    if (!requested || !pageIdRef.current) return;
+    const asked = useSpacesStore.getState().actions.takeRequestedPage(convId);
+    if (asked) openPage(asked);
   }, [convId, openPage, requested]);
 
-  // ---- lifecycle ----------------------------------------------------------
   useEffect(() => {
-    // REST pre-flight first: it maps 401/403/404 to words, and lazily
-    // creates the Space — the socket's hello then finds it existing.
-    spacesApi
+    if (!identity) return;
+    let disposed = false;
+    ownerRef.current = identityKey;
+    const savedPages = savedSpacePages(identity.accountId, convId).filter(
+      (page) => page.orgId === identity.orgId,
+    );
+    const saved = savedPages[savedPages.length - 1];
+    if (saved) openPage(saved.pageId);
+    void spacesApi
       .summary(convId)
       .then((summary) => {
-        useSpacesStore.getState().actions.adoptSummary(convId, summary);
+        if (!disposed) useSpacesStore.getState().actions.adoptSummary(convId, summary);
       })
-      .catch((e) => {
-        patch(convId, { error: typeof e === "string" ? e : "This Space could not be opened." });
+      .catch((error) => {
+        if (!disposed) patch(convId, { error: String(error) });
       });
-    // Held, not owned: a write from outside the canvas may share the socket.
-    acquireSpaceSocket(convId).catch((e) => {
-      console.error("spaces: connect failed:", convId, e);
+    void acquireSpaceSocket(convId).catch((error) => {
+      if (!disposed) setBanner(String(error));
     });
     return () => {
-      // A mid-drag edit must not die with the unmount.
-      flushOutbound();
-      if (outboundTimer.current !== undefined) window.clearTimeout(outboundTimer.current);
-      // Cursor off the canvas for everyone else, then the socket down —
-      // unless something else still holds it.
+      disposed = true;
+      // Capture the full recovery snapshot before destroying the Y.Doc.
+      void journalRef.current
+        ?.flush()
+        .catch((error) => console.error("Space recovery save failed", error));
+      unsubscribeJournalRef.current?.();
+      unsubscribeJournalRef.current = null;
       unregisterPageRef.current?.();
       unregisterPageRef.current = null;
+      generationRef.current += 1;
       releaseSpaceSocket(convId);
       docRef.current?.destroy();
       undoRef.current?.destroy();
       docRef.current = null;
       undoRef.current = null;
+      journalRef.current = null;
       pageIdRef.current = null;
       slotRef.current = null;
-      if (awarenessTimer.current !== undefined) window.clearTimeout(awarenessTimer.current);
+      setReady(false);
+      setPageId(null);
+      if (outboundTimer.current !== undefined) clearTimeout(outboundTimer.current);
+      if (proofTimer.current !== undefined) clearTimeout(proofTimer.current);
+      if (awarenessTimer.current !== undefined) clearTimeout(awarenessTimer.current);
+      if (repaintRef.current !== null) clearTimeout(repaintRef.current);
+      outboundTimer.current = undefined;
+      proofTimer.current = undefined;
+      awarenessTimer.current = undefined;
+      repaintRef.current = null;
     };
-  }, [convId, flushOutbound, patch]);
+  }, [convId, identity, identityKey, openPage, patch]);
 
-  // ---- tree actions (non-optimistic; the server broadcasts the tree) ------
   const send = useCallback(
     (message: SpaceClientMessage) => {
-      void spacesApi.sendControl(convId, message).catch(() => {});
+      if (
+        !identity ||
+        recoveryRef.current ||
+        connRef.current !== "open" ||
+        readOnlyRef.current !== null
+      )
+        return;
+      void spacesApi
+        .sendControl(convId, message, identity)
+        .catch((error) => setBanner(String(error)));
     },
-    [convId],
+    [convId, identity],
   );
+  const retrySync = useCallback(() => {
+    sentRef.current = new Set();
+    void journalRef.current
+      ?.hydrate()
+      .then(() => flushOutbound())
+      .catch((error) => setSyncError(String(error)));
+    if (pageIdRef.current) requestPage(pageIdRef.current, true);
+  }, [flushOutbound, requestPage]);
+  const meta = useSpacesStore((state) => state.byConv[convId]);
+  const recoveryPages = accountId
+    ? savedSpacePages(accountId, convId).filter((page) => page.orgId === orgId)
+    : [];
 
-  const meta = useSpacesStore((s) => s.byConv[convId]);
-
-  return useMemo(
-    () => ({
-      pageId,
-      ready,
-      revision,
-      actors,
-      readOnly,
-      banner,
-      following,
-      follow,
-      dismissBanner: () => setBanner(null),
-      meta,
-      doc: docRef,
-      undo: undoRef,
-      openPage,
-      publishAwareness,
-      createPage: (opts: { kind?: "page" | "folder"; parent_id?: string | null }) =>
-        send({ t: "page.create", ...opts }),
-      renamePage: (id: string, fields: { name?: string; icon?: string | null }) =>
-        send({ t: "page.rename", page_id: id, ...fields }),
-      movePage: (id: string, parentId: string | null, index: number) =>
-        send({ t: "page.move", page_id: id, parent_id: parentId, index }),
-      deletePage: (id: string) => send({ t: "page.delete", page_id: id }),
-    }),
-    [
-      pageId,
-      ready,
-      revision,
-      actors,
-      readOnly,
-      banner,
-      following,
-      follow,
-      meta,
-      openPage,
-      publishAwareness,
-      send,
-    ],
-  );
+  return {
+    pageId,
+    ready: ready && ownerRef.current === identityKey,
+    revision,
+    actors,
+    readOnly,
+    banner,
+    syncError,
+    pendingUpdates,
+    following,
+    follow,
+    meta,
+    recoveryPages,
+    retrySync,
+    dismissBanner: () => setBanner(null),
+    doc: docRef,
+    undo: undoRef,
+    pageTarget: (): SpacePageTarget | null =>
+      docRef.current && journalRef.current
+        ? { scope: journalRef.current.scope, snapshot: Y.encodeStateAsUpdate(docRef.current) }
+        : null,
+    openPage: (id: string) => openPage(id),
+    recoverPage: (id: string) => openPage(id, true),
+    publishAwareness,
+    createPage: (options: { kind?: "page" | "folder"; parent_id?: string | null }) =>
+      send({ t: "page.create", ...options }),
+    renamePage: (id: string, fields: { name?: string; icon?: string | null }) =>
+      send({ t: "page.rename", page_id: id, ...fields }),
+    movePage: (id: string, parentId: string | null, index: number) =>
+      send({ t: "page.move", page_id: id, parent_id: parentId, index }),
+    deletePage: (id: string) => send({ t: "page.delete", page_id: id }),
+  };
 }
-
 export type SpaceSession = ReturnType<typeof useSpaceSession>;

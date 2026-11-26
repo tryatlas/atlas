@@ -168,6 +168,9 @@ pub async fn project_browse(path: String) -> Result<BrowseListing, String> {
     // both keep one), so the path the palette adds matches the same folder
     // added without it.
     let dir: PathBuf = expand_home(&path)?.components().collect();
+    if !dir.is_absolute() {
+        return Err("Choose an absolute folder path or a path starting with ~/.".into());
+    }
     tokio::task::spawn_blocking(move || {
         let entries = std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let mut directories: Vec<String> = entries
@@ -543,6 +546,11 @@ pub async fn project_clone(url: String, github: bool) -> Result<String, String> 
     }
     tokio::task::spawn_blocking(move || {
         let out = atlas_git::GitCommand::without_repo(&["clone", "--"])
+            .env(
+                "GIT_SSH_COMMAND",
+                "ssh -o BatchMode=yes -o ConnectTimeout=15",
+            )
+            .timeout(std::time::Duration::from_secs(300))
             .arg(&url)
             .arg(&dest)
             .output()

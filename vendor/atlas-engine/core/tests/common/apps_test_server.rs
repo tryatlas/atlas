@@ -30,8 +30,8 @@ const DISCOVERABLE_CALENDAR_ID: &str = "connector_2128aebfecb84f64a069897515042a
 const DISCOVERABLE_GMAIL_ID: &str = "connector_68df038e0ba48191908c8434991bbac2";
 const CONNECTOR_DESCRIPTION: &str = "Plan events and manage your calendar.";
 const ATLAS_APPS_META_KEY: &str = "_atlas_apps";
-const ATLAS_APPS_MCP_PATH_REGEX: &str = "^/api/atlas-agent/ps/mcp/?$";
-const HOSTED_PLUGIN_RUNTIME_MCP_PATH_REGEX: &str = "^/api/atlas-agent/ps/mcp/?$";
+const ATLAS_APPS_MCP_PATH_REGEX: &str = "^/api/codex/ps/mcp/?$";
+const HOSTED_PLUGIN_RUNTIME_MCP_PATH_REGEX: &str = "^/api/codex/ps/mcp/?$";
 const PROTOCOL_VERSION: &str = "2025-11-25";
 const SERVER_NAME: &str = "atlas-engine-apps-test";
 const SERVER_VERSION: &str = "1.0.0";
@@ -308,7 +308,7 @@ pub async fn recorded_apps_tool_calls(server: &MockServer) -> Vec<Value> {
         .into_iter()
         .filter_map(|request| {
             let body: Value = serde_json::from_slice(&request.body).ok()?;
-            (request.url.path() == "/api/atlas-agent/ps/mcp"
+            (request.url.path() == "/api/codex/ps/mcp"
                 && body.get("method").and_then(Value::as_str) == Some("tools/call"))
             .then_some(body)
         })

@@ -66,6 +66,8 @@ interface LogActions {
 }
 
 const BUFFER_CAP = 500;
+let projectLoadGeneration = 0;
+let pinsLoadGeneration = 0;
 
 function genId(): string {
   return `l_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -178,6 +180,7 @@ export const useLogStore = create<LogState & LogActions>()(
         }
       },
       loadPinned: async () => {
+        const generation = ++pinsLoadGeneration;
         const org = activeOrg();
         // Keyed on the org, not a one-shot `ready` flag: an org switch has to
         // be able to re-read, and the old guard made the first org's pins the
@@ -192,6 +195,7 @@ export const useLogStore = create<LogState & LogActions>()(
         }
         try {
           const text = await invoke<string>("load_pinned_log", { org });
+          if (generation !== pinsLoadGeneration || activeOrg() !== org) return;
           const lines = text.split("\n").filter((l) => l.trim());
           const parsed: LogEntry[] = [];
           for (const l of lines) {
@@ -209,6 +213,7 @@ export const useLogStore = create<LogState & LogActions>()(
             s.loadedOrg = org;
           });
         } catch {
+          if (generation !== pinsLoadGeneration || activeOrg() !== org) return;
           set((s) => {
             s.ready = true;
             s.loadedOrg = org;
@@ -216,6 +221,7 @@ export const useLogStore = create<LogState & LogActions>()(
         }
       },
       loadProject: async (project) => {
+        const generation = ++projectLoadGeneration;
         if (!project || get().loadedProject === project) return;
         let fileEntries: LogEntry[] = [];
         try {
@@ -232,6 +238,7 @@ export const useLogStore = create<LogState & LogActions>()(
         } catch {
           fileEntries = [];
         }
+        if (generation !== projectLoadGeneration) return;
         set((s) => {
           // Scope the buffer to this project: union of persisted entries +
           // any in-session entries already buffered for it, deduped by id,
@@ -252,6 +259,8 @@ export const useLogStore = create<LogState & LogActions>()(
 
       setOrg: async (orgId) => {
         if (get().loadedOrg === orgId) return;
+        projectLoadGeneration += 1;
+        pinsLoadGeneration += 1;
         set((s) => {
           // Drop the outgoing org's entries. An org switch tears down its
           // whole project set, so leaving its activity in the console would

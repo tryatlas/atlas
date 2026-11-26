@@ -45,25 +45,31 @@ export function ShowFull({
         : await cloudPayload(remote?.projectId, remote?.sessionId, rowId, part);
       if (payload.text !== null) onLoaded(payload.text);
       else setError("The full payload is binary and cannot be shown.");
-    } catch {
-      setError("The full payload is no longer on disk.");
+    } catch (error) {
+      setError(
+        `Could not load the full payload: ${error instanceof Error ? error.message : String(error)}`,
+      );
     } finally {
       setBusy(false);
     }
   };
 
-  if (error) {
-    return <span className="ml-1.5 text-xs text-[var(--muted-foreground)]">{error}</span>;
-  }
   return (
-    <button
-      type="button"
-      disabled={busy}
-      onClick={() => void fetchFull()}
-      className="ml-1.5 inline-flex cursor-pointer items-center gap-1 text-xs text-[var(--secondary-foreground)] underline underline-offset-2 transition-colors hover:no-underline hover:text-[var(--foreground)] disabled:opacity-60"
-    >
-      {busy && <Loader2 size={10} className="animate-spin" />}
-      Show full
-    </button>
+    <>
+      {error && (
+        <span role="status" className="ml-1.5 text-xs text-muted-foreground">
+          {error}
+        </span>
+      )}
+      <button
+        type="button"
+        disabled={busy}
+        onClick={() => void fetchFull()}
+        className="ml-1.5 inline-flex cursor-pointer items-center gap-1 text-xs text-[var(--secondary-foreground)] underline underline-offset-2 transition-colors hover:no-underline hover:text-[var(--foreground)] disabled:opacity-60"
+      >
+        {busy && <Loader2 size={10} className="animate-spin" />}
+        {error ? "Retry" : "Show full"}
+      </button>
+    </>
   );
 }

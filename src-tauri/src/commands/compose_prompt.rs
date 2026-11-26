@@ -116,6 +116,8 @@ pub enum MentionSpec {
     },
     PastMessage {
         id: String,
+        #[serde(default)]
+        timestamp: Option<String>,
         display_name: String,
         session_title: String,
         content: String,
@@ -293,7 +295,9 @@ impl MentionSpec {
             }
             MentionSpec::Paper { display_name, .. } => format!("@paper:{}", v(display_name)),
             MentionSpec::Branch { display_name, .. } => format!("@branch:{}", v(display_name)),
-            MentionSpec::PastMessage { id, .. } => format!("@msg:{id}"),
+            MentionSpec::PastMessage { id, timestamp, .. } => {
+                format!("@msg:{}", timestamp.as_deref().unwrap_or(id))
+            }
             MentionSpec::PastSession { display_name, .. } => {
                 format!("@session:{}", v(display_name))
             }
@@ -351,12 +355,17 @@ pub struct ResourceLinkSpec {
     pub name: String,
 }
 
-/// `file://` URI for an absolute path.
-///
-/// Percent-encodes the characters that would otherwise terminate or re-scope
-/// the URI. Deliberately narrow: over-encoding a path breaks agents that
-/// naively strip the scheme and use the remainder as a path, which several do.
+/// `file://` URI for an absolute path, built by [`url::Url::from_file_path`]:
+/// a Windows drive path becomes `file:///C:/…` with its backslashes turned
+/// into slashes, and every character a URI path cannot carry raw — spaces,
+/// `#`, `?`, `%`, non-ASCII — is percent-encoded, so no strict parser reads
+/// the rest of the path as a fragment or query. A path the platform does not
+/// call absolute has no file URI; it gets the same narrow encoding as a last
+/// resort rather than being dropped.
 fn file_uri(abs_path: &str) -> String {
+    if let Ok(url) = url::Url::from_file_path(abs_path) {
+        return url.into();
+    }
     let mut out = String::with_capacity(abs_path.len() + 8);
     out.push_str("file://");
     for ch in abs_path.chars() {
@@ -997,20 +1006,46 @@ mod resource_link_tests {
         assert_eq!(file_uri("/a/100%.rs"), "file:///a/100%25.rs");
     }
 
-    /// Deliberately narrow encoding: several agents strip the scheme and use
-    /// the remainder as a path, so over-encoding ordinary characters would
-    /// hand them a path that no longer exists.
+    /// Characters a URI path carries as they are stay as they are, so an
+    /// agent that strips the scheme still finds the file.
     #[test]
+    #[cfg(unix)]
     fn ordinary_path_characters_are_left_alone() {
         for path in [
             "/a/b-c_d.rs",
             "/a/b.test.ts",
             "/a/@scope/pkg/index.js",
             "/a/b(1)/c.rs",
-            "/Users/x/Ünïcodé/файл.rs",
         ] {
             assert_eq!(file_uri(path), format!("file://{path}"), "{path}");
         }
+    }
+
+    /// A URI is ASCII: a non-ASCII name is its UTF-8 bytes, percent-encoded,
+    /// and decodes back to the same path.
+    #[test]
+    #[cfg(unix)]
+    fn non_ascii_names_are_percent_encoded_and_round_trip() {
+        let path = "/Users/x/Ünïcodé/файл #1.rs";
+        let uri = file_uri(path);
+        assert!(uri.is_ascii(), "{uri}");
+        let back = url::Url::parse(&uri).unwrap().to_file_path().unwrap();
+        assert_eq!(back, std::path::PathBuf::from(path));
+    }
+
+    /// A drive path is `file:///C:/…`, its backslashes slashes: raw, it read
+    /// as `file://C:\…`, whose "host" is `C:`.
+    #[test]
+    #[cfg(windows)]
+    fn a_windows_drive_path_becomes_a_well_formed_file_uri() {
+        assert_eq!(
+            file_uri(r"C:\Users\x\My Project\a#1.rs"),
+            "file:///C:/Users/x/My%20Project/a%231.rs"
+        );
+        assert_eq!(
+            file_uri(r"D:\repo\src\main.rs"),
+            "file:///D:/repo/src/main.rs"
+        );
     }
 }
 

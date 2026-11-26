@@ -680,12 +680,17 @@ async fn bedrock_unauthorized_error_uses_provider_mapping() {
     .await
     .expect_err("expired Bedrock signature should fail");
 
-    assert_eq!(
-        error.to_string(),
+    let expected = if atlas_engine_model_provider::is_supported_amazon_bedrock_region("us-east-2") {
         format!(
             "Amazon Bedrock rejected the request because its AWS signature has expired. Refresh your AWS credentials and retry. If `AWS_BEARER_TOKEN_BEDROCK` is set, update or unset it, then restart Atlas Agent, url: {url}"
         )
-    );
+    } else {
+        // The embedded Atlas runtime does not enable the optional AWS provider.
+        format!(
+            "unexpected status 401 Unauthorized: Signature expired: 20260609T133205Z is now earlier than 20260614T062525Z, url: {url}"
+        )
+    };
+    assert_eq!(error.to_string(), expected);
 }
 
 #[tokio::test]

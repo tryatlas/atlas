@@ -5,26 +5,35 @@ import { cn } from "@/lib/utils";
 import { useGitStore } from "../stores/git-store";
 import { useGithubAvatars } from "../lib/git-avatars-api";
 
-// Module-level cache so we don't recompute the same hash repeatedly while
-// scrolling through the virtualized list.
-const hashCache = new Map<string, string>();
-
-async function sha256(text: string): Promise<string> {
-  const cached = hashCache.get(text);
-  if (cached) return cached;
-  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
-  const bytes = Array.from(new Uint8Array(buf));
-  const hex = bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
-  hashCache.set(text, hex);
-  return hex;
-}
-
 /** GitHub's private-email form `<id>+<login>@users.noreply.github.com` names
  *  the account outright — no lookup needed. */
 const NOREPLY = /^(\d+)\+[^@]+@users\.noreply\.github\.com$/;
 
 function withSize(url: string, px: number): string {
   return `${url}${url.includes("?") ? "&" : "?"}s=${px}`;
+}
+
+/**
+ * The image URL for an author's face, or `null` for initials.
+ *
+ * Only GitHub: an avatar the user's own `gh` returned for this repository, or
+ * the one a GitHub noreply address names outright. There is deliberately no
+ * Gravatar fallback. It sent a hash of every commit author's email, plus the
+ * user's IP, to a third party for any author GitHub didn't know, and a hash of
+ * an email is easily reversed.
+ */
+export function commitAvatarSrc(
+  email: string | null | undefined,
+  byEmail: Record<string, string> | undefined,
+  px: number,
+): string | null {
+  const key = email?.trim().toLowerCase() ?? "";
+  if (!key) return null;
+  const noreplyId = key.match(NOREPLY)?.[1];
+  const github =
+    byEmail?.[key] ||
+    (noreplyId ? `https://avatars.githubusercontent.com/u/${noreplyId}?v=4` : null);
+  return github ? withSize(github, px) : null;
 }
 
 interface CommitAvatarProps {
@@ -41,45 +50,21 @@ interface CommitAvatarProps {
 
 /**
  * A commit author's face: their GitHub avatar when GitHub knows the email,
- * else Gravatar, else a generic glyph. Each source that fails to load falls
- * through to the next.
+ * else their initials, else a generic glyph. An avatar that fails to load
+ * falls through to the initials.
  */
 export function CommitAvatar({ email, name, repoPath, size = 16, className }: CommitAvatarProps) {
   const key = email?.trim().toLowerCase() ?? "";
-  const [hash, setHash] = useState<string | null>(() =>
-    key ? (hashCache.get(key) ?? null) : null,
-  );
   const [failed, setFailed] = useState<ReadonlySet<string>>(new Set());
   const activeRepo = useGitStore((s) => s.repoPath);
   const byEmail = useGithubAvatars(repoPath ?? activeRepo ?? "");
 
   useEffect(() => {
-    let cancelled = false;
     setFailed(new Set());
-    if (!key) {
-      setHash(null);
-      return;
-    }
-    if (hashCache.has(key)) {
-      setHash(hashCache.get(key)!);
-      return;
-    }
-    sha256(key).then((h) => {
-      if (!cancelled) setHash(h);
-    });
-    return () => {
-      cancelled = true;
-    };
   }, [key]);
 
-  const noreplyId = key.match(NOREPLY)?.[1];
-  const github =
-    (key && byEmail?.[key]) ||
-    (noreplyId ? `https://avatars.githubusercontent.com/u/${noreplyId}?v=4` : null);
-  const src = [
-    github ? withSize(github, size * 2) : null,
-    hash ? `https://www.gravatar.com/avatar/${hash}?s=${size * 2}&d=404` : null,
-  ].find((url): url is string => !!url && !failed.has(url));
+  const candidate = commitAvatarSrc(email, byEmail, size * 2);
+  const src = candidate && !failed.has(candidate) ? candidate : null;
   // No face anywhere: the author's initials, else the email's; the glyph
   // only when neither gives a letter.
   const fallback = initialsOf(name ?? "", email ?? undefined);

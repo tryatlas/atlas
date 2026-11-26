@@ -3,11 +3,88 @@ use crate::config_types::EnvironmentVariablePattern;
 use crate::config_types::ShellEnvironmentPolicy;
 use crate::config_types::ShellEnvironmentPolicyInherit;
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::ffi::OsStr;
+use std::ffi::OsString;
 
 pub const ATLAS_AGENT_SESSION_ID_ENV_VAR: &str = "ATLAS_AGENT_SESSION_ID";
 pub const ATLAS_AGENT_THREAD_ID_ENV_VAR: &str = "ATLAS_AGENT_THREAD_ID";
 pub const OPENAI_FEDERATION_RULE_ID_ENV_VAR: &str = "OPENAI_FEDERATION_RULE_ID";
 pub const OPENAI_IDENTITY_TOKEN_FILE_ENV_VAR: &str = "OPENAI_IDENTITY_TOKEN_FILE";
+
+/// Environment for host executables, before explicit per-command overrides.
+/// AppImage loader and GTK paths belong to the application, not its tools.
+pub fn host_environment() -> HashMap<OsString, OsString> {
+    host_environment_from_vars(std::env::vars_os())
+}
+
+pub fn host_environment_from_vars(
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+) -> HashMap<OsString, OsString> {
+    let vars: HashMap<OsString, OsString> = vars.into_iter().collect();
+    #[cfg(not(target_os = "linux"))]
+    {
+        vars
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut vars = vars;
+        let Some(app_dir) = vars.get(OsStr::new("APPDIR")).cloned() else {
+            return vars;
+        };
+        let app_dir = std::path::Path::new(&app_dir);
+        if !app_dir.is_absolute() {
+            return vars;
+        }
+        for name in [
+            "LD_LIBRARY_PATH",
+            "LD_PRELOAD",
+            "GTK_PATH",
+            "GIO_EXTRA_MODULES",
+            "GIO_MODULE_DIR",
+            "GI_TYPELIB_PATH",
+            "GSETTINGS_SCHEMA_DIR",
+        ] {
+            let Some(value) = vars.get(OsStr::new(name)) else {
+                continue;
+            };
+            // ld.so accepts semicolons in LD_LIBRARY_PATH and spaces in LD_PRELOAD.
+            // Operate on bytes so a non-UTF-8 host path is preserved exactly.
+            let paths: Vec<_> = if matches!(name, "LD_LIBRARY_PATH" | "LD_PRELOAD") {
+                value
+                    .as_bytes()
+                    .split(|byte| {
+                        *byte == b':'
+                            || name == "LD_LIBRARY_PATH" && *byte == b';'
+                            || name == "LD_PRELOAD" && *byte == b' '
+                    })
+                    .map(|path| std::path::PathBuf::from(OsStr::from_bytes(path)))
+                    .collect()
+            } else {
+                std::env::split_paths(value).collect()
+            };
+            let host_paths: Vec<_> = paths
+                .into_iter()
+                .filter(|path| !path.starts_with(app_dir))
+                .collect();
+            if host_paths.is_empty() {
+                vars.remove(OsStr::new(name));
+            } else if let Ok(value) = std::env::join_paths(host_paths) {
+                vars.insert(name.into(), value);
+            }
+        }
+        match vars.remove(OsStr::new("ATLAS_HOST_GTK_THEME")) {
+            Some(value) if !value.is_empty() => {
+                vars.insert("GTK_THEME".into(), value);
+            }
+            _ => {
+                vars.remove(OsStr::new("GTK_THEME"));
+            }
+        }
+        vars
+    }
+}
 
 /// Environment variables that model-reachable child processes must not inherit.
 pub const NON_INHERITABLE_ENV_VARS: &[&str] = &[
@@ -51,7 +128,13 @@ pub fn create_env(
     policy: &ShellEnvironmentPolicy,
     thread_id: Option<&str>,
 ) -> HashMap<String, String> {
-    create_env_from_vars(std::env::vars(), policy, thread_id)
+    create_env_from_vars(
+        std::env::vars_os().filter_map(|(name, value)| {
+            Some((name.into_string().ok()?, value.into_string().ok()?))
+        }),
+        policy,
+        thread_id,
+    )
 }
 
 pub fn create_env_from_vars<I>(
@@ -91,6 +174,12 @@ pub fn populate_env<I>(
 where
     I: IntoIterator<Item = (String, String)>,
 {
+    let vars = host_environment_from_vars(
+        vars.into_iter()
+            .map(|(name, value)| (name.into(), value.into())),
+    )
+    .into_iter()
+    .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)));
     // Step 1 - determine the starting set of variables based on the
     // `inherit` strategy.
     let mut env_map: HashMap<String, String> = match policy.inherit {

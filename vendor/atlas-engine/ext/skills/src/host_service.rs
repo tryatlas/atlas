@@ -75,6 +75,7 @@ impl HostSkillsLoadInput {
 /// Source-specific model exposure remains the responsibility of the skills extension.
 pub struct HostSkillsService {
     atlas_agent_home: AbsolutePathBuf,
+    home_dir: Option<AbsolutePathBuf>,
     restriction_product: Option<Product>,
     extra_roots: RwLock<Vec<AbsolutePathBuf>>,
     cache_by_cwd: RwLock<HashMap<AbsolutePathBuf, HostSkillsSnapshot>>,
@@ -126,6 +127,8 @@ impl HostSkillsService {
     ) -> Self {
         let service = Self {
             atlas_agent_home,
+            home_dir: dirs::home_dir()
+                .and_then(|path| AbsolutePathBuf::from_absolute_path_checked(path).ok()),
             restriction_product,
             extra_roots: RwLock::new(Vec::new()),
             cache_by_cwd: RwLock::new(HashMap::new()),
@@ -228,6 +231,7 @@ impl HostSkillsService {
             fs,
             &input.config_layer_stack,
             &input.cwd,
+            self.home_dir.as_ref(),
             input.effective_skill_roots.clone(),
             self.extra_roots(),
         )
@@ -262,6 +266,7 @@ impl HostSkillsService {
             fs.clone(),
             &input.config_layer_stack,
             &input.cwd,
+            self.home_dir.as_ref(),
             input.effective_skill_roots.clone(),
             self.extra_roots(),
         )

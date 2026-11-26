@@ -75,7 +75,6 @@ import { performUiAction } from "./ui-actions";
 import { seedWindow, tab, uiRequest } from "./test-fixtures";
 import type { UiActionReply } from "./types";
 import { RESTING_LIFECYCLE } from "@/features/chat/lib/session-lifecycle";
-import { onWindowEvent } from "@/lib/window-events";
 
 const layout = () => useLayoutStore.getState();
 const result = (reply: UiActionReply) => {
@@ -209,19 +208,11 @@ describe("ui_open", () => {
     expect(useKnowledgeStore.getState().pendingOpenId).toBe("note-3");
   });
 
-  it("navigates an existing browser tab instead of opening a second", async () => {
-    const heard = vi.fn();
-    const off = onWindowEvent("atlas:browser-navigate", heard);
-    const first = result(await act("ui_open", { target: "url", url: "https://a.dev" })).tabId;
-    const second = result(await act("ui_open", { target: "url", url: "https://b.dev" })).tabId;
-    expect(second).toBe(first);
-    expect(layout().tabs.filter((t) => t.type === "browser")).toHaveLength(1);
-    expect(heard).toHaveBeenCalledOnce();
-    expect(heard.mock.calls[0][0]).toEqual({
-      tabId: first,
-      url: "https://b.dev",
-    });
-    off();
+  it("refuses a URL: Atlas has no browser tab to open it in", async () => {
+    const before = layout().tabs.length;
+    expect(error(await act("ui_open", { target: "url", url: "https://a.dev" }))).toBeTruthy();
+    expect(error(await act("ui_open", { target: "tab", type: "browser" }))).toBeTruthy();
+    expect(layout().tabs).toHaveLength(before);
   });
 
   it("focuses a thread whose chat is already open", async () => {

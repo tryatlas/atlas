@@ -4,7 +4,7 @@ import type { ImageAttachment } from "@/types/agents";
 import { agentMeta, catalogEntry as agentCatalogEntry } from "@/features/agents/lib/agent-meta";
 import { useAgentRegistryStore } from "@/features/agents/stores/agent-registry-store";
 import { useChatStore } from "../stores/chat-store";
-import { rebindDisconnectedSession } from "../lib/agent-rebind";
+import { restartDisconnectedSession, restartFailedNotice } from "../lib/agent-rebind";
 import type { MentionData } from "../lib/mentions";
 import { CONTENT_COLUMN } from "../lib/row-metrics";
 import { MessageInput } from "./message-input";
@@ -46,7 +46,14 @@ function DisconnectedBanner({ tabId }: { tabId: string }) {
         onClick: async () => {
           setRestarting(true);
           try {
-            await rebindDisconnectedSession(tabId);
+            const outcome = await restartDisconnectedSession(tabId);
+            // Said in the chat, with the backend's reason: a failed restart
+            // used to go to the console only, leaving the banner as it was.
+            if (!outcome.ok && outcome.error !== null) {
+              useChatStore
+                .getState()
+                .actions.addMessage(tabId, "assistant", restartFailedNotice(outcome.error));
+            }
           } finally {
             setRestarting(false);
           }

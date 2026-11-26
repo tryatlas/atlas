@@ -120,13 +120,13 @@ async fn authorization(
 }
 
 #[tokio::test]
-async fn automatic_cimd_uses_callback_specific_identity() -> Result<()> {
+async fn automatic_registration_uses_atlas_identity_even_when_cimd_is_advertised() -> Result<()> {
     for host in ["127.0.0.1", "localhost"] {
         let server = oauth_server(json!({})).await;
         let redirect = format!("http://{host}:43123/callback/{CALLBACK_ID}");
         let (mut state, query) =
             authorization(&server, &redirect, McpOAuthClientRegistration::Auto).await?;
-        let expected_id = format!("https://chatgpt.com/oauth/codex/{CALLBACK_ID}/client.json");
+        let expected_id = "dcr-client";
         assert_eq!(query["client_id"], expected_id);
         assert_eq!(query["redirect_uri"], redirect);
         assert_eq!(query["code_challenge_method"], "S256");
@@ -147,7 +147,11 @@ async fn automatic_cimd_uses_callback_specific_identity() -> Result<()> {
         assert!(body.contains_key("code_verifier"));
         assert!(!body.contains_key("client_secret"));
         assert!(!request.headers.contains_key("authorization"));
-        assert!(requests_to(&server, "/register").await.is_empty());
+        let registrations = requests_to(&server, "/register").await;
+        assert_eq!(registrations.len(), 1);
+        let registration: Value = serde_json::from_slice(&registrations[0].body)?;
+        assert_eq!(registration["client_name"], "Atlas Agent");
+        assert_eq!(registration["redirect_uris"], json!([redirect]));
         assert_eq!(
             requests_to(&server, "/.well-known/oauth-authorization-server/mcp")
                 .await
@@ -204,54 +208,30 @@ async fn registration_selection_preserves_dcr_capabilities_and_exact_redirects()
 }
 
 #[tokio::test]
-async fn invalid_cimd_metadata_and_redirects_fail_without_dynamic_registration() {
+async fn explicit_cimd_requires_an_atlas_metadata_document() {
+    let server = oauth_server(json!({})).await;
     let valid = "http://127.0.0.1:43123/callback/abc123ABC_-x";
-    for (metadata, redirect, expected_error) in [
-        (
-            json!({"token_endpoint_auth_methods_supported": ["private_key_jwt"]}),
-            valid,
-            "token endpoint auth method `none`",
-        ),
-        (
-            json!({}),
-            "http://127.0.0.1.evil.example:43123/callback/abc123ABC_-x",
-            "ephemeral loopback callback",
-        ),
-        (
-            json!({}),
-            "http://127.0.0.1/callback/abc123ABC_-x",
-            "ephemeral loopback callback",
-        ),
-        (
-            json!({}),
-            "http://127.0.0.1:43123/callback/wrong-id",
-            "ephemeral loopback callback",
-        ),
-        (
-            json!({}),
-            "http://127.0.0.1:43123/callback/abc123ABC_-x?unexpected=true",
-            "ephemeral loopback callback",
-        ),
-        (
-            json!({}),
-            "http://[::1]:43123/callback/abc123ABC_-x",
-            "ephemeral loopback callback",
-        ),
-    ] {
-        let server = oauth_server(metadata).await;
-        let error = authorization(&server, redirect, McpOAuthClientRegistration::Cimd)
-            .await
-            .err()
-            .expect("invalid CIMD metadata or callback should fail");
-        assert!(error.to_string().contains(expected_error));
-        assert!(requests_to(&server, "/register").await.is_empty());
-        assert!(requests_to(&server, "/token").await.is_empty());
-    }
-
-    let server = oauth_server(json!({"registration_endpoint": null})).await;
-    let error = authorization(&server, valid, McpOAuthClientRegistration::Dcr)
+    let error = authorization(&server, valid, McpOAuthClientRegistration::Cimd)
         .await
         .err()
-        .expect("explicit DCR should require an advertised registration endpoint");
-    assert!(error.to_string().contains("registration not supported"));
+        .expect("Atlas must not use another application's metadata document");
+    assert!(
+        error
+            .to_string()
+            .contains("Atlas does not provide a hosted MCP client metadata document")
+    );
+    assert!(requests_to(&server, "/register").await.is_empty());
+    assert!(requests_to(&server, "/token").await.is_empty());
+
+    let server = oauth_server(json!({"registration_endpoint": null})).await;
+    for mode in [
+        McpOAuthClientRegistration::Auto,
+        McpOAuthClientRegistration::Dcr,
+    ] {
+        let error = authorization(&server, valid, mode)
+            .await
+            .err()
+            .expect("registration requires an advertised endpoint");
+        assert!(error.to_string().contains("registration not supported"));
+    }
 }

@@ -2326,3 +2326,84 @@ async fn a_refused_leave_is_denied_and_changes_nothing() {
         Some(vec![org("org_1", "Atlas", Some(Role::Admin))])
     );
 }
+
+#[tokio::test]
+async fn cancelling_during_grant_creation_does_not_publish_a_late_code() {
+    let stub = Stub::start().await;
+    let dir = TempDir::new();
+    stub.grant_ready(600);
+    stub.script
+        .lock()
+        .unwrap()
+        .replies
+        .get_mut("/device/code")
+        .unwrap()[0]
+        .delay = Some(Duration::from_millis(150));
+    let auth = Arc::new(core(&stub, &dir));
+    let task = {
+        let auth = auth.clone();
+        tokio::spawn(async move { auth.start_grant().await })
+    };
+    while stub.hits("/device/code") == 0 {
+        tokio::task::yield_now().await;
+    }
+    auth.cancel_grant();
+    assert!(matches!(task.await.unwrap(), Err(GrantError::Cancelled)));
+    assert_eq!(auth.snapshot(), AuthSnapshot::SignedOut);
+}
+
+#[tokio::test]
+async fn concurrent_sign_in_resumes_one_code_and_one_poller() {
+    let stub = Stub::start().await;
+    let dir = TempDir::new();
+    stub.grant_ready(600);
+    stub.on(
+        "/device/token",
+        vec![Reply::err(400, r#"{"error":"authorization_pending"}"#)],
+    );
+    let auth = Arc::new(core(&stub, &dir));
+    let (first, second) = tokio::join!(auth.start_grant(), auth.start_grant());
+    let (first, second) = (first.unwrap(), second.unwrap());
+    assert_eq!(stub.hits("/device/code"), 1);
+    let runner = {
+        let auth = auth.clone();
+        tokio::spawn(async move { auth.run_grant(&first).await })
+    };
+    while stub.hits("/device/token") == 0 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        auth.run_grant(&second).await,
+        Err(GrantError::AlreadyPolling)
+    );
+    auth.cancel_grant();
+    assert_eq!(runner.await.unwrap(), Err(GrantError::Cancelled));
+}
+
+#[tokio::test]
+async fn a_new_account_never_inherits_old_orgs_after_a_failed_refresh() {
+    let stub = Stub::start().await;
+    let dir = TempDir::new();
+    scripted_grant(&stub);
+    stub.profile("First", None);
+    stub.org_list(&[("private-org", "First account org")]);
+    let auth = core(&stub, &dir);
+    sign_in(&auth).await;
+    assert!(
+        matches!(auth.snapshot(), AuthSnapshot::SignedIn { orgs: Some(orgs), .. } if !orgs.is_empty())
+    );
+    stub.on("/get-session", vec![Reply::ok(r#"{"session":{"id":"s2"},"user":{"id":"user_2","name":"Second","email":"second@example.test","image":null}}"#)]);
+    stub.on("/organization/list", vec![Reply::err(503, "{}")]);
+    stub.on("/token", vec![Reply::err(503, "{}")]);
+    sign_in(&auth).await;
+    let snapshot = auth.snapshot();
+    assert_eq!(user_of(&snapshot).id, "user_2");
+    assert!(matches!(
+        snapshot,
+        AuthSnapshot::SignedIn {
+            orgs: None,
+            active_org_id: None,
+            ..
+        }
+    ));
+}

@@ -434,7 +434,17 @@ pub fn imported_files(root: &Path) -> Vec<PathBuf> {
 /// followed by what it imports. `CLAUDE.md` comes back separately, since
 /// [`render`] heads the block with it.
 fn read_sources(root: &Path, skip: &[String]) -> io::Result<(Option<String>, Vec<Rule>)> {
-    let claude_md = match fs::read_to_string(root.join(CLAUDE_MD)) {
+    let source = root.join(CLAUDE_MD);
+    let allowed = source
+        .canonicalize()
+        .ok()
+        .zip(root.canonicalize().ok())
+        .is_some_and(|(source, root)| source.starts_with(root));
+    let claude_md = match if allowed {
+        fs::read_to_string(source)
+    } else {
+        Err(io::Error::from(io::ErrorKind::NotFound))
+    } {
         Ok(text) => Some(text),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => return Err(e),
@@ -450,7 +460,12 @@ fn collect_sources(root: &Path, skip: &[String]) -> Vec<Rule> {
     let canonical = |rel: &str| fs::canonicalize(root.join(rel)).ok();
     let mut sources = Vec::new();
     for rel in [CLAUDE_MD, DOT_CLAUDE_MD] {
-        if let Ok(text) = fs::read_to_string(root.join(rel)) {
+        let Some(path) = canonical(rel)
+            .filter(|path| root.canonicalize().is_ok_and(|root| path.starts_with(root)))
+        else {
+            continue;
+        };
+        if let Ok(text) = fs::read_to_string(path) {
             sources.push(Source {
                 rule: Rule {
                     rel_path: rel.to_string(),
@@ -710,8 +725,18 @@ fn cut_block(text: &str, (start, end): (usize, usize)) -> String {
 /// Rule files under `<root>/.claude/rules`, sorted by path, minus `skip`
 /// (paths relative to `root`, `/`-separated).
 pub fn read_rules(root: &Path, skip: &[String]) -> Vec<Rule> {
+    let Ok(canonical_root) = root.canonicalize() else {
+        return Vec::new();
+    };
+    let rules_dir = root.join(".claude").join("rules");
+    if !rules_dir
+        .canonicalize()
+        .is_ok_and(|path| path.starts_with(&canonical_root))
+    {
+        return Vec::new();
+    }
     let mut files = Vec::new();
-    collect_md(&root.join(".claude").join("rules"), &mut files);
+    collect_md(&rules_dir, &mut files);
     let mut rules: Vec<Rule> = files
         .into_iter()
         .filter_map(|path| {
@@ -719,7 +744,11 @@ pub fn read_rules(root: &Path, skip: &[String]) -> Vec<Rule> {
             if skip.iter().any(|s| s == &rel) {
                 return None;
             }
-            let raw = fs::read_to_string(&path).ok()?;
+            let canonical_path = path.canonicalize().ok()?;
+            if !canonical_path.starts_with(&canonical_root) {
+                return None;
+            }
+            let raw = fs::read_to_string(&canonical_path).ok()?;
             Some(parse_rule(&rel, &raw))
         })
         .collect();

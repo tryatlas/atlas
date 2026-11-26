@@ -43,6 +43,7 @@ const detail = (isCrossRepository: boolean) =>
     number: 5,
     repository: "acme/shop",
     headSha: "abc",
+    headBranch: "feature",
     state: "open",
     isCrossRepository,
     checks: [],

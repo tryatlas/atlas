@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
-import { captureConnect, captureConnectOptions, captureEnableLocal } from "../lib/capture-api";
-import type { CloudOrg, RunAction } from "../lib/capture-flow";
-import { connectRefusal } from "../lib/capture-format";
+import { captureConnectOptions } from "../lib/capture-api";
+import type { CloudOrg } from "../lib/capture-flow";
 import type { ConnectOptions, ConnectPick } from "../types";
 import { ConnectLockedView, ConnectPickerView } from "./views/connect-picker-view";
 
@@ -20,7 +19,6 @@ export function ConnectTab({
   cloudOrgs,
   cloudReason,
   busy,
-  run,
   onCancel,
   onContinue,
   excludeId = null,
@@ -29,15 +27,9 @@ export function ConnectTab({
   cloudOrgs: CloudOrg[];
   cloudReason: string | null;
   busy: boolean;
-  run: RunAction;
   onCancel: () => void;
-  /**
-   * Promote mode. When set, the button hands the pick up instead of
-   * connecting — a Local Project has history to disclose first, and the
-   * disclosure step owns every mutation. Absent, the pick connects at once
-   * (an unbound Project has nothing to disclose).
-   */
-  onContinue?: (pick: ConnectPick) => void;
+  /** The disclosure step owns every mutation, including an unbound project. */
+  onContinue: (pick: ConnectPick) => void;
   /** Hide this Project from the list — the one already synced to. */
   excludeId?: string | null;
 }) {
@@ -87,29 +79,12 @@ export function ConnectTab({
       selected={selected}
       excludeId={excludeId}
       busy={busy}
-      primaryLabel={onContinue ? "Continue" : "Connect"}
+      primaryLabel="Continue"
       onSelect={setSelected}
       onCancel={onCancel}
       onSubmit={() => {
         if (!project) return;
-        if (onContinue) {
-          onContinue({ orgId, slug: project.slug, workspaceId: project.id });
-          return;
-        }
-        void run(async () => {
-          // Connect needs a binding row to attach the Cloud identity to.
-          await captureEnableLocal(projectPath);
-          const result = await captureConnect({
-            projectPath,
-            orgId,
-            slug: project.slug,
-            workspaceId: project.id,
-          });
-          // Enable just created the binding, so the popover is about to swap
-          // this tab for the bound view; a refusal held here would unmount
-          // unseen. Thrown so the popover's error strip carries it instead.
-          if (!result.matched) throw new Error(connectRefusal(result.candidates));
-        });
+        onContinue({ orgId, slug: project.slug, workspaceId: project.id });
       }}
     />
   );

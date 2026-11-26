@@ -67,7 +67,7 @@ impl Replay {
         let recorder = Arc::new(Recorder::default());
         let projector = DeltaProjector::new(recorder.clone());
         let session_id = acp::SessionId::new("replay");
-        let events = (projector.thread_events())(&session_id);
+        let events = (projector.thread_events())(&"replay".into(), &session_id);
         let thread = Arc::new(Mutex::new(AcpThread::new(
             session_id.clone(),
             stub_connection(),

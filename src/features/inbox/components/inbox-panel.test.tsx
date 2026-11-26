@@ -63,8 +63,8 @@ vi.mock("@tanstack/react-virtual", () => ({
       })),
     getTotalSize: () => count * 80,
     measureElement: () => {},
-    // The package calendar indexes this for its end space (measured
-    // here); a missing array would throw.
+    // The package calendar indexes this for its end space even with
+    // `endSpace` off; a missing array would throw.
     measurementsCache: [],
   }),
 }));
@@ -148,6 +148,15 @@ describe("InboxPanel", () => {
     expect(screen.getByText("Waiz")).toBeTruthy();
     expect(screen.getByText("Guest")).toBeTruthy();
     expect(screen.getByText("mentioned you on")).toBeTruthy();
+  });
+
+  it("draws no measured end space, which looped to a crash under the interface zoom", async () => {
+    // As on the Timeline board (see `timeline-board.test.tsx`): at the end of
+    // the list, where a measured end space would be drawn.
+    page.entries = [entry("n1")];
+    render(<InboxPanel />);
+    expect(await screen.findByText("Priya Raghunathan")).toBeTruthy();
+    expect(document.querySelector('[data-slot="timeline-calendar-end"]')).toBeNull();
   });
 
   it("opens a row on the Timeline at its comment's thread, and marks it read", async () => {

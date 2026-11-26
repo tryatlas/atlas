@@ -29,6 +29,8 @@ pub enum ShellKind {
     Posix,
     /// `set -gx VAR 'value'` — fish is not POSIX and needs its own form.
     Fish,
+    /// `$env:VAR = 'value'` in a PowerShell profile.
+    PowerShell,
 }
 
 impl ShellKind {
@@ -39,7 +41,9 @@ impl ShellKind {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("");
-        if name.contains("fish") {
+        if name.contains("powershell") || name.contains("pwsh") {
+            Self::PowerShell
+        } else if name.contains("fish") {
             Self::Fish
         } else {
             Self::Posix
@@ -68,6 +72,17 @@ pub struct Assignment {
 pub fn scan_candidates(home: &Path, shell: &str) -> Vec<PathBuf> {
     match ShellKind::from_shell_path(shell) {
         ShellKind::Fish => vec![home.join(".config/fish/config.fish")],
+        ShellKind::PowerShell => {
+            let folder = if shell.contains("pwsh") {
+                "PowerShell"
+            } else {
+                "WindowsPowerShell"
+            };
+            vec![home
+                .join("Documents")
+                .join(folder)
+                .join("Microsoft.PowerShell_profile.ps1")]
+        }
         ShellKind::Posix => {
             let name = Path::new(shell)
                 .file_name()
@@ -120,6 +135,24 @@ pub fn parse_assignments(content: &str) -> Vec<Assignment> {
 }
 
 fn parse_line(line: &str, line_no: usize) -> Option<Assignment> {
+    if let Some(rest) = line.strip_prefix("$env:") {
+        let (var, value) = rest.split_once('=')?;
+        let var = var.trim();
+        if !is_var_name(var) {
+            return None;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('\'')
+            .and_then(|v| v.strip_suffix('\''))
+            .map(|v| v.replace("''", "'"))
+            .unwrap_or_else(|| unquote(value));
+        return Some(Assignment {
+            var: var.into(),
+            value,
+            line: line_no,
+        });
+    }
     // fish: `set -gx VAR value` / `set -x VAR value`
     if let Some(rest) = line.strip_prefix("set ") {
         let mut parts = rest.split_whitespace();
@@ -169,7 +202,7 @@ fn strip_trailing_comment(value: &str) -> &str {
     }
 }
 
-fn is_var_name(s: &str) -> bool {
+pub(crate) fn is_var_name(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .next()
@@ -201,6 +234,7 @@ pub fn render_assignment(var: &str, value: &str, kind: ShellKind) -> String {
     match kind {
         ShellKind::Posix => format!("export {var}={quoted}"),
         ShellKind::Fish => format!("set -gx {var} {quoted}"),
+        ShellKind::PowerShell => format!("$env:{var} = '{}'", value.replace('\'', "''")),
     }
 }
 
@@ -219,18 +253,15 @@ pub fn upsert(content: &str, var: &str, value: &str, kind: ShellKind) -> String 
         .collect();
 
     if !existing.is_empty() {
-        // Rewrite the LAST occurrence — that is the one the shell ends up with —
-        // and drop any earlier duplicates so the file can't disagree with itself.
-        let last = *existing.last().unwrap();
+        // Each occurrence may be a different conditional branch. Preserve
+        // every branch and its nonempty body while making the value agree.
         let mut out: Vec<String> = Vec::new();
         for (i, line) in content.lines().enumerate() {
             let n = i + 1;
-            if n == last {
+            if existing.contains(&n) {
                 // Preserve the original indentation.
                 let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
                 out.push(format!("{indent}{rendered}"));
-            } else if existing.contains(&n) {
-                continue; // shadowed duplicate
             } else {
                 out.push(line.to_string());
             }
@@ -257,8 +288,9 @@ pub fn upsert(content: &str, var: &str, value: &str, kind: ShellKind) -> String 
     join_preserving_trailing_newline(out, content)
 }
 
-/// Remove every uncommented assignment of `var`. If that empties the Atlas
-/// block, the header goes too rather than being left dangling.
+/// Unset at each assignment site. Deleting the line can leave an empty
+/// conditional body, which is invalid POSIX shell syntax. An explicit unset
+/// also prevents an inherited value from surviving when the profile is read.
 pub fn remove(content: &str, var: &str) -> String {
     let targets: Vec<usize> = parse_assignments(content)
         .into_iter()
@@ -268,30 +300,24 @@ pub fn remove(content: &str, var: &str) -> String {
     if targets.is_empty() {
         return content.to_string();
     }
-    let mut out: Vec<String> = content
+    let out: Vec<String> = content
         .lines()
         .enumerate()
-        .filter(|(i, _)| !targets.contains(&(i + 1)))
-        .map(|(_, l)| l.to_string())
-        .collect();
-
-    if let Some(pos) = out.iter().position(|l| l.trim() == BLOCK_HEADER) {
-        let empty = out
-            .get(pos + 1)
-            .map(|l| l.trim().is_empty())
-            .unwrap_or(true);
-        if empty {
-            out.remove(pos);
-            // Collapse the blank line we added ahead of the block.
-            if pos > 0
-                && out
-                    .get(pos.wrapping_sub(1))
-                    .is_some_and(|l| l.trim().is_empty())
-            {
-                out.remove(pos - 1);
+        .map(|(i, l)| {
+            if !targets.contains(&(i + 1)) {
+                return l.to_string();
             }
-        }
-    }
+            let indent: String = l.chars().take_while(|c| c.is_whitespace()).collect();
+            let unset = if l.trim_start().starts_with("set ") {
+                format!("set -e {var}")
+            } else if l.trim_start().starts_with("$env:") {
+                format!("Remove-Item Env:{var} -ErrorAction SilentlyContinue")
+            } else {
+                format!("unset {var}")
+            };
+            format!("{indent}{unset}")
+        })
+        .collect();
     join_preserving_trailing_newline(out, content)
 }
 
@@ -440,13 +466,11 @@ export XAI_API_KEY=sk-x  # trailing comment
     }
 
     #[test]
-    fn upsert_collapses_shadowed_duplicates() {
-        // The shell keeps the LAST assignment; leaving an earlier one behind
-        // means the file disagrees with what the user sees in Atlas.
+    fn upsert_replaces_every_assignment_without_removing_branch_statements() {
         let content = "export K=first\necho between\nexport K=second\n";
         let out = upsert(content, "K", "final", ShellKind::Posix);
-        assert_eq!(out, "echo between\nexport K='final'\n");
-        assert_eq!(parse_assignments(&out).len(), 1);
+        assert_eq!(out, "export K='final'\necho between\nexport K='final'\n");
+        assert!(parse_assignments(&out).iter().all(|a| a.value == "final"));
     }
 
     #[test]
@@ -479,18 +503,43 @@ export XAI_API_KEY=sk-x  # trailing comment
     }
 
     #[test]
-    fn remove_deletes_every_occurrence_and_nothing_else() {
+    fn remove_unsets_every_occurrence_and_preserves_other_statements() {
         let content = "export A=1\nexport K=x\necho hi\nexport K=y\nexport B=2\n";
         let out = remove(content, "K");
-        assert_eq!(out, "export A=1\necho hi\nexport B=2\n");
+        assert_eq!(out, "export A=1\nunset K\necho hi\nunset K\nexport B=2\n");
     }
 
     #[test]
-    fn remove_cleans_up_an_emptied_atlas_block() {
+    fn remove_leaves_an_unset_in_the_atlas_block_to_clear_inherited_keys() {
         let content = upsert("export PATH=/usr/bin\n", "K", "v", ShellKind::Posix);
         let out = remove(&content, "K");
-        assert!(!out.contains(BLOCK_HEADER), "{out}");
-        assert_eq!(out, "export PATH=/usr/bin\n");
+        assert!(out.contains(BLOCK_HEADER), "{out}");
+        assert!(out.contains("unset K"), "{out}");
+        assert!(parse_assignments(&out).iter().all(|a| a.var != "K"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editing_or_removing_the_only_statement_in_a_branch_preserves_shell_syntax() {
+        use std::io::Write;
+        let original = "if true; then\n  export K=one\nelse\n  export K=two\nfi\n";
+        for edited in [
+            upsert(original, "K", "final", ShellKind::Posix),
+            remove(original, "K"),
+        ] {
+            let mut child = std::process::Command::new("sh")
+                .arg("-n")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(edited.as_bytes())
+                .unwrap();
+            assert!(child.wait().unwrap().success(), "{edited}");
+        }
     }
 
     #[test]

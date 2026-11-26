@@ -113,5 +113,7 @@ function parkHeld(tabId: string): void {
   if (!held) return;
   actions.setPendingSend(tabId, undefined);
   actions.updateSessionStatus(tabId, "idle");
-  actions.enqueueMessage(tabId, held.content, held.mentions ?? []);
+  // With its images: a queue item carries them now (`queueContent`), and the
+  // queue is what sends this message once the session is back.
+  actions.enqueueMessage(tabId, held.content, held.mentions ?? [], null, held.attachments);
 }

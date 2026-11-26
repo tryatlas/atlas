@@ -513,7 +513,7 @@ async fn an_unknown_or_revoked_token_is_refused() {
         .expect("a live token connects");
     let (err, _) = call(&client, "memory_list", json!({})).await;
     assert!(!err);
-    tokens.session_ended("s1");
+    tokens.session_ended("s1", "codex");
     assert_eq!(tokens.token_for("s1"), None);
     let refused = client
         .call_tool(CallToolRequestParams::new("memory_list").with_arguments(JsonObject::new()))
@@ -1349,9 +1349,14 @@ async fn a_bound_sessions_token_file_goes_when_the_session_ends() {
         file.exists(),
         "a bound session keeps its file while it runs"
     );
-    files.session_ended("s-other");
+    files.session_ended("claude-code", "s-other");
     assert!(file.exists());
-    files.session_ended("s-bound");
+    files.session_ended("other-agent", "s-bound");
+    assert!(
+        file.exists(),
+        "another agent's session by the same id is not it"
+    );
+    files.session_ended("claude-code", "s-bound");
     assert!(!file.exists(), "the file goes with the session");
 }
 
@@ -1396,7 +1401,7 @@ async fn an_http_agent_is_offered_the_server_with_a_token_that_binds_to_its_sess
     );
 
     // And the session's end revokes it.
-    host.tokens().session_ended("s1");
+    host.tokens().session_ended("s1", "claude-code");
     assert!(
         connect(&url, &token).await.is_err(),
         "a revoked token is refused"

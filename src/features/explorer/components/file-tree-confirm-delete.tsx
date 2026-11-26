@@ -51,12 +51,6 @@ export function FileTreeConfirmDelete({
             "shadow-md",
             "p-4 flex flex-col gap-3",
           )}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              onConfirm();
-            }
-          }}
         >
           <Dialog.Title className="text-base font-semibold text-foreground">
             {title ?? (multi ? `Delete ${count} items?` : `Delete ${isDir ? "folder" : "file"}?`)}
@@ -80,6 +74,7 @@ export function FileTreeConfirmDelete({
           <div className="flex items-center justify-end gap-2 mt-1">
             <button
               type="button"
+              autoFocus
               onClick={() => onOpenChange(false)}
               className={cn(
                 "px-3 h-7 rounded text-xs",
@@ -103,8 +98,12 @@ export function FileTreeConfirmDelete({
                 supplies both halves itself. */}
             <button
               type="button"
-              autoFocus
               onClick={onConfirm}
+              onKeyDown={(event) => {
+                if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) {
+                  event.preventDefault();
+                }
+              }}
               className={cn(
                 "px-3 h-7 rounded text-xs font-medium",
                 "border border-error/40 bg-error-muted text-error transition-colors hover:bg-error/20",

@@ -1,5 +1,5 @@
 import type { SessionMessage, SessionSnapshot } from "@/types/agents";
-import { toolLocations, type SnapshotLive } from "../stores/chat-store";
+import { toolLocations, toolResultText, type SnapshotLive } from "../stores/chat-store";
 
 /**
  * Map an atlas-agents `SessionMessage` (the rich Rust snapshot state returned by
@@ -49,7 +49,8 @@ export function snapshotMessageToWire(m: SessionMessage) {
       toolName: tc.tool_name,
       kind: tc.kind ?? null,
       arguments: (tc.arguments ?? {}) as Record<string, unknown>,
-      result: tc.result ?? null,
+      // `rawOutput` stands in when it is the call's only result (ACP audit finding 100).
+      result: toolResultText(tc) ?? null,
       status: tc.status,
       ...(tc.started_at_ms !== undefined ? { startedAt: tc.started_at_ms } : {}),
       ...(tc.ended_at_ms !== undefined ? { endedAt: tc.ended_at_ms } : {}),

@@ -41,7 +41,7 @@ pub(crate) fn clear_entry(link: &Path) -> Result<(), String> {
         if !meta.file_type().is_symlink() && meta.is_dir() {
             fs::remove_dir_all(link).map_err(|e| e.to_string())?;
         } else {
-            let _ = fs::remove_file(link);
+            fs::remove_file(link).map_err(|e| e.to_string())?;
         }
     }
     Ok(())
@@ -79,7 +79,6 @@ pub(crate) fn create_copy(
     if let Some(parent) = link.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    clear_entry(&link)?;
     copy_dir_all(&canonical, &link)
 }
 
@@ -107,21 +106,161 @@ pub(crate) fn symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
     ))
 }
 
-/// Recursively copy `src` → `dst` (dirs + files), creating parents as needed.
-/// Used by `adopt_skill` to lift an external skill into the canonical store
-/// without a new dependency. Symlinks inside the source are not followed into
-/// new symlinks — their target contents are copied through `fs::copy`.
+/// Build a replacement beside the destination before moving the existing
+/// entry. Copy/validation failures leave the installed copy untouched.
+pub(crate) fn replace_entry(
+    dst: &Path,
+    build: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = dst.parent().ok_or("destination has no parent")?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let mut staging = None;
+    for _ in 0..64 {
+        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(".atlas-stage-{}-{serial}", std::process::id()));
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                staging = Some(path);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    struct Cleanup {
+        path: PathBuf,
+        keep: bool,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if !self.keep {
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+    let mut staging = Cleanup {
+        path: staging.ok_or("cannot reserve installation staging directory")?,
+        keep: false,
+    };
+    let payload = staging.path.join("new");
+    build(&payload)?;
+    let backup = staging.path.join("previous");
+    let existed = match dst.symlink_metadata() {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.to_string()),
+    };
+    if existed {
+        fs::rename(dst, &backup).map_err(|e| e.to_string())?;
+    }
+    if let Err(error) = fs::rename(&payload, dst) {
+        if existed {
+            if let Err(restore) = fs::rename(&backup, dst) {
+                staging.keep = true;
+                return Err(format!("install failed: {error}; restore failed: {restore}; previous copy is preserved at {}", backup.display()));
+            }
+        }
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+/// Copy an entire tree, preserving internal directory and dangling symlinks
+/// without following them. Links escaping the copied tree are refused before
+/// any existing installation is replaced.
 pub(crate) fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), String> {
+    replace_entry(dst, |staging| copy_tree(src, staging))
+}
+
+pub(crate) fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
+    let source_root = fs::canonicalize(src).map_err(|e| e.to_string())?;
+    let parent = dst.parent().ok_or("copy destination has no parent")?;
+    if fs::canonicalize(parent)
+        .map_err(|e| e.to_string())?
+        .starts_with(&source_root)
+    {
+        return Err("cannot copy a directory into itself".to_string());
+    }
+    copy_tree_inner(&source_root, &source_root, dst)
+}
+
+fn copy_tree_inner(root: &Path, src: &Path, dst: &Path) -> Result<(), String> {
     fs::create_dir_all(dst).map_err(|e| e.to_string())?;
     for entry in fs::read_dir(src).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
         let ty = entry.file_type().map_err(|e| e.to_string())?;
-        if ty.is_dir() {
-            copy_dir_all(&from, &to)?;
-        } else {
+        if ty.is_symlink() {
+            let target = fs::read_link(&from).map_err(|e| e.to_string())?;
+            // Absolute links encode the throwaway clone path and cannot be
+            // preserved in a moved installation. Relative links stay valid.
+            if target.is_absolute() {
+                return Err(format!(
+                    "absolute symlink cannot be installed: {}",
+                    from.display()
+                ));
+            }
+            let mut resolved = src.to_path_buf();
+            for component in target.components() {
+                match component {
+                    std::path::Component::Normal(part) => resolved.push(part),
+                    std::path::Component::ParentDir => {
+                        resolved.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    _ => return Err(format!("invalid symlink: {}", from.display())),
+                }
+            }
+            if !resolved.starts_with(root) {
+                return Err(format!(
+                    "symlink escapes the installed tree: {}",
+                    from.display()
+                ));
+            }
+            // A link such as `alias/../private`, with `alias -> .`, can
+            // escape even though its lexical spelling stays inside the tree.
+            // Resolve the existing prefix too; a dangling final target is fine.
+            let mut existing = src.join(&target);
+            loop {
+                match fs::canonicalize(&existing) {
+                    Ok(resolved) if resolved.starts_with(root) => break,
+                    Ok(_) => {
+                        return Err(format!(
+                            "symlink escapes the installed tree: {}",
+                            from.display()
+                        ));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if !existing.pop() {
+                            return Err(format!("cannot resolve symlink: {}", from.display()));
+                        }
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &to).map_err(|e| e.to_string())?;
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::FileTypeExt;
+                if ty.is_symlink_dir() {
+                    std::os::windows::fs::symlink_dir(&target, &to)
+                } else {
+                    std::os::windows::fs::symlink_file(&target, &to)
+                }
+                .map_err(|e| e.to_string())?;
+            }
+            #[cfg(not(any(unix, windows)))]
+            return Err("symlink installation is unsupported on this platform".to_string());
+        } else if ty.is_dir() {
+            copy_tree_inner(root, &from, &to)?;
+        } else if ty.is_file() {
             fs::copy(&from, &to).map_err(|e| e.to_string())?;
+        } else {
+            return Err(format!("unsupported entry in skill: {}", from.display()));
         }
     }
     Ok(())
@@ -152,7 +291,10 @@ pub(crate) fn hash_skill_dir(dir: &Path) -> String {
     for (rel, abs) in &files {
         fold(rel.as_bytes());
         fold(&[0x00]);
-        if let Ok(bytes) = fs::read(abs) {
+        if let Ok(target) = fs::read_link(abs) {
+            fold(b"symlink\0");
+            fold(target.to_string_lossy().as_bytes());
+        } else if let Ok(bytes) = fs::read(abs) {
             fold(&bytes);
         }
     }
@@ -170,13 +312,101 @@ fn collect_files(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
         let Ok(meta) = path.symlink_metadata() else {
             continue;
         };
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        if meta.is_dir() {
+        if meta.is_dir() && !meta.file_type().is_symlink() {
             collect_files(base, &path, out);
         } else if let Ok(rel) = path.strip_prefix(base) {
             out.push((rel.to_string_lossy().replace('\\', "/"), path));
         }
+    }
+}
+
+#[cfg(test)]
+mod replacement_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_copy_refuses_an_escape_through_an_internal_link() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let installed = root.path().join("installed");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&installed).unwrap();
+        fs::write(installed.join("SKILL.md"), "local edits").unwrap();
+        fs::write(root.path().join("private"), "private content").unwrap();
+        std::os::unix::fs::symlink(".", source.join("alias")).unwrap();
+        for target in ["alias/../private", "alias/../future"] {
+            let link = source.join("escape");
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            assert!(copy_dir_all(&source, &installed)
+                .unwrap_err()
+                .contains("symlink escapes"));
+            assert_eq!(
+                fs::read_to_string(installed.join("SKILL.md")).unwrap(),
+                "local edits"
+            );
+            fs::remove_file(link).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_failed_replacement_keeps_the_installed_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let installed = root.path().join("installed");
+        fs::create_dir(&installed).unwrap();
+        fs::write(installed.join("SKILL.md"), "local edits").unwrap();
+        let error = replace_entry(&installed, |staging| {
+            fs::create_dir(staging).unwrap();
+            fs::write(staging.join("SKILL.md"), "partial update").unwrap();
+            Err("copy failed".to_string())
+        });
+        assert!(error.is_err());
+        assert_eq!(
+            fs::read_to_string(installed.join("SKILL.md")).unwrap(),
+            "local edits"
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_copy_preserves_internal_directory_and_dangling_links() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir_all(source.join("scripts")).unwrap();
+        fs::write(source.join("scripts/run.sh"), "echo ready").unwrap();
+        std::os::unix::fs::symlink("scripts", source.join("bin")).unwrap();
+        std::os::unix::fs::symlink("future", source.join("optional")).unwrap();
+        let installed = root.path().join("installed");
+        copy_dir_all(&source, &installed).unwrap();
+        assert_eq!(
+            fs::read_link(installed.join("bin")).unwrap(),
+            Path::new("scripts")
+        );
+        assert_eq!(
+            fs::read_link(installed.join("optional")).unwrap(),
+            Path::new("future")
+        );
+        assert_eq!(
+            fs::read_to_string(installed.join("bin/run.sh")).unwrap(),
+            "echo ready"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_escaping_link_refuses_an_update_before_removing_the_old_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let installed = root.path().join("installed");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&installed).unwrap();
+        fs::write(installed.join("SKILL.md"), "keep this").unwrap();
+        std::os::unix::fs::symlink("../private", source.join("escape")).unwrap();
+        assert!(copy_dir_all(&source, &installed).is_err());
+        assert_eq!(
+            fs::read_to_string(installed.join("SKILL.md")).unwrap(),
+            "keep this"
+        );
     }
 }

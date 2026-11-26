@@ -588,6 +588,19 @@ impl TurnRequestProcessor {
             }
         };
 
+        // Core has installed the task before it returns Started. Its event
+        // writer/listener may still be awaiting disk I/O; Stop must not depend
+        // on that notification winning the race with this response.
+        if started {
+            let state = self.thread_state_manager.thread_state(thread_id).await;
+            let mut state = state.lock().await;
+            if state.last_terminal_turn_id.as_deref() != Some(turn_id.as_str())
+                && state.active_turn_snapshot().is_none()
+            {
+                state.pending_started_turn_id = Some(turn_id.clone());
+            }
+        }
+
         if turn_has_input && started {
             let config_snapshot = thread.config_snapshot().await;
             let parent_permission_profile =
@@ -1480,7 +1493,9 @@ impl TurnRequestProcessor {
                         )));
                     }
                 } else if thread_state.last_terminal_turn_id.as_deref() == Some(turn_id.as_str())
-                    || !is_running
+                    || (!is_running
+                        && thread_state.pending_started_turn_id.as_deref()
+                            != Some(turn_id.as_str()))
                 {
                     return Err(invalid_request("no active turn to interrupt"));
                 }

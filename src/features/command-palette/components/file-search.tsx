@@ -48,6 +48,7 @@ export function FileSearch(props: { onClose: () => void; escapeLabel: string }) 
   const [matchedQuery, setMatchedQuery] = useState("");
   const [indexing, setIndexing] = useState(false);
   const searchSeq = useRef(0);
+  const indexReady = useRef(false);
 
   const openFiles = useLayoutStore((s) => editorPaths(s.tabs));
   const recentFiles = useRecentFilesStore((s) => s.items);
@@ -58,6 +59,7 @@ export function FileSearch(props: { onClose: () => void; escapeLabel: string }) 
       .search(q, FILE_SEARCH_RESULT_LIMIT)
       .then((found) => {
         if (seq !== searchSeq.current) return;
+        if (!q.trim() && found.length === 0 && !indexReady.current) return;
         setResults(found);
         setMatchedQuery(q);
         if (projectPath && q.trim() === "" && found.length) cacheFileList(projectPath, found);
@@ -69,9 +71,17 @@ export function FileSearch(props: { onClose: () => void; escapeLabel: string }) 
   // once, however many callers ask).
   useEffect(() => {
     if (!projectPath) return;
+    indexReady.current = false;
+    searchSeq.current += 1;
+    setResults(getCachedFileList(projectPath));
+    setIndexing(true);
     let cancelled = false;
     void ensureFileIndex(projectPath).then((status) => {
-      if (!cancelled) setIndexing(status ? !status.indexed : false);
+      if (!cancelled) {
+        indexReady.current = !!status?.indexed;
+        setIndexing(status ? !status.indexed : false);
+        if (status?.indexed) void runSearch(queryRef.current);
+      }
     });
     return () => {
       cancelled = true;
@@ -97,6 +107,7 @@ export function FileSearch(props: { onClose: () => void; escapeLabel: string }) 
     let cancelled = false;
     void onFileIndexUpdated(() => {
       if (cancelled) return;
+      indexReady.current = true;
       setIndexing(false);
       void runSearch(queryRef.current);
     }).then((un) => {

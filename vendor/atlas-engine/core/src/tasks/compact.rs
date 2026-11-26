@@ -74,7 +74,8 @@ impl SessionTask for CompactTask {
                     // Compaction prompt is synthesized; no UI element ranges to preserve.
                     text_elements: Vec::new(),
                 }];
-                crate::compact::run_compact_task(session.clone(), ctx, input).await
+                crate::compact::run_compact_task(session.clone(), ctx, input).await?;
+                Ok(())
             }
         };
         if let Err(err) = result

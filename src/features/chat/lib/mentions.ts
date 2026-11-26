@@ -55,7 +55,10 @@ import type { PackComponentKind } from "@/features/skills/lib/types";
 function stripCategoryAlias(query: string, kind: MentionKind): string {
   const q = query;
   for (const a of categoryForKind(kind).aliases) {
-    if (q.toLowerCase().startsWith(a)) {
+    if (
+      q.toLowerCase().startsWith(a) &&
+      (a.endsWith("/") || q.length === a.length || /\s/.test(q[a.length]))
+    ) {
       return q.slice(a.length).trimStart();
     }
   }
@@ -517,7 +520,7 @@ export function toShortForm(m: MentionData): string {
     case "symbol":
       return `@symbol:${shortFormValue(m.displayName)}`;
     case "knowledge":
-      return `@note:${m.id}`;
+      return `@note:${shortFormValue(m.id)}`;
     case "component":
       return `#${m.componentKind}:${shortFormValue(m.displayName)}`;
     case "repo":

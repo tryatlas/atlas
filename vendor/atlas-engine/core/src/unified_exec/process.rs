@@ -171,8 +171,14 @@ impl UnifiedExecProcess {
         &self.output
     }
 
-    pub(super) fn output_receiver(&self) -> tokio::sync::broadcast::Receiver<Vec<u8>> {
-        self.output_tx.subscribe()
+    pub(super) async fn output_receiver(
+        &self,
+    ) -> (Vec<u8>, tokio::sync::broadcast::Receiver<Vec<u8>>) {
+        // Producers publish under the same lock, so the snapshot and live
+        // subscription meet at one boundary without dropping or duplicating bytes.
+        let output = self.output.output_buffer.lock().await;
+        let receiver = self.output_tx.subscribe();
+        (output.to_bytes_with_omission_marker(), receiver)
     }
 
     pub(super) fn cancellation_token(&self) -> CancellationToken {
@@ -507,8 +513,8 @@ impl UnifiedExecProcess {
                         let bytes = chunk.chunk.into_inner();
                         let mut guard = output_buffer.lock().await;
                         guard.push_chunk(bytes.clone());
-                        drop(guard);
                         let _ = output_tx.send(bytes);
+                        drop(guard);
                         output_notify.notify_waiters();
                     }
                     last_seq = last_seq.max(next_seq.saturating_sub(1));
@@ -550,8 +556,8 @@ impl UnifiedExecProcess {
                         let bytes = chunk.chunk.into_inner();
                         let mut guard = output_buffer.lock().await;
                         guard.push_chunk(bytes.clone());
-                        drop(guard);
                         let _ = output_tx.send(bytes);
+                        drop(guard);
                         output_notify.notify_waiters();
                     }
                     ExecProcessEvent::Exited {
@@ -611,8 +617,8 @@ impl UnifiedExecProcess {
                     Ok(chunk) => {
                         let mut guard = output_buffer.lock().await;
                         guard.push_chunk(chunk.clone());
-                        drop(guard);
                         let _ = output_tx.send(chunk);
+                        drop(guard);
                         output_notify.notify_waiters();
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

@@ -17,6 +17,7 @@ use crate::tags::{
 pub enum SkipReason {
     Binary,
     TooLarge { added_lines: usize },
+    FileLimit,
     Generated,
     DeletedFile,
     TimeBudget,
@@ -76,9 +77,7 @@ pub fn build(changes: Vec<FileChange>, limits: &Limits) -> RiskMap {
     });
     for file in files.iter_mut().skip(limits.max_files) {
         if file.skip.is_none() {
-            file.skip = Some(SkipReason::TooLarge {
-                added_lines: file.added_count(),
-            });
+            file.skip = Some(SkipReason::FileLimit);
         }
     }
     RiskMap { files }

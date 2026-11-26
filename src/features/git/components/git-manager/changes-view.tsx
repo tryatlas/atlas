@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import { gitDiffFile, hunkOps } from "../../lib/git-changes-api";
+import { useSelectedFileDiff } from "../../lib/use-selected-file-diff";
 import {
   Plus,
   Minus,
@@ -296,8 +297,8 @@ export function ChangesView() {
   const currentProject = useAppStore((s) => s.currentProject);
 
   const [selected, setSelected] = useState<string | null>(null);
+  const [selectedStaged, setSelectedStaged] = useState(false);
   const [stashesOpen, setStashesOpen] = useState(false);
-  const [fileDiff, setFileDiff] = useState<string | null>(null);
   // Bumped after a hunk op: discarding one hunk of several leaves the file
   // list as it was, so `files` alone would not reload the diff.
   const [diffEpoch, setDiffEpoch] = useState(0);
@@ -330,22 +331,9 @@ export function ChangesView() {
     if (moveOptionFocus(e.currentTarget, e.key, e.target as Element)) e.preventDefault();
   }, []);
 
-  // Load the selected file's diff.
-  useEffect(() => {
-    if (!selected || !repoPath) {
-      setFileDiff(null);
-      return;
-    }
-    let cancelled = false;
-    void gitDiffFile(repoPath, selected)
-      .then((d) => {
-        if (!cancelled) setFileDiff(d);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [selected, repoPath, files, diffEpoch]);
+  // Load the selected file's diff. `files` and `diffEpoch` reload it in
+  // place; a different selection never shows the previous file's diff.
+  const fileDiff = useSelectedFileDiff(repoPath, selected, selectedStaged, files, diffEpoch);
 
   // Revert button. Tracked changes → `git restore` (back to HEAD). Added/
   // untracked files have no HEAD to restore to, so reverting deletes them:
@@ -464,7 +452,7 @@ export function ChangesView() {
       if (!repoPath) return;
       // Measured now: a refresh during the read can unmount the row.
       const rect = anchor.getBoundingClientRect();
-      void gitDiffFile(repoPath, f.path)
+      void gitDiffFile(repoPath, f.path, f.staged)
         .catch(() => "")
         .then((diff) => {
           const ctx = fileDiffContext(f.path, diff, stagedState(f.path));
@@ -485,7 +473,6 @@ export function ChangesView() {
   const opKind = inProgressLabel(inProgress);
 
   const hasConflicts = useMemo(() => files.some((f) => f.status === "conflicted"), [files]);
-  const selectedStaged = staged.some((f) => f.path === selected);
 
   return (
     <div className="flex h-full min-w-0 flex-col">
@@ -551,9 +538,13 @@ export function ChangesView() {
                     <FileRow
                       key={`s:${f.path}`}
                       file={f}
-                      selected={selected === f.path}
+                      selected={selectedStaged && selected === f.path}
                       tabbable={stagedStop === i}
-                      onSelect={toggleSelected}
+                      onSelect={(path) => {
+                        setSelectedStaged(true);
+                        if (selectedStaged) toggleSelected(path);
+                        else setSelected(path);
+                      }}
                       action="unstage"
                       onAction={unstageOne}
                       onOpenDiff={repoPath ? openDiff : undefined}
@@ -589,9 +580,13 @@ export function ChangesView() {
                     <FileRow
                       key={`u:${f.path}`}
                       file={f}
-                      selected={selected === f.path}
+                      selected={!selectedStaged && selected === f.path}
                       tabbable={unstagedStop === i}
-                      onSelect={toggleSelected}
+                      onSelect={(path) => {
+                        setSelectedStaged(false);
+                        if (!selectedStaged) toggleSelected(path);
+                        else setSelected(path);
+                      }}
                       action="stage"
                       onAction={stageOne}
                       onDiscard={handleRevert}
@@ -638,12 +633,18 @@ export function ChangesView() {
             <IconButton size="xs" icon={X} label="Close diff" onClick={() => setSelected(null)} />
           </div>
           <DiffView
-            diff={fileDiff ?? ""}
+            diff={fileDiff.state === "ready" ? fileDiff.diff : ""}
             onOpenFile={openFile}
             onOpenDiff={repoPath ? (p) => openGitDiff(repoPath, p, false) : undefined}
-            emptyLabel="No diff for this file"
+            emptyLabel={
+              fileDiff.state === "loading"
+                ? "Loading diff…"
+                : fileDiff.state === "error"
+                  ? `Couldn't load this file's diff: ${fileDiff.message}`
+                  : "No diff for this file"
+            }
             className="flex-1"
-            hunkActions={["stage", "discard"]}
+            hunkActions={selectedStaged ? ["unstage"] : ["stage", "discard"]}
             onHunkAction={onHunkAction}
             askHunk={askHunk}
             askSuggestions={CHANGE_ASKS}

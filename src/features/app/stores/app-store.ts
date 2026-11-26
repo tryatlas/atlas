@@ -6,7 +6,6 @@ import { useProjectStore } from "@/features/projects/stores/project-store";
 import { useOrgStore } from "@/features/organisations/stores/org-store";
 import { fromOrganisationWire, toOrganisationWire } from "@/features/organisations/types";
 import { registerFlush } from "@/features/projects/lib/flush-registry";
-import { persistHashOf } from "@/features/projects/lib/project-snapshot";
 import { useSettingsStore } from "@/features/settings/stores/settings-store";
 import type { AppSettings } from "@/features/settings/lib/app-settings";
 import type { AppStatePatch } from "@/bindings/app-state/AppStatePatch";
@@ -166,28 +165,14 @@ registerFlush("app-state", (ctx) => {
   return flushAppStateSave();
 });
 
-// Dedup gate: the persist hash last written to disk per project. If the
-// project's snapshot hash is unchanged since the last write, we skip the
-// editor-state disk write entirely (the user's "don't re-write the cache when
-// the snapshot is identical").
-const lastPersistedHash = new Map<string, string>();
-
 // Editor tabs / split layout for a project. `ctx.path` is the OUTGOING
 // project path (passed explicitly so the write targets the right project even
 // after `currentProject` has swapped); falls back to the live current project
-// for non-switch flushes (e.g. app quit).
+// for non-switch flushes (e.g. app quit). The layout store skips a write
+// whose payload is byte-identical to the last one that reached disk.
 registerFlush("editor-state", async (ctx) => {
   const path = ctx.path ?? useAppStore.getState().currentProject?.path;
   if (!path) return;
-
-  // Skip the disk write when nothing the user cares about changed.
-  if (ctx.projectId) {
-    const hash = persistHashOf(ctx.projectId);
-    if (hash && lastPersistedHash.get(ctx.projectId) === hash) {
-      return; // identical snapshot — no write
-    }
-    if (hash) lastPersistedHash.set(ctx.projectId, hash);
-  }
   await useLayoutStore.getState().actions.flushEditorState(path);
 });
 
@@ -303,7 +288,9 @@ export const useAppStore = create<AppState>()((set) => ({
       maybeEnsureAtlasGitignore(path, useSettingsStore.getState().settings);
       // Grant the asset protocol access to this project's tree so the media
       // viewer can serve its files. Scope only widens across projects.
-      invoke("asset_allow_dir", { path }).catch(() => {});
+      void flushAppStateSave()
+        .then(() => invoke("asset_allow_dir", { path }))
+        .catch((error) => console.warn("Could not grant project media access:", error));
 
       logEvent({
         source: "project",

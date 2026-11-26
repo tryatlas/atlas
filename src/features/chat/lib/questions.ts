@@ -26,6 +26,9 @@ export interface QuestionSpec {
   options: QuestionOption[];
 }
 
+/** The kinds a question call may declare: none of them acts on anything. */
+const QUESTION_KINDS = new Set(["other", "think"]);
+
 /**
  * Pull the structured questions out of an `AskUserQuestion` permission tool
  * call. Returns the parsed specs when present and non-empty, else null (so the
@@ -34,6 +37,12 @@ export interface QuestionSpec {
  * depending on how the adapter serializes them.
  */
 export function extractQuestions(tc: ToolCallRef): QuestionSpec[] | null {
+  // The question card replaces the card that says what a call does, so only a
+  // call that does nothing else may become one. ACP has no kind for "ask the
+  // user"; a call that declared a kind that acts (`execute`, `edit`, `fetch`,
+  // …) and whose arguments merely hold a `questions` array is that act, and
+  // is shown as one (ADR-0002: kind and structure, never a tool name).
+  if (typeof tc.kind === "string" && !QUESTION_KINDS.has(tc.kind)) return null;
   const record = tc as Record<string, unknown>;
   const input = (record.rawInput ?? record.input) as unknown;
   if (!input || typeof input !== "object") return null;

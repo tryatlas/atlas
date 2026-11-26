@@ -28,19 +28,22 @@
 
 import { emit } from "@tauri-apps/api/event";
 import * as Y from "yjs";
-import { toBase64 } from "@/features/comms/lib/draft-sync";
+import { fromBase64, toBase64 } from "@/features/comms/lib/draft-sync";
 import type { CanvasEdge, CanvasFile, CanvasNode } from "@/features/canvas/stores/canvas-store";
 import { addEdge, addNode } from "@/features/spaces/lib/space-doc";
 import {
+  decodeSpaceFrame,
   encodeSpaceAwarenessState,
   encodeSpaceFrame,
   SPACE_FRAME_AWARENESS,
+  SPACE_FRAME_UPDATE,
   type SpaceAwarenessState,
 } from "@/features/spaces/lib/space-wire";
 import type {
   SpaceClientMessage,
   SpaceEnvelope,
   SpaceMediaUploaded,
+  SpaceOutboxEntry,
   SpacePage,
   SpaceServerMessage,
   SpaceSummary,
@@ -267,8 +270,13 @@ const MEDIA_MIME = "image/png";
 
 /** Build one page's document by running the real writers, then encode it the
  *  way the server would hand it over in `page.opened`. */
-function snapshotFor(pageId: string): string | null {
+const pageDocuments = new Map<string, Y.Doc>();
+function documentFor(convId: string, pageId: string): Y.Doc {
+  const key = JSON.stringify([convId, pageId]);
+  const existing = pageDocuments.get(key);
+  if (existing) return existing;
   const doc = new Y.Doc();
+  pageDocuments.set(key, doc);
   if (pageId === "sp_board") {
     addNode(doc, {
       id: SPACE_NODES.brief,
@@ -346,11 +354,11 @@ function snapshotFor(pageId: string): string | null {
       text: "yes",
       color: "#4bd1a0",
     });
-    return toBase64(Y.encodeStateAsUpdate(doc));
   }
-  // `sp_empty` really is empty — an unwritten page has no snapshot at all,
-  // and `applyPageContent` has to cope with that, not with empty bytes.
-  return null;
+  return doc;
+}
+function snapshotFor(convId: string, pageId: string): string {
+  return toBase64(Y.encodeStateAsUpdate(documentFor(convId, pageId)));
 }
 
 /** Two people already on the board. The first claims a selection, which is
@@ -411,6 +419,12 @@ function awarenessFanout(slot: number): Uint8Array {
 /** Slots are handed out per conversation, as the server does — a page re-open
  *  gets a NEW one, and the session drops frames for the old one. */
 const slots = new Map<string, number>();
+const slotPages = new Map<string, string>();
+const outboxRows = new Map<number, SpaceOutboxEntry>();
+const outboxSnapshots = new Map<string, number[]>();
+let nextOutboxId = 0;
+const scopeKey = (args: Record<string, unknown>) =>
+  JSON.stringify([args.accountId, args.orgId, args.convId, args.pageId]);
 
 function send(convId: string, ev: SpaceEnvelope["ev"]): void {
   void emit("atlas:spaces", { org: MOCK_ORG_ID, conv: convId, ev } satisfies SpaceEnvelope);
@@ -466,6 +480,11 @@ export interface SpacesResponses {
   spaces_cycle: Unit;
   spaces_send_control: Unit;
   spaces_send_binary: Unit;
+  spaces_outbox_enqueue: number;
+  spaces_outbox_load: SpaceOutboxEntry[];
+  spaces_outbox_acknowledge: Unit;
+  spaces_outbox_save_snapshot: Unit;
+  spaces_outbox_snapshot: number[] | null;
   spaces_media_upload: SpaceMediaUploaded;
   spaces_media_fetch: string;
 }
@@ -523,13 +542,14 @@ export const spacesHandlers: TypedHandlers<SpacesResponses> = {
       case "page.open": {
         const slot = (slots.get(conv) ?? -1) + 1;
         slots.set(conv, slot);
+        slotPages.set(JSON.stringify([conv, slot]), message.page_id);
         setTimeout(() => {
           control(conv, {
             t: "page.opened",
             page_id: message.page_id,
             slot,
             resume: message.since !== undefined,
-            snapshot: snapshotFor(message.page_id),
+            snapshot: snapshotFor(conv, message.page_id),
             index: 1,
             updates: [],
             read_only: null,
@@ -556,8 +576,56 @@ export const spacesHandlers: TypedHandlers<SpacesResponses> = {
         return null;
     }
   },
-  // Local edits are accepted and relayed nowhere — there is no second client.
-  spaces_send_binary: (): null => null,
+  spaces_send_binary: ({ convId, data }): null => {
+    const bytes = fromBase64(String(data));
+    const frame = bytes && decodeSpaceFrame(bytes);
+    if (!frame) throw new Error("invalid Space frame");
+    if (frame.type === SPACE_FRAME_UPDATE) {
+      const pageId = slotPages.get(JSON.stringify([String(convId), frame.slot]));
+      if (!pageId) throw new Error("page slot is not open");
+      Y.applyUpdate(documentFor(String(convId), pageId), frame.payload);
+    }
+    return null;
+  },
+  spaces_outbox_enqueue: (args): number => {
+    const id = ++nextOutboxId;
+    outboxRows.set(id, {
+      id,
+      accountId: String(args.accountId),
+      orgId: String(args.orgId),
+      conversationId: String(args.convId),
+      pageId: String(args.pageId),
+      data: [...fromBase64(String(args.data))!],
+    });
+    return id;
+  },
+  spaces_outbox_load: (args): SpaceOutboxEntry[] =>
+    [...outboxRows.values()].filter(
+      (row) =>
+        row.accountId === args.accountId &&
+        row.orgId === args.orgId &&
+        row.conversationId === args.convId &&
+        row.pageId === args.pageId,
+    ),
+  spaces_outbox_acknowledge: (args): null => {
+    for (const id of Array.isArray(args.ids) ? args.ids : []) {
+      const row = outboxRows.get(Number(id));
+      if (
+        row &&
+        row.accountId === args.accountId &&
+        row.orgId === args.orgId &&
+        row.conversationId === args.convId &&
+        row.pageId === args.pageId
+      )
+        outboxRows.delete(row.id);
+    }
+    return null;
+  },
+  spaces_outbox_save_snapshot: (args): null => {
+    outboxSnapshots.set(scopeKey(args), [...fromBase64(String(args.data))!]);
+    return null;
+  },
+  spaces_outbox_snapshot: (args): number[] | null => outboxSnapshots.get(scopeKey(args)) ?? null,
 
   spaces_media_upload: ({ path }): SpaceMediaUploaded => {
     const ext = String(path).split(".").pop()?.toLowerCase() ?? "";

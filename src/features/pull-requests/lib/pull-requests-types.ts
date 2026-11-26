@@ -108,6 +108,7 @@ export interface PrComment {
   author: PrActor | null;
   body: string;
   createdAt: string;
+  publishedAt?: string | null;
   editedAt: string | null;
   url: string | null;
   /** For a line comment, the file it is on. */
@@ -129,6 +130,7 @@ export interface PrThreadComment {
   author: PrActor | null;
   body: string;
   createdAt: string;
+  publishedAt?: string | null;
   editedAt: string | null;
   url: string | null;
   reactions: PrReaction[];

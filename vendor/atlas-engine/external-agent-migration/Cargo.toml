@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 chrono = { workspace = true }
+dirs = { workspace = true }
 atlas-engine-analytics = { workspace = true }
 atlas-engine-config = { workspace = true }
 atlas-engine-core = { workspace = true }

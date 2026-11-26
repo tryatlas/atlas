@@ -54,7 +54,10 @@ fn selection_op(
         SelOp::Stage | SelOp::Discard => vec!["diff", "--no-color", "--", file],
         SelOp::Unstage => vec!["diff", "--cached", "--no-color", "--", file],
     };
-    let out = GitCommand::new(path, &diff_args).read_only().run()?;
+    let out = GitCommand::new(path, &["--literal-pathspecs"])
+        .args(&diff_args)
+        .read_only()
+        .run()?;
     let parsed = patch::parse_file_diff(&out.stdout).ok_or_else(|| {
         GitErrorPayload::internal(
             "No changes found for this file — it may already be staged. Refresh and try again.",
@@ -73,8 +76,13 @@ fn selection_op(
         )
     })?;
 
-    let patch_text = patch::line_selection_patch(&parsed, idx, selected)
-        .ok_or_else(|| GitErrorPayload::internal("The selection contains no changed lines."))?;
+    let patch_text = match op {
+        SelOp::Stage => patch::line_selection_patch(&parsed, idx, selected),
+        SelOp::Unstage | SelOp::Discard => {
+            patch::reverse_line_selection_patch(&parsed, idx, selected)
+        }
+    }
+    .ok_or_else(|| GitErrorPayload::internal("The selection contains no changed lines."))?;
 
     let apply_args: Vec<&str> = match op {
         SelOp::Stage => vec!["apply", "--cached", "--whitespace=nowarn", "-"],

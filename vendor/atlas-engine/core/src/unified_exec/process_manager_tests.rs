@@ -102,7 +102,7 @@ fn exec_env_policy_excludes_non_inheritable_and_runtime_variables() {
     let policy = ShellEnvironmentPolicy {
         r#set: HashMap::from([
             (
-                "atlas_engine_permission_profile".to_string(),
+                ATLAS_AGENT_PERMISSION_PROFILE_ENV_VAR.to_ascii_lowercase(),
                 "stale-profile".to_string(),
             ),
             (
@@ -110,11 +110,12 @@ fn exec_env_policy_excludes_non_inheritable_and_runtime_variables() {
                 "/run/identity-token".to_string(),
             ),
             (
-                "atlas_engine_apply_patch_preserve_line_endings".to_string(),
+                atlas_engine_apply_patch::ATLAS_AGENT_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR
+                    .to_ascii_lowercase(),
                 "1".to_string(),
             ),
             (
-                "atlas_engine_plugin_metrics_output".to_string(),
+                PLUGIN_METRICS_OUTPUT_ENV_VAR.to_ascii_lowercase(),
                 "/stale/sidecar".to_string(),
             ),
             ("KEEP".to_string(), "value".to_string()),

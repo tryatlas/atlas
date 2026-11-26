@@ -347,11 +347,28 @@ impl SharedMemoryStore {
     /// imported — lines the user left unticked are not offered again — and
     /// announces the change. Returns how many lines were stored anew (a line
     /// merged into a near-duplicate does not count). Empty `ids` is a no-op.
+    #[cfg(test)]
     pub fn claude_import_confirm(
         &self,
         project_path: &str,
         dirs: &[PathBuf],
         ids: &[String],
+    ) -> Result<usize, String> {
+        let offered: Vec<String> = self
+            .claude_import_preview(project_path, dirs)?
+            .lines
+            .into_iter()
+            .map(|l| l.id)
+            .collect();
+        self.claude_import_confirm_preview(project_path, dirs, ids, &offered)
+    }
+
+    pub fn claude_import_confirm_preview(
+        &self,
+        project_path: &str,
+        dirs: &[PathBuf],
+        ids: &[String],
+        offered_ids: &[String],
     ) -> Result<usize, String> {
         // Nothing kept is not a consent to import: no write, no gate.
         if ids.is_empty() {
@@ -360,7 +377,12 @@ impl SharedMemoryStore {
         let preview = self.claude_import_preview(project_path, dirs)?;
         let store = store_for(project_path)?;
         let now = self.now();
-        let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let offered: HashSet<&str> = offered_ids.iter().map(String::as_str).collect();
+        let wanted: HashSet<&str> = ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| offered.contains(id))
+            .collect();
         let mut written = 0;
         let mut kinds: Vec<&str> = Vec::new();
         for line in preview
@@ -395,6 +417,9 @@ impl SharedMemoryStore {
             store.mark_imported(&source_name(dir), now).map_err(err)?;
             store.mark_imported(&lines_marker(dir), now).map_err(err)?;
             for m in read_dir(dir) {
+                if !offered.contains(line_id(m.kind, &m.content).as_str()) {
+                    continue;
+                }
                 store
                     .mark_imported(&line_source(dir, &line_id(m.kind, &m.content)), now)
                     .map_err(err)?;
@@ -430,6 +455,7 @@ pub async fn memory_claude_import_preview(
 pub async fn memory_claude_import_confirm(
     project_path: String,
     ids: Vec<String>,
+    offered_ids: Vec<String>,
     store: State<'_, SharedMemoryStore>,
     registry: State<'_, std::sync::Arc<super::memory_indexer::MemoryRegistry>>,
 ) -> Result<usize, String> {
@@ -437,7 +463,7 @@ pub async fn memory_claude_import_confirm(
     let cwd = project_path.clone();
     let written = tauri::async_runtime::spawn_blocking(move || {
         let dirs = claude_memory_dirs(&project_path);
-        store.claude_import_confirm(&project_path, &dirs, &ids)
+        store.claude_import_confirm_preview(&project_path, &dirs, &ids, &offered_ids)
     })
     .await
     .map_err(|e| e.to_string())??;

@@ -290,8 +290,7 @@ struct TurnState {
 ///
 /// `tool_calls` is the one that matters: the turn continues, and reporting it
 /// as ended would strand the tool results the engine is about to produce.
-/// `length` means the answer was cut off at `max_tokens`, which is also not a
-/// turn the model chose to end.
+/// `length` is surfaced as an explicit error before completion is emitted.
 fn end_turn_for(finish_reason: Option<&str>) -> Option<bool> {
     finish_reason.map(|reason| matches!(reason, "stop" | "content_filter"))
 }
@@ -594,6 +593,13 @@ async fn emit_turn(
         {
             return;
         }
+    }
+
+    if state.finish_reason.as_deref() == Some("length") {
+        let _ = tx_event.send(Err(ApiError::InvalidRequest {
+            message: "The model reply reached the output token limit and was cut short. Ask the model to continue.".to_string(),
+        })).await;
+        return;
     }
 
     let _ = tx_event

@@ -1,7 +1,6 @@
 // What the composer may do right now, per tab: the session's agent, the org's
-// AI grant and the lock it drives, a mode a resume could not restore, a
-// session another process is still writing, and a remote driver holding the
-// seat. Plus the per-session seeds that ride along with the same reads.
+// AI grant and the lock it drives, a mode a resume could not restore, and a
+// remote driver holding the seat. Plus the per-session seeds that ride along with the same reads.
 
 import { switchableAgentOf } from "@/features/agents/lib/agent-meta";
 import type { SwitchableAgent } from "@/types/agent";
@@ -9,12 +8,11 @@ import { composerGates, sendStateOf } from "../lib/send-gate";
 import { useAiGrantBarShown } from "../components/ai-grant-bar";
 import { grantLocksComposer, useAiGrantProbe, useNoAiGrant } from "../stores/ai-grant-store";
 import { useChatStore } from "../stores/chat-store";
-import { useSendHeldForTerminal } from "../stores/live-elsewhere-store";
 import { useNativeModelsOrgRefresh } from "../stores/native-models-store";
 import { useRcRemoteDriver } from "../stores/rc-store";
 import { useComposerModesSelfHeal } from "./use-composer-modes-self-heal";
-import { useLiveElsewhereFeed } from "./use-live-elsewhere-feed";
 import { useNativeEffortSeed } from "./use-native-effort-seed";
+import { useSessionProjectsFeed } from "./use-session-projects-feed";
 
 export function useComposerGates({
   tabId,
@@ -71,27 +69,20 @@ export function useComposerGates({
   // A resume could not restore the user's mode (`ModeRestoreBar`): no send
   // until they pick one. Only the send — typing and the mode picker stay live.
   const unrestoredModeId = useChatStore((s) => s.sessions[tabId]?.unrestoredModeId);
-  // Another process is still writing this session: sends wait for "Send anyway".
-  // The composer feeds the live set itself, so the guard holds whichever view
-  // (sidebar, History, another project) the session was opened from.
   const acpSessionId = useChatStore((s) => s.sessions[tabId]?.acpSessionId);
-  // The same read keeps the session's attached projects current for the
-  // project chips' access toggles (`session-projects-store`).
-  useLiveElsewhereFeed(!!acpSessionId);
-  const heldElsewhere = useSendHeldForTerminal(acpSessionId);
+  // Keeps the session's attached projects current for the project chips'
+  // access toggles (`session-projects-store`).
+  useSessionProjectsFeed(!!acpSessionId);
   // Someone else holds the session's remote-control seat (`RcDriverBar`):
   // nothing sends or queues from here until the owner takes over. Rust's
   // steering entry refuses it too; this is what lets the composer say so
   // rather than bounce an error. Stop stays live — it is the owner's.
   const remoteDriver = useRcRemoteDriver(acpSessionId) !== null;
   // The facts above, read through the one gate the send handler and the drain
-  // read too (`send-gate.ts`): these four are what `planSubmit` and the send
+  // read too (`send-gate.ts`): these three are what `planSubmit` and the send
   // button take.
-  const { blockedByGrant, modeUnrestored, heldForTerminal, remoteDriving } = composerGates(
-    sendStateOf(
-      { acpSessionId, unrestoredModeId },
-      { heldElsewhere, grantHold, remoteDriving: remoteDriver },
-    ),
+  const { blockedByGrant, modeUnrestored, remoteDriving } = composerGates(
+    sendStateOf({ acpSessionId, unrestoredModeId }, { grantHold, remoteDriving: remoteDriver }),
     running,
   );
   const disabled = disabledProp || blockedByGrant;
@@ -112,7 +103,6 @@ export function useComposerGates({
     disabled,
     modeUnrestored,
     acpSessionId,
-    heldForTerminal,
     remoteDriving,
   };
 }

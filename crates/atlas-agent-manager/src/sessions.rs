@@ -44,7 +44,7 @@
 //! | [`FollowUp::AnnounceEnded`]  | 1st     | last              | only      |
 //! | [`FollowUp::ForgetHistoryBinding`] | 2nd | no (the rebind needs it) | no |
 //! | [`FollowUp::CloseProjection`] | 3rd    | after the notice  | no (the caller empties the projector whole) |
-//! | [`FollowUp::CloseOnAgent`]   | last, if advertised | no (the process is going) | no |
+//! | [`FollowUp::CloseOnAgent`]   | last, for a bound thread | no (the process is going) | no |
 //!
 //! Ending twice is a no-op: the second call finds no record and returns
 //! nothing to do.
@@ -167,8 +167,8 @@ pub enum FollowUp {
     /// Drop the wire projection, which owns the thread and through it the
     /// connection.
     CloseProjection,
-    /// Ask the agent to close its side (`session/close`). Only present when
-    /// the agent advertised it.
+    /// Release the connection's local session handle. `release_session` also
+    /// asks the agent to close its side when it advertised `session/close`.
     CloseOnAgent {
         connection: Arc<dyn AgentConnection>,
     },
@@ -319,9 +319,43 @@ pub struct Residue {
     pub manager_handle: bool,
 }
 
+/// A record's key: ACP scopes a session id to its connection, so two agents
+/// can both answer `"1"` (#86). A lookup by the bare id answers only when
+/// exactly one agent holds it ([`State::scope_of`]).
+type Scope = (Agent, String);
+
 struct State<X> {
-    records: HashMap<String, Record>,
+    records: HashMap<Scope, Record>,
+    /// By bare id: an extra can outlive its record (a queue waiting for the
+    /// rebind), and then there is no agent to file it under. Ending one
+    /// agent's session never drops an extra another agent's live session by
+    /// the same id still uses ([`SessionRegistry::end_locked`]).
     extras: HashMap<String, X>,
+}
+
+impl<X> State<X> {
+    /// The one record holding this bare id; `None` when none or several do.
+    fn scope_of(&self, session_id: &str) -> Option<Scope> {
+        let mut holders = self.records.keys().filter(|(_, id)| id == session_id);
+        let scope = holders.next()?.clone();
+        if holders.next().is_some() {
+            tracing::warn!(
+                session = %session_id,
+                "two agents hold this session id; naming the agent is required"
+            );
+            return None;
+        }
+        Some(scope)
+    }
+
+    fn record_mut(&mut self, session_id: &str) -> Option<&mut Record> {
+        let scope = self.scope_of(session_id)?;
+        self.records.get_mut(&scope)
+    }
+
+    fn record(&self, session_id: &str) -> Option<&Record> {
+        self.records.get(&self.scope_of(session_id)?)
+    }
 }
 
 #[derive(Default)]
@@ -412,8 +446,11 @@ impl<X: SessionExtra> SessionRegistry<X> {
                 None => {
                     self.manager
                         .settle_session(&meta.agent, &session_id, thread, true);
+                    // Keyed by agent too: another agent's session that
+                    // happens to share the id is another session, not this
+                    // one's previous bind (#86).
                     state.records.insert(
-                        session_id.to_string(),
+                        (meta.agent.clone(), session_id.to_string()),
                         Record {
                             agent: meta.agent,
                             plugin_id: meta.plugin_id,
@@ -437,8 +474,7 @@ impl<X: SessionExtra> SessionRegistry<X> {
                     // agent's one session by this id is that bind's now.
                     let rebound = state
                         .records
-                        .get(session_id.0.as_ref())
-                        .is_some_and(|record| record.agent == meta.agent)
+                        .contains_key(&(meta.agent.clone(), session_id.to_string()))
                         || self.manager.holds_session(&meta.agent, &session_id);
                     (ended_by, rebound)
                 }
@@ -449,7 +485,7 @@ impl<X: SessionExtra> SessionRegistry<X> {
         // a newer bind of this session is live on: the agent knows one
         // session by this id, and closing it would close that one.
         if ended_by == EndKind::Closed && !rebound {
-            follow_ups.extend(close_on_agent(thread));
+            follow_ups.push(release_on_agent(thread));
         }
         Err(BindRefused {
             ended_by,
@@ -459,32 +495,61 @@ impl<X: SessionExtra> SessionRegistry<X> {
 
     // ---- reads -----------------------------------------------------------
 
+    /// Whether any agent has a session bound by this id.
     pub fn contains(&self, session_id: &str) -> bool {
-        lock(&self.state).records.contains_key(session_id)
-    }
-
-    pub fn info(&self, session_id: &str) -> Option<SessionInfo> {
         lock(&self.state)
             .records
-            .get(session_id)
-            .map(|record| SessionInfo {
-                agent: record.agent.clone(),
-                plugin_id: record.plugin_id.clone(),
-                cwd: record.cwd.clone(),
-                current_model: record.current_model.clone(),
-                turn_seq: record.turn_seq,
-                created_at: record.created_at,
-                held: !record.holds.is_empty(),
-            })
+            .keys()
+            .any(|(_, id)| id == session_id)
     }
 
+    /// The session by its bare id; `None` when two agents share the id
+    /// (see [`Self::info_of`]).
+    pub fn info(&self, session_id: &str) -> Option<SessionInfo> {
+        lock(&self.state).record(session_id).map(SessionInfo::of)
+    }
+
+    /// One agent's session by this id.
+    pub fn info_of(&self, agent: &Agent, session_id: &str) -> Option<SessionInfo> {
+        lock(&self.state)
+            .records
+            .get(&(agent.clone(), session_id.to_owned()))
+            .map(SessionInfo::of)
+    }
+
+    /// How many agents have a session bound by this id. More than one is a
+    /// collision only the agent can tell apart.
+    pub fn holders(&self, session_id: &str) -> usize {
+        lock(&self.state)
+            .records
+            .keys()
+            .filter(|(_, id)| id == session_id)
+            .count()
+    }
+}
+
+impl SessionInfo {
+    fn of(record: &Record) -> Self {
+        Self {
+            agent: record.agent.clone(),
+            plugin_id: record.plugin_id.clone(),
+            cwd: record.cwd.clone(),
+            current_model: record.current_model.clone(),
+            turn_seq: record.turn_seq,
+            created_at: record.created_at,
+            held: !record.holds.is_empty(),
+        }
+    }
+}
+
+impl<X: SessionExtra> SessionRegistry<X> {
     /// Every session bound on `agent`.
     pub fn sessions_of(&self, agent: &Agent) -> Vec<String> {
         lock(&self.state)
             .records
             .iter()
             .filter(|(_, record)| &record.agent == agent)
-            .map(|(id, _)| id.clone())
+            .map(|((_, id), _)| id.clone())
             .collect()
     }
 
@@ -494,14 +559,13 @@ impl<X: SessionExtra> SessionRegistry<X> {
             .records
             .iter()
             .filter(|(_, record)| !record.holds.is_empty())
-            .map(|(id, _)| id.clone())
+            .map(|((_, id), _)| id.clone())
             .collect()
     }
 
     pub fn is_held(&self, session_id: &str) -> bool {
         lock(&self.state)
-            .records
-            .get(session_id)
+            .record(session_id)
             .is_some_and(|record| !record.holds.is_empty())
     }
 
@@ -509,7 +573,7 @@ impl<X: SessionExtra> SessionRegistry<X> {
 
     /// Record the model the user picked. `false` for a session not bound.
     pub fn set_current_model(&self, session_id: &str, model: String) -> bool {
-        match lock(&self.state).records.get_mut(session_id) {
+        match lock(&self.state).record_mut(session_id) {
             Some(record) => {
                 record.current_model = Some(model);
                 true
@@ -523,7 +587,7 @@ impl<X: SessionExtra> SessionRegistry<X> {
     /// drop what belongs to a turn that was superseded.
     pub fn next_turn_seq(&self, session_id: &str) -> Option<u64> {
         let mut state = lock(&self.state);
-        let record = state.records.get_mut(session_id)?;
+        let record = state.record_mut(session_id)?;
         record.turn_seq = record.turn_seq.wrapping_add(1);
         Some(record.turn_seq)
     }
@@ -532,9 +596,21 @@ impl<X: SessionExtra> SessionRegistry<X> {
 
     /// Take a hold: keep the session open without its tab. Answers whether
     /// it is the first hold taken; `None` for a session not bound.
+    /// By the bare id; `None` when two agents share it (see [`Self::hold_of`]).
     pub fn hold(&self, session_id: &str, holder: &str) -> Option<bool> {
         let mut state = lock(&self.state);
-        let record = state.records.get_mut(session_id)?;
+        let record = state.record_mut(session_id)?;
+        let first = record.holds.is_empty();
+        record.holds.insert(holder.to_owned());
+        Some(first)
+    }
+
+    /// [`Self::hold`], for one agent's session.
+    pub fn hold_of(&self, agent: &Agent, session_id: &str, holder: &str) -> Option<bool> {
+        let mut state = lock(&self.state);
+        let record = state
+            .records
+            .get_mut(&(agent.clone(), session_id.to_owned()))?;
         let first = record.holds.is_empty();
         record.holds.insert(holder.to_owned());
         Some(first)
@@ -542,10 +618,22 @@ impl<X: SessionExtra> SessionRegistry<X> {
 
     /// Let go of a hold. If it was the last and the window had already let
     /// the session go, the session ends here, as its close would have.
+    ///
+    /// By the bare id; nothing is released when two agents share it (see
+    /// [`Self::release_of`]).
     pub fn release(&self, session_id: &str, holder: &str) -> Released {
+        let Some((agent, _)) = lock(&self.state).scope_of(session_id) else {
+            return Released::NotHeld;
+        };
+        self.release_of(&agent, session_id, holder)
+    }
+
+    /// [`Self::release`], for one agent's session.
+    pub fn release_of(&self, agent: &Agent, session_id: &str, holder: &str) -> Released {
         let ended = {
             let mut state = lock(&self.state);
-            let Some(record) = state.records.get_mut(session_id) else {
+            let scope = (agent.clone(), session_id.to_owned());
+            let Some(record) = state.records.get_mut(&scope) else {
                 return Released::NotHeld;
             };
             if !record.holds.remove(holder) {
@@ -557,7 +645,7 @@ impl<X: SessionExtra> SessionRegistry<X> {
             if !record.released_by_window {
                 return Released::Last;
             }
-            self.close_locked(&mut state, session_id)
+            self.close_locked(&mut state, &scope)
         };
         match ended {
             Some(ended) => Released::LastAndEnded(ended.into_ended(session_id)),
@@ -569,7 +657,7 @@ impl<X: SessionExtra> SessionRegistry<X> {
     /// session is bound; if it was let go while held, it is the window's
     /// again, so a later release does not end it under the tab.
     pub fn reclaim_for_window(&self, session_id: &str) -> bool {
-        match lock(&self.state).records.get_mut(session_id) {
+        match lock(&self.state).record_mut(session_id) {
             Some(record) => {
                 record.released_by_window = false;
                 true
@@ -601,13 +689,37 @@ impl<X: SessionExtra> SessionRegistry<X> {
     /// A held session keeps running: the close is remembered, and the last
     /// hold's [`Self::release`] finishes it. A bind still in flight for this
     /// id is cancelled either way, so the session it opens is refused.
+    ///
+    /// By the bare id; when two agents share it, nothing is closed (see
+    /// [`Self::close_of`]).
     pub fn close(&self, session_id: &str) -> Closed {
-        let ended = {
-            let mut state = lock(&self.state);
-            match state.records.get_mut(session_id) {
+        let scope = {
+            let state = lock(&self.state);
+            match state.scope_of(session_id) {
+                Some(scope) => scope,
+                None if state.records.keys().any(|(_, id)| id == session_id) => {
+                    return Closed::Unknown;
+                }
                 None => {
                     self.cancel_binds(EndKind::Closed, |bind| {
                         bind.session_id.as_deref() == Some(session_id)
+                    });
+                    return Closed::Unknown;
+                }
+            }
+        };
+        self.close_of(&scope.0, session_id)
+    }
+
+    /// [`Self::close`], for one agent's session.
+    pub fn close_of(&self, agent: &Agent, session_id: &str) -> Closed {
+        let scope = (agent.clone(), session_id.to_owned());
+        let ended = {
+            let mut state = lock(&self.state);
+            match state.records.get_mut(&scope) {
+                None => {
+                    self.cancel_binds(EndKind::Closed, |bind| {
+                        &bind.agent == agent && bind.session_id.as_deref() == Some(session_id)
                     });
                     return Closed::Unknown;
                 }
@@ -615,7 +727,7 @@ impl<X: SessionExtra> SessionRegistry<X> {
                     record.released_by_window = true;
                     return Closed::Held;
                 }
-                Some(_) => self.close_locked(&mut state, session_id),
+                Some(_) => self.close_locked(&mut state, &scope),
             }
         };
         match ended {
@@ -637,10 +749,14 @@ impl<X: SessionExtra> SessionRegistry<X> {
                 .records
                 .iter()
                 .filter(|(_, record)| &record.agent == agent)
-                .map(|(id, _)| id.clone())
+                .map(|((_, id), _)| id.clone())
                 .collect();
             for session_id in &ended {
-                self.end_locked(&mut state, session_id, EndKind::AgentGone);
+                self.end_locked(
+                    &mut state,
+                    &(agent.clone(), session_id.clone()),
+                    EndKind::AgentGone,
+                );
             }
             self.cancel_binds(EndKind::AgentGone, |bind| &bind.agent == agent);
             if how.drop_connection {
@@ -682,7 +798,7 @@ impl<X: SessionExtra> SessionRegistry<X> {
             let ended = state
                 .records
                 .drain()
-                .map(|(id, record)| (id, record.agent))
+                .map(|((_, id), record)| (id, record.agent))
                 .collect();
             self.manager.shutdown();
             ended
@@ -704,19 +820,27 @@ impl<X: SessionExtra> SessionRegistry<X> {
     fn end_locked(
         &self,
         state: &mut MutexGuard<'_, State<X>>,
-        session_id: &str,
+        scope: &Scope,
         kind: EndKind,
     ) -> Option<Agent> {
-        let record = state.records.remove(session_id)?;
-        let keep = state
-            .extras
-            .get_mut(session_id)
-            .is_some_and(|extra| extra.survives(kind));
-        if !keep {
-            state.extras.remove(session_id);
+        let record = state.records.remove(scope)?;
+        let (agent, session_id) = scope;
+        // Another agent's live session by the same id is still using the
+        // extra filed under it: leave it be.
+        let shared = state.records.keys().any(|(_, id)| id == session_id);
+        if !shared {
+            let keep = state
+                .extras
+                .get_mut(session_id)
+                .is_some_and(|extra| extra.survives(kind));
+            if !keep {
+                state.extras.remove(session_id);
+            }
         }
         if kind == EndKind::Closed {
-            self.cancel_binds(kind, |bind| bind.session_id.as_deref() == Some(session_id));
+            self.cancel_binds(kind, |bind| {
+                &bind.agent == agent && bind.session_id.as_deref() == Some(session_id.as_str())
+            });
         }
         Some(record.agent)
     }
@@ -726,12 +850,12 @@ impl<X: SessionExtra> SessionRegistry<X> {
     fn close_locked(
         &self,
         state: &mut MutexGuard<'_, State<X>>,
-        session_id: &str,
+        scope: &Scope,
     ) -> Option<ClosedLocked> {
-        let agent = self.end_locked(state, session_id, EndKind::Closed)?;
+        let agent = self.end_locked(state, scope, EndKind::Closed)?;
         let thread = self
             .manager
-            .forget_session(&agent, &acp::SessionId::new(session_id))
+            .forget_session(&agent, &acp::SessionId::new(scope.1.as_str()))
             .map(|handle| handle.thread);
         Some(ClosedLocked { agent, thread })
     }
@@ -753,7 +877,7 @@ impl<X: SessionExtra> SessionRegistry<X> {
     pub fn residue(&self, session_id: &str) -> Residue {
         let (bound, holds, released_by_window, extra) = {
             let state = lock(&self.state);
-            let record = state.records.get(session_id);
+            let record = state.record(session_id);
             (
                 record.is_some(),
                 record.map_or_else(Vec::new, |r| r.holds.iter().cloned().collect()),
@@ -801,7 +925,7 @@ impl ClosedLocked {
             FollowUp::ForgetHistoryBinding,
             FollowUp::CloseProjection,
         ];
-        follow_ups.extend(self.thread.as_ref().and_then(close_on_agent));
+        follow_ups.extend(self.thread.as_ref().map(release_on_agent));
         Ended {
             session_id: session_id.to_owned(),
             agent: self.agent,
@@ -811,12 +935,11 @@ impl ClosedLocked {
     }
 }
 
-/// The `session/close` follow-up for a thread, if its agent advertised it.
-fn close_on_agent(thread: &AcpThreadHandle) -> Option<FollowUp> {
+/// Local session release is unconditional; the connection decides whether
+/// an advertised `session/close` RPC is needed as part of that release.
+fn release_on_agent(thread: &AcpThreadHandle) -> FollowUp {
     let connection = lock(thread).connection().clone();
-    connection
-        .supports_close_session()
-        .then_some(FollowUp::CloseOnAgent { connection })
+    FollowUp::CloseOnAgent { connection }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

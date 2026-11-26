@@ -12,9 +12,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => import("@/test/tauri-core"));
 vi.mock("@tauri-apps/api/event", () => import("@/test/tauri-event"));
+const nativeFocus = vi.hoisted(() => ({
+  focused: true,
+  listeners: new Set<(focused: boolean) => void>(),
+}));
+vi.mock("@/lib/window-focus", () => ({
+  isWindowFocused: () => nativeFocus.focused,
+  onWindowFocusChange: (listener: (focused: boolean) => void) => {
+    nativeFocus.listeners.add(listener);
+    return () => nativeFocus.listeners.delete(listener);
+  },
+}));
 
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { tauri } from "@/test/tauri-fake";
+import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { useChatStore } from "../stores/chat-store";
 import { VIEWED_DEBOUNCE_MS } from "../stores/session-lifecycle-store";
 import { useMarkActiveSessionViewed } from "./use-mark-session-viewed";
@@ -24,30 +36,34 @@ const viewed = () => tauri.calls("threads_mark_viewed").map((c) => c.args.sessio
 const advance = (ms: number) => act(() => vi.advanceTimersByTimeAsync(ms));
 const windowEvent = (name: "focus" | "blur") =>
   act(() => {
-    window.dispatchEvent(new Event(name));
+    nativeFocus.focused = name === "focus";
+    for (const listener of nativeFocus.listeners) listener(nativeFocus.focused);
   });
-
-let focused = true;
 
 function open(tabId: string, sessionId: string | null) {
   const { actions } = store();
   actions.createSession(tabId, "atlas-agent");
   if (sessionId) actions.setAcpBinding(tabId, "agent-1", sessionId, "/proj");
 }
-const activate = (tabId: string | null) => act(() => store().actions.setActiveSession(tabId));
+/** Show a tab the way the tab strip does: in the layout, which is all a tab
+ *  switch changes. The chat store's `activeSessionId` is not touched. */
+const activate = (tabId: string | null) =>
+  act(() => useLayoutStore.setState({ activeTabId: tabId }));
 
 beforeEach(() => {
   vi.useFakeTimers();
   tauri.reset();
   tauri.handleRaw({ threads_mark_viewed: () => true });
   localStorage.clear();
-  focused = true;
-  vi.spyOn(document, "hasFocus").mockImplementation(() => focused);
+  nativeFocus.focused = true;
+  // The webview still says focused during a macOS Space switch.
+  vi.spyOn(document, "hasFocus").mockReturnValue(true);
   useChatStore.setState({ sessions: {}, activeSessionId: null });
   open("tab-a", "sess-a");
   open("tab-b", "sess-b");
   open("tab-new", null);
   store().actions.setActiveSession(null);
+  useLayoutStore.setState({ activeTabId: null });
 });
 afterEach(() => {
   cleanup();
@@ -73,6 +89,17 @@ describe("useMarkActiveSessionViewed", () => {
     expect(viewed()).toEqual(["sess-a"]);
   });
 
+  // ACP audit finding 103: a tab switch moves the layout's tab and nothing else. Following the
+  // chat store's `activeSessionId` marked the tab left behind and never the
+  // one on screen.
+  it("follows the tab the layout shows, not the chat store's active session", async () => {
+    act(() => store().actions.setActiveSession("tab-a"));
+    renderHook(() => useMarkActiveSessionViewed());
+    activate("tab-b");
+    await advance(VIEWED_DEBOUNCE_MS);
+    expect(viewed()).toEqual(["sess-b"]);
+  });
+
   it("does not mark a session the user only passed through", async () => {
     renderHook(() => useMarkActiveSessionViewed());
     activate("tab-a");
@@ -94,13 +121,13 @@ describe("useMarkActiveSessionViewed", () => {
   });
 
   it("leaves a session unread while the window is in the background, and marks it on return", async () => {
-    focused = false;
+    nativeFocus.focused = false;
     renderHook(() => useMarkActiveSessionViewed());
     activate("tab-a");
     await advance(60_000);
     expect(viewed()).toEqual([]);
 
-    focused = true;
+    nativeFocus.focused = true;
     windowEvent("focus");
     await advance(VIEWED_DEBOUNCE_MS - 1);
     expect(viewed()).toEqual([]);
@@ -133,26 +160,27 @@ describe("useMarkActiveSessionViewed", () => {
     act(() => store().actions.updateSessionStatus("tab-a", "running"));
     renderHook(() => useMarkActiveSessionViewed());
     activate("tab-a");
-    focused = false;
+    nativeFocus.focused = false;
     windowEvent("blur");
 
     act(() => store().actions.updateSessionStatus("tab-a", "idle"));
     await advance(60_000);
     expect(viewed()).toEqual([]);
 
-    focused = true;
+    nativeFocus.focused = true;
     windowEvent("focus");
     await advance(VIEWED_DEBOUNCE_MS);
     expect(viewed()).toEqual(["sess-a"]);
   });
 
-  it("as found: a focus during a running turn marks it viewed before it has finished", async () => {
-    // The mount-and-activate path waits for the turn (above); the focus
-    // listener does not ask whether one is running.
+  it("waits for completion when native focus returns during a running turn", async () => {
     act(() => store().actions.updateSessionStatus("tab-a", "running"));
     renderHook(() => useMarkActiveSessionViewed());
     activate("tab-a");
     windowEvent("focus");
+    await advance(VIEWED_DEBOUNCE_MS);
+    expect(viewed()).toEqual([]);
+    act(() => store().actions.updateSessionStatus("tab-a", "idle"));
     await advance(VIEWED_DEBOUNCE_MS);
     expect(viewed()).toEqual(["sess-a"]);
   });

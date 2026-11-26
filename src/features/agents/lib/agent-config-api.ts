@@ -34,4 +34,11 @@ export const agentConfig = {
    *  with `empty` first if it doesn't exist yet. */
   openConfigFile: (path: string, empty: string) =>
     invoke<string>("agents_open_config_file", { path, empty }),
+  /** Stop a running agent and start it again, so it runs the settings saved
+   *  now. Refused while it is replying. */
+  restartToApply: (agentId: string) => invoke<void>("agents_restart_to_apply", { agentId }),
+  /** Save the variables an `env_var` sign-in method asked for as the agent's
+   *  sensitive variables (keychain), and restart it so it has them. */
+  setAuthEnv: (agentId: string, values: { name: string; value: string }[]) =>
+    invoke<void>("agents_set_auth_env", { agentId, values }),
 };

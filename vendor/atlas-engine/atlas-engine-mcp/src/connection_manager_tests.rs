@@ -251,7 +251,7 @@ impl ServerHandler for RefreshTestTransportFactory {
 
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         self.list_requests
@@ -262,8 +262,15 @@ impl ServerHandler for RefreshTestTransportFactory {
         if let Some(release_list) = &self.release_list {
             release_list.notified().await;
         }
-        let mut result = ListToolsResult::with_all_items(vec![self.tool.clone()]);
-        result.next_cursor = self.next_cursor.clone();
+        let cursor = request.and_then(|request| request.cursor);
+        let mut tool = self.tool.clone();
+        let mut next_cursor = self.next_cursor.clone();
+        if cursor.is_some() && cursor == self.next_cursor {
+            tool.name = "second-page".into();
+            next_cursor = None;
+        }
+        let mut result = ListToolsResult::with_all_items(vec![tool]);
+        result.next_cursor = next_cursor;
         Ok(result)
     }
 }
@@ -367,7 +374,7 @@ impl InProcessTransportFactory for DisconnectingToolsTransportFactory {
 }
 
 #[tokio::test]
-async fn legacy_tool_catalog_does_not_follow_pagination_cursor() -> anyhow::Result<()> {
+async fn legacy_tool_catalog_follows_pagination_cursor() -> anyhow::Result<()> {
     let requests = Arc::new(AtomicUsize::new(0));
     let client = Arc::new(
         RmcpClient::new_in_process_client(Arc::new(RefreshTestTransportFactory {
@@ -402,9 +409,10 @@ async fn legacy_tool_catalog_does_not_follow_pagination_cursor() -> anyhow::Resu
     )
     .await?;
 
-    assert_eq!(tools.len(), 1);
+    assert_eq!(tools.len(), 2);
     assert_eq!(tools[0].tool.name.as_ref(), "first-page");
-    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(tools[1].tool.name.as_ref(), "second-page");
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
     client.shutdown().await;
     Ok(())
 }

@@ -1,7 +1,9 @@
 //! Session tokens: who is calling the memory tools, and for which scope.
 //!
 //! One bearer token per (session, scope). A session runs in one launch
-//! directory, hence one scope, so the table is keyed by session; a session
+//! directory, hence one scope, so the table is keyed by session — by its
+//! agent and its id, since ACP scopes a session id to its connection and two
+//! agents can both mint `"1"` (#86); a session
 //! rebound elsewhere gets a fresh token for the new scope and the old one is
 //! revoked. A token is minted when the session starts and revoked when it
 //! ends, through the [`SessionLifecycle`] hook that also records the session
@@ -48,10 +50,31 @@ pub struct Grant {
     pub ui: bool,
 }
 
+/// A session's key in the table: its agent's durable id and its session id.
+type SessionKey = (String, String);
+
+fn key(agent: &str, session_id: &str) -> SessionKey {
+    (agent.to_string(), session_id.to_string())
+}
+
 #[derive(Default)]
 struct TokenTable {
     by_token: HashMap<String, Grant>,
-    by_session: HashMap<String, String>,
+    by_session: HashMap<SessionKey, String>,
+}
+
+impl TokenTable {
+    /// The one session holding the bare `session_id`; `None` when no agent's
+    /// or several agents' sessions do.
+    fn sole_session(&self, session_id: &str) -> Option<&String> {
+        let mut holders = self
+            .by_session
+            .iter()
+            .filter(|((_, id), _)| id == session_id)
+            .map(|(_, token)| token);
+        let token = holders.next()?;
+        holders.next().is_none().then_some(token)
+    }
 }
 
 /// The live bearer tokens: one per session, minted at session start and
@@ -76,7 +99,7 @@ impl SessionTokens {
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
-        if let Some(old) = table.by_session.remove(session_id) {
+        if let Some(old) = table.by_session.remove(&key(agent, session_id)) {
             table.by_token.remove(&old);
         }
         table.by_token.insert(
@@ -91,7 +114,7 @@ impl SessionTokens {
         );
         table
             .by_session
-            .insert(session_id.to_string(), token.clone());
+            .insert(key(agent, session_id), token.clone());
         token
     }
 
@@ -132,18 +155,18 @@ impl SessionTokens {
         token
     }
 
-    /// Make `token` the token of `session_id`, revoking any other it had.
-    /// Does nothing for a token that is no longer live.
+    /// Make `token` the token of `session_id` — of the agent the token was
+    /// minted for — revoking any other that session had. Another agent's
+    /// session by the same id keeps its own (#86). Does nothing for a token
+    /// that is no longer live.
     pub fn bind(&self, token: &str, session_id: &str) {
         let mut table = self.table.lock();
         let Some(grant) = table.by_token.get_mut(token) else {
             return;
         };
         grant.session_id = session_id.to_string();
-        if let Some(old) = table
-            .by_session
-            .insert(session_id.to_string(), token.to_string())
-        {
+        let session = key(&grant.agent, session_id);
+        if let Some(old) = table.by_session.insert(session, token.to_string()) {
             if old != token {
                 table.by_token.remove(&old);
             }
@@ -154,12 +177,9 @@ impl SessionTokens {
     pub fn revoke_token(&self, token: &str) {
         let mut table = self.table.lock();
         if let Some(grant) = table.by_token.remove(token) {
-            if table
-                .by_session
-                .get(&grant.session_id)
-                .is_some_and(|t| t == token)
-            {
-                table.by_session.remove(&grant.session_id);
+            let session = key(&grant.agent, &grant.session_id);
+            if table.by_session.get(&session).is_some_and(|t| t == token) {
+                table.by_session.remove(&session);
             }
         }
     }
@@ -168,25 +188,37 @@ impl SessionTokens {
     /// server entry carries.
     ///
     /// Also the honest test for "was this session given memory at all".
+    /// By the bare id: answers only when one agent's session holds it.
     #[cfg(test)]
     pub fn token_for(&self, session_id: &str) -> Option<String> {
-        self.table.lock().by_session.get(session_id).cloned()
+        self.table.lock().sole_session(session_id).cloned()
+    }
+
+    /// [`token_for`](Self::token_for), for one agent's session.
+    #[cfg(test)]
+    pub fn token_of(&self, agent: &str, session_id: &str) -> Option<String> {
+        self.table
+            .lock()
+            .by_session
+            .get(&key(agent, session_id))
+            .cloned()
     }
 
     /// What `session_id`'s live token grants, if it has one — the grant a
     /// call from that session is answered under, read without its token: the
     /// native seam asks about a waiting call by session (an outward action's
-    /// approval card, ADR-0014).
+    /// approval card, ADR-0014). By the bare id, so `None` when two agents'
+    /// sessions share it: guessing would answer under the wrong grant.
     pub fn grant_for_session(&self, session_id: &str) -> Option<Grant> {
         let table = self.table.lock();
-        let token = table.by_session.get(session_id)?;
+        let token = table.sole_session(session_id)?;
         table.by_token.get(token).cloned()
     }
 
-    /// Revoke `session_id`'s token. Idempotent.
-    pub fn revoke(&self, session_id: &str) {
+    /// Revoke `agent`'s session `session_id`'s token. Idempotent.
+    pub fn revoke(&self, agent: &str, session_id: &str) {
         let mut table = self.table.lock();
-        if let Some(token) = table.by_session.remove(session_id) {
+        if let Some(token) = table.by_session.remove(&key(agent, session_id)) {
             table.by_token.remove(&token);
         }
     }
@@ -210,7 +242,7 @@ impl SessionLifecycle for SessionTokens {
         let mut table = self.table.lock();
         let same = table
             .by_session
-            .get(session_id)
+            .get(&key(agent, session_id))
             .and_then(|t| table.by_token.get(t))
             .is_some_and(|g| {
                 std::path::Path::new(&g.cwd) == std::path::Path::new(cwd) && g.agent == agent
@@ -220,8 +252,8 @@ impl SessionLifecycle for SessionTokens {
         }
     }
 
-    fn session_ended(&self, session_id: &str) {
-        self.revoke(session_id);
+    fn session_ended(&self, session_id: &str, agent: &str) {
+        self.revoke(agent, session_id);
     }
 }
 

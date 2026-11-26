@@ -16,7 +16,8 @@ export type { AuthEnvStatus, AuthMethodWire };
 export type SignInPhase =
   | { kind: "loading" }
   | { kind: "choose"; methods: AuthMethodWire[] }
-  /** An `env_var` method: nothing to run until the shell provides the vars. */
+  /** An `env_var` method: a checklist of the variables it reads, with a field
+   *  for each one that doesn't reach the agent yet. */
   | { kind: "env"; method: AuthMethodWire; methods: AuthMethodWire[] }
   /** `docked`: this run has nothing for the user to read — it is a short check,
    *  not a login Atlas is driving and tailing — so it belongs in the dock
@@ -71,9 +72,31 @@ export function isDocked(phase: SignInPhase): boolean {
 /** How an env checklist row reads a variable's state. */
 export function envStatusLabel(
   v: AuthEnvStatus,
-): "from shell profile" | "from environment" | "optional" | "not set" {
-  if (v.satisfied) return v.source === "shell-env" ? "from shell profile" : "from environment";
+): "from shell profile" | "from environment" | "set for this agent" | "optional" | "not set" {
+  if (v.satisfied) {
+    if (v.source === "agent-settings") return "set for this agent";
+    return v.source === "shell-env" ? "from shell profile" : "from environment";
+  }
   return v.optional ? "optional" : "not set";
+}
+
+/** What the user typed into an `env_var` checklist, keyed by variable name. */
+export type EnteredEnv = Record<string, string>;
+
+/** The values to save for `method`: its own variables the user typed a
+ *  non-blank value for, trimmed. Saved for the agent (keychain) and handed to
+ *  it on a restart — the variable an `env_var` method asks for has to reach
+ *  the agent's process, and authenticating the process already running never
+ *  gave it one (audit #61). */
+export function enteredEnvValues(
+  method: AuthMethodWire,
+  env: AuthEnvStatus[],
+  entered: EnteredEnv,
+): { name: string; value: string }[] {
+  return env
+    .filter((e) => e.methodId === method.id)
+    .map((e) => ({ name: e.name, value: (entered[e.name] ?? "").trim() }))
+    .filter((e) => e.value !== "");
 }
 
 /** The command that finishes this sign-in, or null when the method has no
@@ -125,13 +148,23 @@ export function methodForReason(
  *  getting it wrong either dead-ends the user on a button that does nothing or
  *  blocks a sign-in that would have worked.
  */
-export function methodBlockedReason(method: AuthMethodWire, env: AuthEnvStatus[]): string | null {
+export function methodBlockedReason(
+  method: AuthMethodWire,
+  env: AuthEnvStatus[],
+  entered: EnteredEnv = {},
+): string | null {
   if (method.kind === "env_var") {
     const missing = env
-      .filter((e) => e.methodId === method.id && !e.optional && !e.satisfied)
+      .filter(
+        (e) =>
+          e.methodId === method.id &&
+          !e.optional &&
+          !e.satisfied &&
+          (entered[e.name] ?? "").trim() === "",
+      )
       .map((e) => e.name);
     if (missing.length > 0) {
-      return `Set ${missing.join(", ")} in your shell profile, then reopen this.`;
+      return `Enter ${missing.join(", ")} to continue.`;
     }
     return null;
   }

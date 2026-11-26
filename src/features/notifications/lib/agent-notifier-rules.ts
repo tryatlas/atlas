@@ -54,7 +54,9 @@ export function toAgentErrorKind(kind: string | undefined): AgentErrorKind | und
 }
 
 /** What the agent adapter hands the classifier. `nonce` makes the dedupe key
- *  unique per occurrence (a turn_seq, or a counter for agents without one). */
+ *  unique per occurrence (a turn_seq, or a counter for agents without one).
+ *  A turn_seq alone is not: Rust restarts it at every bind, so a turn's nonce
+ *  carries its bind epoch too (`turnNonce`). */
 export type AgentNotifyEvent =
   | {
       type: "permission_requested";
@@ -460,4 +462,31 @@ export function decideAgentNotification(
     }
   }
   return decision;
+}
+
+/**
+ * The nonce of a turn's finish or failure: the session's bind epoch and its
+ * turn_seq. Rust restarts turn_seq at 1 on every bind, the same session id
+ * included, and delivery dedupes a key for the window's life: keyed on the
+ * turn_seq alone, the first turns after a reopen or a restarted agent reused
+ * keys already delivered and were never announced. The epoch moves with each
+ * bind; a re-delivery of the same turn in the same bind keeps its key.
+ */
+export function turnNonce(bindEpoch: number, turnSeq: number): string {
+  return `${bindEpoch}.${turnSeq}`;
+}
+
+/**
+ * Whether a chat tab's change is a new bind of `after.acpSessionId`: the tab
+ * took a session it did not hold (a new tab, or a reopen), or the same session
+ * was bound again — which resets the turn high-water mark to 0
+ * (`setAcpBinding`); nothing else lowers it.
+ */
+export function isNewBind(
+  before: { acpSessionId?: string; currentTurnSeq?: number } | undefined,
+  after: { acpSessionId?: string; currentTurnSeq?: number },
+): boolean {
+  if (!after.acpSessionId) return false;
+  if (!before || before.acpSessionId !== after.acpSessionId) return true;
+  return (after.currentTurnSeq ?? 0) < (before.currentTurnSeq ?? 0);
 }

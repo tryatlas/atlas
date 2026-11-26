@@ -1,5 +1,9 @@
 //! Tauri command surface for the Rust-owned `AppState`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use parking_lot::{Condvar, Mutex};
 use serde::Serialize;
 use tauri::{AppHandle, Runtime, State};
 use ts_rs::TS;
@@ -84,11 +88,88 @@ pub fn app_profile() -> AppProfile {
     }
 }
 
+/// Orders the background writes of `state.json`.
+///
+/// Every save takes a ticket while it still holds the state lock, so ticket
+/// order is snapshot order. The writes run on detached threads, which the OS
+/// may schedule in any order; [`Self::write`] serializes them and drops a
+/// write whose ticket is older than one already on disk, so an older snapshot
+/// can never land after a newer one. [`Self::flush`] lets the quit path wait
+/// for the newest ticket before the process exits.
+pub struct OrderedSaves {
+    issued: AtomicU64,
+    /// The newest ticket whose write has finished (or was attempted).
+    landed: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl OrderedSaves {
+    pub const fn new() -> Self {
+        Self {
+            issued: AtomicU64::new(0),
+            landed: parking_lot::const_mutex(0),
+            changed: Condvar::new(),
+        }
+    }
+
+    /// The next ticket. Take it under the same lock the snapshot is cloned
+    /// under, so tickets and snapshots are ordered alike.
+    pub fn ticket(&self) -> u64 {
+        self.issued.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Run `write` for `ticket` unless a newer ticket already landed. Writes
+    /// are serialized: the lock is held across `write`.
+    pub fn write(&self, ticket: u64, write: impl FnOnce() -> std::io::Result<()>) {
+        let mut landed = self.landed.lock();
+        if ticket > *landed {
+            if let Err(e) = write() {
+                tracing::warn!(target: "atlas::app_state", "save failed: {e}");
+            }
+            *landed = ticket;
+        }
+        self.changed.notify_all();
+    }
+
+    /// Wait until every ticket issued so far has landed, or `timeout` passes.
+    /// Returns whether it all landed.
+    pub fn flush(&self, timeout: Duration) -> bool {
+        let target = self.issued.load(Ordering::SeqCst);
+        let deadline = Instant::now() + timeout;
+        let mut landed = self.landed.lock();
+        while *landed < target {
+            if self.changed.wait_until(&mut landed, deadline).timed_out() {
+                return *landed >= target;
+            }
+        }
+        true
+    }
+}
+
+impl Default for OrderedSaves {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The process's `state.json` writes.
+pub static APP_STATE_SAVES: OrderedSaves = OrderedSaves::new();
+
+/// Called on the way out: wait (bounded) for the last `save_app_state` to
+/// reach the disk, since its write runs on a detached thread the exit would
+/// otherwise kill.
+pub fn flush_app_state_saves() {
+    if !APP_STATE_SAVES.flush(Duration::from_secs(2)) {
+        tracing::warn!(target: "atlas::app_state", "quit before the last state save landed");
+    }
+}
+
 /// Merge a frontend save into the in-memory snapshot and persist it to disk.
 /// The disk write runs on a background thread so the IPC reply isn't blocked on
 /// fsync — this command resolves as soon as the in-memory state is updated. For
 /// the frontend's purposes, that's "saved" — the on-disk copy converges within
-/// milliseconds and is only needed on the next app launch.
+/// milliseconds and is only needed on the next app launch. The writes are
+/// ordered through [`APP_STATE_SAVES`], and the quit path flushes them.
 ///
 /// Takes an [`AppStatePatch`], **not** an `AppState`: the payload is a subset of
 /// the wire shape the frontend already sends, and taking the narrower type is
@@ -100,15 +181,69 @@ pub fn save_app_state<R: Runtime>(
     state: State<'_, AppStateHandle>,
     app: AppHandle<R>,
 ) -> Result<(), String> {
-    {
+    let (snapshot, ticket) = {
         let mut guard = state.lock();
         guard.apply_patch(payload);
-    }
-    let snapshot = state.lock().clone();
+        (guard.clone(), APP_STATE_SAVES.ticket())
+    };
     std::thread::spawn(move || {
-        if let Err(e) = AppState::save(&app, &snapshot) {
-            tracing::warn!(target: "atlas::app_state", "save failed: {e}");
-        }
+        APP_STATE_SAVES.write(ticket, || AppState::save(&app, &snapshot));
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// D6: two saves whose threads run in the opposite order. The older
+    /// snapshot must not land after the newer one.
+    #[test]
+    fn an_older_save_never_lands_after_a_newer_one() {
+        let saves = OrderedSaves::new();
+        let disk = Mutex::new(String::new());
+        let older = saves.ticket();
+        let newer = saves.ticket();
+
+        saves.write(newer, || {
+            *disk.lock() = "newer".into();
+            Ok(())
+        });
+        saves.write(older, || {
+            *disk.lock() = "older".into();
+            Ok(())
+        });
+
+        assert_eq!(*disk.lock(), "newer");
+    }
+
+    /// D6: the quit path waits for the pending write to finish.
+    #[test]
+    fn flush_waits_for_the_pending_write() {
+        let saves = Arc::new(OrderedSaves::new());
+        let disk = Arc::new(Mutex::new(String::new()));
+        let ticket = saves.ticket();
+        let writer = {
+            let (saves, disk) = (saves.clone(), disk.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                saves.write(ticket, || {
+                    *disk.lock() = "saved".into();
+                    Ok(())
+                });
+            })
+        };
+
+        assert!(saves.flush(Duration::from_secs(5)));
+        assert_eq!(*disk.lock(), "saved");
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn flush_gives_up_after_its_timeout() {
+        let saves = OrderedSaves::new();
+        let _never_written = saves.ticket();
+        assert!(!saves.flush(Duration::from_millis(20)));
+    }
 }

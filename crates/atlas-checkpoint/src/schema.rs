@@ -23,7 +23,7 @@ use crate::error::{Error, Result};
 /// withdrawn; the real V9 (`file_touch.sketch_after`) then reused it. A store
 /// stamped 9 may therefore be either shape, which is why `migrate` re-runs V9
 /// tolerantly on a 9 rather than trusting the stamp — see the comment there.
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     // Fast path, outside any transaction: the overwhelmingly common case is a
@@ -106,6 +106,11 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         if found < 13 {
             conn.execute_batch(V13)?;
         }
+        if found < 14 {
+            apply_tolerant(conn, V14_COLUMNS)?;
+            conn.execute_batch(V14)?;
+            repair_tool_titles(conn)?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     })();
@@ -121,6 +126,91 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         }
     }
 }
+
+/// Titles used to bypass capture's redactor. Repair them before any reader or
+/// drain can open the store, and resend corrections for previously shared rows.
+/// A failed scrub aborts the migration, so the old plaintext cannot leave disk.
+fn repair_tool_titles(conn: &Connection) -> Result<()> {
+    let mut stmt =
+        conn.prepare("SELECT id, session_id, title FROM tool_call WHERE title IS NOT NULL")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, session_id, title) = row?;
+        let redacted = crate::capture::scrub_auto(&title)?;
+        if redacted.text == title {
+            continue;
+        }
+        conn.execute(
+            "UPDATE tool_call SET title = ?2,
+             sync_state = CASE WHEN sync_state = 'local' THEN 'local' ELSE 'pending' END,
+             sync_attempts = 0 WHERE id = ?1",
+            rusqlite::params![id, redacted.text],
+        )?;
+        let existing: String = conn.query_row(
+            "SELECT redaction_counts FROM agent_session WHERE id = ?1",
+            [&session_id],
+            |r| r.get(0),
+        )?;
+        let mut counts: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&existing).unwrap_or_default();
+        for (category, count) in redacted.counts.entries() {
+            let old = counts
+                .get(category)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            counts.insert(category.to_string(), (old + u64::from(count)).into());
+        }
+        conn.execute(
+            "UPDATE agent_session SET redaction_counts = ?2 WHERE id = ?1",
+            rusqlite::params![session_id, serde_json::Value::Object(counts).to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+const V14_COLUMNS: &str = r#"
+ALTER TABLE agent_session ADD COLUMN sync_revision INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agent_message ADD COLUMN sync_revision INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tool_call ADD COLUMN sync_revision INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE checkpoint ADD COLUMN sync_revision INTEGER NOT NULL DEFAULT 0;
+"#;
+
+const V14: &str = r#"
+CREATE TABLE IF NOT EXISTS examined_commit (
+    workspace_id TEXT NOT NULL, commit_sha TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, commit_sha)
+);
+
+
+CREATE TRIGGER IF NOT EXISTS session_sync_revision AFTER UPDATE OF
+    workspace_id, source, native_session_id, title, agent, model, token_totals, started_at, sync_state
+    ON agent_session BEGIN
+    UPDATE agent_session SET sync_revision = OLD.sync_revision + 1 WHERE id = NEW.id;
+END;
+CREATE TRIGGER IF NOT EXISTS message_sync_revision AFTER UPDATE OF
+    session_id, turn_seq, role, mode, preview, body, body_ref, content_hash, created_at, sync_state
+    ON agent_message BEGIN
+    UPDATE agent_message SET sync_revision = OLD.sync_revision + 1 WHERE id = NEW.id;
+END;
+CREATE TRIGGER IF NOT EXISTS tool_sync_revision AFTER UPDATE OF
+    session_id, turn_seq, tool_name, title, kind, status, locations, arguments, arguments_ref,
+    result, result_ref, result_binary, created_at, sync_state
+    ON tool_call BEGIN
+    UPDATE tool_call SET sync_revision = OLD.sync_revision + 1 WHERE id = NEW.id;
+END;
+CREATE TRIGGER IF NOT EXISTS checkpoint_sync_revision AFTER UPDATE OF
+    session_id, commit_sha, patch_id, link_state, branch, git_author_name, git_author_email,
+    files_touched, insertions, deletions, created_at, sync_state
+    ON checkpoint BEGIN
+    UPDATE checkpoint SET sync_revision = OLD.sync_revision + 1 WHERE id = NEW.id;
+END;
+"#;
 
 /// Apply V6 one statement at a time, tolerating columns that already exist.
 ///
@@ -827,6 +917,36 @@ mod tests {
             conn.execute_batch(sql).unwrap();
         }
         conn.pragma_update(None, "user_version", version).unwrap();
+    }
+
+    #[test]
+    fn upgrade_repairs_existing_titles_and_requeues_the_shared_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        seeded_at(&conn, 13);
+        seed_rows(&conn, 13);
+        let raw = "curl https://example.test -H 'Authorization: Bearer sk-proj-abcdefghijklmnopqrstuvwxyz1234567890ABCDEFGHIJKLMNOP'";
+        conn.execute(
+            "UPDATE tool_call SET title = ?1, sync_state = 'sent'",
+            [raw],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let (title, state, revision): (String, String, i64) = conn
+            .query_row(
+                "SELECT title, sync_state, sync_revision FROM tool_call LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(!title.contains("abcdefghijklmnopqrstuvwxyz1234567890"));
+        assert!(title.contains("curl"), "keep useful command context");
+        assert_eq!(state, "pending");
+        assert!(revision > 0);
+        migrate(&conn).unwrap();
+        let again: String = conn
+            .query_row("SELECT title FROM tool_call LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(again, title);
     }
 
     const T0: &str = "2026-06-01T10:00:00+00:00";

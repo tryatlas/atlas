@@ -1,5 +1,6 @@
 import { useUpdaterStore } from "../stores/updater-store";
 import { updater } from "./updater-api";
+import { openSettingsSection } from "@/features/settings/lib/open-settings";
 
 /** Swap the staged update in and relaunch. Shared by the "Restart to update"
  *  prompt and the update notification's Restart action. On success the app
@@ -11,6 +12,11 @@ export function restartToUpdate(): void {
 }
 
 /** Reopen the "Restart to update" prompt (a notification click). */
-export function openUpdatePrompt(): void {
-  useUpdaterStore.getState().actions.openModal();
+export async function openUpdatePrompt(): Promise<void> {
+  const state = await updater.state();
+  if (state.phase === "ready" && state.version) {
+    useUpdaterStore.getState().actions.setReady(state.version);
+  } else {
+    openSettingsSection("updates");
+  }
 }

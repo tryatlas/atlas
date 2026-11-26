@@ -46,3 +46,43 @@ describe("pending reveals", () => {
     expect(useEditorStore.getState().pendingReveals["/a.ts"]).toBeUndefined();
   });
 });
+
+// D4: a rename or move of a file with unsaved edits re-keys its buffer and
+// carries the live text, instead of dropping it with the old tab.
+describe("moving a buffer", () => {
+  it("re-keys the buffer and carries the unsaved text as a draft", () => {
+    actions().openBuffer("/a.ts", "disk", 5);
+    actions().moveBuffer("/a.ts", "/b.ts", "edited");
+    const { buffers, activeBufferPath } = useEditorStore.getState();
+    expect(buffers["/a.ts"]).toBeUndefined();
+    expect(buffers["/b.ts"]).toMatchObject({
+      path: "/b.ts",
+      originalContent: "disk",
+      diskMtimeMs: 5,
+      draft: "edited",
+      dirty: true,
+    });
+    expect(activeBufferPath).toBe("/b.ts");
+  });
+
+  it("carries nothing when the text is the disk's", () => {
+    actions().openBuffer("/a.ts", "disk");
+    actions().moveBuffer("/a.ts", "/b.ts", "disk");
+    expect(useEditorStore.getState().buffers["/b.ts"]).toMatchObject({ dirty: false });
+    expect(useEditorStore.getState().buffers["/b.ts"].draft).toBeUndefined();
+  });
+
+  it("drops the draft once saved, reloaded, or edited back to the disk's text", () => {
+    for (const settle of [
+      () => actions().markSaved("/b.ts", "edited"),
+      () => actions().reloadBuffer("/b.ts", "disk2", 9),
+      () => actions().setDirty("/b.ts", false),
+    ]) {
+      useEditorStore.setState({ buffers: {} });
+      actions().openBuffer("/a.ts", "disk");
+      actions().moveBuffer("/a.ts", "/b.ts", "edited");
+      settle();
+      expect(useEditorStore.getState().buffers["/b.ts"].draft).toBeUndefined();
+    }
+  });
+});

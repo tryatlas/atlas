@@ -127,6 +127,21 @@ pub async fn fetch_remote_featured_plugin_ids(
     product: Option<Product>,
 ) -> Result<Vec<String>, RemotePluginFetchError> {
     let base_url = config.chatgpt_base_url.trim_end_matches('/');
+    // Atlas: the featured list is ChatGPT's own, and the engine's built-in base
+    // URL points at chatgpt.com, so an unconfigured engine used to GET it on
+    // every start. Atlas never contacts ChatGPT: with no base URL, or one that
+    // names a ChatGPT host, there is nothing to fetch and no request goes out.
+    // A deployment that serves the endpoint itself configures its own host.
+    let targets_chatgpt = Url::parse(base_url)
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(atlas_engine_http_client::is_allowed_chatgpt_host)
+        })
+        .unwrap_or(true);
+    if base_url.is_empty() || targets_chatgpt {
+        return Ok(Vec::new());
+    }
     let mut url = Url::parse(&format!("{base_url}/plugins/featured"))
         .map_err(RemotePluginFetchError::InvalidBaseUrl)?;
     url.query_pairs_mut().append_pair(
@@ -258,4 +273,36 @@ fn remote_plugin_mutation_url(
         segments.push(action);
     }
     Ok(url.to_string())
+}
+
+#[cfg(test)]
+mod featured_fetch_tests {
+    use super::*;
+    use crate::test_support::recorded_http_client_urls;
+    use crate::test_support::recording_remote_plugin_service_config;
+
+    /// Atlas: the featured-plugins list is ChatGPT's. The engine's built-in base URL
+    /// points there, so an unconfigured engine used to GET it on every start.
+    /// Nothing may leave for a ChatGPT host, whatever the base URL says.
+    #[tokio::test]
+    async fn the_featured_fetch_never_contacts_a_chatgpt_host() {
+        for base in [
+            "https://chatgpt.com/backend-api/",
+            "https://chatgpt.com/backend-api",
+            "https://foo.chatgpt.com/backend-api/",
+            "https://chat.openai.com/backend-api/",
+            "",
+        ] {
+            let (config, selected_urls) = recording_remote_plugin_service_config(base.to_string());
+            let ids = fetch_remote_featured_plugin_ids(&config, None, None)
+                .await
+                .unwrap_or_else(|err| panic!("{base:?}: {err}"));
+            assert_eq!(ids, Vec::<String>::new(), "{base:?}");
+            assert_eq!(
+                recorded_http_client_urls(&selected_urls),
+                Vec::<String>::new(),
+                "{base:?} sent a request",
+            );
+        }
+    }
 }

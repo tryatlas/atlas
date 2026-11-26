@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::error::Result;
+use crate::error::{CommsError, Result};
 use crate::wire::{Conversation, ReadState};
 
 /// Where the store lives, given the app's config directory.
@@ -34,6 +34,19 @@ pub struct OrgSnapshot {
 
 pub struct CommsStore {
     conn: Connection,
+    durable: bool,
+}
+
+/// An edit is scoped to the identity that made it, independent of later logins.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SpaceOutboxEntry {
+    pub id: i64,
+    pub account_id: String,
+    pub org_id: String,
+    pub conversation_id: String,
+    pub page_id: String,
+    pub data: Vec<u8>,
 }
 
 impl CommsStore {
@@ -43,7 +56,10 @@ impl CommsStore {
         }
         let conn = Connection::open(path)?;
         Self::migrate(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            durable: true,
+        })
     }
 
     /// An ephemeral store. Used by tests, and the honest fallback if the real
@@ -52,12 +68,16 @@ impl CommsStore {
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         Self::migrate(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            durable: false,
+        })
     }
 
     fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=FULL;
              CREATE TABLE IF NOT EXISTS orgs (
                org_id             TEXT PRIMARY KEY,
                watermark          INTEGER NOT NULL DEFAULT 0,
@@ -65,8 +85,131 @@ impl CommsStore {
                discoverable_json  TEXT,
                reads_json         TEXT,
                updated_at         INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS space_outbox (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               account_id TEXT NOT NULL,
+               org_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               page_id TEXT NOT NULL,
+               data BLOB NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS space_outbox_scope ON space_outbox
+               (account_id, org_id, conversation_id, page_id, id);
+             CREATE TABLE IF NOT EXISTS space_local_snapshot (
+               account_id TEXT NOT NULL, org_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL, page_id TEXT NOT NULL,
+               data BLOB NOT NULL,
+               PRIMARY KEY (account_id, org_id, conversation_id, page_id)
              );",
         )?;
+        Ok(())
+    }
+
+    pub fn is_durable(&self) -> bool {
+        self.durable
+    }
+
+    /// Last full local page state, retained even when server access disappears.
+    /// Acknowledging outbox deltas never deletes this independent recovery copy.
+    pub fn save_space_snapshot(
+        &self,
+        account_id: &str,
+        org_id: &str,
+        conversation_id: &str,
+        page_id: &str,
+        data: &[u8],
+    ) -> Result<()> {
+        if !self.durable {
+            return Err(CommsError::Store(
+                "Space recovery cannot be saved: the local database is unavailable".into(),
+            ));
+        }
+        if [account_id, org_id, conversation_id, page_id]
+            .iter()
+            .any(|s| s.is_empty())
+        {
+            return Err(CommsError::Protocol(
+                "Space snapshot scope must not be empty".into(),
+            ));
+        }
+        self.conn.execute("INSERT INTO space_local_snapshot (account_id, org_id, conversation_id, page_id, data) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(account_id, org_id, conversation_id, page_id) DO UPDATE SET data = excluded.data", params![account_id, org_id, conversation_id, page_id, data])?;
+        Ok(())
+    }
+
+    pub fn load_space_snapshot(
+        &self,
+        account_id: &str,
+        org_id: &str,
+        conversation_id: &str,
+        page_id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(self.conn.query_row("SELECT data FROM space_local_snapshot WHERE account_id = ?1 AND org_id = ?2 AND conversation_id = ?3 AND page_id = ?4", params![account_id, org_id, conversation_id, page_id], |r| r.get(0)).optional()?)
+    }
+
+    /// Returns only after SQLite commits the bytes to the profile's real store.
+    /// An in-memory fallback must never claim to have saved an edit.
+    pub fn enqueue_space_update(
+        &self,
+        account_id: &str,
+        org_id: &str,
+        conversation_id: &str,
+        page_id: &str,
+        data: &[u8],
+    ) -> Result<i64> {
+        if !self.durable {
+            return Err(CommsError::Store(
+                "Space edits cannot be saved: the local database is unavailable".into(),
+            ));
+        }
+        if [account_id, org_id, conversation_id, page_id]
+            .iter()
+            .any(|s| s.is_empty())
+        {
+            return Err(CommsError::Protocol(
+                "Space edit scope must not be empty".into(),
+            ));
+        }
+        self.conn.execute("INSERT INTO space_outbox (account_id, org_id, conversation_id, page_id, data) VALUES (?1, ?2, ?3, ?4, ?5)", params![account_id, org_id, conversation_id, page_id, data])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn load_space_updates(
+        &self,
+        account_id: &str,
+        org_id: &str,
+        conversation_id: &str,
+        page_id: &str,
+    ) -> Result<Vec<SpaceOutboxEntry>> {
+        let mut stmt = self.conn.prepare("SELECT id, account_id, org_id, conversation_id, page_id, data FROM space_outbox WHERE account_id = ?1 AND org_id = ?2 AND conversation_id = ?3 AND page_id = ?4 ORDER BY id")?;
+        let rows = stmt.query_map(params![account_id, org_id, conversation_id, page_id], |r| {
+            Ok(SpaceOutboxEntry {
+                id: r.get(0)?,
+                account_id: r.get(1)?,
+                org_id: r.get(2)?,
+                conversation_id: r.get(3)?,
+                page_id: r.get(4)?,
+                data: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Call only after authoritative server state proves these edits persisted;
+    /// socket enqueue/write is not a persistence acknowledgement.
+    pub fn acknowledge_space_updates(
+        &self,
+        account_id: &str,
+        org_id: &str,
+        conversation_id: &str,
+        page_id: &str,
+        ids: &[i64],
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for id in ids {
+            tx.execute("DELETE FROM space_outbox WHERE id = ?1 AND account_id = ?2 AND org_id = ?3 AND conversation_id = ?4 AND page_id = ?5", params![id, account_id, org_id, conversation_id, page_id])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 

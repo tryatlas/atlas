@@ -74,7 +74,7 @@ export function AgentSignInView({
   dockHidden: boolean;
   onChooseMethod: (method: AuthMethodWire) => void;
   onBackToMethods: () => void;
-  onContinueEnv: () => void;
+  onContinueEnv: (values: { name: string; value: string }[]) => void;
   onRetry: () => void;
   onSignOut: () => void;
   onOpenUrl: (url: string) => void;

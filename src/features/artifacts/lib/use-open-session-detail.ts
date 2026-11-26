@@ -103,6 +103,7 @@ export function useOpenSessionDetail({
   const [detailError, setDetailError] = useState<string | null>(null);
   /** Same, for the detail read. */
   const detailSeq = useRef(0);
+  const opened = useRef<OpenSession | null>(null);
 
   // Opening a Session reads its full timeline; the list row does not carry it.
   // The read goes to the store of the project the row came from, which is not
@@ -162,6 +163,20 @@ export function useOpenSessionDetail({
   );
 
   useEffect(() => {
+    const previous = opened.current;
+    opened.current = open;
+    // Resolving the server Project for a commit arrival enriches its address;
+    // it must not replace the timeline (and its checkpoint target) with a shell.
+    if (
+      open &&
+      previous &&
+      open.sessionId === previous.sessionId &&
+      open.projectPath === previous.projectPath &&
+      (open.remoteProjectId === previous.remoteProjectId || !previous.remoteProjectId)
+    ) {
+      readDetail(false);
+      return;
+    }
     // Whatever is on screen belongs to the row being left.
     shownWhole.current = false;
     setEntriesStreaming(false);
@@ -215,7 +230,9 @@ export function useOpenSessionDetail({
   // older than the live window is not going to grow.
   useEffect(() => {
     if (!open || !loaded || !detail) return;
-    if (sessionState(detail.summary) !== "live") return;
+    const row = boardRowFor(sessions, open);
+    if (!row || (row.updatedAt === detail.summary.updatedAt && sessionState(row) !== "live"))
+      return;
     readDetail(false);
     // `sessions` is the freshest signal that a background refresh landed.
     // oxlint-disable-next-line react-hooks/exhaustive-deps

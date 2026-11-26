@@ -453,6 +453,7 @@ fn affected_kind(kind: EventKind) -> &'static str {
 pub struct SessionMeta {
     pub cwd: String,
     pub agent: String,
+    route: Arc<()>,
 }
 
 // ── Store ────────────────────────────────────────────────────────────────────
@@ -543,8 +544,19 @@ impl SharedMemoryStore {
             SessionMeta {
                 cwd: cwd.to_string(),
                 agent: agent.to_string(),
+                route: Arc::new(()),
             },
         );
+    }
+
+    pub fn unregister_session(&self, session_id: &str, captured: &SessionMeta) {
+        let mut sessions = self.inner.sessions.lock();
+        if sessions
+            .get(session_id)
+            .is_some_and(|current| Arc::ptr_eq(&current.route, &captured.route))
+        {
+            sessions.remove(session_id);
+        }
     }
 
     pub fn session_meta(&self, session_id: &str) -> Option<SessionMeta> {
@@ -633,6 +645,7 @@ impl SharedMemoryStore {
                     SessionMeta {
                         cwd: cwd.to_string(),
                         agent: agent.to_string(),
+                        route: Arc::new(()),
                     },
                 );
             }
@@ -827,13 +840,15 @@ fn citations_for(
                 .filter_map(|w| abs.strip_prefix(w).ok().map(|rel| (w, rel)))
                 .min_by_key(|(_, rel)| rel.components().count())
                 .ok_or_else(|| format!("`{}` is outside the repository", ev.path))?;
-            atlas_memory::citation::cite(
+            let mut citation = atlas_memory::citation::cite(
                 &atlas_memory::citation::FileResolver::new(tree.as_path()),
                 &rel.to_string_lossy().replace('\\', "/"),
                 a,
                 b,
                 ev.symbol.clone().filter(|s| !s.trim().is_empty()),
-            )
+            )?;
+            citation.worktree_root = Some(tree.to_string_lossy().into_owned());
+            Ok(citation)
         })
         .collect()
 }
@@ -1423,7 +1438,7 @@ impl super::agent_host::SessionLifecycle for SharedMemoryStore {
         SharedMemoryStore::session_started(self, session_id, agent, cwd);
     }
 
-    fn session_ended(&self, session_id: &str) {
+    fn session_ended(&self, session_id: &str, _agent: &str) {
         let _ = SharedMemoryStore::session_ended(self, session_id);
     }
 }

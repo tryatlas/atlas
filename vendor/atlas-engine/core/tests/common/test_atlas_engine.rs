@@ -795,16 +795,11 @@ impl TestAtlasEngineBuilder {
             // `atlas-engine-exec` also supports `--atlas-engine-run-as-apply-patch`, so use it
             // when the multitool binary is not available in test builds.
             config.atlas_engine_self_exe = Some(path);
-        } else if let Ok(exe) = std::env::current_exe()
-            && let Some(bin_dir) = exe.parent().and_then(|parent| parent.parent())
-        {
-            let atlas_engine = bin_dir.join("atlas-agent");
-            let atlas_engine_exec = bin_dir.join("atlas-engine-exec");
-            if atlas_engine.is_file() {
-                config.atlas_engine_self_exe = Some(atlas_engine);
-            } else if atlas_engine_exec.is_file() {
-                config.atlas_engine_self_exe = Some(atlas_engine_exec);
-            }
+        } else {
+            // This support crate installs arg0 dispatch before the test harness starts.
+            // Its test binary can therefore service apply-patch/process helper requests
+            // without depending on a separately built, unshipped CLI.
+            config.atlas_engine_self_exe = Some(std::env::current_exe()?);
         }
 
         let mut mutators = vec![];

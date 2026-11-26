@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 import { Fragment, memo, useEffect, useRef } from "react";
 import {
   AlertCircle,
@@ -329,7 +330,7 @@ export function RenameInput({
       onMouseDown={(e) => e.stopPropagation()}
       onKeyDown={(e) => {
         e.stopPropagation();
-        if (e.key === "Enter") {
+        if (e.key === "Enter" && !isComposingKey(e)) {
           e.preventDefault();
           finish(e.currentTarget.value, true);
         } else if (e.key === "Escape") {

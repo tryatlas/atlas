@@ -1,4 +1,6 @@
 import { create } from "zustand";
+import { registerFlush } from "@/features/projects/lib/flush-registry";
+import { parseCombo } from "../lib/combo";
 import { toast } from "sonner";
 import { ACTION_BY_ID, type ActionId } from "../lib/actions";
 import { loadKeybindings, saveKeybindings } from "../lib/keybindings-api";
@@ -25,6 +27,8 @@ import {
 
 interface KeybindingsState {
   loaded: boolean;
+  writable: boolean;
+  saveError: string | null;
   file: KeybindingsFile;
   path: string | null;
   warnings: string[];
@@ -37,6 +41,7 @@ interface KeybindingsState {
   firstRun: boolean;
   actions: {
     load: () => Promise<void>;
+    retrySave: () => Promise<void>;
     setRecording: (on: boolean) => void;
     setActiveProfile: (id: string) => void;
     createProfile: (name: string) => string;
@@ -112,9 +117,15 @@ export const useKeybindingsStore = create<KeybindingsState>((set, get) => {
   let lastSaved: KeybindingsFile = DEFAULT_KEYBINDINGS_FILE;
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let inFlight: Promise<void> | null = null;
+  let loadGeneration = 0;
+  let editGeneration = 0;
 
   const flush = async (force = false) => {
-    if (inFlight) await inFlight;
+    if (!get().writable) return;
+    if (inFlight) {
+      await inFlight;
+      return flush(force);
+    }
     const file = get().file;
     if (file === lastSaved && !force) return;
     inFlight = (async () => {
@@ -124,12 +135,17 @@ export const useKeybindingsStore = create<KeybindingsState>((set, get) => {
         if (get().firstRun) set({ firstRun: false });
         // Only adopt Rust's normalised copy if nothing changed meanwhile.
         if (get().file === file) {
-          set({ file: normalized, resolved: resolveProfile(activeProfile(normalized)) });
+          set({
+            file: normalized,
+            resolved: resolveProfile(activeProfile(normalized)),
+            saveError: null,
+          });
         }
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         toast.error(`Keybindings not saved: ${message}`);
-        set({ file: lastSaved, resolved: resolveProfile(activeProfile(lastSaved)) });
+        set({ saveError: message });
+        throw e;
       } finally {
         inFlight = null;
       }
@@ -137,12 +153,27 @@ export const useKeybindingsStore = create<KeybindingsState>((set, get) => {
     await inFlight;
   };
 
+  registerFlush(
+    "keybindings",
+    async () => {
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = null;
+      await flush();
+    },
+    { required: true },
+  );
+
   const commit = (file: KeybindingsFile) => {
+    if (!get().writable) {
+      toast.error("Keybindings are read-only until the file is repaired and reloaded.");
+      return;
+    }
+    editGeneration += 1;
     set({ file, resolved: resolveProfile(activeProfile(file)) });
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
       saveTimer = null;
-      void flush();
+      void flush().catch(() => {});
     }, SAVE_DEBOUNCE_MS);
   };
 
@@ -225,6 +256,8 @@ export const useKeybindingsStore = create<KeybindingsState>((set, get) => {
 
   return {
     loaded: false,
+    writable: false,
+    saveError: null,
     file: DEFAULT_KEYBINDINGS_FILE,
     path: null,
     warnings: [],
@@ -233,12 +266,20 @@ export const useKeybindingsStore = create<KeybindingsState>((set, get) => {
     firstRun: false,
     actions: {
       load: async () => {
+        // Focus reloads must not replace edits awaiting a disk acknowledgement.
+        if (inFlight || saveTimer || (get().loaded && get().writable && get().file !== lastSaved))
+          return;
+        const generation = ++loadGeneration;
+        const edits = editGeneration;
         try {
           const result = await loadKeybindings();
+          if (generation !== loadGeneration || edits !== editGeneration) return;
           lastSaved = result.file;
           set({
             loaded: true,
-            firstRun: !result.exists,
+            firstRun: !result.exists && result.writable !== false,
+            writable: result.writable !== false,
+            saveError: null,
             file: result.file,
             path: result.path,
             warnings: result.warnings,
@@ -246,8 +287,19 @@ export const useKeybindingsStore = create<KeybindingsState>((set, get) => {
           });
         } catch (e) {
           const message = e instanceof Error ? e.message : String(e);
-          set({ loaded: true, warnings: [`Could not load keybindings: ${message}`] });
+          if (generation === loadGeneration && edits === editGeneration)
+            set({
+              loaded: true,
+              writable: false,
+              firstRun: false,
+              warnings: [`Could not load keybindings: ${message}`],
+            });
         }
+      },
+      retrySave: () => {
+        if (saveTimer) clearTimeout(saveTimer);
+        saveTimer = null;
+        return flush();
       },
       setRecording: (on) => set({ recording: on }),
       setActiveProfile: (id) => {
@@ -289,6 +341,8 @@ export const useKeybindingsStore = create<KeybindingsState>((set, get) => {
         });
       },
       importProfile: (text) => {
+        if (!get().writable)
+          return { ok: false, error: "Repair and reload keybindings.json before importing." };
         const result = parseProfile(text);
         if (!result.ok) return result;
         const file = get().file;
@@ -304,6 +358,7 @@ export const useKeybindingsStore = create<KeybindingsState>((set, get) => {
         return result;
       },
       completeOnboarding: async (presetId) => {
+        if (!get().writable) return;
         if (presetId) createFromPreset(presetId);
         if (saveTimer) {
           clearTimeout(saveTimer);
@@ -367,13 +422,23 @@ export const useKeybindingsStore = create<KeybindingsState>((set, get) => {
           ),
         });
       },
-      setBinding: (actionId, combos) =>
-        withBinding(actionId, () => (combos.length ? combos : null)),
-      addBinding: (actionId, combo) =>
+      setBinding: (actionId, combos) => {
+        if (combos.some((combo) => !parseCombo(combo))) {
+          toast.error("That shortcut is not supported. The previous binding was kept.");
+          return;
+        }
+        withBinding(actionId, () => (combos.length ? combos : null));
+      },
+      addBinding: (actionId, combo) => {
+        if (!parseCombo(combo)) {
+          toast.error("That shortcut is not supported. The previous binding was kept.");
+          return;
+        }
         withBinding(actionId, (prev, defaults) => {
           const base = prev === undefined ? [...defaults] : (prev ?? []);
           return base.includes(combo) ? base : [...base, combo];
-        }),
+        });
+      },
       removeBinding: (actionId, combo) =>
         withBinding(actionId, (prev, defaults) => {
           if (combo === undefined) return null;
@@ -413,18 +478,8 @@ export const useKeybindingsStore = create<KeybindingsState>((set, get) => {
  *  watcher, so a hand edit to keybindings.json lands without a relaunch. */
 export function watchKeybindingsOnFocus(): () => void {
   const onFocus = () => {
-    const { loaded, file } = useKeybindingsStore.getState();
-    if (!loaded) return;
-    void loadKeybindings()
-      .then((result) => {
-        if (JSON.stringify(result.file) === JSON.stringify(file)) return;
-        useKeybindingsStore.setState({
-          file: result.file,
-          warnings: result.warnings,
-          resolved: resolveProfile(activeProfile(result.file)),
-        });
-      })
-      .catch(() => {});
+    const { loaded, actions } = useKeybindingsStore.getState();
+    if (loaded) void actions.load();
   };
   window.addEventListener("focus", onFocus);
   return () => window.removeEventListener("focus", onFocus);

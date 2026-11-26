@@ -45,6 +45,8 @@ export function navigationTabs(
 /** A project's saved tab/split view — everything needed to restore its
  *  CenterPanel without touching disk. */
 export interface ProjectView {
+  zen?: boolean;
+  zenPrev?: ZenSnapshot | null;
   tabs: Tab[];
   activeTabId: string | null;
   groupOrder: string[];
@@ -59,6 +61,8 @@ interface ZenSnapshot {
   activeByGroup: Record<string, string | null>;
   focusedGroupId: string;
   tabGroups: Record<string, string>;
+  /** Absent in a snapshot saved before zen hid the surfaces pane. */
+  surfaces?: SurfacesMode;
 }
 
 interface LayoutState {
@@ -111,8 +115,8 @@ interface LayoutState {
   activeByGroup: Record<string, string | null>;
   /** The column that owns keyboard focus (tab hotkeys target it). */
   focusedGroupId: string;
-  /** Zen mode: the session beside a browser, with the global side panels
-   *  hidden. `zenPrev` snapshots the layout to restore. */
+  /** Zen mode: the session alone, the surfaces pane hidden with its tabs
+   *  still running. `zenPrev` snapshots the layout to restore. */
   zen: boolean;
   zenPrev: ZenSnapshot | null;
   /** The surfaces pane — every split column after the first, which is the
@@ -178,6 +182,7 @@ interface LayoutActions {
      *  ⌘1–9, and the per-project layout file. */
     moveTab: (id: string, toIndex: number) => void;
     setActiveTab: (id: string) => void;
+    showProjectlessHome: () => void;
     /** Back to the session from a destination; it stays mounted, hidden. */
     hideDestination: () => void;
     /** Open `tab` on the destination screen. A destination-only type is the
@@ -204,8 +209,8 @@ interface LayoutActions {
     /** Close a split column, moving its tabs to the left neighbour (never the
      *  last remaining column). */
     closeGroup: (groupId: string) => void;
-    /** Toggle Zen mode: the session beside a browser with the global side
-     *  panels hidden; toggling again restores the prior layout. */
+    /** Toggle Zen mode: the session alone, the surfaces pane hidden;
+     *  toggling again restores the prior layout. */
     toggleZenMode: () => void;
     /** Apply a predefined layout template to the active project: set panels +
      *  split columns + a tab of each template type per column (reusing existing
@@ -294,7 +299,7 @@ export function groupOf(tab: { groupId?: string } | undefined): string {
 }
 
 /** Return `base` if no tab uses it, else a suffixed variant ("base-2", …).
- *  Lets a singleton type (terminal/browser/settings…) be opened in more than
+ *  Lets a singleton type (terminal/settings…) be opened in more than
  *  one split column: callers may reuse a fixed id (e.g. "terminal"), and two
  *  tabs sharing an id would collide React keys / activeByGroup / closeTab. */
 function uniqueTabId(s: LayoutState, base: string): string {
@@ -428,6 +433,8 @@ function welcomeView(wsId: string): ProjectView {
 /** Snapshot the singular mirror fields into a portable ProjectView. */
 function captureView(s: LayoutState): ProjectView {
   return {
+    zen: s.zen,
+    zenPrev: s.zenPrev,
     tabs: s.tabs.map((t) => ({ ...t })),
     activeTabId: s.activeTabId,
     groupOrder: [...s.groupOrder],
@@ -495,9 +502,15 @@ function buildEditorState(state: LayoutState) {
     groupId: groupOf(t),
   }));
   const terminalTabIds = tabs.filter((t) => t.type === "terminal").map((t) => t.id);
+  // The welcome chat is recreated on open, so it is not among `tabs`; but
+  // its `data` is what names the conversation it shows (`sessionId`), and
+  // without it a restart opens that tab empty.
+  const welcomeSession = baselineChatTab(state.tabs)?.data?.sessionId;
   return {
     version: 3,
     tabs,
+    welcomeChat:
+      typeof welcomeSession === "string" && welcomeSession ? { sessionId: welcomeSession } : null,
     groupOrder: state.groupOrder,
     activeByGroup: state.activeByGroup,
     focusedGroupId: state.focusedGroupId,
@@ -506,8 +519,45 @@ function buildEditorState(state: LayoutState) {
   };
 }
 
+/** The project's non-closable welcome chat tab — the recreated baseline. */
+function baselineChatTab<T extends { type: TabType; closable: boolean }>(tabs: T[]): T | null {
+  return tabs.find((t) => t.type === "chat" && !t.closable) ?? null;
+}
+
+/**
+ * The last `editor-state.json` payload written per project path, recorded
+ * only once the write succeeded. A save whose payload is byte-identical is
+ * skipped; anything else — including a change only to a terminal's split
+ * panes, which no tab-level hash sees — is written. A failed write records
+ * nothing, so the next save retries instead of being skipped as "unchanged".
+ */
+const lastWrittenEditorState = new Map<string, string>();
+const editorStateWriteSeq = new Map<string, number>();
+let editorStateSeq = 0;
+
+async function writeEditorState(projectPath: string): Promise<void> {
+  const data = buildEditorState(useLayoutStore.getState());
+  if (!data) return;
+  const json = JSON.stringify(data);
+  if (lastWrittenEditorState.get(projectPath) === json) return;
+  const seq = ++editorStateSeq;
+  editorStateWriteSeq.set(projectPath, seq);
+  try {
+    await invoke("save_editor_state", { projectPath, stateJson: json });
+    // Only the newest write may vouch for what is on disk; an older one
+    // landing late leaves it unknown, so the next save writes.
+    if (editorStateWriteSeq.get(projectPath) === seq) lastWrittenEditorState.set(projectPath, json);
+    else lastWrittenEditorState.delete(projectPath);
+  } catch (error) {
+    lastWrittenEditorState.delete(projectPath);
+    throw error;
+  }
+}
+
 /** Load a ProjectView into the singular mirror fields. */
 function applyView(s: LayoutState, v: ProjectView): void {
+  s.zen = v.zen ?? false;
+  s.zenPrev = v.zenPrev ?? null;
   s.tabs = v.tabs.map((t) => ({ ...t }));
   s.activeTabId = v.activeTabId;
   s.groupOrder = [...v.groupOrder];
@@ -799,6 +849,12 @@ export const useLayoutStore = create<LayoutState & LayoutActions>()(
           set((s) => {
             if (isDestinationOnly(tab.type) || isDualPlacement(tab.type)) enterDestination(s, tab);
           }),
+        showProjectlessHome: () =>
+          set((s) => {
+            delete s.activeByGroup[s.focusedGroupId];
+            s.activeTabId = null;
+            s.destinationShown = false;
+          }),
         setActiveTab: (id) =>
           set((s) => {
             if (s.destination?.id === id) {
@@ -848,6 +904,7 @@ export const useLayoutStore = create<LayoutState & LayoutActions>()(
         // ⌘1–9 — use the same visible targets as the current tab strip.
         activateTabByIndex: (i, projectless = false) =>
           set((s) => {
+            if (s.destinationShown) return;
             const groupTabs = navigationTabs(s.tabs, s.focusedGroupId, projectless);
             const target = i < 0 ? groupTabs[groupTabs.length - 1] : groupTabs[i];
             if (!target) return;
@@ -858,6 +915,7 @@ export const useLayoutStore = create<LayoutState & LayoutActions>()(
           }),
         cycleTab: (delta, projectless = false) =>
           set((s) => {
+            if (s.destinationShown) return;
             const groupTabs = navigationTabs(s.tabs, s.focusedGroupId, projectless);
             if (groupTabs.length === 0) return;
             const cur = s.activeByGroup[s.focusedGroupId];
@@ -952,13 +1010,15 @@ export const useLayoutStore = create<LayoutState & LayoutActions>()(
               s.activeByGroup = { ...p.activeByGroup };
               s.focusedGroupId = p.focusedGroupId;
               for (const t of s.tabs) t.groupId = p.tabGroups[t.id] ?? s.groupOrder[0];
+              s.surfaces = p.surfaces ?? "shown";
               s.zen = false;
               s.zenPrev = null;
               reconcileGroups(s);
               keepMainForSessions(s);
+              syncActiveMirror(s);
               return;
             }
-            // Enter: snapshot the current layout, then build Session │ Browser.
+            // Enter: snapshot the current layout, then show the session alone.
             const tabGroups: Record<string, string> = {};
             for (const t of s.tabs) tabGroups[t.id] = groupOf(t);
             s.zenPrev = {
@@ -966,30 +1026,13 @@ export const useLayoutStore = create<LayoutState & LayoutActions>()(
               activeByGroup: { ...s.activeByGroup },
               focusedGroupId: s.focusedGroupId,
               tabGroups,
+              surfaces: s.surfaces,
             };
-            const G_CHAT = "zen-chat";
-            const G_BROWSER = "zen-browser";
-            // Reuse the existing singleton tab if present, else create one.
-            const ensure = (type: TabType, title: string, gid: string): string => {
-              const existing = s.tabs.find((x) => x.type === type);
-              if (existing) {
-                existing.groupId = gid;
-                return existing.id;
-              }
-              const id = `${type}-zen`;
-              s.tabs.push({
-                id,
-                type,
-                title,
-                closable: true,
-                dirty: false,
-                data: {},
-                groupId: gid,
-              });
-              return id;
-            };
+            const main = s.groupOrder[0];
             // A chat tab always exists (welcome-chat is the non-closable baseline).
-            let chat = s.tabs.find((x) => x.type === "chat");
+            let chat =
+              s.tabs.find((x) => x.id === s.activeByGroup[main] && x.type === "chat") ??
+              s.tabs.find((x) => x.type === "chat");
             if (!chat) {
               chat = {
                 id: "chat-zen",
@@ -998,19 +1041,17 @@ export const useLayoutStore = create<LayoutState & LayoutActions>()(
                 closable: true,
                 dirty: false,
                 data: {},
-                groupId: G_CHAT,
+                groupId: main,
               };
               s.tabs.push(chat);
             } else {
-              chat.groupId = G_CHAT;
+              chat.groupId = main;
             }
-            const browserId = ensure("browser", "Browser", G_BROWSER);
-            // The agent first: the main column holds the session.
-            s.groupOrder = [G_CHAT, G_BROWSER];
-            s.activeByGroup = { [G_CHAT]: chat.id, [G_BROWSER]: browserId };
-            s.focusedGroupId = G_CHAT;
-            // Team chat, like every tab outside the three, stays where it
-            // was and comes back on exit.
+            s.activeByGroup[main] = chat.id;
+            s.focusedGroupId = main;
+            // Like the one-column Focus template: the tools beside the session
+            // keep running, out of sight, and come back on exit.
+            if (s.groupOrder.length > 1) s.surfaces = "hidden";
             s.zen = true;
             syncActiveMirror(s);
           }),
@@ -1027,7 +1068,10 @@ export const useLayoutStore = create<LayoutState & LayoutActions>()(
             template.columns.forEach((col, i) => {
               const gid = i === 0 ? DEFAULT_GROUP : `tpl-${i}`;
               order.push(gid);
-              const existing = s.tabs.find((t) => t.type === col.type);
+              const existing =
+                s.tabs.find(
+                  (t) => t.type === col.type && Object.values(s.activeByGroup).includes(t.id),
+                ) ?? s.tabs.find((t) => t.type === col.type);
               let id: string;
               if (existing) {
                 existing.groupId = gid;
@@ -1069,6 +1113,13 @@ export const useLayoutStore = create<LayoutState & LayoutActions>()(
           set((s) => {
             const tab = s.tabs.find((t) => t.id === id);
             if (tab) tab.dirty = dirty;
+            // A background project's editor still saves (quit, project close
+            // and org switch save every dirty tab): its committed view must
+            // agree, or switching back revives a stale unsaved mark.
+            for (const view of Object.values(s.viewsByWs)) {
+              const held = view.tabs.find((t) => t.id === id);
+              if (held) held.dirty = dirty;
+            }
           }),
         setTabTitle: (id, title) =>
           set((s) => {
@@ -1084,20 +1135,10 @@ export const useLayoutStore = create<LayoutState & LayoutActions>()(
         // project so the AKB arrangement comes back on reopen. The Rust
         // save/load commands store the JSON opaquely, so the shape is ours.
         saveEditorState: (projectPath) => {
-          const data = buildEditorState(useLayoutStore.getState());
-          if (!data) return;
-          invoke("save_editor_state", {
-            projectPath,
-            stateJson: JSON.stringify(data),
-          }).catch(() => {});
+          writeEditorState(projectPath).catch(() => {});
         },
         flushEditorState: async (projectPath) => {
-          const data = buildEditorState(useLayoutStore.getState());
-          if (!data) return;
-          await invoke("save_editor_state", {
-            projectPath,
-            stateJson: JSON.stringify(data),
-          }).catch(() => {});
+          await writeEditorState(projectPath).catch(() => {});
         },
         commitProjectView: (wsId) =>
           set((s) => {
@@ -1131,7 +1172,18 @@ export const useLayoutStore = create<LayoutState & LayoutActions>()(
               focusedGroupId?: string;
               activeTabId?: string;
               terminalTrees?: Record<string, TerminalTabState>;
+              welcomeChat?: { sessionId?: unknown } | null;
             };
+            // The welcome chat's conversation, unless the live tab already
+            // shows one (a session started before the file loaded wins).
+            const welcomeSession = data.welcomeChat?.sessionId;
+            if (typeof welcomeSession === "string" && welcomeSession) {
+              set((s) => {
+                const welcome = baselineChatTab(s.tabs);
+                if (welcome && !welcome.data?.sessionId)
+                  welcome.data = { ...welcome.data, sessionId: welcomeSession };
+              });
+            }
             if (data.tabs && data.tabs.length > 0) {
               // Pane trees first, so `TerminalPanel`'s `initTab` (a no-op
               // when the tree exists) finds the restored one. Only for tabs

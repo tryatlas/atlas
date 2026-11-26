@@ -1,7 +1,7 @@
 //! Pack projection: an installed pack's components placed into a tool's homes,
 //! recorded in the pack-projection ledger so they can be undone exactly.
 
-use crate::disk::{atomic_write, clear_entry, copy_dir_all, symlink};
+use crate::disk::{atomic_write, clear_entry, copy_tree, replace_entry, symlink};
 use crate::frontmatter::parse_frontmatter;
 use crate::model::{ComponentKind, PackComponent};
 use crate::packs::install::list_installed_packs;
@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 const ATLAS_PACK_TAG: &str = "_atlasPack";
 
 /// One recorded pack-component projection (for precise un-projection).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PackProjEntry {
     pub(crate) kind: ComponentKind,
@@ -152,7 +152,7 @@ fn relative_link_target(link: &Path, dest: &Path) -> Option<PathBuf> {
 }
 
 /// Symlink (or copy-fallback) `src_abs` → `target_abs`. Returns the mode used
-/// (`"symlink"`/`"copy"`). Clears any existing entry first; creates parent dirs.
+/// (`"symlink"`/`"copy"`). Stages the replacement before moving the existing entry.
 fn link_or_copy_into(
     src_abs: &Path,
     target_abs: &Path,
@@ -161,21 +161,26 @@ fn link_or_copy_into(
     if let Some(parent) = target_abs.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    clear_entry(target_abs)?;
-
-    if supports_symlink {
-        let link_target =
-            relative_link_target(target_abs, src_abs).unwrap_or_else(|| src_abs.to_path_buf());
-        if symlink(&link_target, target_abs).is_ok() {
-            return Ok("symlink".to_string());
+    let mut mode = "copy".to_string();
+    replace_entry(target_abs, |staging| {
+        if supports_symlink {
+            let link_target =
+                relative_link_target(target_abs, src_abs).unwrap_or_else(|| src_abs.to_path_buf());
+            // The target is relative to the final location, not staging.
+            if symlink(&link_target, staging).is_ok() {
+                mode = "symlink".to_string();
+                return Ok(());
+            }
         }
-    }
-    if src_abs.is_dir() {
-        copy_dir_all(src_abs, target_abs)?;
-    } else {
-        fs::copy(src_abs, target_abs).map_err(|e| e.to_string())?;
-    }
-    Ok("copy".to_string())
+        if src_abs.is_dir() {
+            copy_tree(src_abs, staging)
+        } else {
+            fs::copy(src_abs, staging)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+    })?;
+    Ok(mode)
 }
 
 /// The `_atlasPack` tag on a hook entry, if any.
@@ -434,59 +439,30 @@ pub(crate) fn project_pack(
     let mut new_entries: Vec<PackProjEntry> = Vec::new();
     let mut report: Vec<PackProjectReport> = Vec::new();
 
-    for comp in &parsed.components {
-        if let Some(filter) = kinds {
-            if !filter.contains(&comp.kind) {
+    let projected = (|| -> Result<(), String> {
+        for comp in &parsed.components {
+            if let Some(filter) = kinds {
+                if !filter.contains(&comp.kind) {
+                    continue;
+                }
+            }
+            let src_abs = store.join(&comp.rel_path);
+
+            // Scripts are placed in the store but never projected.
+            if comp.kind == ComponentKind::Script {
+                report.push(PackProjectReport {
+                    kind: comp.kind,
+                    name: comp.name.clone(),
+                    mode: "skip".to_string(),
+                    status: "skipped".to_string(),
+                });
                 continue;
             }
-        }
-        let src_abs = store.join(&comp.rel_path);
 
-        // Scripts are placed in the store but never projected.
-        if comp.kind == ComponentKind::Script {
-            report.push(PackProjectReport {
-                kind: comp.kind,
-                name: comp.name.clone(),
-                mode: "skip".to_string(),
-                status: "skipped".to_string(),
-            });
-            continue;
-        }
-
-        // Skills use the tool skills dir (not represented in `homes`).
-        if comp.kind == ComponentKind::Skill {
-            let safe_leaf = sanitize_name(&comp.name)?;
-            let target = tool_skills_dir(def, scope, root).join(&safe_leaf);
-            if is_foreign_conflict(root, &target, &safe_pack, tool_id, &proj, force) {
-                report.push(conflict_report(comp));
-                continue;
-            }
-            let mode = link_or_copy_into(&src_abs, &target, def.supports_symlink)?;
-            new_entries.push(PackProjEntry {
-                kind: comp.kind,
-                rel_path: comp.rel_path.clone(),
-                leaf: safe_leaf,
-                mode: mode.clone(),
-                target_rel: rel_to_root(root, &target),
-            });
-            report.push(projected_report(comp, &mode));
-            continue;
-        }
-
-        // Everything else routes through the tool home for its kind/scope.
-        let Some(home) = tool_home(def, comp.kind, scope) else {
-            report.push(PackProjectReport {
-                kind: comp.kind,
-                name: comp.name.clone(),
-                mode: "unsupported".to_string(),
-                status: "skipped".to_string(),
-            });
-            continue;
-        };
-        match home.style {
-            HomeStyle::Dir => {
-                let leaf = comp_leaf(&comp.rel_path, &comp.name);
-                let target = root.join(home.rel).join(&leaf);
+            // Skills use the tool skills dir (not represented in `homes`).
+            if comp.kind == ComponentKind::Skill {
+                let safe_leaf = sanitize_name(&comp.name)?;
+                let target = tool_skills_dir(def, scope, root).join(&safe_leaf);
                 if is_foreign_conflict(root, &target, &safe_pack, tool_id, &proj, force) {
                     report.push(conflict_report(comp));
                     continue;
@@ -495,55 +471,126 @@ pub(crate) fn project_pack(
                 new_entries.push(PackProjEntry {
                     kind: comp.kind,
                     rel_path: comp.rel_path.clone(),
-                    leaf,
+                    leaf: safe_leaf,
                     mode: mode.clone(),
                     target_rel: rel_to_root(root, &target),
                 });
                 report.push(projected_report(comp, &mode));
+                continue;
             }
-            HomeStyle::SettingsMerge => {
-                let target = root.join(home.rel);
-                merge_hooks_into_settings(&target, &src_abs, &safe_pack, &store)?;
-                new_entries.push(PackProjEntry {
+
+            // Everything else routes through the tool home for its kind/scope.
+            let Some(home) = tool_home(def, comp.kind, scope) else {
+                report.push(PackProjectReport {
                     kind: comp.kind,
-                    rel_path: comp.rel_path.clone(),
-                    leaf: comp.name.clone(),
-                    mode: "settings-merge".to_string(),
-                    target_rel: home.rel.to_string(),
+                    name: comp.name.clone(),
+                    mode: "unsupported".to_string(),
+                    status: "skipped".to_string(),
                 });
-                report.push(projected_report(comp, "settings-merge"));
-            }
-            HomeStyle::AppendFile => {
-                let target = root.join(home.rel);
-                let content = fs::read_to_string(&src_abs).map_err(|e| e.to_string())?;
-                let rule = sanitize_name(&comp.name)?;
-                append_rule_block(&target, &safe_pack, &rule, &content)?;
-                new_entries.push(PackProjEntry {
-                    kind: comp.kind,
-                    rel_path: comp.rel_path.clone(),
-                    leaf: rule,
-                    mode: "append".to_string(),
-                    target_rel: home.rel.to_string(),
-                });
-                report.push(projected_report(comp, "append"));
+                continue;
+            };
+            match home.style {
+                HomeStyle::Dir => {
+                    let leaf = comp_leaf(&comp.rel_path, &comp.name);
+                    let target = root.join(home.rel).join(&leaf);
+                    if is_foreign_conflict(root, &target, &safe_pack, tool_id, &proj, force) {
+                        report.push(conflict_report(comp));
+                        continue;
+                    }
+                    let mode = link_or_copy_into(&src_abs, &target, def.supports_symlink)?;
+                    new_entries.push(PackProjEntry {
+                        kind: comp.kind,
+                        rel_path: comp.rel_path.clone(),
+                        leaf,
+                        mode: mode.clone(),
+                        target_rel: rel_to_root(root, &target),
+                    });
+                    report.push(projected_report(comp, &mode));
+                }
+                HomeStyle::SettingsMerge => {
+                    let target = root.join(home.rel);
+                    merge_hooks_into_settings(&target, &src_abs, &safe_pack, &store)?;
+                    new_entries.push(PackProjEntry {
+                        kind: comp.kind,
+                        rel_path: comp.rel_path.clone(),
+                        leaf: comp.name.clone(),
+                        mode: "settings-merge".to_string(),
+                        target_rel: home.rel.to_string(),
+                    });
+                    report.push(projected_report(comp, "settings-merge"));
+                }
+                HomeStyle::AppendFile => {
+                    let target = root.join(home.rel);
+                    let content = fs::read_to_string(&src_abs).map_err(|e| e.to_string())?;
+                    let rule = sanitize_name(&comp.name)?;
+                    append_rule_block(&target, &safe_pack, &rule, &content)?;
+                    new_entries.push(PackProjEntry {
+                        kind: comp.kind,
+                        rel_path: comp.rel_path.clone(),
+                        leaf: rule,
+                        mode: "append".to_string(),
+                        target_rel: home.rel.to_string(),
+                    });
+                    report.push(projected_report(comp, "append"));
+                }
             }
         }
-    }
 
-    // Merge into the ledger: keep prior entries for kinds we didn't touch this
-    // run (so a kind-filtered project doesn't orphan other kinds' records).
+        Ok(())
+    })();
+
     let tool_entries = proj
         .projections
-        .entry(safe_pack)
+        .entry(safe_pack.clone())
         .or_default()
         .entry(tool_id.to_string())
         .or_default();
-    match kinds {
-        Some(filter) => tool_entries.retain(|e| !filter.contains(&e.kind)),
-        None => tool_entries.clear(),
+    // Replace only successful components. Conflicts and a later failure must
+    // not orphan previous or newly created projections.
+    for entry in &new_entries {
+        tool_entries.retain(|old| old != entry);
     }
-    tool_entries.extend(new_entries);
+    tool_entries.extend(new_entries.iter().cloned());
     write_pack_proj(root, &proj)?;
+    projected?;
+
+    let stale = proj
+        .projections
+        .get(&safe_pack)
+        .and_then(|p| p.get(tool_id))
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|old| {
+            kinds.is_none_or(|filter| filter.contains(&old.kind))
+                && (!parsed
+                    .components
+                    .iter()
+                    .any(|comp| comp.kind == old.kind && comp.rel_path == old.rel_path)
+                    || (!new_entries.contains(old)
+                        && new_entries
+                            .iter()
+                            .any(|new| new.kind == old.kind && new.rel_path == old.rel_path)))
+        })
+        .collect::<Vec<_>>();
+    for old in stale {
+        // A renamed component can replace the same target. Removing it would
+        // delete the successful replacement (or all newly merged pack hooks).
+        let shared_replacement = new_entries.iter().any(|new| {
+            new.target_rel == old.target_rel && (old.mode != "append" || new.leaf == old.leaf)
+        });
+        if !shared_replacement {
+            unproject_entry(root, tool_id, &safe_pack, &old)?;
+        }
+        if let Some(entries) = proj
+            .projections
+            .get_mut(&safe_pack)
+            .and_then(|p| p.get_mut(tool_id))
+        {
+            entries.retain(|entry| entry != &old);
+        }
+        write_pack_proj(root, &proj)?;
+    }
 
     Ok(report)
 }
@@ -566,6 +613,72 @@ fn conflict_report(comp: &PackComponent) -> PackProjectReport {
     }
 }
 
+/// The destination `entry` may act on, or `None` when the ledger names a path
+/// projection could never have written.
+///
+/// The ledger is a plain file inside the root, so it is untrusted: a forged
+/// `targetRel` (`../victim`, an absolute path) must not choose what gets
+/// deleted. Instead the destination is recomputed from the tool registry for
+/// the entry's kind, mode and leaf, and accepted only when it is exactly the
+/// path that `project_pack` records. The match is lexical on purpose: a
+/// symlinked tool dir (`.claude -> ~/dotfiles/claude`) and a relocated global
+/// skills dir (`env_override`, an absolute path) are the user's own layout and
+/// stay valid, while the leaf — the only part un-projection removes — must be
+/// a single plain path component.
+fn trusted_target(root: &Path, tool_id: &str, entry: &PackProjEntry) -> Option<PathBuf> {
+    let def = tool_def(tool_id)?;
+    let single_component = |leaf: &str| {
+        let mut comps = Path::new(leaf).components();
+        matches!(comps.next(), Some(std::path::Component::Normal(_)))
+            && comps.next().is_none()
+            && !leaf.contains(['/', '\\'])
+    };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for scope in ["global", "project"] {
+        if entry.kind == ComponentKind::Skill {
+            if matches!(entry.mode.as_str(), "symlink" | "copy")
+                && sanitize_name(&entry.leaf).is_ok_and(|safe| safe == entry.leaf)
+            {
+                candidates.push(tool_skills_dir(def, scope, root).join(&entry.leaf));
+            }
+            continue;
+        }
+        let Some(home) = tool_home(def, entry.kind, scope) else {
+            continue;
+        };
+        match (home.style, entry.mode.as_str()) {
+            (HomeStyle::Dir, "symlink" | "copy") if single_component(&entry.leaf) => {
+                candidates.push(root.join(home.rel).join(&entry.leaf));
+            }
+            (HomeStyle::SettingsMerge, "settings-merge") | (HomeStyle::AppendFile, "append") => {
+                candidates.push(root.join(home.rel));
+            }
+            _ => {}
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| rel_to_root(root, candidate) == entry.target_rel)
+}
+
+fn unproject_entry(
+    root: &Path,
+    tool_id: &str,
+    pack: &str,
+    entry: &PackProjEntry,
+) -> Result<(), String> {
+    // An entry no projection could have produced is dropped from the ledger
+    // without touching the disk.
+    let Some(target) = trusted_target(root, tool_id, entry) else {
+        return Ok(());
+    };
+    match entry.mode.as_str() {
+        "settings-merge" => remove_pack_hooks_from_settings(&target, pack),
+        "append" => remove_rule_block(&target, pack, &entry.leaf),
+        _ => clear_entry(&target),
+    }
+}
+
 /// Undo every recorded projection for `(pack, tool)` and drop the ledger subtree.
 pub(crate) fn unproject_pack(root: &Path, pack: &str, tool_id: &str) -> Result<(), String> {
     let safe_pack = sanitize_name(pack)?;
@@ -578,14 +691,15 @@ pub(crate) fn unproject_pack(root: &Path, pack: &str, tool_id: &str) -> Result<(
         .unwrap_or_default();
 
     for e in &entries {
-        let target = root.join(&e.target_rel);
-        match e.mode.as_str() {
-            "settings-merge" => remove_pack_hooks_from_settings(&target, &safe_pack)?,
-            "append" => remove_rule_block(&target, &safe_pack, &e.leaf)?,
-            _ => {
-                let _ = clear_entry(&target);
-            }
+        unproject_entry(root, tool_id, &safe_pack, e)?;
+        if let Some(recorded) = proj
+            .projections
+            .get_mut(&safe_pack)
+            .and_then(|tools| tools.get_mut(tool_id))
+        {
+            recorded.retain(|entry| entry != e);
         }
+        write_pack_proj(root, &proj)?;
     }
 
     if let Some(tools) = proj.projections.get_mut(&safe_pack) {
@@ -724,6 +838,60 @@ mod tests {
     use crate::test_support::{
         installed_root, make_full_src_pack, tmp_pack_dir, tmp_root, write_file,
     };
+
+    #[test]
+    fn a_pack_update_removes_components_that_disappeared() {
+        let src = make_full_src_pack();
+        let root = installed_root(&src);
+        project_pack(&root, "global", "demo-pack", "claude-code", None, false).unwrap();
+        let store = pack_store_dir(&root, "demo-pack").unwrap();
+        fs::remove_file(store.join("agents/rev.md")).unwrap();
+        project_pack(&root, "global", "demo-pack", "claude-code", None, false).unwrap();
+        assert!(root
+            .join(".claude/agents/rev.md")
+            .symlink_metadata()
+            .is_err());
+        assert!(
+            !read_pack_proj(&root).projections["demo-pack"]["claude-code"]
+                .iter()
+                .any(|entry| entry.rel_path == "agents/rev.md")
+        );
+        assert!(root.join(".claude/skills/foo/SKILL.md").exists());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(src).unwrap();
+    }
+
+    #[test]
+    fn a_mid_projection_error_keeps_completed_components_in_the_ledger() {
+        let src = make_full_src_pack();
+        let root = installed_root(&src);
+        // Agents and skills precede hooks. A malformed existing settings file
+        // causes a later merge to fail after those projections were written.
+        write_file(&root.join(".claude/settings.json"), "{ invalid json");
+        assert!(project_pack(&root, "global", "demo-pack", "claude-code", None, false).is_err());
+        let ledger = read_pack_proj(&root);
+        let entries = &ledger.projections["demo-pack"]["claude-code"];
+        assert!(!entries.is_empty());
+        assert!(entries
+            .iter()
+            .any(|entry| entry.kind == ComponentKind::Agent));
+        for entry in entries {
+            assert!(root.join(&entry.target_rel).symlink_metadata().is_ok());
+        }
+        // The failed hook merge was never recorded, so cleanup can remove the
+        // successful projections without trying to parse the malformed file.
+        unproject_pack(&root, "demo-pack", "claude-code").unwrap();
+        assert!(root
+            .join(".claude/agents/rev.md")
+            .symlink_metadata()
+            .is_err());
+        assert_eq!(
+            fs::read_to_string(root.join(".claude/settings.json")).unwrap(),
+            "{ invalid json"
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(src).unwrap();
+    }
 
     #[test]
     fn pack_project_claude_links_agent_and_skill_and_records_ledger() {

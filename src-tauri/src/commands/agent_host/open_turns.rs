@@ -47,9 +47,6 @@ pub(crate) struct OpenTurns {
     entries: Arc<Mutex<HashMap<ThreadId, OpenTurn>>>,
     write: Arc<Mutex<()>>,
     frozen: AtomicBool,
-    /// Continuations the launch sweep is about to start, by thread: the turn
-    /// they open is written in with this count rather than 0.
-    pending: Mutex<HashMap<ThreadId, u32>>,
 }
 
 impl OpenTurns {
@@ -78,17 +75,11 @@ impl OpenTurns {
         taken.into_iter().collect()
     }
 
-    /// The next turn in `thread` is a continuation, the `count`th in a row.
-    pub(crate) fn expect_continuation(&self, thread: ThreadId, count: u32) {
-        lock(&self.pending).insert(thread, count);
-    }
-
     /// A turn started in `thread`.
-    pub(crate) fn begin(&self, thread: ThreadId) {
+    pub(crate) fn begin(&self, thread: ThreadId, continuations: u32) {
         if self.frozen.load(Ordering::SeqCst) {
             return;
         }
-        let continuations = lock(&self.pending).remove(&thread).unwrap_or(0);
         lock(&self.entries).insert(
             thread,
             OpenTurn {
@@ -171,8 +162,8 @@ mod tests {
         let (a, b) = (ThreadId::new(), ThreadId::new());
 
         let turns = OpenTurns::load(path.clone());
-        turns.begin(a);
-        turns.begin(b);
+        turns.begin(a, 0);
+        turns.begin(b, 0);
         wait_for(&path, 2);
         turns.end(b);
         wait_for(&path, 1);
@@ -222,12 +213,17 @@ mod tests {
         let path = dir.path().join("open-turns.json");
         let thread = ThreadId::new();
         let turns = OpenTurns::load(path.clone());
-        turns.expect_continuation(thread, 2);
-        turns.begin(thread);
-        assert_eq!(wait_for(&path, 1)[&thread].continuations, 2);
+        turns.begin(thread, 0);
+        wait_until(&path, |map| {
+            map.get(&thread).is_some_and(|t| t.continuations == 0)
+        });
+        turns.begin(thread, 2);
+        wait_until(&path, |map| {
+            map.get(&thread).is_some_and(|t| t.continuations == 2)
+        });
         // The next turn there is the user's own again.
         turns.end(thread);
-        turns.begin(thread);
+        turns.begin(thread, 0);
         wait_until(&path, |map| {
             map.get(&thread).is_some_and(|t| t.continuations == 0)
         });

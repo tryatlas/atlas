@@ -109,6 +109,23 @@ pub fn run_spans(chunks: &[AssistantMessageChunk]) -> Vec<RunSpan> {
     spans
 }
 
+/// The chunks of an assistant entry that are the agent's own prose.
+///
+/// A subagent's narration, forwarded on the parent session because Atlas
+/// declares `subagent-transcript`, is attributed to its launch by the thread
+/// and kept out of the parent's transcript: rendered there it read as the
+/// parent speaking (audit #96). The wire has no place to nest it under the
+/// subagent's row yet, so it projects as nothing — the same thing the
+/// transcript showed before the capability was declared — and the child's
+/// progress and report still reach the row through its tool calls.
+pub fn prose_chunks(message: &atlas_acp_thread::AssistantMessage) -> &[AssistantMessageChunk] {
+    if message.parent_tool_call_id.is_some() {
+        &[]
+    } else {
+        &message.chunks
+    }
+}
+
 /// The byte length of a span's text, without building it.
 pub fn run_span_len(chunks: &[AssistantMessageChunk], span: &RunSpan) -> usize {
     chunks[span.start..span.end]
@@ -163,7 +180,7 @@ pub fn runs(chunks: &[AssistantMessageChunk]) -> Vec<Run> {
 ///
 /// A resource link contributes its URI rather than nothing: the agent referred
 /// to a file, and dropping the reference would make the transcript read as
-/// though it never did. Images have no text and contribute none.
+/// though it never did. Images have no text and contribute a placeholder.
 /// A user message's prose and its images, from the raw chunks.
 ///
 /// Not from `UserMessage::content`: that merges every chunk into one block, and
@@ -201,7 +218,9 @@ pub fn block_str(block: &ContentBlock) -> &str {
         ContentBlock::Text(text) => text,
         ContentBlock::EmbeddedResource { text, .. } => text,
         ContentBlock::ResourceLink { resource_link } => &resource_link.uri,
-        ContentBlock::Image { .. } => "",
+        // A labelled placeholder, not nothing: an image-only reply or tool
+        // result otherwise vanished from the transcript (audit #19).
+        ContentBlock::Image { .. } => atlas_acp_thread::IMAGE_PLACEHOLDER,
     }
 }
 
@@ -725,7 +744,7 @@ pub fn snapshot_messages(
             AgentThreadEntry::AssistantMessage(message) => {
                 // `run_ix` counts over the UNFILTERED list, so skipping an
                 // empty run does not shift the ids of the ones after it.
-                for (run_ix, run) in runs(&message.chunks).iter().enumerate() {
+                for (run_ix, run) in runs(prose_chunks(message)).iter().enumerate() {
                     if run.text.is_empty() {
                         continue;
                     }
@@ -1122,6 +1141,7 @@ mod turn_timing_tests {
             stop_reason: acp::StopReason::EndTurn,
             entries,
             worked_ms: Some(worked_ms),
+            turn_seq: 0,
         }
     }
 

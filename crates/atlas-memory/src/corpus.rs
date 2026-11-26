@@ -48,6 +48,15 @@ pub struct CorpusIndex {
     /// The database was damaged and replaced by an empty one on open (taken
     /// by the next health pass).
     pub recreated: bool,
+    _fallback: Option<PrivateDirectory>,
+}
+
+struct PrivateDirectory(PathBuf);
+
+impl Drop for PrivateDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// A doc's usearch key: from its id, so a doc keeps its key across edits.
@@ -99,6 +108,40 @@ fn open_db(dir: &Path) -> Result<Connection> {
 }
 
 impl CorpusIndex {
+    /// Never reuse a shared temp corpus, even for two failing opens of the same
+    /// project. Exclusive directory creation also rejects pre-planted links.
+    pub fn open_fallback() -> Result<Self> {
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        for _ in 0..64 {
+            let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "atlas-corpus-{}-{nanos}-{serial}",
+                std::process::id()
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&dir) {
+                Ok(()) => {
+                    let owned = PrivateDirectory(dir);
+                    let mut corpus = Self::open(&owned.0)?;
+                    corpus._fallback = Some(owned);
+                    return Ok(corpus);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        anyhow::bail!("could not allocate a private corpus directory")
+    }
+
     /// Open (creating if needed) the corpus index in `dir`, and heal its
     /// vector file from the cache. A damaged database is kept as
     /// `corpus.sqlite.corrupt-<ms>` and replaced by an empty one: the corpus
@@ -149,6 +192,7 @@ impl CorpusIndex {
             dims,
             vectors,
             recreated,
+            _fallback: None,
         };
         me.heal()?;
         Ok(me)
@@ -590,6 +634,19 @@ mod tests {
         let plan = idx.plan(&docs).unwrap();
         let fresh = HashMap::from([("note:a".to_string(), v)]);
         idx.apply(&plan, &docs, &fresh).unwrap();
+    }
+
+    #[test]
+    fn fallback_indexes_never_share_documents_and_are_removed_on_drop() {
+        let mut first = CorpusIndex::open_fallback().unwrap();
+        let second = CorpusIndex::open_fallback().unwrap();
+        assert_ne!(first.dir, second.dir);
+        index(&mut first, "only-first", unit(0));
+        assert!(first.doc("note:a").is_some());
+        assert!(second.doc("note:a").is_none());
+        let dir = first.dir.clone();
+        drop(first);
+        assert!(!dir.exists(), "private fallback must be cleaned up");
     }
 
     /// An edit committed to the database whose vector file save never

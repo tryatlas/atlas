@@ -13,4 +13,12 @@ export type QueuedPrompt = {
 /**
  * Stable for the item's life in the queue; what remove / send-now name.
  */
-id: string, text: string, origin: Origin, };
+id: string, text: string, origin: Origin, 
+/**
+ * `text` is only the head of the prompt: a `queue_changed` delta carries
+ * every queued item on every change, so a long one travels cut. The
+ * whole of it is in a session snapshot, which is where a reader that
+ * needs it (an edit, a hand-over to another session) gets it. `Some(true)`
+ * or omitted: a whole text says nothing.
+ */
+truncated?: boolean, };

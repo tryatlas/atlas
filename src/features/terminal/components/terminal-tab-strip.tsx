@@ -26,7 +26,7 @@ import { HintGroup, HintItem, IconButton } from "@tryatlas/design";
  *
  * Nothing in it animates — no slide, no fade, no colour transition — except
  * the running ring. Tabs
- * reorder by dragging one onto another (native drag and drop): the order
+ * reorder by dragging one onto another (captured pointer events): the order
  * changes on drop, in one step.
  *
  * It replaced a 220px side list (directory, branch, command, age per row),
@@ -59,8 +59,14 @@ export function TerminalTabStrip({
   } = useTerminalStore((s) => s.actions);
   // The tab being dragged; a drop on another tab moves it to that slot.
   const dragged = useRef<string | null>(null);
+  const pointer = useRef<{ id: number; x: number; y: number; moved: boolean } | null>(null);
+  const skipClick = useRef(false);
 
-  const select = (ptyId: string) => {
+  const select = (ptyId: string, keyboard = false) => {
+    if (!keyboard && skipClick.current) {
+      skipClick.current = false;
+      return;
+    }
     setActiveTerminalInPane(tabId, pane.id, ptyId);
     setActivePane(tabId, pane.id);
   };
@@ -90,6 +96,43 @@ export function TerminalTabStrip({
         style={mask ? { maskImage: mask, WebkitMaskImage: mask } : undefined}
         role="tablist"
         aria-label="Terminals"
+        onPointerDown={(event) => {
+          if (event.button !== 0 || (event.target as Element).closest("button")) return;
+          const item = (event.target as Element).closest<HTMLElement>("[data-terminal-id]");
+          if (!item) return;
+          dragged.current = item.dataset.terminalId ?? null;
+          pointer.current = {
+            id: event.pointerId,
+            x: event.clientX,
+            y: event.clientY,
+            moved: false,
+          };
+          skipClick.current = false;
+          item.setPointerCapture(event.pointerId);
+        }}
+        onPointerMove={(event) => {
+          const start = pointer.current;
+          if (!start || event.pointerId !== start.id) return;
+          if (Math.hypot(event.clientX - start.x, event.clientY - start.y) > 4) start.moved = true;
+        }}
+        onPointerUp={(event) => {
+          const start = pointer.current;
+          if (!start || event.pointerId !== start.id) return;
+          pointer.current = null;
+          if (start.moved) {
+            const target = document
+              .elementFromPoint(event.clientX, event.clientY)
+              ?.closest<HTMLElement>("[data-terminal-id]");
+            if (target && event.currentTarget.contains(target) && target.dataset.terminalId)
+              dropOn(target.dataset.terminalId);
+            skipClick.current = true;
+          }
+          dragged.current = null;
+        }}
+        onPointerCancel={() => {
+          pointer.current = null;
+          dragged.current = null;
+        }}
         // Sideways scroll for a long strip; a vertical wheel scrolls it too.
         onWheel={(e) => {
           if (e.deltaY !== 0 && e.currentTarget.scrollWidth > e.currentTarget.clientWidth) {
@@ -105,12 +148,8 @@ export function TerminalTabStrip({
             position={index + 1}
             active={ptyId === pane.activeTerminalId}
             closable={pane.terminals.length > 1}
-            onSelect={() => select(ptyId)}
+            onSelect={(keyboard) => select(ptyId, keyboard)}
             onClose={() => closeTerminalInPane(tabId, pane.id, ptyId)}
-            onDragStart={() => {
-              dragged.current = ptyId;
-            }}
-            onDrop={() => dropOn(ptyId)}
           />
         ))}
       </div>
@@ -219,18 +258,14 @@ function TerminalTab({
   closable,
   onSelect,
   onClose,
-  onDragStart,
-  onDrop,
 }: {
   ptyId: string;
   /** 1-based, in strip order. */
   position: number;
   active: boolean;
   closable: boolean;
-  onSelect: () => void;
+  onSelect: (keyboard?: boolean) => void;
   onClose: () => void;
-  onDragStart: () => void;
-  onDrop: () => void;
 }) {
   const session = useSession(ptyId);
   const summary = useSummary(session);
@@ -254,21 +289,14 @@ function TerminalTab({
         aria-selected={active}
         aria-label={`Terminal ${position}, ${where}, ${status}`}
         title={`${where}\n${status}`}
-        draggable
-        onDragStart={(e) => {
-          e.dataTransfer.effectAllowed = "move";
-          onDragStart();
+        data-terminal-id={ptyId}
+        onClick={(event) => {
+          if (event.button === 0) onSelect();
         }}
-        onDragOver={(e) => e.preventDefault()}
-        onDrop={(e) => {
-          e.preventDefault();
-          onDrop();
-        }}
-        onClick={onSelect}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
-            onSelect();
+            onSelect(true);
           }
         }}
         // Middle-click must not paste the primary selection on Linux, nor
@@ -276,7 +304,7 @@ function TerminalTab({
         onMouseDown={(e) => {
           if (e.button === 1) e.preventDefault();
         }}
-        onAuxClick={(e) => {
+        onMouseUp={(e) => {
           if (e.button === 1 && closable) {
             e.preventDefault();
             onClose();

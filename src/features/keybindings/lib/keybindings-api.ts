@@ -10,6 +10,8 @@ export interface KeybindingsLoadResult {
   /** False until the file has been written once — the first-run signal. */
   exists: boolean;
   warnings: string[];
+  /** Existing unreadable files use defaults for dispatch only. */
+  writable?: boolean;
 }
 
 export function loadKeybindings(): Promise<KeybindingsLoadResult> {

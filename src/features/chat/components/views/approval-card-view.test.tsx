@@ -96,3 +96,43 @@ describe("question card keys", () => {
     expect(onSubmit).toHaveBeenCalledWith([{ selected: ["Nothing"], custom: "" }]);
   });
 });
+
+it("does not submit an unanswered text field or an IME confirmation", () => {
+  const onSubmit = vi.fn();
+  render(<ApprovalCardView questions={[QUESTIONS[0]]} onSubmit={onSubmit} />);
+  const field = screen.getByRole("textbox");
+  field.focus();
+  key("Enter", field);
+  expect(onSubmit).not.toHaveBeenCalled();
+  fireEvent.change(field, { target: { value: "candidate" } });
+  fireEvent.keyDown(field, { key: "Enter", keyCode: 229 });
+  expect(onSubmit).not.toHaveBeenCalled();
+  key("Enter", field);
+  expect(onSubmit).toHaveBeenCalledTimes(1);
+});
+it("ignores keys in another editor and in an inert card", () => {
+  const onSubmit = vi.fn();
+  const view = render(
+    <>
+      <input aria-label="other search" />
+      <div inert>
+        <ApprovalCardView questions={[QUESTIONS[0]]} onSubmit={onSubmit} />
+      </div>
+    </>,
+  );
+  const search = screen.getByLabelText("other search");
+  search.focus();
+  key("1", search);
+  key("Enter", search);
+  expect(onSubmit).not.toHaveBeenCalled();
+  view.rerender(
+    <>
+      <input aria-label="other search" />
+      <ApprovalCardView questions={[QUESTIONS[0]]} onSubmit={onSubmit} />
+    </>,
+  );
+  search.focus();
+  key("1", search);
+  key("Enter", search);
+  expect(onSubmit).not.toHaveBeenCalled();
+});

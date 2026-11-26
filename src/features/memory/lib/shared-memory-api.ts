@@ -255,8 +255,8 @@ export const sharedMemory = {
     invoke<ClaudeImportPreview>("memory_claude_import_preview", { projectPath }),
   /** Import the previewed lines in `ids` (source `import:claude`, confidence 0.7).
    *  Returns how many were written. */
-  confirmClaudeImport: (projectPath: string, ids: string[]) =>
-    invoke<number>("memory_claude_import_confirm", { projectPath, ids }),
+  confirmClaudeImport: (projectPath: string, ids: string[], offeredIds: string[]) =>
+    invoke<number>("memory_claude_import_confirm", { projectPath, ids, offeredIds }),
   appendEvent: (
     projectPath: string,
     agent: string,

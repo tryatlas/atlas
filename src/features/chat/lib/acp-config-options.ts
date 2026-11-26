@@ -99,6 +99,8 @@ function booleanOf(o: Record<string, unknown>): { value: boolean } | null {
 export function parseConfigOptions(raw: unknown): AcpConfigOption[] {
   if (!Array.isArray(raw)) return [];
   const out: AcpConfigOption[] = [];
+  // The categories whose pill has already claimed its select.
+  const claimed = new Set<string>();
   for (const item of raw) {
     if (!item || typeof item !== "object") continue;
     const o = item as Record<string, unknown>;
@@ -110,8 +112,18 @@ export function parseConfigOptions(raw: unknown): AcpConfigOption[] {
     // model- or mode-category knob of any other kind belongs to nobody —
     // skipping it here would make it invisible AND unsettable, which is the
     // very failure this filter caused for model selection.
+    //
+    // And each pill holds ONE select: the first of its category, the one
+    // {@link modeSelectOf} / {@link modelSelectOf} (and the backend's
+    // `mode_select_of` / `model_select_of`) read. An agent that offers a
+    // second (a "small model" beside the main one) gets that one here, as a
+    // knob of its own, set by its own option id — hiding it too left it on no
+    // control at all (#42).
     const category = str(o.category);
-    if (category && OWNED_ELSEWHERE.has(category) && selectOf(o)) continue;
+    if (category && OWNED_ELSEWHERE.has(category) && selectOf(o) && !claimed.has(category)) {
+      claimed.add(category);
+      continue;
+    }
     const description = str(o.description);
 
     const boolean = booleanOf(o);
@@ -153,8 +165,13 @@ export function parseConfigOptions(raw: unknown): AcpConfigOption[] {
  *  `session/set_mode`, or the mode a plan approval selected — it answers with
  *  a `config_option_update` whose `mode` select carries the new value. That
  *  is the only live mode signal it emits, so the pill must read it here or
- *  stay on the mode the session was bound with. Matched by id OR category:
- *  the adapter sets `id: "mode"` and a category is what the other agents use. */
+ *  stay on the mode the session was bound with.
+ *
+ *  Matched by category alone (`SessionConfigOptionCategory::Mode`), as the
+ *  adapter sends it and as `parseConfigOptions` and the backend's
+ *  `session_modes_of` read it. An id is only a name: a select an agent calls
+ *  `mode` without the category is one of its own knobs, and reading it here
+ *  too would put one setting on two controls (#58). */
 export function modeSelectOf(
   raw: unknown,
 ): { currentMode: string | null; availableModes: SessionModeInfo[] } | null {
@@ -162,7 +179,7 @@ export function modeSelectOf(
   for (const item of raw) {
     if (!item || typeof item !== "object") continue;
     const o = item as Record<string, unknown>;
-    if (str(o.category) !== "mode" && str(o.id) !== "mode") continue;
+    if (str(o.category) !== "mode") continue;
     const select = selectOf(o);
     if (!select) continue;
     return {

@@ -37,7 +37,7 @@
 //! immediately, so a key works in the running app without a restart — while a
 //! *terminal* needs a new shell, as it would for any profile edit.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -147,6 +147,55 @@ struct EnvKeyState {
     /// True once the login-shell pass finished (or failed) — the snapshot is
     /// as complete as it will get this run.
     shell_done: bool,
+    /// Edits win over an older process environment or an in-flight probe.
+    edited: BTreeSet<String>,
+    /// Vars a login-shell probe looked for and did not find, and when. A miss
+    /// is remembered for [`MISS_TTL`] so the sign-in modal, which re-checks on
+    /// every open and every `atlas:byok-env-updated`, does not pay a
+    /// `$SHELL -lic` spawn (up to 5 s) for a var that is simply not set. An
+    /// edit through Atlas clears the var's miss; a hand edit to the profile is
+    /// seen once the miss expires.
+    missed: BTreeMap<String, std::time::Instant>,
+}
+
+/// How long a probed-and-absent var stays known-absent.
+const MISS_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Record which of `probed` the probe did not find.
+fn record_misses<'a>(
+    state: &mut EnvKeyState,
+    probed: impl IntoIterator<Item = &'a str>,
+    found: &BTreeMap<String, String>,
+    now: std::time::Instant,
+) {
+    for var in probed {
+        if !found.contains_key(var) {
+            state.missed.insert(var.to_string(), now);
+        }
+    }
+}
+
+/// The names a probe would still have to look for: valid, not edited here, not
+/// already found, not set in the process env, and not a recent miss.
+fn vars_needing_probe<'a>(
+    state: &EnvKeyState,
+    names: &'a [String],
+    now: std::time::Instant,
+) -> Vec<&'a str> {
+    names
+        .iter()
+        .filter(|n| {
+            shell_profile::is_var_name(n)
+                && !state.edited.contains(n.as_str())
+                && !state.by_var.contains_key(n.as_str())
+                && !state
+                    .missed
+                    .get(n.as_str())
+                    .is_some_and(|at| now.saturating_duration_since(*at) < MISS_TTL)
+        })
+        .filter(|n| std::env::var(n.as_str()).is_err())
+        .map(String::as_str)
+        .collect()
 }
 
 fn env_state() -> &'static parking_lot::RwLock<EnvKeyState> {
@@ -167,6 +216,8 @@ fn env_state() -> &'static parking_lot::RwLock<EnvKeyState> {
         parking_lot::RwLock::new(EnvKeyState {
             by_var,
             shell_done: false,
+            edited: BTreeSet::new(),
+            missed: BTreeMap::new(),
         })
     })
 }
@@ -209,10 +260,18 @@ pub fn ensure_shell_probe(app: &AppHandle) {
         let shell = shell_env_values();
         {
             let mut state = env_state().write();
+            record_misses(
+                &mut state,
+                ENV_KEY_VARS.iter().flat_map(|(_, vs)| vs.iter().copied()),
+                &shell,
+                std::time::Instant::now(),
+            );
             for (var, value) in shell {
                 // Process env wins: a var exported in the launching terminal
                 // is more current than the shell profile's.
-                state.by_var.entry(var).or_insert(value);
+                if !state.edited.contains(&var) {
+                    state.by_var.entry(var).or_insert(value);
+                }
             }
             state.shell_done = true;
         }
@@ -230,46 +289,7 @@ fn shell_env_values() -> BTreeMap<String, String> {
         .iter()
         .flat_map(|(_, vs)| vs.iter().copied())
         .collect();
-    let fmt: String = vars
-        .iter()
-        .map(|v| format!("\"${{{v}}}\""))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let script = format!("printf 'ATLAS_ENV_PROBE\x1f'; printf '%s\x1f' {fmt}");
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let child = atlas_process::command(&shell)
-        .args(["-lic", &script])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-    let Ok(child) = child else {
-        return BTreeMap::new();
-    };
-    let pid = child.id();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    let out = match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(Ok(out)) if out.status.success() => out,
-        _ => {
-            let _ = atlas_process::command("kill")
-                .args(["-9", &pid.to_string()])
-                .status();
-            return BTreeMap::new();
-        }
-    };
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let Some(after) = raw.rsplit("ATLAS_ENV_PROBE").next() else {
-        return BTreeMap::new();
-    };
-    let values: Vec<&str> = after.split('').collect();
-    vars.iter()
-        .zip(values)
-        .filter(|(_, v)| !v.trim().is_empty())
-        .map(|(var, v)| ((*var).to_string(), v.trim().to_string()))
-        .collect()
+    probe_shell_vars(&vars)
 }
 
 /// Non-secret view of an env-imported key for the settings UI.
@@ -328,6 +348,16 @@ fn agent_key_env() -> std::collections::HashMap<String, String> {
             .unwrap_or(&[])
     };
     let mut env = std::collections::HashMap::new();
+    // An empty explicit value masks an inherited key in newly spawned agents.
+    // A remaining alias for the same provider replaces it below.
+    {
+        let state = env_state().read();
+        for var in &state.edited {
+            if !state.by_var.contains_key(var) {
+                env.insert(var.clone(), String::new());
+            }
+        }
+    }
     for (provider, ek) in env_keys() {
         for var in inject_vars(provider.as_str()) {
             env.insert((*var).to_string(), ek.key.clone());
@@ -354,12 +384,20 @@ pub fn sync_agent_key_env(app: &AppHandle) {
 
 // ── Shell-profile view + editor ───────────────────────────────────────────────
 
+static PROFILE_WRITE: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    dirs::home_dir()
 }
 
 fn user_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+    std::env::var("SHELL").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "powershell.exe".into()
+        } else {
+            "/bin/sh".into()
+        }
+    })
 }
 
 /// Every var Atlas recognises, flattened, with the provider it belongs to.
@@ -424,21 +462,28 @@ pub fn byok_profile_info() -> ProfileInfo {
 }
 
 /// The first profile file that assigns `var`, with the parsed assignment.
-fn locate_in_profiles(var: &str) -> Option<(PathBuf, shell_profile::Assignment)> {
-    let home = home_dir()?;
+fn scanned_assignments() -> BTreeMap<String, (PathBuf, shell_profile::Assignment)> {
+    let Some(home) = home_dir() else {
+        return BTreeMap::new();
+    };
+    let mut found = BTreeMap::new();
     for path in shell_profile::scan_candidates(&home, &user_shell()) {
         let Ok(content) = fs::read_to_string(&path) else {
             continue;
         };
-        // Last assignment wins — that is what the shell ends up with.
-        if let Some(a) = shell_profile::parse_assignments(&content)
-            .into_iter()
-            .rfind(|a| a.var == var)
-        {
-            return Some((path, a));
+        let mut local = BTreeMap::new();
+        for assignment in shell_profile::parse_assignments(&content) {
+            local.insert(assignment.var.clone(), (path.clone(), assignment));
+        }
+        for (var, assignment) in local {
+            found.entry(var).or_insert(assignment);
         }
     }
-    None
+    found
+}
+
+fn locate_in_profiles(var: &str) -> Option<(PathBuf, shell_profile::Assignment)> {
+    scanned_assignments().remove(var)
 }
 
 fn last4(s: &str) -> String {
@@ -448,14 +493,15 @@ fn last4(s: &str) -> String {
 
 /// Every recognised key Atlas can see, whether it came from a profile file or
 /// the ambient environment. Secrets stay in Rust — only `last4` is returned.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn byok_env_entries(app: AppHandle) -> Vec<EnvEntry> {
     ensure_shell_probe(&app);
     let live = env_state().read().by_var.clone();
     let mut out = Vec::new();
+    let profiles = scanned_assignments();
 
     for (provider, var) in known_vars() {
-        let located = locate_in_profiles(var);
+        let located = profiles.get(var);
         // A value can be in a profile, in the live env, or both. Prefer the
         // profile's own text when present: it is what an edit would change.
         let value = match (&located, live.get(var)) {
@@ -524,7 +570,7 @@ fn backup_once(path: &Path) {
 }
 
 /// Replace the profile at `path` with `content` through
-/// [`atlas_fs::replace_file_with_mode`], so a crash mid-write can never leave a
+/// [`atlas_fs::replace_file_follow_symlink_with_mode`], so a crash mid-write can never leave a
 /// truncated profile — the difference between a working shell and a broken
 /// login.
 fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
@@ -539,7 +585,7 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
     };
     #[cfg(not(unix))]
     let mode = 0o600;
-    atlas_fs::replace_file_with_mode(path, content, mode)
+    atlas_fs::replace_file_follow_symlink_with_mode(path, content, mode)
         .map_err(|e| format!("replace {}: {e}", path.display()))
 }
 
@@ -549,18 +595,20 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
 fn apply_live(app: &AppHandle, var: &str, value: Option<&str>) {
     {
         let mut state = env_state().write();
+        state.edited.insert(var.to_string());
+        state.missed.remove(var);
         match value {
             Some(v) => state.by_var.insert(var.to_string(), v.to_string()),
             None => state.by_var.remove(var),
         };
     }
-    // Also update this process's own env so an in-process consumer that reads
-    // it directly agrees with the snapshot.
-    match value {
-        Some(v) => std::env::set_var(var, v),
-        None => std::env::remove_var(var),
-    }
     sync_agent_key_env(app);
+    // Agents already running were handed the old keys when they started;
+    // Settings → Agents offers each a restart to pick this up (audit #65).
+    if let Some(host) = app.try_state::<std::sync::Arc<super::agent_host::AgentHost>>() {
+        super::agent_config::mark_all_stale(&host);
+        super::catalog::emit_catalog_changed(app, "provider-key");
+    }
     let _ = app.emit("atlas:byok-env-updated", ());
 }
 
@@ -570,6 +618,7 @@ fn apply_live(app: &AppHandle, var: &str, value: Option<&str>) {
 /// shell's primary rc file under a marked block.
 #[tauri::command(async)]
 pub fn byok_env_set(app: AppHandle, env_var: String, value: String) -> Result<String, String> {
+    let _write = PROFILE_WRITE.lock();
     let value = value.trim().to_string();
     if value.is_empty() {
         return Err("Value is empty.".into());
@@ -586,7 +635,15 @@ pub fn byok_env_set(app: AppHandle, env_var: String, value: String) -> Result<St
         .map(|(p, _)| p)
         .unwrap_or_else(|| shell_profile::primary_target(&home, &shell));
 
-    let content = fs::read_to_string(&path).unwrap_or_default();
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound && fs::symlink_metadata(&path).is_err() =>
+        {
+            String::new()
+        }
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
     let updated = shell_profile::upsert(
         &content,
         &env_var,
@@ -603,6 +660,7 @@ pub fn byok_env_set(app: AppHandle, env_var: String, value: String) -> Result<St
 /// Remove a key's assignment from the profile that defines it.
 #[tauri::command(async)]
 pub fn byok_env_unset(app: AppHandle, env_var: String) -> Result<(), String> {
+    let _write = PROFILE_WRITE.lock();
     let Some((path, _)) = locate_in_profiles(&env_var) else {
         // Live-env-only: nothing of ours to delete, and we will not guess.
         return Err("This key is set outside your shell profile, so Atlas can't remove it.".into());
@@ -648,6 +706,36 @@ pub enum EnvVarSource {
     ProcessEnv,
     /// Found by the login-shell probe, i.e. it lives in `~/.zshrc` & friends.
     ShellEnv,
+    /// Set for this one agent in Settings → Agents (or saved from its sign-in
+    /// dialog), and handed to it when it starts.
+    AgentSettings,
+}
+
+/// Whether `name` reaches an agent's process, and from where — the question
+/// an `env_var` sign-in checklist is really asking (audit #61).
+///
+/// [`env_var_source`] says where Atlas can *see* a variable, which is not the
+/// same thing. An agent inherits Atlas's own environment and the provider
+/// keys Atlas injects ([`ENV_KEY_VARS`]), and gets the variables set for it;
+/// a variable found only by the login-shell probe and outside that table is
+/// visible here and never passed on. The checklist used to tick it anyway,
+/// and "Continue" signed in an agent that still lacked it.
+///
+/// `set_for_agent`: the agent's own settings name it.
+pub fn delivered_source(name: &str, set_for_agent: bool) -> Option<EnvVarSource> {
+    if set_for_agent {
+        return Some(EnvVarSource::AgentSettings);
+    }
+    match env_var_source(name)? {
+        EnvVarSource::ShellEnv if !is_provider_var(name) => None,
+        source => Some(source),
+    }
+}
+
+/// A variable Atlas injects into every agent's environment when it has a
+/// value for it ([`agent_key_env`]).
+fn is_provider_var(name: &str) -> bool {
+    known_vars().iter().any(|(_, var)| *var == name)
 }
 
 /// Whether `name` is set, and where it came from (R5).
@@ -658,6 +746,16 @@ pub enum EnvVarSource {
 /// in `~/.zshrc` visible to an app launched from Finder — the case the whole
 /// env-BYOK model depends on.
 pub fn env_var_source(name: &str) -> Option<EnvVarSource> {
+    {
+        let state = env_state().read();
+        if state.edited.contains(name) {
+            return state
+                .by_var
+                .get(name)
+                .filter(|v| !v.trim().is_empty())
+                .map(|_| EnvVarSource::ShellEnv);
+        }
+    }
     if std::env::var(name).is_ok_and(|v| !v.trim().is_empty()) {
         return Some(EnvVarSource::ProcessEnv);
     }
@@ -676,62 +774,98 @@ pub fn env_var_source(name: &str) -> Option<EnvVarSource> {
 /// is free. Deliberately does nothing when every name is already known: each
 /// call costs a `$SHELL -lic` spawn, and the auth modal re-checks on every
 /// `atlas:byok-env-updated`.
+///
+/// BLOCKING (spawns the login shell): call from `spawn_blocking`. Misses are
+/// cached too (see [`EnvKeyState::missed`]), and concurrent callers are
+/// serialised so a second modal open waits for the first probe instead of
+/// spawning its own.
 pub fn ensure_vars_probed(names: &[String]) {
-    let unknown: Vec<&str> = {
-        let state = env_state().read();
-        names
-            .iter()
-            .filter(|n| !state.by_var.contains_key(n.as_str()))
-            .filter(|n| std::env::var(n.as_str()).is_err())
-            .map(String::as_str)
+    static PROBING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let needed = |state: &EnvKeyState| -> Vec<String> {
+        vars_needing_probe(state, names, std::time::Instant::now())
+            .into_iter()
+            .map(str::to_string)
             .collect()
     };
+    if needed(&env_state().read()).is_empty() {
+        return;
+    }
+    let _probing = PROBING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Re-read: whoever held the lock may have just answered these.
+    let unknown = needed(&env_state().read());
     if unknown.is_empty() {
         return;
     }
+    let unknown: Vec<&str> = unknown.iter().map(String::as_str).collect();
     let found = probe_shell_vars(&unknown);
     let mut state = env_state().write();
+    record_misses(
+        &mut state,
+        unknown.iter().copied(),
+        &found,
+        std::time::Instant::now(),
+    );
     for (var, value) in found {
-        state.by_var.entry(var).or_insert(value);
+        if !state.edited.contains(&var) {
+            state.by_var.entry(var).or_insert(value);
+        }
     }
 }
 
+/// Only identifiers validated by `is_var_name` may reach this renderer.
+fn probe_script(vars: &[&str], kind: ShellKind) -> String {
+    let mut script = if kind == ShellKind::PowerShell {
+        "[Console]::Write('ATLAS_ENV_PROBE' + [char]31); ".to_string()
+    } else {
+        "printf 'ATLAS_ENV_PROBE\x1f'; ".to_string()
+    };
+    for var in vars.iter().filter(|v| shell_profile::is_var_name(v)) {
+        match kind {
+            ShellKind::Posix => script.push_str(&format!("printf '%s\x1f' \"${{{var}}}\"; ")),
+            // One printf per variable also emits a field for an unset fish variable.
+            ShellKind::Fish => script.push_str(&format!("printf '%s\x1f' \"${var}\"; ")),
+            ShellKind::PowerShell => script.push_str(&format!(
+                "[Console]::Write([string]$env:{var} + [char]31); "
+            )),
+        }
+    }
+    script
+}
+
 fn probe_shell_vars(vars: &[&str]) -> BTreeMap<String, String> {
+    let vars: Vec<&str> = vars
+        .iter()
+        .copied()
+        .filter(|v| shell_profile::is_var_name(v))
+        .collect();
     if vars.is_empty() {
         return BTreeMap::new();
     }
-    let fmt: String = vars
-        .iter()
-        .map(|v| format!("\"${{{v}}}\""))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let script = format!("printf 'ATLAS_ENV_PROBE\x1f'; printf '%s\x1f' {fmt}");
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let child = atlas_process::command(&shell)
-        .args(["-lic", &script])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-    let Ok(child) = child else {
-        return BTreeMap::new();
-    };
-    let pid = child.id();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    let out = match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(Ok(out)) if out.status.success() => out,
-        _ => {
-            let _ = atlas_process::command("kill")
-                .args(["-9", &pid.to_string()])
-                .status();
-            return BTreeMap::new();
+    let shell = user_shell();
+    let kind = ShellKind::from_shell_path(&shell);
+    let script = probe_script(&vars, kind);
+    let result = tauri::async_runtime::block_on(async {
+        let mut command = atlas_process::async_command(&shell);
+        if kind == ShellKind::PowerShell {
+            command.args(["-NoLogo", "-NonInteractive", "-Command", &script]);
+        } else {
+            command.args(["-lic", &script]);
         }
+        command
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        tokio::time::timeout(std::time::Duration::from_secs(5), command.output()).await
+    });
+    let out = match result {
+        Ok(Ok(out)) if out.status.success() => out,
+        _ => return BTreeMap::new(),
     };
     let raw = String::from_utf8_lossy(&out.stdout);
-    let Some(after) = raw.rsplit("ATLAS_ENV_PROBE").next() else {
+    let Some((_, after)) = raw.rsplit_once("ATLAS_ENV_PROBE") else {
         return BTreeMap::new();
     };
     let values: Vec<&str> = after.split('').collect();
@@ -745,6 +879,70 @@ fn probe_shell_vars(vars: &[&str]) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit #61: a variable only the login-shell probe found, and outside
+    /// the provider table, never reaches an agent — so it must not tick the
+    /// sign-in checklist. One set for the agent does.
+    #[test]
+    fn a_shell_only_variable_is_not_delivered_but_an_agent_setting_is() {
+        let name = "ATLAS_TEST_SHELL_ONLY_TOKEN_61";
+        env_state()
+            .write()
+            .by_var
+            .insert(name.to_string(), "secret".to_string());
+
+        assert_eq!(env_var_source(name), Some(EnvVarSource::ShellEnv));
+        assert_eq!(delivered_source(name, false), None);
+        assert_eq!(
+            delivered_source(name, true),
+            Some(EnvVarSource::AgentSettings)
+        );
+
+        env_state().write().by_var.remove(name);
+    }
+
+    fn empty_state() -> EnvKeyState {
+        EnvKeyState {
+            by_var: BTreeMap::new(),
+            shell_done: true,
+            edited: BTreeSet::new(),
+            missed: BTreeMap::new(),
+        }
+    }
+
+    /// R2: a var the probe did not find must not be probed again on the next
+    /// modal open; every probe is a `$SHELL -lic` spawn of up to 5 s.
+    #[test]
+    fn a_probe_miss_is_cached_until_it_expires() {
+        let name = "ATLAS_TEST_SURELY_UNSET_VAR_R2".to_string();
+        let names = vec![name.clone()];
+        let mut state = empty_state();
+        let t0 = std::time::Instant::now();
+        assert_eq!(vars_needing_probe(&state, &names, t0), vec![name.as_str()]);
+
+        record_misses(&mut state, [name.as_str()], &BTreeMap::new(), t0);
+        assert!(vars_needing_probe(&state, &names, t0).is_empty());
+        assert!(vars_needing_probe(&state, &names, t0 + MISS_TTL / 2).is_empty());
+        assert_eq!(
+            vars_needing_probe(&state, &names, t0 + MISS_TTL),
+            vec![name.as_str()],
+            "a miss expires, so a hand edit to the profile is seen eventually"
+        );
+    }
+
+    #[test]
+    fn a_found_var_is_not_recorded_as_a_miss() {
+        let mut state = empty_state();
+        let found = BTreeMap::from([("A_VAR".to_string(), "v".to_string())]);
+        record_misses(
+            &mut state,
+            ["A_VAR", "B_VAR"],
+            &found,
+            std::time::Instant::now(),
+        );
+        assert!(!state.missed.contains_key("A_VAR"));
+        assert!(state.missed.contains_key("B_VAR"));
+    }
 
     #[test]
     fn test_minimax_region_keys_are_separate() {

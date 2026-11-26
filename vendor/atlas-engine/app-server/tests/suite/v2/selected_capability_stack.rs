@@ -65,6 +65,7 @@ const MCP_CALL_ID: &str = "selected-executor-mcp-call";
 const CONNECTOR_ID: &str = "calendar";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs the standalone atlas-agent CLI binary as an exec-server executor, which Atlas does not build: the engine runs in-process (ADR-0004)"]
 async fn selected_capability_stack_tracks_environment_availability_and_resume() -> Result<()> {
     let responses_server = responses::start_mock_server().await;
     let (apps_url, apps_server_handle) = start_apps_server_with_delays(
@@ -267,6 +268,7 @@ async fn selected_capability_stack_tracks_environment_availability_and_resume() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs the standalone atlas-agent CLI binary as an exec-server executor, which Atlas does not build: the engine runs in-process (ADR-0004)"]
 async fn selected_capabilities_become_available_between_samples_in_one_turn() -> Result<()> {
     const USER_INPUT_CALL_ID: &str = "pause-for-environment";
 

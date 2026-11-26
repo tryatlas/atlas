@@ -95,7 +95,6 @@ fn is_safe_to_call_with_exec(command: &[String]) -> bool {
             "tr" |
             "true" |
             "uname" |
-            "uniq" |
             "wc" |
             "which" |
             "whoami") => {
@@ -111,6 +110,8 @@ fn is_safe_to_call_with_exec(command: &[String]) -> bool {
                     || (arg.starts_with("-o") && arg != "-o")
             })
         }
+
+        Some("uniq") => uniq_is_read_only(&command[1..]),
 
         Some("find") => {
             // Certain options to `find` can delete files, write to files, or
@@ -171,6 +172,68 @@ fn is_safe_to_call_with_exec(command: &[String]) -> bool {
         // ── anything else ─────────────────────────────────────────────────
         _ => false,
     }
+}
+
+fn uniq_is_read_only(args: &[String]) -> bool {
+    let mut operands = 0;
+    let mut options = true;
+    let mut args = args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        if options && arg == "--" {
+            options = false;
+        } else if options
+            && matches!(
+                arg,
+                "-f" | "-s" | "-w" | "--skip-fields" | "--skip-chars" | "--check-chars"
+            )
+        {
+            if args
+                .next()
+                .is_none_or(|value| value.parse::<usize>().is_err())
+            {
+                return false;
+            }
+        } else if options && arg.starts_with('-') && arg != "-" {
+            let read_only = matches!(
+                arg,
+                "--count"
+                    | "--repeated"
+                    | "--all-repeated"
+                    | "--ignore-case"
+                    | "--unique"
+                    | "--zero-terminated"
+                    | "--help"
+                    | "--version"
+            ) || arg.strip_prefix('-').is_some_and(|flags| {
+                !flags.is_empty()
+                    && flags
+                        .chars()
+                        .all(|ch| matches!(ch, 'c' | 'd' | 'D' | 'i' | 'u' | 'z'))
+            }) || [
+                "--skip-fields=",
+                "--skip-chars=",
+                "--check-chars=",
+                "-f",
+                "-s",
+                "-w",
+            ]
+            .iter()
+            .any(|prefix| {
+                arg.strip_prefix(prefix)
+                    .is_some_and(|value| value.parse::<usize>().is_ok())
+            });
+            if !read_only {
+                return false;
+            }
+        } else {
+            operands += 1;
+            // The second operand is an output file on both GNU and BSD uniq.
+            if operands > 1 {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 pub(crate) fn is_safe_git_command(command: &[String]) -> bool {
@@ -341,6 +404,44 @@ mod tests {
 
     fn vec_str(args: &[&str]) -> Vec<String> {
         args.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn escaped_shell_options_are_classified_as_executed_arguments() {
+        for script in [
+            r"find . -\delete",
+            r"f\ind . -de\lete",
+            r#"find . -de"lete""#,
+        ] {
+            assert!(
+                !is_known_safe_command(&vec_str(&["bash", "-lc", script])),
+                "{script}"
+            );
+        }
+        assert!(is_known_safe_command(&vec_str(&[
+            "bash",
+            "-lc",
+            r"find . -na\me literal"
+        ])));
+        assert!(is_known_safe_command(&vec_str(&["find", ".", r"-\delete"])));
+    }
+
+    #[test]
+    fn uniq_requires_approval_when_it_has_an_output_operand() {
+        for command in [
+            vec_str(&["uniq", "input", "output"]),
+            vec_str(&["uniq", "--", "-input", "-output"]),
+            vec_str(&["uniq", "-c", "input", "output"]),
+        ] {
+            assert!(!is_known_safe_command(&command), "{command:?}");
+        }
+        for command in [
+            vec_str(&["uniq"]),
+            vec_str(&["uniq", "-c", "input"]),
+            vec_str(&["uniq", "--", "-input"]),
+        ] {
+            assert!(is_known_safe_command(&command), "{command:?}");
+        }
     }
 
     #[test]

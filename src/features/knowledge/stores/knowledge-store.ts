@@ -12,26 +12,20 @@ export interface KnowledgeEntry {
 }
 
 interface KnowledgeState {
+  projectPath: string | null;
   entries: KnowledgeEntry[];
   activeEntryId: string | null;
   editContent: string;
   loading: boolean;
-  /** A note the user asked to open from OUTSIDE the KB panel (e.g. the
-   *  left-panel quick list). The panel consumes this on mount/change and
-   *  routes it through its dirty-save-aware select, so opening a specific
-   *  note works even when the (lazy) panel isn't mounted yet. */
+  error: string | null;
+  /** Requests from another surface are consumed after the outgoing note saves. */
   pendingOpenId: string | null;
   actions: {
     loadEntries: (projectPath: string) => Promise<void>;
     selectEntry: (id: string) => void;
-    /** Request the panel open a specific note (from the left-panel list). */
     requestOpen: (id: string) => void;
-    /** Panel clears the pending request after handling it. */
     consumePendingOpen: () => void;
     setEditContent: (content: string) => void;
-    /** Save an explicit (project path, note id, content) triple. The caller
-     *  captures all three atomically so a project switch can never cross the
-     *  content of one project into another's file. */
     saveEntry: (projectPath: string, id: string, content: string) => Promise<void>;
     createEntry: (projectPath: string) => Promise<void>;
     deleteEntry: (projectPath: string, id: string) => Promise<void>;
@@ -39,143 +33,130 @@ interface KnowledgeState {
   };
 }
 
+let loadGeneration = 0;
+
 export const useKnowledgeStore = create<KnowledgeState>()((set, get) => ({
+  projectPath: null,
   entries: [],
   activeEntryId: null,
   editContent: "",
   loading: false,
+  error: null,
   pendingOpenId: null,
   actions: {
     loadEntries: async (projectPath) => {
-      try {
-        const newEntries = await invoke<KnowledgeEntry[]>("list_knowledge", {
+      const generation = ++loadGeneration;
+      if (get().projectPath !== projectPath) {
+        set({
           projectPath,
+          entries: [],
+          activeEntryId: null,
+          editContent: "",
+          loading: true,
+          error: null,
         });
+      }
+      try {
+        const newEntries = await invoke<KnowledgeEntry[]>("list_knowledge", { projectPath });
+        if (generation !== loadGeneration || get().projectPath !== projectPath) return;
         const current = get();
-
-        // Skip update if entries haven't changed (prevent unnecessary re-renders)
-        const unchanged =
-          current.entries.length === newEntries.length &&
-          current.entries.every(
-            (e, i) => e.id === newEntries[i]?.id && e.updated_at === newEntries[i]?.updated_at,
-          );
-        if (unchanged && !current.loading) return;
-
-        const activeStillExists = newEntries.find((e) => e.id === current.activeEntryId);
+        const active =
+          newEntries.find((entry) => entry.id === current.activeEntryId) ?? newEntries[0];
         set({
           entries: newEntries,
           loading: false,
-          activeEntryId: activeStillExists ? current.activeEntryId : (newEntries[0]?.id ?? null),
-          editContent: activeStillExists?.content ?? newEntries[0]?.content ?? "",
+          error: null,
+          activeEntryId: active?.id ?? null,
+          editContent: active?.content ?? "",
         });
-        // Mirror the new entry set into the Rust mention cache so
-        // the @-picker doesn't have to ship the full knowledge
-        // array on every keystroke. Lazy import to avoid a circular
-        // module cycle (chat/lib/mentions imports this store).
         void import("@/features/chat/lib/mentions").then((m) => m.publishKnowledgeToMentionCache());
-      } catch {
-        set({ loading: false });
+      } catch (error) {
+        if (generation === loadGeneration && get().projectPath === projectPath) {
+          set({ loading: false, error: String(error) });
+        }
+        throw error;
       }
     },
     selectEntry: (id) => {
       const entry = get().entries.find((e) => e.id === id);
-      set({
-        activeEntryId: id,
-        editContent: entry?.content ?? "",
-      });
+      set({ activeEntryId: id, editContent: entry?.content ?? "" });
     },
     requestOpen: (id) => set({ pendingOpenId: id }),
     consumePendingOpen: () => set({ pendingOpenId: null }),
     setEditContent: (content) => set({ editContent: content }),
     saveEntry: async (projectPath, id, content) => {
-      if (!id || !projectPath) return;
-      try {
-        await invoke("save_knowledge_note", {
-          projectPath,
-          id,
-          content,
-        });
-        // Update the entry's content in-place without a full reload. Match on
-        // the saved `id` only — if the store has since been swapped to another
-        // project (different `entries`), this is a harmless no-op rather
-        // than a cross-project mutation.
-        const title =
-          content
-            .split("\n")[0]
-            ?.replace(/^#+\s*/, "")
-            .slice(0, 60) || "note";
-        set({
-          entries: get().entries.map((e) =>
+      if (!id || !projectPath) throw new Error("The note has no project or document identity.");
+      await invoke("save_knowledge_note", { projectPath, id, content });
+      const title =
+        content
+          .split("\n")[0]
+          ?.replace(/^#+\s*/, "")
+          .slice(0, 60) || "note";
+      if (get().projectPath === projectPath) {
+        set((state) => ({
+          entries: state.entries.map((e) =>
             e.id === id ? { ...e, content, title, updated_at: new Date().toISOString() } : e,
           ),
-        });
-        invoke("log_interaction", {
-          projectPath,
-          interactionType: "note_edit",
-          summary: `Edited note: ${title}`,
-        }).catch(() => {});
-        logEvent({
-          source: "knowledge",
-          kind: "note-save",
-          summary: title,
-          projectPath,
-          payload: { id },
-        });
-      } catch {
-        // silent
+          ...(state.activeEntryId === id ? { editContent: content } : {}),
+        }));
       }
+      void invoke("log_interaction", {
+        projectPath,
+        interactionType: "note_edit",
+        summary: `Edited note: ${title}`,
+      }).catch(() => {});
+      logEvent({
+        source: "knowledge",
+        kind: "note-save",
+        summary: title,
+        projectPath,
+        payload: { id },
+      });
     },
     createEntry: async (projectPath) => {
-      const id = `note-${Date.now()}`;
+      const id = `note-${crypto.randomUUID()}`;
       const content = "# Untitled\n\n";
-      try {
-        await invoke("save_knowledge_note", {
-          projectPath,
-          id,
-          content,
-        });
+      await invoke("save_knowledge_note", { projectPath, id, content });
+      if (get().projectPath === projectPath) {
         await get().actions.loadEntries(projectPath);
-        set({ activeEntryId: id, editContent: content });
-        logEvent({
-          source: "knowledge",
-          kind: "note-create",
-          summary: "New note",
-          projectPath,
-          payload: { id },
-        });
-      } catch {
-        // silent
+        if (get().projectPath === projectPath) set({ activeEntryId: id, editContent: content });
       }
+      logEvent({
+        source: "knowledge",
+        kind: "note-create",
+        summary: "New note",
+        projectPath,
+        payload: { id },
+      });
     },
     deleteEntry: async (projectPath, id) => {
-      try {
-        await invoke("delete_knowledge_note", { projectPath, id });
-        await get().actions.loadEntries(projectPath);
-        logEvent({
-          source: "knowledge",
-          kind: "note-delete",
-          summary: id,
-          projectPath,
-          payload: { id },
+      await invoke("delete_knowledge_note", { projectPath, id });
+      if (get().projectPath === projectPath) {
+        // The successful delete is reflected before refreshing; a failed refresh
+        // must not make the caller think deletion itself failed.
+        set((state) => {
+          const entries = state.entries.filter((entry) => entry.id !== id);
+          const active = entries.find((entry) => entry.id === state.activeEntryId) ?? entries[0];
+          return { entries, activeEntryId: active?.id ?? null, editContent: active?.content ?? "" };
         });
-      } catch {
-        // silent
       }
+      logEvent({
+        source: "knowledge",
+        kind: "note-delete",
+        summary: id,
+        projectPath,
+        payload: { id },
+      });
     },
     createDir: async (projectPath, dirName) => {
-      try {
-        await invoke("create_knowledge_dir", { projectPath, dirName });
-        await get().actions.loadEntries(projectPath);
-        logEvent({
-          source: "knowledge",
-          kind: "dir-create",
-          summary: dirName,
-          projectPath,
-          payload: { dirName },
-        });
-      } catch (e) {
-        console.error("Failed to create directory:", e);
-      }
+      await invoke("create_knowledge_dir", { projectPath, dirName });
+      logEvent({
+        source: "knowledge",
+        kind: "dir-create",
+        summary: dirName,
+        projectPath,
+        payload: { dirName },
+      });
     },
   },
 }));

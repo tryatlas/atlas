@@ -2,6 +2,7 @@ import { useEffect, type RefObject } from "react";
 import { matchesAction } from "@/features/keybindings/lib/use-scoped-hotkeys";
 import { useChatStore } from "../stores/chat-store";
 import { requestModelPicker } from "../lib/model-picker-events";
+import { onClaudeModeList } from "../lib/session-configuration";
 
 /** The chat panel's own chords, gated on focus being inside `rootRef`. */
 export function useChatPanelHotkeys(
@@ -40,7 +41,7 @@ export function useChatPanelHotkeys(
       // For non-Claude agents (Codex) cycle the agent-advertised ACP modes.
       const sess = useChatStore.getState().sessions[tabId];
       const actions = useChatStore.getState().actions;
-      if (sess?.agentType !== "claude-code") {
+      if (!onClaudeModeList(sess)) {
         const modes = sess?.acpAvailableModes ?? [];
         if (modes.length === 0) return;
         const i = modes.findIndex((m) => m.id === sess?.acpCurrentMode);

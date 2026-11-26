@@ -50,7 +50,16 @@ const ORBIT = [
   { x: 86, y: 60, d: 1.8 },
 ];
 
-export function ShareMorph({
+export function ShareMorph(props: Parameters<typeof SessionShareMorph>[0]) {
+  return (
+    <SessionShareMorph
+      key={`${props.projectId ?? ""}\u0000${props.detail.summary.id}`}
+      {...props}
+    />
+  );
+}
+
+function SessionShareMorph({
   detail,
   projectId,
   directory,
@@ -60,6 +69,8 @@ export function ShareMorph({
   anchorY = "bottom",
   anchorX = "start",
   inPill = false,
+  projectPath = "",
+  entriesReady = true,
 }: {
   detail: Detail;
   /** The server Project, or `null` when this Session is local-only — there is
@@ -79,6 +90,8 @@ export function ShareMorph({
   anchorX?: "start" | "end";
   /** Closed, it is a button in the reader's footer pill (`footer-pill.tsx`). */
   inPill?: boolean;
+  projectPath?: string;
+  entriesReady?: boolean;
 }) {
   const s = detail.summary;
   const title = sessionTitle(s.title) ?? "Untitled session";
@@ -122,6 +135,7 @@ export function ShareMorph({
    * not list state it sets itself.
    */
   const loadedFor = useRef<string | null>(null);
+  const [readAttempt, setReadAttempt] = useState(0);
 
   // Read the Session's link the first time the sheet opens, not on mount:
   // this is a network round trip per Session and most are never shared.
@@ -129,7 +143,6 @@ export function ShareMorph({
     if (!open) return;
     const key = `${projectId ?? ""}\u0000${s.id}`;
     if (loadedFor.current === key) return;
-    loadedFor.current = key;
 
     if (!projectId) {
       setStatus("ready");
@@ -143,13 +156,13 @@ export function ShareMorph({
           shares.forSession(projectId, s.id),
           shares.orgUrl(projectId, s.id),
         ]);
+        const publicLink = existing ? await shares.url(existing.slug) : "";
         if (cancelled) return;
+        loadedFor.current = key;
         setShare(existing);
         setOrgUrl(org ?? "");
-        if (existing) {
-          setPublicUrl(await shares.url(existing.slug));
-          setAccess("link");
-        }
+        setPublicUrl(publicLink);
+        setAccess(existing ? "link" : "org");
         setStatus("ready");
       } catch {
         // A refusal is an answer: say so rather than spinning. The sheet's
@@ -160,7 +173,7 @@ export function ShareMorph({
     return () => {
       cancelled = true;
     };
-  }, [open, projectId, s.id]);
+  }, [open, projectId, s.id, readAttempt]);
 
   // Dismiss on a click outside or Escape.
   useEffect(() => {
@@ -221,7 +234,14 @@ export function ShareMorph({
   /** The targets. Markdown is the one that works with no link at all. */
   const send = (target: "email" | "github" | "x" | "markdown" | "embed") => {
     if (target === "markdown") {
-      void exportSession(detail, "md");
+      if (!entriesReady) return;
+      void exportSession(detail, "md", {
+        projectPath,
+        remoteProjectId: projectId,
+        entriesReady,
+      }).catch((error: unknown) => {
+        toast.error("Couldn't export the session", { description: String(error) });
+      });
       return;
     }
     if (!url) return;
@@ -334,6 +354,19 @@ export function ShareMorph({
                 />
               )}
 
+              {status === "error" && (
+                <p className="text-2xs text-error">
+                  Couldn't load this Project's links.{" "}
+                  <button
+                    type="button"
+                    className="underline"
+                    onClick={() => setReadAttempt((attempt) => attempt + 1)}
+                  >
+                    Retry
+                  </button>
+                </p>
+              )}
+
               {!projectId && (
                 <p className="rounded-lg bg-foreground/5 px-3 py-2 text-2xs text-muted-foreground">
                   This Session is only on this machine. Sync its Project to share it.
@@ -344,7 +377,8 @@ export function ShareMorph({
                 <span className="text-xs text-secondary-foreground">Share to</span>
                 <ul className="grid grid-cols-5 gap-1">
                   {TARGETS.map((t, i) => {
-                    const disabled = t.id !== "markdown" && (!url || (t.publicOnly && !isPublic));
+                    const disabled =
+                      t.id === "markdown" ? !entriesReady : !url || (t.publicOnly && !isPublic);
                     return (
                       <motion.li
                         key={t.id}
@@ -507,7 +541,7 @@ function PublicLink({
     return <p className="text-2xs text-muted-foreground">Checking for a public link…</p>;
   }
   if (status === "error") {
-    return <p className="text-2xs text-error">Couldn't load this Project's links.</p>;
+    return null;
   }
   return (
     <div className="flex flex-col gap-2 rounded-xl bg-foreground/5 p-2.5">

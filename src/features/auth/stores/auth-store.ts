@@ -72,6 +72,9 @@ interface AuthStoreState {
   };
 }
 
+let signInGeneration = 0;
+let snapshotGeneration = 0;
+
 const useAuthStoreBase = create<AuthStoreState>()((set, get) => ({
   snapshot: { status: "signed-out" },
   dialogOpen: false,
@@ -80,12 +83,13 @@ const useAuthStoreBase = create<AuthStoreState>()((set, get) => ({
 
   actions: {
     setSnapshot: (snapshot) => {
+      snapshotGeneration++;
       syncTelemetryIdentity(snapshot);
       set((s) => ({
         snapshot,
         starting: false,
         // Signing in is the end of the flow — close the dialog for them.
-        dialogOpen: snapshot.status === "connecting" ? s.dialogOpen : false,
+        dialogOpen: snapshot.status === "signed-in" ? false : s.dialogOpen,
         error: snapshot.status === "signed-in" ? null : s.error,
       }));
     },
@@ -93,11 +97,16 @@ const useAuthStoreBase = create<AuthStoreState>()((set, get) => ({
     setError: (message) => set({ error: message, starting: false }),
 
     beginSignIn: async () => {
+      const generation = ++signInGeneration;
+      const snapshotVersion = snapshotGeneration;
       set({ dialogOpen: true, error: null, starting: true });
       try {
         const snapshot = await auth.signIn();
-        set({ snapshot, starting: false });
+        if (generation !== signInGeneration) return;
+        if (snapshotVersion === snapshotGeneration) get().actions.setSnapshot(snapshot);
+        set({ starting: false });
       } catch (e) {
+        if (generation !== signInGeneration) return;
         set({
           error: e instanceof Error ? e.message : String(e),
           starting: false,
@@ -106,9 +115,11 @@ const useAuthStoreBase = create<AuthStoreState>()((set, get) => ({
     },
 
     cancelSignIn: async () => {
+      const generation = ++signInGeneration;
       set({ dialogOpen: false, error: null, starting: false });
       try {
-        set({ snapshot: await auth.cancelSignIn() });
+        const snapshot = await auth.cancelSignIn();
+        if (generation === signInGeneration) get().actions.setSnapshot(snapshot);
       } catch {
         // Cancelling is best-effort; the dialog is already gone either way.
       }
@@ -128,11 +139,12 @@ const useAuthStoreBase = create<AuthStoreState>()((set, get) => ({
     },
 
     hydrate: async () => {
+      const generation = snapshotGeneration;
       try {
         const snapshot = await auth.snapshot();
         // Never resurrect the dialog from hydration — if a grant is still in
         // flight it belongs in the title bar, not popped over the project.
-        set({ snapshot });
+        if (generation === snapshotGeneration) get().actions.setSnapshot(snapshot);
       } catch {
         // A failed hydrate leaves the default signed-out state, which is the
         // correct thing to show when we cannot tell.

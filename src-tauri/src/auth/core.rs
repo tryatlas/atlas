@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -51,6 +51,7 @@ pub struct PendingGrant {
     pub interval: Duration,
     /// Flipped by `cancel_grant`; the loop checks it between polls.
     cancel: Arc<AtomicBool>,
+    polling: Arc<AtomicBool>,
 }
 
 impl PendingGrant {
@@ -99,6 +100,7 @@ pub enum GrantError {
     Denied,
     Expired,
     Cancelled,
+    AlreadyPolling,
     /// Could not even start the grant.
     Start(String),
 }
@@ -110,6 +112,7 @@ impl GrantError {
             GrantError::Denied => "Connection denied in the browser.".into(),
             GrantError::Expired => "That code expired. Get a new one to try again.".into(),
             GrantError::Cancelled => "Sign-in canceled.".into(),
+            GrantError::AlreadyPolling => "Sign-in is already in progress.".into(),
             GrantError::Start(e) => format!("Could not reach Atlas: {e}"),
         }
     }
@@ -245,6 +248,8 @@ pub struct AuthCore {
     /// competing codes, and is what makes a second click *resume* rather than
     /// restart — the recovery path for someone who got lost mid-flow.
     pending: Mutex<Option<PendingGrant>>,
+    grant_start: tokio::sync::Semaphore,
+    grant_epoch: AtomicU64,
     /// Serialises every read-modify-write of the credential file. The store
     /// is disk-backed with no in-memory copy, so `set_active_org` (a switch)
     /// and the tail of `refresh_identity` (a revalidate finishing) are both
@@ -278,6 +283,8 @@ impl AuthCore {
             dir: dir.into(),
             http,
             pending: Mutex::new(None),
+            grant_start: tokio::sync::Semaphore::new(1),
+            grant_epoch: AtomicU64::new(0),
             file: Mutex::new(()),
             backoff_base: backoff::BASE,
             rejection_observers: Mutex::new(Vec::new()),
@@ -586,10 +593,16 @@ impl AuthCore {
         previous: Option<StoredIdentity>,
         access_token: Option<String>,
     ) {
+        let Some(credential) = self.stored().map(|s| s.session_token) else {
+            return;
+        };
         let Ok(Some(session)) = self.fetch_profile().await else {
             return;
         };
         let profile = session.user;
+        // A fallback belongs to one account. Failed org/role refreshes must
+        // never carry another account's memberships into this profile.
+        let previous = previous.filter(|identity| identity.id == profile.id);
         let held = previous
             .as_ref()
             .map(|p| avatar::CachedAvatar::new(p.avatar_url.clone(), p.avatar_path.clone()))
@@ -616,6 +629,10 @@ impl AuthCore {
             avatar::discard(avatar.path.as_deref());
             return;
         };
+
+        if current.session_token != credential {
+            return;
+        }
 
         // The desktop's own choice survives the refresh. #73 made this field
         // the organisation every gateway request bills, and `set_active_org`
@@ -665,6 +682,15 @@ impl AuthCore {
     /// account button again must return them to the *same* approval page —
     /// now with a browser session in hand — instead of stranding a fresh code.
     pub async fn start_grant(&self) -> Result<PendingGrant, GrantError> {
+        let epoch = self.grant_epoch.load(Ordering::SeqCst);
+        let _start = self
+            .grant_start
+            .acquire()
+            .await
+            .map_err(|_| GrantError::Cancelled)?;
+        if self.grant_epoch.load(Ordering::SeqCst) != epoch {
+            return Err(GrantError::Cancelled);
+        }
         if let Some(existing) = self.pending.lock().ok().and_then(|g| g.clone()) {
             if !existing.expired() && !existing.cancel.load(Ordering::SeqCst) {
                 return Ok(existing);
@@ -674,6 +700,7 @@ impl AuthCore {
         let res = self
             .http
             .post(self.url("/device/code"))
+            .timeout(AUTHED_TIMEOUT)
             .json(&serde_json::json!({ "client_id": CLIENT_ID }))
             .send()
             .await
@@ -696,9 +723,16 @@ impl AuthCore {
             expires_at: SystemTime::now() + Duration::from_secs(body.expires_in.max(1)),
             interval: Duration::from_secs(body.interval).max(MIN_POLL_INTERVAL),
             cancel: Arc::new(AtomicBool::new(false)),
+            polling: Arc::new(AtomicBool::new(false)),
         };
 
         if let Ok(mut slot) = self.pending.lock() {
+            if self.grant_epoch.load(Ordering::SeqCst) != epoch {
+                return Err(GrantError::Cancelled);
+            }
+            if let Some(old) = slot.as_ref() {
+                old.cancel.store(true, Ordering::SeqCst);
+            }
             *slot = Some(grant.clone());
         }
         Ok(grant)
@@ -707,6 +741,7 @@ impl AuthCore {
     /// Abandon the in-flight grant, if any. Idempotent.
     pub fn cancel_grant(&self) {
         if let Ok(mut slot) = self.pending.lock() {
+            self.grant_epoch.fetch_add(1, Ordering::SeqCst);
             if let Some(p) = slot.as_ref() {
                 p.cancel.store(true, Ordering::SeqCst);
             }
@@ -720,6 +755,7 @@ impl AuthCore {
         let res = self
             .http
             .post(self.url("/device/token"))
+            .timeout(AUTHED_TIMEOUT)
             .json(&serde_json::json!({
                 "grant_type": DEVICE_GRANT,
                 "device_code": device_code,
@@ -762,6 +798,9 @@ impl AuthCore {
     /// the browser. They simply cost one poll, and the 10-minute server-side
     /// deadline still bounds the whole thing.
     pub async fn run_grant(&self, grant: &PendingGrant) -> Result<(), GrantError> {
+        if grant.polling.swap(true, Ordering::SeqCst) {
+            return Err(GrantError::AlreadyPolling);
+        }
         let mut interval = grant.interval;
 
         loop {
@@ -769,7 +808,7 @@ impl AuthCore {
                 return Err(GrantError::Cancelled);
             }
             if grant.expired() {
-                self.finish();
+                self.finish(grant);
                 return Err(GrantError::Expired);
             }
 
@@ -779,14 +818,31 @@ impl AuthCore {
                 return Err(GrantError::Cancelled);
             }
 
-            match self.poll_once(&grant.device_code).await {
+            let outcome = self.poll_once(&grant.device_code).await;
+            if grant.cancel.load(Ordering::SeqCst) {
+                return Err(GrantError::Cancelled);
+            }
+            match outcome {
                 PollOutcome::Token(token) => {
                     // Captured before the write: a new grant may be a different
                     // person, and this is what lets the avatar cache prune the
                     // previous user's photo and skip a re-fetch for the same.
                     let previous = self.stored().and_then(|s| s.identity);
-                    self.persist(&token).map_err(GrantError::Start)?;
-                    self.finish();
+                    {
+                        let mut slot = self
+                            .pending
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if grant.cancel.load(Ordering::SeqCst)
+                            || !slot
+                                .as_ref()
+                                .is_some_and(|p| Arc::ptr_eq(&p.cancel, &grant.cancel))
+                        {
+                            return Err(GrantError::Cancelled);
+                        }
+                        self.persist(&token).map_err(GrantError::Start)?;
+                        *slot = None;
+                    }
                     // Inline rather than spawned, so the single state broadcast
                     // the caller emits already carries the user's name and face.
                     // The alternative flashes a nameless signed-in title bar on
@@ -804,11 +860,11 @@ impl AuthCore {
                     continue;
                 }
                 PollOutcome::Denied => {
-                    self.finish();
+                    self.finish(grant);
                     return Err(GrantError::Denied);
                 }
                 PollOutcome::Expired => {
-                    self.finish();
+                    self.finish(grant);
                     return Err(GrantError::Expired);
                 }
             }
@@ -817,9 +873,14 @@ impl AuthCore {
 
     /// Clear the pending slot without signalling cancellation (the grant is
     /// over on its own terms).
-    fn finish(&self) {
+    fn finish(&self, grant: &PendingGrant) {
         if let Ok(mut slot) = self.pending.lock() {
-            *slot = None;
+            if slot
+                .as_ref()
+                .is_some_and(|p| Arc::ptr_eq(&p.cancel, &grant.cancel))
+            {
+                *slot = None;
+            }
         }
     }
 

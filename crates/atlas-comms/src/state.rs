@@ -202,6 +202,48 @@ impl ChatState {
     }
 }
 
+/// Reconcile a late acknowledgement even after its retry record expired.
+/// The page fetch may already contain the server id, so replace both rows at
+/// once. A locally deleted send stays tombstoned until its server delete lands.
+fn settle_optimistic(
+    state: &mut ChatState,
+    conv_id: &str,
+    client_msg_id: &str,
+    id: &str,
+    seq: i64,
+    message: Option<Message>,
+) -> Option<StateDelta> {
+    let optimistic = optimistic_id(client_msg_id);
+    let list = state.messages.get_mut(conv_id)?;
+    let index = list.iter().position(|row| row.message.id == optimistic)?;
+    let mut row = list.remove(index);
+    if let Some(message) = message.or_else(|| {
+        list.iter()
+            .find(|row| row.message.id == id)
+            .map(|row| row.message.clone())
+    }) {
+        row.message = message;
+    }
+    list.retain(|row| row.message.id != id);
+    row.message.id = id.to_string();
+    row.message.seq = seq;
+    row.client_msg_id = None;
+    row.status = SendStatus::Settled;
+    if row.deleted {
+        row.message.body.clear();
+        row.message.attachments.clear();
+        row.message.code_refs.clear();
+        row.message.artifact_refs.clear();
+    }
+    list.push(row);
+    list.sort_by_key(|row| row.message.seq);
+    Some(StateDelta::MessageUpdated {
+        conv_id: conv_id.to_string(),
+        id: id.to_string(),
+        replaced_id: Some(optimistic),
+    })
+}
+
 /// Apply one server frame. Pure — no I/O, no clock beyond `now_ms`.
 ///
 /// `now_ms` is passed in rather than read so a test can drive time.
@@ -239,39 +281,23 @@ pub fn apply_frame(
             id,
             seq,
         } => {
-            let Some(sent) = pending.remove(&client_msg_id) else {
-                // An ack for something we are not holding: a duplicate, or a
-                // resend after a restart. Nothing to reconcile.
+            let optimistic_id = optimistic_id(&client_msg_id);
+            let conv_id = pending
+                .remove(&client_msg_id)
+                .map(|sent| sent.conv_id)
+                .or_else(|| {
+                    state
+                        .messages
+                        .iter()
+                        .find(|(_, rows)| rows.iter().any(|row| row.message.id == optimistic_id))
+                        .map(|(conv_id, _)| conv_id.clone())
+                });
+            let Some(conv_id) = conv_id else {
                 return Vec::new();
             };
-            let optimistic_id = optimistic_id(&client_msg_id);
-            let conv_id = sent.conv_id;
-
-            // The optimistic row may already have been replaced by a
-            // `message.new` from our own other device; if so there is nothing
-            // left to promote and the real row is already in place.
-            let existing = state
-                .messages
-                .get_mut(&conv_id)
-                .and_then(|l| l.iter_mut().find(|m| m.message.id == optimistic_id));
-
-            match existing {
-                Some(row) => {
-                    row.message.id = id.clone();
-                    row.message.seq = seq;
-                    row.client_msg_id = None;
-                    row.status = SendStatus::Settled;
-                    if let Some(list) = state.messages.get_mut(&conv_id) {
-                        list.sort_by_key(|m| m.message.seq);
-                    }
-                    vec![StateDelta::MessageUpdated {
-                        conv_id,
-                        id,
-                        replaced_id: Some(optimistic_id),
-                    }]
-                }
-                None => Vec::new(),
-            }
+            settle_optimistic(state, &conv_id, &client_msg_id, &id, seq, None)
+                .into_iter()
+                .collect()
         }
 
         ServerFrame::MessageNew(new) => {
@@ -285,21 +311,16 @@ pub fn apply_frame(
             // `client_msg_id` or the message doubles: the sender's socket gets
             // `ack`, every *other* socket of the same author gets this.
             if let Some(cmid) = client_msg_id.as_ref() {
-                if pending.remove(cmid).is_some() {
-                    let optimistic = optimistic_id(cmid);
-                    if let Some(row) = state.find_mut(&conv_id, &optimistic) {
-                        row.message = message;
-                        row.client_msg_id = None;
-                        row.status = SendStatus::Settled;
-                        if let Some(list) = state.messages.get_mut(&conv_id) {
-                            list.sort_by_key(|m| m.message.seq);
-                        }
-                        return vec![StateDelta::MessageUpdated {
-                            conv_id,
-                            id,
-                            replaced_id: Some(optimistic),
-                        }];
-                    }
+                pending.remove(cmid);
+                if let Some(delta) = settle_optimistic(
+                    state,
+                    &conv_id,
+                    cmid,
+                    &id,
+                    message.seq,
+                    Some(message.clone()),
+                ) {
+                    return vec![delta];
                 }
             }
 

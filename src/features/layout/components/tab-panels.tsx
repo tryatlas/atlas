@@ -34,9 +34,6 @@ const TerminalPanel = lazy(() =>
 const EditorPanel = lazy(() =>
   import("@/features/editor/components/editor-panel").then((m) => ({ default: m.EditorPanel })),
 );
-const BrowserPanel = lazy(() =>
-  import("@/features/browser/components/browser-panel").then((m) => ({ default: m.BrowserPanel })),
-);
 const MediaViewer = lazy(() =>
   import("@/features/media/components/media-viewer").then((m) => ({ default: m.MediaViewer })),
 );
@@ -141,8 +138,6 @@ export function PersistentPanel({
           <EditorPanel tabId={tab.id} filePath={t.data.filePath} containerHeight={height} />
         </FileTabFrame>
       );
-    case "browser":
-      return <BrowserPanel tabId={tab.id} groupId={GROUP_OF(tab)} initialUrl={t.data.url} />;
     case "pdf":
       return (
         <FileTabFrame tabId={tab.id} projectId={projectId} filePath={t.data.filePath}>
@@ -180,8 +175,6 @@ export function TabContent({ tab, projectId = null }: { tab: Tab; projectId?: st
   switch (t.type) {
     case "chat":
       return <ChatPanel tabId={tab.id} />;
-    case "browser":
-      return <BrowserPanel initialUrl={t.data.url} />;
     case "log":
       return <LogPanel />;
     case "source-control":

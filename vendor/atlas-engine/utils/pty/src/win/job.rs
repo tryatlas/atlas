@@ -141,6 +141,16 @@ impl JobObject {
     /// Nested jobs can reject assignment. Such a child is resumed without
     /// containment so callers can preserve their existing compatibility fallback.
     pub fn assign_and_resume_process(&self, process_id: u32) -> io::Result<bool> {
+        self.assign_and_resume(process_id, false)
+    }
+
+    /// Resumes a suspended process only when containment succeeded.
+    /// The caller must kill and reap its suspended child on error.
+    pub fn assign_and_resume_process_strict(&self, process_id: u32) -> io::Result<()> {
+        self.assign_and_resume(process_id, true).map(|_| ())
+    }
+
+    fn assign_and_resume(&self, process_id: u32, required: bool) -> io::Result<bool> {
         let process = unsafe {
             OpenProcess(
                 PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_SUSPEND_RESUME,
@@ -153,6 +163,9 @@ impl JobObject {
         }
         let process = unsafe { OwnedHandle::from_raw_handle(process.cast()) };
         let assignment = self.assign_process(process.as_raw_handle());
+        if required && let Err(error) = assignment {
+            return Err(error);
+        }
 
         let status = unsafe { NtResumeProcess(process.as_raw_handle().cast()) };
         if !NT_SUCCESS(status) {

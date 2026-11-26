@@ -60,12 +60,13 @@ export function UsagePanel() {
         toast.success("Copied Markdown report");
         return;
       }
-      if (kind === "markdown") await exportMarkdown(view);
+      let saved = false;
+      if (kind === "markdown") saved = await exportMarkdown(view);
       else if (captureRef.current) {
-        if (kind === "pdf") await exportPdf(captureRef.current);
-        else await exportJpeg(captureRef.current);
+        if (kind === "pdf") saved = await exportPdf(captureRef.current);
+        else saved = await exportJpeg(captureRef.current);
       }
-      toast.success(`Exported ${kind.toUpperCase()}`);
+      if (saved) toast.success(`Exported ${kind.toUpperCase()}`);
     } catch (e) {
       toast.error(`Export failed: ${String(e)}`);
     }
@@ -159,7 +160,7 @@ export function UsagePanel() {
                   eff={view.eff}
                   prevEff={view.prevEff}
                   rows={view.rows}
-                  sessions={view.sessions}
+                  sessions={view.sessionIdentities}
                   groupBy={groupBy}
                   data={data}
                 />

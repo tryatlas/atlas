@@ -19,11 +19,17 @@ pub(crate) fn create_env_for_mcp_server(
     env_vars: &[McpServerEnvVar],
 ) -> Result<HashMap<OsString, OsString>> {
     let additional_env_vars = local_stdio_env_var_names(env_vars)?;
+    let inherited_env = atlas_engine_protocol::shell_environment::host_environment();
     let mut env: HashMap<OsString, OsString> = DEFAULT_ENV_VARS
         .iter()
         .copied()
         .chain(additional_env_vars)
-        .filter_map(|var| env::var_os(var).map(|value| (OsString::from(var), value)))
+        .filter_map(|var| {
+            inherited_env
+                .get(std::ffi::OsStr::new(var))
+                .cloned()
+                .map(|value| (OsString::from(var), value))
+        })
         .collect();
     for name in CUSTOM_CA_ENV_KEYS {
         let Some(value) = env::var_os(name) else {

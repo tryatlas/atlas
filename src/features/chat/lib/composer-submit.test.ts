@@ -14,8 +14,7 @@ const idle: SubmitInput = {
   running: false,
   remoteDriving: false,
   modeUnrestored: false,
-  heldForTerminal: false,
-  supportsFork: false,
+  atlasCommands: { fork: null, queue: "queue" },
 };
 const plan = (over: Partial<SubmitInput>) => planSubmit({ ...idle, ...over });
 
@@ -46,8 +45,26 @@ describe("planSubmit", () => {
   });
 
   it("forks only when the agent supports it", () => {
-    expect(plan({ text: " /fork ", supportsFork: true })).toEqual({ kind: "fork" });
+    expect(plan({ text: " /fork ", atlasCommands: { fork: "fork", queue: "queue" } })).toEqual({
+      kind: "fork",
+    });
     expect(plan({ text: "/fork" })).toEqual({ kind: "send", text: "/fork" });
+  });
+
+  // #44: Atlas's /fork and /queue captured the agent's own commands of the
+  // same name. Where the agent advertises one, Atlas's goes by `atlas:`.
+  it("sends the agent's own /fork and /queue to it, and answers Atlas's renamed ones", () => {
+    const atlasCommands = { fork: "atlas:fork", queue: "atlas:queue" };
+    expect(plan({ text: "/fork", atlasCommands })).toEqual({ kind: "send", text: "/fork" });
+    expect(plan({ text: "/queue later", atlasCommands })).toEqual({
+      kind: "send",
+      text: "/queue later",
+    });
+    expect(plan({ text: "/atlas:fork", atlasCommands })).toEqual({ kind: "fork" });
+    expect(plan({ text: "/atlas:queue later", atlasCommands })).toEqual({
+      kind: "queue-command",
+      message: "later",
+    });
   });
 
   it("parses /queue with and without a message", () => {
@@ -59,17 +76,16 @@ describe("planSubmit", () => {
     expect(plan({ text: "/queued" })).toEqual({ kind: "send", text: "/queued" });
   });
 
-  it("enqueues while running, ahead of the mode and terminal gates", () => {
+  it("enqueues while running, ahead of the mode gate", () => {
     expect(plan({ running: true })).toEqual({ kind: "enqueue", text: "hello" });
-    expect(plan({ running: true, modeUnrestored: true, heldForTerminal: true })).toEqual({
+    expect(plan({ running: true, modeUnrestored: true })).toEqual({
       kind: "enqueue",
       text: "hello",
     });
   });
 
-  it("blocks an idle send on an unrestored mode or a session held elsewhere", () => {
+  it("blocks an idle send on an unrestored mode", () => {
     expect(plan({ modeUnrestored: true })).toEqual({ kind: "blocked" });
-    expect(plan({ heldForTerminal: true })).toEqual({ kind: "blocked" });
   });
 });
 
@@ -79,7 +95,6 @@ describe("submitButtonState", () => {
     hasText: false,
     disabled: false,
     modeUnrestored: false,
-    heldForTerminal: false,
     remoteDriving: false,
   };
   const state = (over: Partial<typeof base>) => submitButtonState({ ...base, ...over });
@@ -105,10 +120,9 @@ describe("submitButtonState", () => {
     });
   });
 
-  it("disables send on the mode and terminal gates, and everything when disabled", () => {
+  it("disables send on the mode gate, and everything when disabled", () => {
     expect(state({ hasText: true, modeUnrestored: true }).enabled).toBe(false);
-    expect(state({ hasText: true, heldForTerminal: true }).enabled).toBe(false);
-    expect(state({ running: true, heldForTerminal: true }).enabled).toBe(true);
+    expect(state({ running: true, modeUnrestored: true }).enabled).toBe(true);
     expect(state({ running: true, disabled: true })).toEqual({ mode: "stop", enabled: false });
   });
 });

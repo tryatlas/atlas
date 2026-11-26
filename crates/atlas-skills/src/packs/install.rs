@@ -147,7 +147,6 @@ fn install_pack_at(
             }
             _ => {}
         }
-        fs::remove_dir_all(&store).map_err(|e| e.to_string())?;
     }
 
     copy_dir_all(src, &store)?;

@@ -238,11 +238,12 @@ export const comms = {
     invoke<PromptDraft>("comms_create_draft", { convId, title }),
   /** Subscribe this socket to a draft; answered with a `draftOpened` event.
    *  Re-call on every reconnect — the subscription dies with the socket. */
-  draftOpen: (draftId: string) => invoke<void>("comms_draft_open", { draftId }),
-  draftUpdate: (draftId: string, update: string) =>
-    invoke<void>("comms_draft_update", { draftId, update }),
-  draftAwareness: (draftId: string, state: string) =>
-    invoke<void>("comms_draft_awareness", { draftId, state }),
+  draftOpen: (draftId: string, scope?: { accountId: string; orgId: string }) =>
+    invoke<void>("comms_draft_open", { draftId, ...scope }),
+  draftUpdate: (draftId: string, update: string, scope?: { accountId: string; orgId: string }) =>
+    invoke<void>("comms_draft_update", { draftId, update, ...scope }),
+  draftAwareness: (draftId: string, state: string, scope?: { accountId: string; orgId: string }) =>
+    invoke<void>("comms_draft_awareness", { draftId, state, ...scope }),
   /** Start a call. The server's join token never crosses the bridge — the
    *  browser's call tab mints its own; this answers the call row only.
    *  `provider` is required here even though Rust takes it as optional: the

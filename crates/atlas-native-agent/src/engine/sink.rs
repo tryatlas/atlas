@@ -70,6 +70,18 @@ pub struct EngineSession {
     /// `(server, tool)` (`engine::tool_approvals`). The engine keeps no session
     /// approval for a tool that always asks, so the seam does.
     allowed_for_session: std::collections::HashSet<(String, String)>,
+    turn_boundaries: Vec<EngineTurnBoundary>,
+    autonomous_turn: Option<(String, u32)>,
+}
+
+/// An engine turn's actual place in the visible transcript. Local slash
+/// commands have entries but no engine turn, so user-message counts are not
+/// a valid way to map rollback onto the transcript.
+#[derive(Clone)]
+pub(crate) struct EngineTurnBoundary {
+    pub id: String,
+    pub entry: usize,
+    pub prompt: String,
 }
 
 /// A card's place in its session's line: one card at a time (ADR-0013).
@@ -168,6 +180,11 @@ impl EngineSessions {
         // outlived the AcpThread it described. Swept at insert, so the state
         // is bounded by live sessions rather than by every session the
         // process ever opened.
+        let mut reaped: Vec<String> = sessions
+            .iter()
+            .filter(|(id, session)| *id != &session_id && session.thread.strong_count() == 0)
+            .map(|(id, _)| id.to_string())
+            .collect();
         sessions.retain(|_, session| session.thread.strong_count() > 0);
         // A child stays while its chain of parents leads back to a live
         // session: a subagent's own children are recorded under the
@@ -191,8 +208,20 @@ impl EngineSessions {
             }
             live.extend(reached);
         }
+        reaped.extend(children.keys().filter(|id| !live.contains(*id)).cloned());
         children.retain(|id, _| live.contains(id));
         drop(children);
+        for id in &reaped {
+            self.mcp_startup_lock().remove(id);
+            self.host_servers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(id);
+            self.every_time
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(id);
+        }
         sessions.insert(
             session_id,
             EngineSession {
@@ -203,8 +232,162 @@ impl EngineSessions {
                 selected_model: None,
                 prompt_tail: None,
                 allowed_for_session: std::collections::HashSet::new(),
+                turn_boundaries: Vec::new(),
+                autonomous_turn: None,
             },
         );
+    }
+
+    pub(crate) fn remove(&self, session_id: &acp::SessionId) {
+        let mut ids = self.descendants_of(&session_id.to_string());
+        ids.push(session_id.to_string());
+        self.lock().remove(session_id);
+        let mut children = self
+            .children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for id in &ids {
+            children.remove(id);
+        }
+        drop(children);
+        for id in &ids {
+            self.mcp_startup_lock().remove(id);
+            self.host_servers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(id);
+            self.every_time
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(id);
+        }
+        self.mcp_settled.notify_waiters();
+    }
+
+    pub(crate) fn prompt_entry(&self, session_id: &acp::SessionId) -> Option<(usize, String)> {
+        let thread = self.thread(session_id)?;
+        let locked = lock(&thread);
+        locked
+            .entries()
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, entry)| match entry {
+                atlas_acp_thread::AgentThreadEntry::UserMessage(message) => {
+                    Some((index, message.prompt_text()))
+                }
+                _ => None,
+            })
+    }
+
+    pub(crate) fn record_turn(&self, thread_id: &str, id: &str, entry: usize, prompt: String) {
+        if let Some(session) = self.lock().get_mut(&session_id(thread_id)) {
+            if !session.turn_boundaries.iter().any(|turn| turn.id == id) {
+                session.turn_boundaries.push(EngineTurnBoundary {
+                    id: id.to_string(),
+                    entry,
+                    prompt,
+                });
+            }
+        }
+    }
+
+    pub(crate) fn set_turn_boundaries(
+        &self,
+        session_id: &acp::SessionId,
+        boundaries: Vec<EngineTurnBoundary>,
+    ) {
+        if let Some(session) = self.lock().get_mut(session_id) {
+            session.turn_boundaries = boundaries;
+        }
+    }
+
+    pub(crate) fn rolled_back_boundary(
+        &self,
+        session_id: &acp::SessionId,
+        retained: &[atlas_engine_app_server_protocol::Turn],
+    ) -> Option<EngineTurnBoundary> {
+        let mut sessions = self.lock();
+        let session = sessions.get_mut(session_id)?;
+        let retained: std::collections::HashSet<&str> =
+            retained.iter().map(|turn| turn.id.as_str()).collect();
+        let removed = session
+            .turn_boundaries
+            .iter()
+            .find(|turn| !retained.contains(turn.id.as_str()))
+            .cloned();
+        session
+            .turn_boundaries
+            .retain(|turn| retained.contains(turn.id.as_str()));
+        removed
+    }
+
+    fn begin_autonomous_turn(
+        &self,
+        thread_id: &str,
+        turn: &atlas_engine_app_server_protocol::Turn,
+    ) {
+        let id = session_id(thread_id);
+        let Some(thread) = self.thread(&id) else {
+            return;
+        };
+        if self
+            .lock()
+            .get(&id)
+            .and_then(|s| s.autonomous_turn.as_ref())
+            .is_some_and(|(current, _)| current == &turn.id)
+        {
+            return;
+        }
+        let (local, entry) = {
+            let mut thread = lock(&thread);
+            (thread.begin_external_turn(), thread.entries().len())
+        };
+        let prompt = turn
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ThreadItem::UserMessage { content, .. } => {
+                    Some(crate::engine::replay::user_text(content))
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        self.record_turn(thread_id, &turn.id, entry, prompt);
+        if let Some(session) = self.lock().get_mut(&id) {
+            session.autonomous_turn = Some((turn.id.clone(), local));
+        }
+    }
+
+    fn end_autonomous_turn(&self, thread_id: &str, turn: &atlas_engine_app_server_protocol::Turn) {
+        let id = session_id(thread_id);
+        let owned = self.lock().get_mut(&id).and_then(|session| {
+            if session
+                .autonomous_turn
+                .as_ref()
+                .is_some_and(|(current, _)| current == &turn.id)
+            {
+                session.autonomous_turn.take().map(|(_, local)| local)
+            } else {
+                None
+            }
+        });
+        if let (Some(local), Some(thread)) = (owned, self.thread(&id)) {
+            use atlas_engine_app_server_protocol::TurnStatus;
+            let mut thread = lock(&thread);
+            match turn.status {
+                TurnStatus::Failed => {
+                    thread.set_error_unless_superseded(local);
+                }
+                TurnStatus::Interrupted => {
+                    thread.end_turn_unless_superseded(local, acp::StopReason::Cancelled);
+                }
+                TurnStatus::Completed => {
+                    thread.end_turn_unless_superseded(local, acp::StopReason::EndTurn);
+                }
+                TurnStatus::InProgress => {}
+            }
+        }
     }
 
     /// Takes the next place in `session_id`'s line of cards. Called on the
@@ -409,7 +592,7 @@ impl EngineSessions {
 
     /// Remembers the child a `Started` activity on `parent_thread_id` names,
     /// so its end can be reported there. Anything else is ignored.
-    fn note_spawned_child(&self, parent_thread_id: &str, item: &ThreadItem) {
+    pub(crate) fn note_spawned_child(&self, parent_thread_id: &str, item: &ThreadItem) {
         use atlas_engine_app_server_protocol::SubAgentActivityKind as K;
         let ThreadItem::SubAgentActivity {
             kind: K::Started,
@@ -1072,6 +1255,11 @@ pub fn apply_notification(
     notification: ServerNotification,
 ) {
     match notification {
+        ServerNotification::TurnStarted(params) => {
+            if turns.started(&params.thread_id, &params.turn.id) {
+                sessions.begin_autonomous_turn(&params.thread_id, &params.turn);
+            }
+        }
         // A host MCP server finished starting (or gave up). The next turn on
         // its thread may be waiting for exactly this; see `MCP_STARTUP_WAIT`.
         ServerNotification::McpServerStatusUpdated(params) => {
@@ -1253,6 +1441,7 @@ pub fn apply_notification(
                     let _ = lock(&thread).upsert_tool_call(call);
                 }
             }
+            sessions.end_autonomous_turn(&params.thread_id, &params.turn);
             turns.complete(&params.thread_id, params.turn);
         }
 
@@ -1301,13 +1490,19 @@ pub fn apply_notification(
             });
         }
 
-        // A terminal error. The turn is ending, and `TurnCompleted` carries
-        // the outcome `prompt` reports, so this only needs to be visible.
+        // Normal prompts surface failures through their awaited result.
+        // Manual compaction and automatic continuations have no such caller.
         ServerNotification::Error(params) => {
             tracing::warn!(
                 target: "atlas_native_agent::engine",
                 "the engine reported a terminal error: {}", params.error.message,
             );
+            if !turns.has_prompt(&params.thread_id, &params.turn_id) {
+                if let Some(thread) = sessions.thread(&session_id(&params.thread_id)) {
+                    lock(&thread)
+                        .push_assistant_content_block(text_block(&params.error.message), false);
+                }
+            }
         }
 
         // The account's quota windows. Account-level — the notification names
@@ -1893,6 +2088,69 @@ mod command_output {
         fn terminal_output(&self, id: &str) -> Option<String> {
             lock(&self.thread).terminal_output(&command_terminal_id(id))
         }
+    }
+
+    #[test]
+    fn an_automatic_goal_turn_owns_generation_until_its_own_completion() {
+        use atlas_engine_app_server_protocol::{
+            Turn, TurnCompletedNotification, TurnStartedNotification, TurnStatus,
+        };
+        let f = fixture();
+        let slash_turn = lock(&f.thread).begin_turn();
+        let turn = Turn {
+            id: "goal-continuation".into(),
+            items: Vec::new(),
+            items_view: Default::default(),
+            status: TurnStatus::InProgress,
+            error: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+        };
+        f.apply(ServerNotification::TurnStarted(TurnStartedNotification {
+            thread_id: f.session.to_string(),
+            turn: turn.clone(),
+        }));
+        assert!(lock(&f.thread).is_generating());
+        assert_eq!(
+            f.turns.active_turn(&f.session.to_string()).as_deref(),
+            Some("goal-continuation")
+        );
+        lock(&f.thread).end_turn_unless_superseded(slash_turn, acp::StopReason::EndTurn);
+        assert!(
+            lock(&f.thread).is_generating(),
+            "the local /goal reply cannot finish the automatic turn"
+        );
+        f.apply(ServerNotification::TurnCompleted(
+            TurnCompletedNotification {
+                thread_id: f.session.to_string(),
+                turn: Turn {
+                    status: TurnStatus::Completed,
+                    ..turn
+                },
+            },
+        ));
+        assert!(!lock(&f.thread).is_generating());
+        assert!(f.turns.active_turn(&f.session.to_string()).is_none());
+    }
+
+    #[test]
+    fn a_compaction_failure_without_a_prompt_waiter_is_visible() {
+        use atlas_engine_app_server_protocol::{ErrorNotification, TurnError};
+        let f = fixture();
+        f.apply(ServerNotification::Error(ErrorNotification {
+            thread_id: f.session.to_string(),
+            turn_id: "compact".into(),
+            will_retry: false,
+            error: TurnError {
+                message: "Compaction failed: gateway unavailable".into(),
+                atlas_engine_error_info: None,
+                additional_details: None,
+                retry_delay_ms: None,
+            },
+        }));
+        assert!(format!("{:?}", lock(&f.thread).entries())
+            .contains("Compaction failed: gateway unavailable"));
     }
 
     /// v2 reports a child's start on the parent and its end only on the

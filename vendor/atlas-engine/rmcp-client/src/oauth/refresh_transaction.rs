@@ -1,6 +1,7 @@
 // Modified by Atlas from upstream OpenAI Codex (Apache-2.0). See CONTEXT.md.
 //! Serialized read-refresh-write transactions for MCP OAuth credentials.
 
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -110,11 +111,15 @@ impl OAuthPersistor {
         // Stay on the lifecycle-pinned store. A failure is surfaced rather than falling back and
         // possibly replaying an older rotating refresh token from the other store.
         debug!("rereading authoritative MCP OAuth credentials");
-        let latest = self.inner.credential_store.load(
-            keyring_store,
-            &self.inner.server_name,
-            &self.inner.url,
-        )?;
+        let inner = Arc::clone(&self.inner);
+        let load_keyring = keyring_store.clone();
+        let latest = tokio::task::spawn_blocking(move || {
+            inner
+                .credential_store
+                .load(&load_keyring, &inner.server_name, &inner.url)
+        })
+        .await
+        .context("OAuth credential load task failed")??;
 
         // The pre-lock snapshot is only a hint. This locked reread is authoritative, so adopt a
         // winner from another process rather than refreshing its predecessor.
@@ -222,11 +227,18 @@ impl OAuthPersistor {
         // TODO: Add a bounded persistence retry only if telemetry shows this is common; never
         // silently switch stores or continue with an unpersisted credential.
         debug!("persisting refreshed MCP OAuth credentials to the resolved store");
-        if let Err(error) =
-            self.inner
+        let inner = Arc::clone(&self.inner);
+        let save_keyring = keyring_store.clone();
+        let tokens_to_save = refreshed.clone();
+        let saved = tokio::task::spawn_blocking(move || {
+            inner
                 .credential_store
-                .save(keyring_store, &self.inner.server_name, &refreshed)
-        {
+                .save(&save_keyring, &inner.server_name, &tokens_to_save)
+        })
+        .await
+        .context("OAuth credential save task failed")
+        .and_then(|result| result);
+        if let Err(error) = saved {
             warn!(
                 error = %error,
                 "failed to persist refreshed MCP OAuth credentials; returning the error and restoring the previous in-process credentials"

@@ -20,7 +20,7 @@
  * the text the moment the request failed.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type SetStateAction } from "react";
 
 import { useOrgDirectory } from "@/features/organisations/lib/use-org-directory";
 import { safeUnlistenPromise } from "@/lib/safe-unlisten";
@@ -60,11 +60,34 @@ export function useSessionComments(
   // threads would otherwise show under it (badge, panel, pills) until its own
   // list answered — indefinitely on a hung or offline read.
   const identity = shared ? `${remoteProjectId}\u0000${sessionId}` : null;
+  const generation = useRef(0);
   const [threadsFor, setThreadsFor] = useState(identity);
   if (threadsFor !== identity) {
+    generation.current += 1;
     setThreadsFor(identity);
     setThreads(EMPTY_THREADS);
   }
+
+  const owner = generation.current;
+  const mounted = useRef(true);
+  const setOwnedThreads = useCallback(
+    (next: SetStateAction<CommentThreads>) => {
+      setThreads((current) =>
+        mounted.current && owner === generation.current
+          ? typeof next === "function"
+            ? next(current)
+            : next
+          : current,
+      );
+    },
+    [owner],
+  );
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   // Follow this Session. Rust opens a socket subscribed to exactly it (or
   // shares the one another surface already holds — the Timeline and a chat
@@ -83,25 +106,25 @@ export function useSessionComments(
 
   const load = useCallback(() => {
     if (!shared) {
-      setThreads(EMPTY_THREADS);
+      setOwnedThreads(EMPTY_THREADS);
       return;
     }
     let live = true;
     void api
       .list(remoteProjectId, sessionId)
       .then((next) => {
-        if (live) setThreads(next);
+        if (live) setOwnedThreads(next);
       })
       // A failed read leaves no comments rather than an error banner over a
       // Session that is otherwise perfectly readable. The realtime channel
       // still fills them in if it connects.
       .catch(() => {
-        if (live) setThreads(EMPTY_THREADS);
+        if (live) setOwnedThreads(EMPTY_THREADS);
       });
     return () => {
       live = false;
     };
-  }, [shared, remoteProjectId, sessionId]);
+  }, [shared, remoteProjectId, sessionId, setOwnedThreads]);
 
   useEffect(() => load(), [load]);
 
@@ -112,7 +135,7 @@ export function useSessionComments(
         case "commentUpsert":
           // Frames reach every socket on the Project, not only this Session's.
           if (event.sessionId !== sessionId) return;
-          setThreads((current) => applyComment(current, event.comment));
+          setOwnedThreads((current) => applyComment(current, event.comment));
           return;
         case "resync":
           // We fell behind and frames were dropped, so local state has a gap
@@ -127,7 +150,7 @@ export function useSessionComments(
       }
     });
     return () => safeUnlistenPromise(stop);
-  }, [shared, sessionId, load]);
+  }, [shared, sessionId, load, setOwnedThreads]);
 
   const actions = useMemo(
     () => ({
@@ -149,7 +172,7 @@ export function useSessionComments(
         // Apply the answer directly rather than waiting for the echo: the
         // socket frame is the same comment, and `applyComment` is keyed by id,
         // so whichever lands second is a no-op replacement.
-        setThreads((current) => applyComment(current, posted));
+        setOwnedThreads((current) => applyComment(current, posted));
       },
       // Author only — the server refuses anyone else (`forbidden`), and the
       // thread only offers it on your own comments. It stamps `editedAt`,
@@ -157,17 +180,17 @@ export function useSessionComments(
       edit: async (commentId: string, body: string) => {
         if (!shared) return;
         const updated = await api.update(remoteProjectId, sessionId, commentId, { body });
-        setThreads((current) => applyComment(current, updated));
+        setOwnedThreads((current) => applyComment(current, updated));
       },
       resolve: async (commentId: string, resolved: boolean) => {
         if (!shared) return;
         const updated = await api.update(remoteProjectId, sessionId, commentId, { resolved });
-        setThreads((current) => applyComment(current, updated));
+        setOwnedThreads((current) => applyComment(current, updated));
       },
       remove: async (commentId: string) => {
         if (!shared) return;
         const removed = await api.remove(remoteProjectId, sessionId, commentId);
-        setThreads((current) => applyComment(current, removed));
+        setOwnedThreads((current) => applyComment(current, removed));
       },
       // Drawn at once, as the server will store it, then replaced by its
       // answer — a vote that waited on the round trip felt broken. A refusal
@@ -177,7 +200,7 @@ export function useSessionComments(
         const me = meRef.current;
         const before = findComment(threadsRef.current, commentId);
         if (me && before) {
-          setThreads((current) =>
+          setOwnedThreads((current) =>
             applyComment(current, {
               ...before,
               votes: withVote(before.votes ?? NO_VOTES, me, value),
@@ -186,14 +209,14 @@ export function useSessionComments(
         }
         try {
           const updated = await api.vote(remoteProjectId, sessionId, commentId, value);
-          setThreads((current) => applyComment(current, updated));
+          setOwnedThreads((current) => applyComment(current, updated));
         } catch (e) {
-          if (before) setThreads((current) => applyComment(current, before));
+          if (before) setOwnedThreads((current) => applyComment(current, before));
           throw e;
         }
       },
     }),
-    [shared, remoteProjectId, sessionId],
+    [shared, remoteProjectId, sessionId, setOwnedThreads],
   );
 
   return useMemo(

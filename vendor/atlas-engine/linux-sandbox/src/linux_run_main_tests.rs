@@ -301,9 +301,6 @@ fn cleanup_synthetic_mount_targets_removes_only_empty_mount_targets() {
     let empty_dir = temp_dir.path().join(".agents");
     let non_empty_file = temp_dir.path().join("non-empty");
     let missing_file = temp_dir.path().join(".missing");
-    std::fs::write(&empty_file, "").expect("write empty file");
-    std::fs::create_dir(&empty_dir).expect("create empty dir");
-    std::fs::write(&non_empty_file, "keep").expect("write nonempty file");
 
     let registrations = register_synthetic_mount_targets(&[
         crate::bwrap::SyntheticMountTarget::missing(&empty_file),
@@ -311,6 +308,7 @@ fn cleanup_synthetic_mount_targets_removes_only_empty_mount_targets() {
         crate::bwrap::SyntheticMountTarget::missing(&non_empty_file),
         crate::bwrap::SyntheticMountTarget::missing(&missing_file),
     ]);
+    std::fs::write(&non_empty_file, "keep").expect("write nonempty file");
     cleanup_synthetic_mount_targets(&registrations);
 
     assert!(!empty_file.exists());
@@ -325,19 +323,58 @@ fn cleanup_synthetic_mount_targets_removes_only_empty_mount_targets() {
 #[test]
 fn synthetic_mount_registry_root_is_unique_to_effective_user() {
     let effective_uid = unsafe { libc::geteuid() };
-    assert_eq!(
-        synthetic_mount_registry_root(),
-        std::env::temp_dir().join(format!(
-            "atlas-engine-bwrap-synthetic-mount-targets-{effective_uid}"
-        ))
-    );
+    let root = synthetic_mount_registry_root();
+    with_synthetic_mount_registry_lock(|| {});
+    let metadata = std::fs::symlink_metadata(root).unwrap();
+    assert_eq!(metadata.uid(), effective_uid);
+    assert_eq!(metadata.mode() & 0o077, 0);
+}
+
+#[test]
+fn registry_rejects_symlink_directories_and_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let victim = temp.path().join("victim");
+    std::fs::write(&victim, "keep").unwrap();
+    let link = temp.path().join("link");
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+    assert!(ensure_private_registry_directory(&link).is_err());
+    assert!(write_private_registry_file(&link, b"overwrite").is_err());
+    assert_eq!(std::fs::read_to_string(victim).unwrap(), "keep");
+}
+
+#[test]
+fn orphaned_synthetic_inode_is_reclaimed_but_a_replacement_is_preserved() {
+    let temp = tempfile::tempdir().unwrap();
+    for replace in [false, true] {
+        let target_path = temp
+            .path()
+            .join(if replace { "replaced" } else { "orphan" });
+        let registrations = register_synthetic_mount_targets(&[
+            crate::bwrap::SyntheticMountTarget::missing_empty_directory(&target_path),
+        ]);
+        // Model the marker left by a helper that exited without cleanup.
+        std::fs::rename(
+            &registrations[0].marker_file,
+            registrations[0].marker_dir.join("2147483647"),
+        )
+        .unwrap();
+        if replace {
+            std::fs::rename(&target_path, temp.path().join("old-inode")).unwrap();
+            std::fs::create_dir(&target_path).unwrap();
+        }
+        let metadata = std::fs::symlink_metadata(&target_path).unwrap();
+        let next = register_synthetic_mount_targets(&[
+            crate::bwrap::SyntheticMountTarget::existing_empty_directory(&target_path, &metadata),
+        ]);
+        cleanup_synthetic_mount_targets(&next);
+        assert_eq!(target_path.exists(), replace);
+    }
 }
 
 #[test]
 fn cleanup_synthetic_mount_targets_waits_for_other_active_registrations() {
     let temp_dir = tempfile::TempDir::new().expect("tempdir");
     let empty_file = temp_dir.path().join(".git");
-    std::fs::write(&empty_file, "").expect("write empty file");
     let target = crate::bwrap::SyntheticMountTarget::missing(&empty_file);
 
     let registrations = register_synthetic_mount_targets(std::slice::from_ref(&target));

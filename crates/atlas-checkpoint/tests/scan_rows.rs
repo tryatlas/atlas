@@ -178,14 +178,14 @@ fn scan_state_round_trips() {
 // ── Labels: "Not useful" on a finding ───────────────────────────────────────
 
 #[test]
-fn migrates_to_v13_with_the_label_table() {
+fn migrates_to_current_version_without_losing_the_label_table() {
     let (dir, store) = store();
     drop(store);
     let conn = rusqlite::Connection::open(dir.path().join(".atlas/sessions.db")).unwrap();
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, atlas_checkpoint::SCHEMA_VERSION);
     let n: i64 = conn
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'security_label'",

@@ -2,15 +2,16 @@
 // and the composer's gates, and this carries the plan out.
 
 import { useCallback, type Dispatch, type RefObject, type SetStateAction } from "react";
-import { catalogEntry as agentCatalogEntry } from "@/features/agents/lib/agent-meta";
 import type { ImageAttachment } from "@/types/agents";
 import type { ChatInputHandle } from "../components/chat-input";
+import { atlasCommandNames, buildAgentSlashCommands } from "../lib/agent-slash-commands";
 import { planSubmit } from "../lib/composer-submit";
 import { forkSessionToNewTab } from "../lib/fork-session";
 import type { StagedImage } from "../lib/image-attachment";
 import { forgetSentTexts } from "../lib/mention-registry";
 import type { MentionData } from "../lib/mentions";
 import { sessionSend } from "../lib/session-send";
+import { useChatStore } from "../stores/chat-store";
 
 export function useComposerSubmit({
   tabId,
@@ -25,7 +26,6 @@ export function useComposerSubmit({
   running,
   remoteDriving,
   modeUnrestored,
-  heldForTerminal,
   onSend,
   onStop,
 }: {
@@ -41,10 +41,12 @@ export function useComposerSubmit({
   running: boolean;
   remoteDriving: boolean;
   modeUnrestored: boolean;
-  heldForTerminal: boolean;
   onSend: (message: string, mentions: MentionData[], attachments?: ImageAttachment[]) => void;
   onStop?: () => void;
 }) {
+  // The agent's advertised commands: a name it advertises is its own, so
+  // Atlas's `/fork` and `/queue` go by another there.
+  const availableCommands = useChatStore((s) => s.sessions[tabId]?.availableCommands);
   return useCallback(() => {
     // The gates and their order are `planSubmit`'s (`composer-submit.ts`).
     const plan = planSubmit({
@@ -54,8 +56,8 @@ export function useComposerSubmit({
       running,
       remoteDriving,
       modeUnrestored,
-      heldForTerminal,
-      supportsFork: agentCatalogEntry(agentType)?.supportsFork === true,
+      // The picker's catalogue, so a typed name means what its row does.
+      atlasCommands: atlasCommandNames(buildAgentSlashCommands(agentType, availableCommands)),
     });
     switch (plan.kind) {
       case "blocked":
@@ -102,11 +104,11 @@ export function useComposerSubmit({
     onStop,
     tabId,
     agentType,
+    availableCommands,
     disabled,
     stagedImages,
     githubSyncing,
     modeUnrestored,
-    heldForTerminal,
     remoteDriving,
   ]);
 }

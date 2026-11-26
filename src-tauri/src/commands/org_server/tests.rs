@@ -5588,6 +5588,59 @@ async fn a_native_session_on_a_cloud_bound_project_is_offered_all_three_on_one_t
     client.cancel().await.ok();
 }
 
+/// Audit #93: an agent that takes pre-approval by tool name is handed each
+/// offered server's tools one by one, and the list is exactly what that
+/// server answers `tools/list` with — taken from the same definition, so it
+/// cannot drift. Checked over the wire for every server the host offers.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_preapproved_tools_are_exactly_what_each_server_lists() {
+    let org = FakeOrganisation::with_member("Ada Lovelace", Some(Role::Admin));
+    let host = running_host_as(org, true, FakeSessionOrgs::new(true, Some(acme()))).await;
+    let offer = offers(host.clone()).offer(&session_request(true));
+    let got = entries(&offer);
+    assert_eq!(got.len(), 3, "every tenant is offered: {:?}", names(&offer));
+    let meta =
+        atlas_agent_servers::session_mcp::claude_code_meta(offer.servers(), offer.ask_first());
+    let declared = offer.ask_first().clone();
+    offer.bind(&acp::SessionId::new("s1"));
+
+    let mut listed_everywhere = Vec::new();
+    for (name, url, token) in &got {
+        let client = connect(url, token).await.unwrap();
+        let mut listed: Vec<String> = client
+            .list_all_tools()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        client.cancel().await.ok();
+        let mut advertised: Vec<String> =
+            declared.advertised_on(name).map(str::to_string).collect();
+        listed.sort();
+        advertised.sort();
+        assert!(!listed.is_empty(), "{name} lists tools");
+        assert_eq!(advertised, listed, "{name}");
+        let asks: Vec<&str> = declared.tools_on(name).collect();
+        listed_everywhere.extend(
+            listed
+                .iter()
+                .filter(|tool| !asks.contains(&tool.as_str()))
+                .map(|tool| format!("mcp__{name}__{tool}")),
+        );
+    }
+
+    let mut allowed: Vec<String> = meta["claudeCode"]["options"]["allowedTools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    allowed.sort();
+    listed_everywhere.sort();
+    assert_eq!(allowed, listed_everywhere, "never a whole server");
+}
+
 /// ADR-0014: the host declares which of its tools ask first, and the offer
 /// carries the declaration for the connection to project — the organisation
 /// server's outward actions, and only while that server is offered.
@@ -5616,10 +5669,11 @@ async fn the_offer_declares_the_org_servers_outward_actions_as_asking_first() {
     let host = running_host_as(chatting(), false, bound_to_acme()).await;
     let offer = offers(host).offer(&session_request(true));
     assert_eq!(
-        offer.ask_first(),
-        &atlas_agent_servers::AskFirst::none(),
+        offer.ask_first().tools_on(ORG_SERVER_NAME).count(),
+        0,
         "no org server, nothing asks"
     );
+    assert_eq!(offer.ask_first().every_time_tools().count(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

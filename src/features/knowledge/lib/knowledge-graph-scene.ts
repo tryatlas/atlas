@@ -390,7 +390,12 @@ export function buildKnowledgeScene(app: Application, opts: KnowledgeSceneOption
   window.addEventListener("mousedown", onMaybeStartPan, { capture: true });
   window.addEventListener("mousemove", onPanMove);
   window.addEventListener("mouseup", exitPanMode);
-  window.addEventListener("blur", exitPanMode);
+  const onWindowBlur = () => {
+    spaceHeld = false;
+    exitPanMode();
+    setCursor();
+  };
+  window.addEventListener("blur", onWindowBlur);
 
   // ── Sleep/wake ────────────────────────────────────────────────
   let awake = true;
@@ -562,7 +567,7 @@ export function buildKnowledgeScene(app: Application, opts: KnowledgeSceneOption
     window.removeEventListener("mousedown", onMaybeStartPan, true);
     window.removeEventListener("mousemove", onPanMove);
     window.removeEventListener("mouseup", exitPanMode);
-    window.removeEventListener("blur", exitPanMode);
+    window.removeEventListener("blur", onWindowBlur);
     window.removeEventListener("pointerdown", wake);
     window.removeEventListener("pointermove", wake);
     window.removeEventListener("wheel", wake);

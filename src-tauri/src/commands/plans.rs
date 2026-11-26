@@ -43,11 +43,12 @@ fn plans_path(project_path: &str) -> std::path::PathBuf {
     atlas_profile::dir_in(Path::new(project_path)).join("plans.json")
 }
 
-fn read_plans(project_path: &str) -> PlansFile {
+fn read_plans(project_path: &str) -> Result<PlansFile, String> {
     let path = plans_path(project_path);
     match fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str::<PlansFile>(&raw).unwrap_or_default(),
-        Err(_) => PlansFile::default(),
+        Ok(raw) => serde_json::from_str(&raw).map_err(|e| format!("read plans.json: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PlansFile::default()),
+        Err(e) => Err(format!("read plans.json: {e}")),
     }
 }
 
@@ -60,7 +61,7 @@ fn write_plans(project_path: &str, file: &PlansFile) -> Result<(), String> {
 #[tauri::command]
 pub async fn plans_load(project_path: String) -> Result<Vec<PlanRecord>, String> {
     tokio::task::spawn_blocking(move || -> Result<Vec<PlanRecord>, String> {
-        let mut plans = read_plans(&project_path).plans;
+        let mut plans = read_plans(&project_path)?.plans;
         // Newest first — the panel shows most-recent plans at the top.
         plans.reverse();
         Ok(plans)
@@ -78,7 +79,9 @@ pub async fn plans_append(
     record: PlanRecord,
 ) -> Result<Vec<PlanRecord>, String> {
     tokio::task::spawn_blocking(move || -> Result<Vec<PlanRecord>, String> {
-        let mut file = read_plans(&project_path);
+        static APPEND_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _guard = APPEND_LOCK.lock();
+        let mut file = read_plans(&project_path)?;
         let dup = file
             .plans
             .iter()
@@ -108,6 +111,19 @@ mod tests {
             plan: format!("# plan {id}"),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_damaged_plans_file_survives_an_append_and_can_be_repaired() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().to_string_lossy().to_string();
+        let path = plans_path(&root);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{ damaged").unwrap();
+        assert!(plans_append(root.clone(), record("a")).await.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{ damaged");
+        fs::write(&path, r#"{"plans":[]}"#).unwrap();
+        assert_eq!(plans_append(root, record("a")).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

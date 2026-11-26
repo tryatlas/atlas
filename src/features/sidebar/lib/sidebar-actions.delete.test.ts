@@ -1,5 +1,6 @@
-// A session still live in another process (a terminal) cannot be deleted from
-// here: Rust refuses it, so the sidebar never asks the question at all.
+// Deleting asks first, then deletes. Nothing on disk vetoes it any more:
+// liveness is ACP state only, so a stale `liveElsewhere` on the row (the
+// field is deprecated and always false from Rust) is not read.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -24,13 +25,13 @@ beforeEach(() => {
 });
 
 describe("deleteSession", () => {
-  it("does nothing for a session live in another process", async () => {
+  it("asks, then deletes, whatever a stale liveElsewhere says", async () => {
     await deleteSession(session(true));
-    expect(confirmDeleteChat).not.toHaveBeenCalled();
-    expect(deleteThread).not.toHaveBeenCalled();
+    expect(confirmDeleteChat).toHaveBeenCalledWith("Fix it");
+    expect(deleteThread).toHaveBeenCalledWith("t1");
   });
 
-  it("asks, then deletes, a session that is not", async () => {
+  it("asks, then deletes", async () => {
     await deleteSession(session(false));
     expect(confirmDeleteChat).toHaveBeenCalledWith("Fix it");
     expect(deleteThread).toHaveBeenCalledWith("t1");

@@ -85,11 +85,9 @@ fn extensions(name: &str) -> Vec<String> {
     let mut out = Vec::new();
     // Skip index 0 so a dotfile's whole name is never read as its extension:
     // `.gitignore` has no extension, it has a file name.
-    let mut from = 1usize;
-    while let Some(dot) = lower[from..].find('.') {
-        from += dot + 1;
-        if from < lower.len() {
-            out.push(lower[from..].to_string());
+    for (dot, _) in lower.match_indices('.') {
+        if dot > 0 && dot + 1 < lower.len() {
+            out.push(lower[dot + 1..].to_string());
         }
     }
     out
@@ -287,6 +285,13 @@ mod tests {
             Appearance::Dark,
         )
         .map(str::to_string)
+    }
+
+    #[test]
+    fn unicode_leading_names_resolve_without_slicing_a_codepoint() {
+        assert_eq!(pick("界面.ts", IconKind::File), Some("ts".to_string()));
+        assert_eq!(pick("é.d.ts", IconKind::File), Some("dts".to_string()));
+        assert_eq!(pick("🦀", IconKind::File), Some("file".to_string()));
     }
 
     #[test]

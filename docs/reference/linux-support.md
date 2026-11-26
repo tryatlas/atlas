@@ -30,7 +30,7 @@ binary does.
 | Ubuntu                                   | 22.04          | deb                                |
 | Debian                                   | 12             | deb                                |
 | Fedora                                   | 36             | rpm                                |
-| RHEL, Rocky, Alma                        | 10             | rpm                                |
+| RHEL, Rocky, Alma                        | 10 + EPEL/CRB  | rpm                                |
 | Arch, Manjaro, EndeavourOS               | rolling        | Arch package                       |
 | anything else meeting the two conditions |                | AppImage or tarball                |
 
@@ -38,6 +38,34 @@ Both x86-64 and aarch64 are built. Ubuntu 20.04, Debian 11 and RHEL 8 are not su
 their WebKitGTK predates 4.1. RHEL 9 is not supported either: its glibc is 2.34. Moving the floor means changing the runner in
 `release-linux.yml` and the `GLIBC_FLOOR` its `Verify` step checks, together with this
 table.
+
+### Enterprise Linux prerequisites
+
+RHEL, Rocky and AlmaLinux 10 require **EPEL 10 and CodeReady Builder (CRB)** before
+installing the RPM. Stock BaseOS/AppStream repositories do not provide Atlas's
+WebKitGTK and Ayatana indicator dependencies. Their RPM requirements remain mandatory;
+removing them would produce an application that installs but cannot start.
+[Fedora's Ayatana package](https://packages.fedoraproject.org/pkgs/libayatana-appindicator/libayatana-appindicator-gtk3/)
+
+On Rocky Linux 10, enable CRB and install `epel-release` first:
+
+```bash
+sudo dnf install dnf-plugins-core epel-release
+sudo dnf config-manager --set-enabled crb
+sudo dnf install ./tryatlas-<version>-1.<arch>.rpm
+```
+
+AlmaLinux provides `epel-release` through its extras repository; enable CRB if it is
+not enabled automatically. On RHEL, enable the matching
+`codeready-builder-for-rhel-10-<arch>-rpms` repository through `subscription-manager`,
+then install EPEL 10 using Fedora's distribution-specific instructions.
+[Rocky repository setup](https://docs.rockylinux.org/guides/package_management/dnf_package_manager/),
+[AlmaLinux EPEL setup](https://wiki.almalinux.org/repos/Extras),
+[RHEL repositories](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html/considerations_in_adopting_rhel_10/rhel-repositories),
+[EPEL installation](https://docs.fedoraproject.org/en-US/epel/getting-started/)
+
+The package install gate includes `rockylinux:10` with those prerequisites, alongside
+Fedora. Its result is required before claiming the corresponding RPM installs.
 
 ## Packages
 

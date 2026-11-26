@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { useLocalMedia } from "@/features/media/lib/use-local-media";
 import { attachmentPath, cachedAttachmentPath } from "../lib/attachment-cache";
 import { useLightboxStore, type LightboxItem } from "../stores/lightbox-store";
 import { MediaLightboxView } from "./views/media-lightbox-view";
+import { saveAttachment } from "../lib/attachment-actions";
 
 /**
  * Full-size view of chat media, as a gallery.
@@ -47,15 +48,19 @@ export function MediaLightbox() {
     };
   }, [open, item, items, index]);
 
+  const media = useLocalMedia(open ? path : null, item?.kind ?? "image");
   return (
     <MediaLightboxView
       open={open}
       items={items}
       index={index}
-      src={path ? convertFileSrc(path) : null}
-      failed={failed}
+      src={media.url}
+      failed={failed || !!media.error}
       onIndexChange={goTo}
       onClose={close}
+      onSave={() => {
+        if (item) void saveAttachment(item);
+      }}
     />
   );
 }

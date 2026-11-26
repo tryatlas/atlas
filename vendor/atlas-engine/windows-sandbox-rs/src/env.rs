@@ -1,3 +1,4 @@
+// Modified by Atlas from upstream OpenAI Codex (Apache-2.0). See CONTEXT.md.
 use anyhow::Result;
 use anyhow::anyhow;
 use dirs_next::home_dir;
@@ -114,9 +115,11 @@ fn ensure_denybin(tools: &[&str], denybin_dir: Option<&Path>) -> Result<PathBuf>
     for tool in tools {
         for ext in [".bat", ".cmd"] {
             let path = base.join(format!("{tool}{ext}"));
-            if !path.exists() {
+            const CONTENTS: &[u8] = b"@echo off\r\nexit /b 1\r\n";
+            // Repair stubs cached by older builds with literal backslash escapes.
+            if fs::read(&path).ok().as_deref() != Some(CONTENTS) {
                 let mut f = File::create(&path)?;
-                f.write_all(b"@echo off\\r\\nexit /b 1\\r\\n")?;
+                f.write_all(CONTENTS)?;
             }
         }
     }

@@ -49,6 +49,7 @@ const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// install it — the security anchor for the whole update, since the DMG is
 /// fetched over an attacker-controllable remote-config URL.
 const EXPECTED_TEAM_ID: &str = "PLKDA3WBJJ";
+const EXPECTED_BUNDLE_ID: &str = "dev.atlas.ide";
 
 /// How often to re-check for updates while the app runs.
 const RECHECK_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
@@ -77,6 +78,8 @@ pub struct UpdaterState {
     downloading: AtomicBool,
     /// Version currently staged + ready (mirror of the on-disk manifest).
     ready: Mutex<Option<String>>,
+    /// Serializes manifest publication and applying the selected staged bundle.
+    staging: Mutex<()>,
 }
 
 impl UpdaterState {
@@ -204,13 +207,13 @@ pub(super) async fn update_check_now(app: AppHandle) -> Result<UpdateStatus, Str
     emit_checking(&app, true);
     let cfg = fetch_remote(&app).await;
     emit_checking(&app, false);
-    let available = cfg
-        .as_ref()
-        .map(|c| is_newer(&c.version, CURRENT_VERSION))
-        .unwrap_or(false);
-    let version = cfg.as_ref().map(|c| c.version.clone());
+    let cfg = cfg.ok_or_else(|| {
+        "Could not retrieve update information. Try again in a moment.".to_string()
+    })?;
+    let available = is_newer(&cfg.version, CURRENT_VERSION);
+    let version = Some(cfg.version.clone());
     if available {
-        maybe_start_update(&app, cfg.unwrap(), true).await;
+        maybe_start_update(&app, cfg, true).await;
     }
     Ok(UpdateStatus {
         available,
@@ -341,8 +344,19 @@ async fn do_download_and_stage(
     let staged =
         tauri::async_runtime::spawn_blocking(move || stage_from_dmg(&appc, &dmgc, &dirc, &ver))
             .await
-            .map_err(|e| format!("stage join: {e}"))??;
+            .map_err(|e| format!("stage join: {e}"))
+            .and_then(|result| result);
+    let staged = match staged {
+        Ok(staged) => staged,
+        Err(error) => {
+            // A mount/signature/version failure is not a reusable download.
+            let _ = tokio::fs::remove_file(&dmg).await;
+            return Err(error);
+        }
+    };
 
+    let state = app.state::<UpdaterState>();
+    let _publication = state.staging.lock();
     save_manifest(
         app,
         &Staging {
@@ -383,7 +397,7 @@ fn stage_from_dmg(
         ));
     }
 
-    let result = stage_from_mount(&mount_point, dir);
+    let result = stage_from_mount(&mount_point, dir, version);
 
     let _ = Command::new("hdiutil")
         .args(["detach", "-quiet"])
@@ -393,7 +407,7 @@ fn stage_from_dmg(
     result
 }
 
-fn stage_from_mount(mount_point: &Path, dir: &Path) -> Result<PathBuf, String> {
+fn stage_from_mount(mount_point: &Path, dir: &Path, version: &str) -> Result<PathBuf, String> {
     let src_app = std::fs::read_dir(mount_point)
         .map_err(|e| format!("read mount: {e}"))?
         .filter_map(std::result::Result::ok)
@@ -402,12 +416,15 @@ fn stage_from_mount(mount_point: &Path, dir: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| "no .app found in the update DMG".to_string())?;
 
     // Verify the Apple signature + team id BEFORE trusting the payload.
-    verify_signature(&src_app)?;
+    verify_payload(&src_app, version)?;
 
-    let staged_dir = dir.join("staged");
-    let _ = std::fs::remove_dir_all(&staged_dir);
-    std::fs::create_dir_all(&staged_dir).map_err(|e| format!("staged dir: {e}"))?;
-    let staged_app = staged_dir.join("Atlas.app");
+    // Never touch the path a ready manifest names. A quit or crash while this
+    // copy is in progress can still install the previous verified update.
+    let staging = tempfile::Builder::new()
+        .prefix("staged-")
+        .tempdir_in(dir)
+        .map_err(|e| format!("staged dir: {e}"))?;
+    let staged_app = staging.path().join("Atlas.app");
 
     let out = Command::new("ditto")
         .arg(&src_app)
@@ -420,10 +437,47 @@ fn stage_from_mount(mount_point: &Path, dir: &Path) -> Result<PathBuf, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
+    verify_payload(&staged_app, version)?;
+    let _ = staging.keep();
     Ok(staged_app)
 }
 
 // ── Apply (swap) ─────────────────────────────────────────────────────────────
+
+fn apply_staged(app: &AppHandle, selected: &Staging, dest: &Path) -> Result<(), String> {
+    let state = app.state::<UpdaterState>();
+    let _publication = state.staging.lock();
+    let current = load_manifest(app).ok_or("no update is staged")?;
+    if !current.ready
+        || current.version != selected.version
+        || current.staged_app != selected.staged_app
+    {
+        return Err("The staged update changed. Try restarting again.".into());
+    }
+    let staged_path = PathBuf::from(selected.staged_app.as_deref().ok_or("no staged app")?);
+    verify_payload(&staged_path, &selected.version)?;
+    swap_app(&staged_path, dest)?;
+    save_manifest(
+        app,
+        &Staging {
+            version: selected.version.clone(),
+            staged_app: None,
+            ready: false,
+            applied: true,
+        },
+    )?;
+    // A persisted path is not authority to remove an arbitrary parent folder.
+    if let (Some(parent), Ok(updates)) = (staged_path.parent(), updates_dir(app)) {
+        if parent.parent() == Some(updates.as_path())
+            && parent
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("staged-"))
+        {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+    Ok(())
+}
 
 /// "Restart now": swap the staged `.app` over the running install and relaunch.
 pub(super) async fn update_apply(app: AppHandle) -> Result<(), String> {
@@ -438,25 +492,13 @@ pub(super) async fn update_apply(app: AppHandle) -> Result<(), String> {
     }
     let dest = current_app_bundle()?;
 
-    let sp = staged_path.clone();
-    let res = tauri::async_runtime::spawn_blocking(move || swap_app(&sp, &dest))
+    let appc = app.clone();
+    let res = tauri::async_runtime::spawn_blocking(move || apply_staged(&appc, &m, &dest))
         .await
         .map_err(|e| format!("apply join: {e}"))?;
 
     match res {
         Ok(()) => {
-            let _ = save_manifest(
-                &app,
-                &Staging {
-                    version: m.version,
-                    staged_app: None,
-                    ready: false,
-                    applied: true,
-                },
-            );
-            if let Ok(dir) = updates_dir(&app) {
-                let _ = std::fs::remove_dir_all(dir.join("staged"));
-            }
             app.restart();
         }
         Err(e) => {
@@ -490,20 +532,7 @@ pub fn apply_on_exit(app: &AppHandle) {
     let Ok(dest) = current_app_bundle() else {
         return;
     };
-    if swap_app(&staged_path, &dest).is_ok() {
-        let _ = save_manifest(
-            app,
-            &Staging {
-                version: m.version,
-                staged_app: None,
-                ready: false,
-                applied: true,
-            },
-        );
-        if let Ok(dir) = updates_dir(app) {
-            let _ = std::fs::remove_dir_all(dir.join("staged"));
-        }
-    }
+    let _ = apply_staged(app, &m, &dest);
 }
 
 /// Startup housekeeping: if a staged update was applied (we're now running a
@@ -539,34 +568,85 @@ pub fn spawn_periodic(app: &AppHandle) {
     });
 }
 
-/// Swap `staged` over `dest` with a `.bak` rollback. Tries an atomic rename
-/// (same APFS volume — instant); falls back to a `ditto` copy.
+/// Prepare a complete copy on the destination filesystem before moving the
+/// installed bundle. Cross-volume staging must never expose a partial .app.
 fn swap_app(staged: &Path, dest: &Path) -> Result<(), String> {
+    let parent = dest.parent().ok_or("app bundle has no parent")?;
+    let incoming = tempfile::Builder::new()
+        .prefix(".atlas-update-")
+        .tempdir_in(parent)
+        .map_err(|e| format!("prepare install: {e}"))?;
+    let complete = incoming.path().join("Atlas.app");
+    let out = Command::new("ditto")
+        .arg(staged)
+        .arg(&complete)
+        .output()
+        .map_err(|e| format!("ditto: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "install copy failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    verify_signature(&complete)?;
     let backup = dest.with_extension("app.bak");
-    let _ = std::fs::remove_dir_all(&backup);
+    if backup.exists() {
+        std::fs::remove_dir_all(&backup).map_err(|e| format!("remove old app backup: {e}"))?;
+    }
     if dest.exists() {
         std::fs::rename(dest, &backup).map_err(|e| format!("back up current app: {e}"))?;
     }
-    // Fast path: atomic directory rename on the same volume.
-    if std::fs::rename(staged, dest).is_err() {
-        let out = Command::new("ditto")
-            .arg(staged)
-            .arg(dest)
-            .output()
-            .map_err(|e| format!("ditto: {e}"))?;
-        if !out.status.success() {
-            // Roll back to the original bundle.
-            let _ = std::fs::remove_dir_all(dest);
-            if backup.exists() {
-                let _ = std::fs::rename(&backup, dest);
-            }
-            return Err(format!(
-                "install failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+    if let Err(error) = std::fs::rename(&complete, dest) {
+        if backup.exists() {
+            let _ = std::fs::rename(&backup, dest);
         }
+        return Err(format!("install app: {error}"));
     }
     let _ = std::fs::remove_dir_all(&backup);
+    Ok(())
+}
+
+fn verify_payload(path: &Path, advertised: &str) -> Result<(), String> {
+    verify_signature(path)?;
+    let read = |key: &str| -> Result<String, String> {
+        let out = Command::new("/usr/bin/plutil")
+            .args(["-extract", key, "raw", "-o", "-"])
+            .arg(path.join("Contents/Info.plist"))
+            .output()
+            .map_err(|e| format!("read bundle metadata: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("update has no {key}"));
+        }
+        String::from_utf8(out.stdout)
+            .map(|s| s.trim().to_owned())
+            .map_err(|e| e.to_string())
+    };
+    verify_bundle_identity(
+        &read("CFBundleIdentifier")?,
+        &read("CFBundleShortVersionString")?,
+        advertised,
+        CURRENT_VERSION,
+    )
+}
+
+fn verify_bundle_identity(
+    id: &str,
+    actual: &str,
+    advertised: &str,
+    current: &str,
+) -> Result<(), String> {
+    if id != EXPECTED_BUNDLE_ID {
+        return Err("update rejected: unexpected bundle identifier".into());
+    }
+    let actual_version =
+        semver::Version::parse(actual).map_err(|_| "update rejected: invalid bundle version")?;
+    let advertised_version = semver::Version::parse(advertised)
+        .map_err(|_| "update rejected: invalid advertised version")?;
+    if actual_version != advertised_version || !is_newer(actual, current) {
+        return Err(
+            "update rejected: bundle version does not match a newer advertised release".into(),
+        );
+    }
     Ok(())
 }
 
@@ -623,5 +703,22 @@ fn current_app_bundle() -> Result<PathBuf, String> {
             "running from a non-.app location ({}); update via the DMG",
             app.display()
         ))
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[test]
+    fn signed_bundles_still_need_the_right_product_and_newer_matching_version() {
+        assert!(verify_bundle_identity(EXPECTED_BUNDLE_ID, "1.2.1", "1.2.1", "1.2.0").is_ok());
+        for (id, actual, advertised) in [
+            ("dev.other.app", "1.2.1", "1.2.1"),
+            (EXPECTED_BUNDLE_ID, "1.1.0", "1.2.1"),
+            (EXPECTED_BUNDLE_ID, "1.2.0", "1.2.0"),
+            (EXPECTED_BUNDLE_ID, "broken", "1.2.1"),
+        ] {
+            assert!(verify_bundle_identity(id, actual, advertised, "1.2.0").is_err());
+        }
     }
 }

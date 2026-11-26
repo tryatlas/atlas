@@ -16,8 +16,7 @@ import { checkoutState, switchBranchIfClean } from "@/features/git/lib/git-remot
 import { isGitError } from "@/features/git/lib/git-errors";
 import { busySessions } from "@/features/projects/lib/stop-agents-confirm";
 import { useAppStore } from "@/features/app/stores/app-store";
-import { deleteThread, markSessionViewed, threadProjects } from "@/features/chat/lib/history-api";
-import { isUnderRoot } from "@/features/chat/lib/session-roots";
+import { deleteThread, markSessionViewed } from "@/features/chat/lib/history-api";
 import { confirmDeleteChat } from "@/features/chat/lib/confirm-delete-chat";
 import { discardSessionDrawerFor } from "@/features/terminal/lib/session-drawer";
 import { openNewAgentChat } from "@/features/chat/lib/open-agent-session";
@@ -158,12 +157,16 @@ export function wakeSession(session: SidebarSession): void {
 export async function renameSession(session: SidebarSession, title: string): Promise<void> {
   const next = title.trim();
   if (!next || next === session.title) return;
-  await lifecycle().rename(session.threadId, next);
+  if (!(await lifecycle().rename(session.threadId, next))) return;
+  // The open tab shows the chat store's title, which the rename above never
+  // reached: the sidebar said one name and the tab another until a reopen.
+  // Set here, at the action, so neither store calls the other. Cut as the
+  // tab's title is everywhere else (`open-thread.ts`).
+  const tabId = session.sessionId ? tabShowingSession(session.sessionId) : null;
+  if (tabId) useChatStore.getState().actions.setSessionTitle(tabId, next.slice(0, 40));
 }
 
 export async function deleteSession(session: SidebarSession): Promise<void> {
-  // Rust refuses anyway (ADR-0001 Rule 7); the menu item is disabled for it.
-  if (session.liveElsewhere) return;
   if (!(await confirmDeleteChat(session.title))) return;
   try {
     // One call for every agent: Atlas's row always, the agent's copy only
@@ -236,10 +239,7 @@ export async function newSessionOnBranch(session: SidebarSession): Promise<void>
     leaveAlone("it has uncommitted changes");
     return;
   }
-  if (
-    busySessions(session.projectPath).length > 0 ||
-    (await agentWorkingElsewhere(session.projectPath))
-  ) {
+  if (busySessions(session.projectPath).length > 0) {
     leaveAlone("an agent is working in it");
     return;
   }
@@ -256,24 +256,6 @@ export async function newSessionOnBranch(session: SidebarSession): Promise<void>
   }
   void useGitStore.getState().actions.refreshStatusNow(session.projectPath);
   start();
-}
-
-/** Whether a session running outside Atlas (a terminal agent) works in the
- *  checkout at `projectPath`, where a branch switch would move the tree
- *  under it. Read fresh rather than from the list on screen, which a scope
- *  or a search may have narrowed. A failed read counts as "yes": refusing a
- *  switch is the safe way to be wrong. */
-export async function agentWorkingElsewhere(projectPath: string): Promise<boolean> {
-  try {
-    const groups = await threadProjects(projectPath);
-    return groups.some((group) =>
-      group.threads.some(
-        (thread) => thread.liveElsewhere && isUnderRoot(thread.folderPaths[0] ?? "", projectPath),
-      ),
-    );
-  } catch {
-    return true;
-  }
 }
 
 /** The project's own settings: the Settings screen, scoped to its folder. */

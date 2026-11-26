@@ -1,3 +1,5 @@
+import { toast } from "sonner";
+import { copyText, readClipboardText } from "@/lib/clipboard";
 /**
  * A terminal session that outlives React.
  *
@@ -178,7 +180,7 @@ export class TerminalSession {
   /** Output that arrived before xterm existed. */
   private readonly pendingChunks: Uint8Array[] = [];
   private unacked = 0;
-  private ackTimer = 0;
+  private ackScheduled = false;
   private queuedCommand: string | null = null;
   /** False for a line queued to be typed, not run (see `pendingTyped`). */
   private queuedExecute = true;
@@ -306,8 +308,8 @@ export class TerminalSession {
     this.closed = true;
     if (this.resizeTimer) window.clearTimeout(this.resizeTimer);
     if (this.queuedFloor) window.clearTimeout(this.queuedFloor);
-    if (this.ackTimer) window.clearTimeout(this.ackTimer);
-    this.resizeTimer = this.queuedFloor = this.ackTimer = 0;
+    this.resizeTimer = this.queuedFloor = 0;
+    this.ackScheduled = false;
     this.releaseRenderer();
     this.xterm?.dispose();
     this.xterm = null;
@@ -326,7 +328,10 @@ export class TerminalSession {
   onExited(): void {
     if (this.snapshot.exited) return;
     if (this.xterm) this.writeExitNote(this.xterm);
-    this.publish({ exited: true });
+    this.shell.osc133("D");
+    this.publish({ exited: true, command: null });
+    this.busy = false;
+    useTerminalStore.getState().actions.setTerminalBusy(this.key, false);
   }
 
   private writeExitNote(term: Terminal): void {
@@ -393,18 +398,22 @@ export class TerminalSession {
       const mod = e.metaKey || (e.ctrlKey && e.shiftKey);
       const key = e.key.toLowerCase();
       if (mod && key === "c") {
+        e.preventDefault();
+        e.stopPropagation();
         if (term.hasSelection()) {
           e.preventDefault();
-          void navigator.clipboard.writeText(term.getSelection()).catch(() => {});
+          void copyText(term.getSelection()).then((ok) => {
+            if (!ok) toast.error("Could not copy terminal selection");
+          });
         }
         return false;
       }
       if (mod && key === "v") {
         e.preventDefault();
-        void navigator.clipboard
-          .readText()
+        e.stopPropagation();
+        void readClipboardText()
           .then((t) => t && term.paste(t))
-          .catch(() => {});
+          .catch((error) => toast.error(`Could not paste into terminal: ${String(error)}`));
         return false;
       }
       if (e.metaKey && key === "a") {
@@ -436,7 +445,9 @@ export class TerminalSession {
   private registerLinks(): void {
     if (this.linksRegistered || !this.xterm || !this.ptyId) return;
     this.linksRegistered = true;
-    this.xterm.registerLinkProvider(createPathLinkProvider(this.xterm, this.ptyId));
+    this.xterm.registerLinkProvider(
+      createPathLinkProvider(this.xterm, this.ptyId, () => this.shell.cwd),
+    );
   }
 
   /** Open xterm into its surface once both exist and the surface is in the
@@ -537,7 +548,10 @@ export class TerminalSession {
       // Ack once xterm has PARSED the chunk: the credit window is then real
       // end-to-end backpressure (see terminal.rs). Batched to one IPC per task.
       this.unacked++;
-      if (!this.ackTimer) this.ackTimer = window.setTimeout(this.flushAcks, 0);
+      if (!this.ackScheduled) {
+        this.ackScheduled = true;
+        queueMicrotask(this.flushAcks);
+      }
       if (this.shell.hasDrawnPrompt && this.queuedCommand !== null) this.sendQueued();
       const buf = term.buffer.active;
       const line = buf.getLine(buf.baseY + buf.cursorY)?.translateToString(true) ?? "";
@@ -546,7 +560,7 @@ export class TerminalSession {
   }
 
   private readonly flushAcks = (): void => {
-    this.ackTimer = 0;
+    this.ackScheduled = false;
     const n = this.unacked;
     this.unacked = 0;
     const id = this.ptyId;

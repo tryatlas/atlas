@@ -69,6 +69,14 @@ fn preferred_bwrap_launcher() -> BubblewrapLauncher {
         .clone()
 }
 
+pub(crate) fn preferred_bwrap_path() -> Option<std::path::PathBuf> {
+    match preferred_bwrap_launcher() {
+        BubblewrapLauncher::System(launcher) => Some(launcher.program.as_path().to_path_buf()),
+        BubblewrapLauncher::Bundled(launcher) => Some(launcher.program().to_path_buf()),
+        BubblewrapLauncher::Unavailable => None,
+    }
+}
+
 fn system_bwrap_launcher_for_path(system_bwrap_path: &Path) -> Option<SystemBwrapLauncher> {
     system_bwrap_launcher_for_path_with_probe(system_bwrap_path, system_bwrap_capabilities)
 }

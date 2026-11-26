@@ -16,7 +16,7 @@ The installed-agents map is the only source of runnable agents, with no promotio
 
 - **An agent exists iff it has an entry in the installed-agents map.** Installing writes one entry; uninstalling removes it. There is no other source of runnable agents.
 - **A fresh install offers exactly the native agent (Atlas Agent, called Cersei when this was written).** No ACP agent is pre-seeded, pre-warmed, suggested, or spawned. There is no first-run grid of featured agents either.
-- **A detection is an affordance, not a spawn rung.** An agent found on the user's `PATH` is offered, never run: accepting it is a user action that writes a `custom` installed-map entry pointing at their binary. Finding a binary installs nothing.
+- **A detection is an affordance, not a spawn rung.** An agent found on the user's `PATH` is offered, never run: accepting it is a user action that writes a `custom` installed-map entry pointing at their binary. Finding a binary installs nothing. A detection is the only way a `custom` entry is made: an agent the ACP registry does not list cannot be added by hand (no command/args/env entry form). Custom agents are not supported — registry-only, by decision 2026-11-25.
 - **Nothing is optional-and-switchable.** The way to remove an agent is to uninstall it. `builtin`/`optional`/`disabled`/`autoManaged` leave the catalog wire, and the `disabledBuiltinAgents` setting is retired.
 
 ## Consequences

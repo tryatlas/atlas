@@ -19,7 +19,6 @@ import { tauri } from "@/test/tauri-fake";
 import { pluginIdForAgent } from "@/types/agent";
 import { grantLocksComposer, useAiGrantStore, useNoAiGrant } from "../stores/ai-grant-store";
 import { useChatStore } from "../stores/chat-store";
-import { useLiveElsewhereStore, useSendHeldForTerminal } from "../stores/live-elsewhere-store";
 import { useRcStore } from "../stores/rc-store";
 import { createChatPanelHandlers, type ChatSendHandler } from "../lib/chat-panel-handlers";
 import { sessionSend } from "../lib/session-send";
@@ -45,12 +44,11 @@ let bind: { [K in keyof BindControl]: ReturnType<typeof vi.fn<() => void>> };
 /** The send half of `ChatPanel`, with nothing rendered. */
 function usePanelSend() {
   const live = useChatStore((s) => s.sessions[TAB]);
-  const heldElsewhere = useSendHeldForTerminal(live?.acpSessionId);
   const grantHold = grantLocksComposer(useNoAiGrant(), live?.agentType ?? "", false);
   const bindControlRef = useRef<BindControl | null>(bind);
   const handleSendRef = useRef<ChatSendHandler | null>(null);
   const handleStopRef = useRef<(() => void) | null>(null);
-  useQueueDrain({ tabId: TAB, session: live, heldElsewhere, grantHold, bindControlRef });
+  useQueueDrain({ tabId: TAB, session: live, grantHold, bindControlRef });
   useChatPanelEvents(TAB, handleSendRef, handleStopRef);
   const handlers = createChatPanelHandlers({ tabId: TAB, bindControlRef, setBindEpoch: () => {} });
   handleSendRef.current = handlers.handleSend;
@@ -75,10 +73,9 @@ beforeEach(() => {
     activeSessionId: null,
   });
   store().actions.createSession(TAB, "claude-code");
-  useLiveElsewhereStore.setState({ live: {}, overridden: {} });
   useAiGrantStore.setState({ entitlement: null });
   useRcStore.setState({ bySession: {} });
-  bind = { retry: vi.fn(), abandon: vi.fn(), kick: vi.fn() };
+  bind = { retry: vi.fn(), abandon: vi.fn(), kick: vi.fn(), warm: vi.fn() };
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
 afterEach(() => {
@@ -124,9 +121,17 @@ describe("the drain hook", () => {
     renderHook(usePanelSend);
     await waitFor(() => expect(pauses()).toEqual([false]));
 
-    act(() => useLiveElsewhereStore.getState().actions.setLive([SESSION]));
+    act(() => {
+      useChatStore.setState((s) => {
+        s.sessions[TAB].unrestoredModeId = "plan";
+      });
+    });
     await waitFor(() => expect(pauses()).toEqual([false, true]));
-    act(() => useLiveElsewhereStore.getState().actions.sendAnyway(SESSION));
+    act(() => {
+      useChatStore.setState((s) => {
+        s.sessions[TAB].unrestoredModeId = undefined;
+      });
+    });
     await waitFor(() => expect(pauses()).toEqual([false, true, false]));
 
     act(() => {
@@ -254,8 +259,8 @@ describe("the window events", () => {
 });
 
 describe("the composer's gates", () => {
-  // The composer also feeds the live-elsewhere set from the thread list; here
-  // the store is set directly, and that read answers nothing.
+  // The composer also feeds the session-projects store from the thread list;
+  // that read answers nothing here.
   const gates = (running = false) => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     return renderHook(
@@ -274,7 +279,6 @@ describe("the composer's gates", () => {
     expect(result.current).toMatchObject({
       disabled: false,
       modeUnrestored: false,
-      heldForTerminal: false,
       remoteDriving: false,
     });
 
@@ -282,11 +286,9 @@ describe("the composer's gates", () => {
       useChatStore.setState((s) => {
         s.sessions[TAB].unrestoredModeId = "plan";
       });
-      useLiveElsewhereStore.getState().actions.setLive([SESSION]);
     });
-    expect(result.current).toMatchObject({ modeUnrestored: true, heldForTerminal: true });
+    expect(result.current).toMatchObject({ modeUnrestored: true });
     // The same state, as the module the handler calls sees it.
-    expect(sessionSend.state(TAB)).toMatchObject({ heldElsewhere: true });
     expect(sessionSend.state(TAB).session?.unrestoredModeId).toBe("plan");
   });
 

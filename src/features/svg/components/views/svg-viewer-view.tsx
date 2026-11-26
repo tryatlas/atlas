@@ -9,6 +9,8 @@ export interface SvgViewerViewProps {
   src: string | null;
   copied: boolean;
   onCopy: () => void;
+  error?: string | null;
+  onRetry?: () => void;
 }
 
 /**
@@ -16,7 +18,15 @@ export interface SvgViewerViewProps {
  * checkerboard (so a black `currentColor` drawing stays visible), and a
  * "Copy code" action for the markup.
  */
-export function SvgViewerView({ filePath, name, src, copied, onCopy }: SvgViewerViewProps) {
+export function SvgViewerView({
+  filePath,
+  name,
+  src,
+  copied,
+  onCopy,
+  error,
+  onRetry,
+}: SvgViewerViewProps) {
   return (
     <div data-view="svg-viewer" className="flex h-full w-full flex-col bg-background">
       <ViewerHeaderView
@@ -35,7 +45,17 @@ export function SvgViewerView({ filePath, name, src, copied, onCopy }: SvgViewer
         }
       />
       <div className="min-h-0 flex-1">
-        {src ? (
+        {error ? (
+          <div
+            role="alert"
+            className="flex h-full flex-col items-center justify-center gap-2 p-4 text-sm text-muted-foreground"
+          >
+            <p>{error}</p>
+            <Button size="sm" variant="outline" onClick={onRetry}>
+              Try again
+            </Button>
+          </div>
+        ) : src ? (
           <ImageZoomView src={src} alt={name} fill checkerboard />
         ) : (
           <div className="flex h-full items-center justify-center">

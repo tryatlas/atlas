@@ -10,8 +10,8 @@
 //! Widening `img-src` to `https:` was the other option. It would fix the
 //! first case only, and let every markdown file the user opens make the
 //! webview itself call arbitrary hosts. Fetching from Rust keeps the CSP as
-//! it is and holds each request to the same public-host rule as
-//! `fetch_readable`.
+//! it is and holds each request to the public-host rule in
+//! `knowledge::get_public_url`.
 
 use std::path::{Path, PathBuf};
 

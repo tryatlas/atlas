@@ -53,6 +53,33 @@ import type { Application } from "pixi.js";
  * that a repeat `destroyPixiApp` for the same instance cannot skew the count.
  */
 const liveApps = new Set<Application>();
+const initializing = new Set<Application>();
+const destroyRequested = new WeakSet<Application>();
+
+/** Keep pending init alive until its renderer exists, then honor teardown. */
+export async function initPixiApp(
+  app: Application,
+  options: Parameters<Application["init"]>[0],
+): Promise<void> {
+  initializing.add(app);
+  try {
+    await app.init(options);
+  } catch (error) {
+    initializing.delete(app);
+    try {
+      if (app.renderer) destroyPixiApp(app);
+      else app.stage.destroy({ children: true });
+    } catch {
+      // Partial initialization can also make cleanup fail. Preserve the
+      // original renderer error, which is what the user needs to diagnose.
+    } finally {
+      liveApps.delete(app);
+    }
+    throw error;
+  }
+  initializing.delete(app);
+  if (destroyRequested.has(app)) destroyPixiApp(app);
+}
 
 /**
  * Call immediately after `new Application()`, BEFORE awaiting `init()` — an
@@ -68,11 +95,16 @@ export function registerPixiApp(app: Application): void {
  * returns without touching the app.
  */
 export function destroyPixiApp(app: Application): void {
-  if (!liveApps.delete(app)) return;
+  if (!liveApps.has(app)) return;
+  if (initializing.has(app)) {
+    destroyRequested.add(app);
+    return;
+  }
   app.destroy(
-    { removeView: true, releaseGlobalResources: liveApps.size === 0 },
+    { removeView: true, releaseGlobalResources: liveApps.size === 1 },
     { children: true },
   );
+  liveApps.delete(app);
 }
 
 /** Live Application count. Exported for tests. */

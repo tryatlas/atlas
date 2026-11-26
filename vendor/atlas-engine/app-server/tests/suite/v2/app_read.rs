@@ -751,7 +751,7 @@ async fn start_batch_server(state: BatchServerState) -> Result<(String, JoinHand
     let addr = listener.local_addr()?;
     let router = Router::new()
         .route("/ps/apps/batch", post(batch_apps))
-        .route("/api/atlas-agent/ps/mcp", any(unexpected_mcp_request))
+        .route("/api/codex/ps/mcp", any(unexpected_mcp_request))
         .with_state(state);
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;

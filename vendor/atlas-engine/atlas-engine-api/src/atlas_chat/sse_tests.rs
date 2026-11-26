@@ -407,7 +407,6 @@ fn every_finish_reason_the_gateway_maps_is_reported_honestly() {
     for (reason, expected) in [
         ("stop", Some(true)),
         ("tool_calls", Some(false)),
-        ("length", Some(false)),
         ("content_filter", Some(true)),
     ] {
         let frame = format!(
@@ -419,6 +418,20 @@ fn every_finish_reason_the_gateway_maps_is_reported_honestly() {
         };
         assert_eq!(end_turn, expected, "finish_reason {reason}");
     }
+}
+
+#[test]
+fn output_limit_is_a_terminal_error_with_partial_text_preserved() {
+    let events = tokio_test::block_on(play(&[
+        &text_delta("partial answer"),
+        r#"{"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#,
+        "[DONE]",
+    ]));
+    assert!(completion(&events).is_none());
+    assert!(events.iter().any(|event| matches!(event, Ok(ResponseEvent::OutputTextDelta(text)) if text == "partial answer")));
+    assert!(
+        matches!(events.last(), Some(Err(ApiError::InvalidRequest { message })) if message.contains("output token limit"))
+    );
 }
 
 #[test]

@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 import { useCallback, useEffect, useState } from "react";
 import { FixWithAgentButton } from "@/features/ask-agent/components/ask-agent-button";
 import { toast } from "sonner";
@@ -95,9 +96,11 @@ export function MemoryPolicyView() {
       setPolicyPhase("checking");
       try {
         const status = await memoryGraph.embedStatus();
+        if (useMemoryStore.getState().project !== pp) return;
         if (status.downloaded) await storeLoadPolicies(pp);
         else setPolicyPhase("not-downloaded");
       } catch (e) {
+        if (useMemoryStore.getState().project !== pp) return;
         setPolicyPhase("error", String(e));
       }
     },
@@ -122,7 +125,8 @@ export function MemoryPolicyView() {
       await listenMemoryEmbedProgress((p) => setProgress(p)),
       await listenMemoryEmbedDone((d) => {
         unlistens.forEach((u) => u());
-        if (d.success && projectPath) void storeLoadPolicies(projectPath, true);
+        const currentProject = useMemoryStore.getState().project;
+        if (d.success && currentProject) void storeLoadPolicies(currentProject, true);
         else setPolicyPhase("error", d.error ?? "Download failed");
       }),
     ];
@@ -132,7 +136,7 @@ export function MemoryPolicyView() {
       unlistens.forEach((u) => u());
       setPolicyPhase("error", String(e));
     }
-  }, [projectPath, storeLoadPolicies, setPolicyPhase]);
+  }, [storeLoadPolicies, setPolicyPhase]);
 
   const onSaved = updatePolicyValue;
 
@@ -379,7 +383,7 @@ function PolicyRow({
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") void save();
+            if (e.key === "Enter" && !isComposingKey(e)) void save();
             else if (e.key === "Escape") setDraft(policy.value);
           }}
           spellCheck={false}

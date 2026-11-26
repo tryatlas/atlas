@@ -100,6 +100,10 @@ describe("destinations", () => {
     expect(restoredTabType("editor")).toBe("editor");
   });
 
+  it("drops a saved Browser tab: the built-in browser was removed", () => {
+    expect(restoredTabType("browser")).toBeNull();
+  });
+
   it("drops destination tabs from a project view on load", () => {
     useLayoutStore.setState((s) => ({
       viewsByWs: {

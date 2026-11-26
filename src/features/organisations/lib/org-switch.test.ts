@@ -61,6 +61,17 @@ vi.mock("@/features/projects/lib/stop-agents-confirm", () => ({
   },
 }));
 
+// Unsaved file tabs across the mounted projects, and the save prompt's answer.
+const files = { dirty: [] as { id: string }[], answer: true, asked: [] as string[] };
+vi.mock("@/features/editor/lib/dirty-close", () => ({
+  dirtyFileTabs: () => files.dirty,
+  confirmCloseFileTabs: async (tabs: unknown[], label: string) => {
+    if (tabs.length === 0) return true;
+    files.asked.push(label);
+    return files.answer;
+  },
+}));
+
 const state = {
   organisations: [] as Organisation[],
   activeOrganisationId: "",
@@ -105,6 +116,9 @@ beforeEach(() => {
   state.activeOrganisationId = A.id;
   prompt.busy = 0;
   prompt.answer = null;
+  files.dirty = [];
+  files.answer = true;
+  files.asked = [];
 });
 afterEach(async () => {
   // The switch lets go of its re-entrancy guard on a timer (the overlay's
@@ -164,5 +178,24 @@ describe("a switch and the boot push of the active organisation", () => {
 
     expect(signInLands()).toBe(true);
     expect(pushed()).toEqual(["org_a"]);
+  });
+});
+
+// D1: the teardown unmounted every editor, dropping unsaved edits unasked.
+describe("unsaved file edits on an organization switch", () => {
+  it("asks first, and Cancel leaves the organization as it was", async () => {
+    files.dirty = [{ id: "editor:/p/a.ts" }];
+    files.answer = false;
+    await switchOrg(B.id);
+    expect(files.asked).toEqual(["Switching organizations"]);
+    expect(state.activeOrganisationId).toBe(A.id);
+    expect(pushed()).toEqual([]);
+  });
+
+  it("goes ahead once the edits were saved or let go", async () => {
+    files.dirty = [{ id: "editor:/p/a.ts" }];
+    await switchOrg(B.id);
+    expect(files.asked).toEqual(["Switching organizations"]);
+    expect(state.activeOrganisationId).toBe(B.id);
   });
 });

@@ -58,18 +58,18 @@ def validate_plugin(plugin_root: Path) -> list[str]:
 
 def load_json_object(path: Path, errors: list[str]) -> dict[str, Any] | None:
     if not path.is_file():
-        errors.append("missing `.atlas_engine-plugin/plugin.json`")
+        errors.append("missing `.atlas-agent-plugin/plugin.json`")
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except OSError:
-        errors.append("unable to read `.atlas_engine-plugin/plugin.json`")
+        errors.append("unable to read `.atlas-agent-plugin/plugin.json`")
         return None
     except json.JSONDecodeError:
-        errors.append("`.atlas_engine-plugin/plugin.json` must be valid JSON")
+        errors.append("`.atlas-agent-plugin/plugin.json` must be valid JSON")
         return None
     if not isinstance(payload, dict):
-        errors.append("`.atlas_engine-plugin/plugin.json` must contain a JSON object")
+        errors.append("`.atlas-agent-plugin/plugin.json` must contain a JSON object")
         return None
     return payload
 

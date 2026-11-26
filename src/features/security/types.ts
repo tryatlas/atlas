@@ -33,6 +33,7 @@ export type SkipReason =
   | "deleted_file"
   | "time_budget"
   | "unsupported_lockfile"
+  | "file_limit"
   | { too_large: { added_lines: number } };
 
 export interface NotScannedFile {

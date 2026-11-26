@@ -6,7 +6,9 @@ import { useCommsStore } from "../stores/comms-store";
 import type { ChatAttachment } from "../types";
 
 /** Save an attachment wherever the user wants it. */
-export async function saveAttachment(attachment: ChatAttachment): Promise<void> {
+export async function saveAttachment(
+  attachment: Pick<ChatAttachment, "id" | "filename">,
+): Promise<void> {
   try {
     const dest = await saveFileDialog({ defaultPath: attachment.filename });
     if (!dest) return;

@@ -385,7 +385,10 @@ const toRows = (variables: readonly AgentVariable[]): DraftRow[] =>
   }));
 
 const signature = (variables: readonly AgentVariable[]) =>
-  variables.map((v) => `${v.name}\u0000${v.value}\u0000${v.sensitive}`).join("\u0001");
+  variables
+    .map((v) => `${v.name}\u0000${v.sensitive ? null : v.value}\u0000${v.sensitive}`)
+    .sort()
+    .join("\u0001");
 
 /** The rows as the backend takes them, or `null` while one is half-typed. A
  *  blank row is left out; a new sensitive one waits for its value. */
@@ -415,12 +418,13 @@ export function EnvironmentSection({ item }: { item: AgentItem }) {
   // Reset from the catalog only when it moved for a reason other than our own
   // save, so a row being typed doesn't jump while its save echoes back.
   const seen = useRef(signature(generic));
-  const published = useRef<string | null>(null);
+  const published = useRef(new Set<string>());
+  const writes = useRef(Promise.resolve());
   const incoming = signature(generic);
   useEffect(() => {
     if (incoming === seen.current) return;
     seen.current = incoming;
-    if (incoming === published.current) return;
+    if (published.current.has(incoming)) return;
     setRows(toRows(generic));
     // `generic` is derived from the catalog; its signature is the dependency.
     // oxlint-disable-next-line react-hooks/exhaustive-deps
@@ -433,8 +437,17 @@ export function EnvironmentSection({ item }: { item: AgentItem }) {
     setRows(next);
     const variables = publishable(next);
     if (!variables) return;
-    published.current = signature(variables);
-    void saveVariables(item, [...kept, ...variables]);
+    published.current.add(signature(variables));
+    writes.current = writes.current
+      .catch(() => {})
+      .then(async () => {
+        await saveVariables(item, [...kept, ...variables]);
+      })
+      .catch((error: unknown) => {
+        toast.error("Could not refresh the saved agent environment", {
+          description: String(error),
+        });
+      });
   };
   const update = (id: string, patch: Partial<Omit<DraftRow, "id">>) =>
     publish(

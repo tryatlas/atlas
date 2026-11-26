@@ -52,7 +52,7 @@ pub async fn collect_all_sessions(
     let mut sessions = Vec::new();
     let mut cursor: Option<String> = None;
 
-    for _ in 0..MAX_PAGES {
+    for page in 0..MAX_PAGES {
         let response = list
             .list_sessions(AgentSessionListRequest {
                 cwd: cwd.clone(),
@@ -65,7 +65,7 @@ pub async fn collect_all_sessions(
             Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
             _ => break,
         }
-        if sessions.len() >= MAX_PAGES {
+        if page + 1 == MAX_PAGES {
             // Unreachable in practice — the cursor checks above end every
             // well-behaved and most ill-behaved agents first.
             tracing::warn!(
@@ -104,7 +104,6 @@ pub fn importable_threads(
     known: &HashSet<acp::SessionId>,
     active_since: Option<DateTime<Utc>>,
 ) -> Vec<ThreadMetadata> {
-    let now = Utc::now();
     let mut seen = known.clone();
     sessions
         .into_iter()
@@ -113,8 +112,10 @@ pub fn importable_threads(
             let work_dirs = session.work_dirs.filter(|dirs| !dirs.is_empty())?;
             let folder_paths = PathList::new(&work_dirs);
             // The agent's own last-activity time, so an import sorts into
-            // history where it belongs rather than all at "now".
-            let updated_at = session.updated_at.unwrap_or(now);
+            // history where it belongs rather than all at "now". A session
+            // with no usable time is of unknown age: it sorts last, and
+            // lands settled, rather than claiming it was active just now.
+            let updated_at = session.updated_at.unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
             let mut row =
                 ThreadMetadata::new(ThreadId::new(), agent_id.clone(), PathList::default());
             row.session_id = Some(session.session_id);

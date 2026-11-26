@@ -362,6 +362,9 @@ const useSessionChatStoreBase = create<SessionChatState>()((set, get) => ({
           thread.checkpointScope,
           get().remoteByAgent[thread.agentSessionId] ?? null,
         );
+        // Stop can arrive while retrieval is still running, before a provider
+        // stream exists. The stream identity is the ownership token for both phases.
+        if (get().streamToThread[streamId] !== threadId) return;
         set((st) => ({ sourcesByMsg: { ...st.sourcesByMsg, [assistantMsg.id]: sources } }));
 
         const wire = priorMessages.map((m) => ({ role: m.role, content: m.content }));
@@ -374,7 +377,9 @@ const useSessionChatStoreBase = create<SessionChatState>()((set, get) => ({
 
     stop: (threadId) => {
       const streamId = Object.entries(get().streamToThread).find(([, id]) => id === threadId)?.[0];
-      if (streamId) void providerChat.cancel(streamId);
+      if (!streamId) return;
+      onEvent(set, get, { stream_id: streamId, kind: "done" });
+      void providerChat.cancel(streamId).catch(() => {});
     },
   },
 }));

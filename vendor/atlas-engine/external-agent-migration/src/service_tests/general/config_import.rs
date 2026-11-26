@@ -194,7 +194,7 @@ inherit = "core"
 CI = "false"
 FOO = "bar"
 MAX_RETRIES = "3"
-MY_TEAM = "atlas-agent"
+MY_TEAM = "atlas_engine"
 "#,
     )
     .expect("parse expected config");

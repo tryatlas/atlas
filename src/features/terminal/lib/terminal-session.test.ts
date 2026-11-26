@@ -207,13 +207,12 @@ describe("terminalSessions", () => {
     await s.close();
   });
 
-  it("acks parsed chunks in one call per batch", async () => {
+  it("returns every parsed credit without waiting for a window timer", async () => {
     const { s, ch } = await openSession(`k-${Math.random()}`);
     for (let i = 0; i < 5; i++) ch.onmessage?.(bytes("x\r\n"));
     await settle();
     const acks = calls("terminal_ack");
-    expect(acks).toHaveLength(1);
-    expect(acks[0][1]).toMatchObject({ count: 5 });
+    expect(acks.reduce((count, call) => count + Number(call[1]?.count ?? 0), 0)).toBe(5);
     await s.close();
   });
 

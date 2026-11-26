@@ -24,11 +24,17 @@ import { tauri } from "@/test/tauri-fake";
 import { useAppStore } from "@/features/app/stores/app-store";
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { useChatStore } from "../stores/chat-store";
-import { rebindDisconnectedSession } from "./agent-rebind";
+import { onWindowEvent } from "@/lib/window-events";
+import { useAgentRegistryStore } from "@/features/agents/stores/agent-registry-store";
+import type { AgentCatalogEntry } from "@/types/agent-catalog";
+import { rebindDisconnectedSession, restartDisconnectedSession } from "./agent-rebind";
+import { takeSignInCallback } from "./agent-signin";
+import type { ThreadRow } from "./history-api";
+import { restoreTabSession } from "./restore-tab-session";
 import { ensureAgent, resetAgent } from "./agents-api";
 import { saveLastModePref } from "./last-mode-pref";
 import { openAgentSession } from "./open-agent-session";
-import { openThread, type OpenableThread } from "./open-thread";
+import { loadThreadIntoTab, openThread, type OpenableThread } from "./open-thread";
 
 const TAB = "chat-1";
 // An agent whose type, plugin id and sidebar band are one string, so no test
@@ -350,6 +356,44 @@ describe("openThread", () => {
     expect(session().title).toBe("Two");
   });
 
+  it("a superseded resume that opened its session anyway hands it back (ACP audit finding 11)", async () => {
+    const answers: Record<string, (v: unknown) => void> = {};
+    tauri.handleRaw({
+      threads_resume: ({ threadId }) => new Promise((r) => (answers[String(threadId)] = r)),
+      agents_snapshot: ({ key }) => snapshot({ session_id: (key as typeof KEY).session_id }),
+    });
+    const first = openThread(THREAD);
+    await vi.waitFor(() => expect(Object.keys(answers)).toContain("th-1"));
+    const second = openThread({ ...THREAD, threadId: "th-2", sessionId: "sess-2", title: "Two" });
+    await vi.waitFor(() => expect(Object.keys(answers)).toContain("th-2"));
+    answers["th-2"]!({ key: { ...KEY, session_id: "sess-2" }, resumedWithoutHistory: false });
+    await second;
+    answers["th-1"]!({ key: KEY, resumedWithoutHistory: false });
+    await first;
+
+    expect(session().acpSessionId).toBe("sess-2");
+    expect(tauri.calls("agents_drop_session").map((c) => c.args)).toEqual([
+      { agentId: AGENT.agent_id, sessionId: SESSION },
+    ]);
+  });
+
+  it("two clicks on one row: the superseded load leaves the session to the newer one", async () => {
+    const answers: Array<(v: unknown) => void> = [];
+    tauri.handleRaw({ threads_resume: () => new Promise((r) => answers.push(r)) });
+    const first = openThread(THREAD);
+    await vi.waitFor(() => expect(answers).toHaveLength(1));
+    const second = openThread(THREAD);
+    await vi.waitFor(() => expect(answers).toHaveLength(2));
+    // The older load answers last, after the newer one has bound the session.
+    answers[1]!({ key: KEY, resumedWithoutHistory: false });
+    await second;
+    answers[0]!({ key: KEY, resumedWithoutHistory: false });
+    await Promise.all([first, second]);
+
+    expect(session().acpSessionId).toBe(SESSION);
+    expect(count("agents_drop_session")).toBe(0);
+  });
+
   it("a resume that fails rolls the optimistic binding back and says so", async () => {
     await ensureAgent(PLUGIN);
     tauri.handleRaw({ threads_resume: () => Promise.reject({ message: "no such session" }) });
@@ -588,5 +632,112 @@ describe("rebind after the agent disconnects", () => {
     // Bound, but failed closed: the pick could not be applied.
     expect(session().acpSessionId).toBe(SESSION);
     expect(session().unrestoredModeId).toBe("read-only");
+  });
+});
+
+// ACP audit finding 64: only a NEW session's bind routed an auth refusal to
+// the sign-in dialog. Putting an existing session back showed the agent's raw
+// refusal and stopped. Each entry point now offers the same dialog, and runs
+// again once the user has signed in.
+describe("an auth refusal while putting a session back", () => {
+  const REFUSAL = { message: "Please log in", kind: "auth" };
+  let asked: number[];
+  let off: () => void;
+  beforeEach(() => {
+    useAgentRegistryStore.setState({
+      catalogById: {
+        [PLUGIN]: { id: PLUGIN, agentType: PLUGIN, kind: "external", installed: true },
+      } as unknown as Record<string, AgentCatalogEntry>,
+    });
+    asked = [];
+    off = onWindowEvent("atlas:agent-signin", (d) => asked.push(d.requestId));
+  });
+  afterEach(() => {
+    for (const id of asked) takeSignInCallback(id);
+    off();
+  });
+
+  it("openThread offers sign-in instead of the raw error, and opens the session once signed in", async () => {
+    tauri.handleRaw({ threads_resume: () => Promise.reject(REFUSAL) });
+    await openThread(THREAD);
+    expect(asked).toHaveLength(1);
+    expect(toastError).not.toHaveBeenCalled();
+    expect(session().acpSessionId).toBeUndefined();
+
+    healthyBackend();
+    takeSignInCallback(asked[0]!)?.onSignedIn?.();
+    await vi.waitFor(() => expect(session().acpSessionId).toBe(SESSION));
+  });
+
+  it("a saved tab's restore offers it too", async () => {
+    tauri.handleRaw({ threads_resume: () => Promise.reject(REFUSAL) });
+    store().actions.setPendingRestore(TAB, SESSION);
+    await restoreTabSession(TAB, {
+      history: async () => [
+        {
+          threadId: THREAD.threadId,
+          sessionId: SESSION,
+          agentId: PLUGIN,
+          title: THREAD.title,
+          folderPaths: ["/proj"],
+        } as unknown as ThreadRow,
+      ],
+      load: loadThreadIntoTab,
+      projectPath: () => "/proj",
+      error: (m) => void toast.error(m),
+    });
+    expect(asked).toHaveLength(1);
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it("openAgentSession offers it too", async () => {
+    tauri.handleRaw({ agents_load_session: () => Promise.reject(REFUSAL) });
+    await openAgentSession({ acpSessionId: SESSION, title: "S", cwd: "/proj", agentType: PLUGIN });
+    expect(asked).toHaveLength(1);
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it("a restart after the agent died offers it, says nothing else, and restarts once signed in", async () => {
+    disconnectedTab();
+    tauri.handleRaw({ agents_spawn: () => Promise.reject(REFUSAL) });
+    await expect(restartDisconnectedSession(TAB)).resolves.toEqual({ ok: false, error: null });
+    expect(asked).toHaveLength(1);
+    expect(session().disconnected).toBe(true);
+
+    healthyBackend();
+    takeSignInCallback(asked[0]!)?.onSignedIn?.();
+    await vi.waitFor(() => expect(session().disconnected).toBeFalsy());
+  });
+
+  it("a second refusal after signing in is reported in the agent's words, not offered again", async () => {
+    disconnectedTab();
+    tauri.handleRaw({ agents_spawn: () => Promise.reject(REFUSAL) });
+    await restartDisconnectedSession(TAB);
+    const outcome = restartDisconnectedSession(TAB, { signInAttempted: true });
+    await expect(outcome).resolves.toEqual({ ok: false, error: "Please log in" });
+    expect(asked).toHaveLength(1);
+  });
+});
+
+describe("a saved tab's restore", () => {
+  it("parks a message held for it in the queue with its images", async () => {
+    const image = { data: "aGk=", mimeType: "image/png" } as never;
+    store().actions.setPendingRestore(TAB, SESSION);
+    store().actions.setPendingSend(TAB, {
+      content: "look at this",
+      mentions: [],
+      attachments: [image],
+      clientMessageId: "m-1",
+    });
+    await restoreTabSession(TAB, {
+      history: async () =>
+        [
+          { threadId: "th-1", sessionId: SESSION, agentId: PLUGIN, title: "T", folderPaths: [] },
+        ] as unknown as ThreadRow[],
+      load: async () => true,
+      projectPath: () => "/proj",
+      error: () => {},
+    });
+    expect(store().queueContent[TAB]?.[0]?.attachments).toEqual([image]);
   });
 });

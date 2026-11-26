@@ -338,6 +338,13 @@ function parseLarge(
         source: key,
         priority,
         dispatch: () => {
+          // A queued parse can outlive the worker that admitted it. Re-check at
+          // dispatch so a crashed worker does not cost every batch a watchdog.
+          const currentWorker = ensureWorker();
+          if (!currentWorker) {
+            void renderToHtmlAsync(source, fileRoot, trustedPaths).then(finish);
+            return;
+          }
           waiters.set(id, { source, fileRoot, trustedPaths, finish });
           // Watchdog: if the worker never answers, fall back to a main-thread
           // parse so the message still renders instead of hanging blank. Only
@@ -350,7 +357,12 @@ function parseLarge(
               void renderToHtmlAsync(source, fileRoot, trustedPaths).then(finish);
             }
           }, 3000);
-          w.postMessage({ id, source, fileRoot, trustedPaths });
+          try {
+            currentWorker.postMessage({ id, source, fileRoot, trustedPaths });
+          } catch {
+            workerBroken = true;
+            void renderToHtmlAsync(source, fileRoot, trustedPaths).then(finish);
+          }
         },
       });
       pump();

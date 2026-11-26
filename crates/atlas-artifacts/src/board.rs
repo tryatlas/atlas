@@ -75,11 +75,13 @@ pub struct OrgBoard {
     /// alone leaves an Organisation that cannot reach the server showing a
     /// skeleton for ever; gating it on this shows the honest empty board.
     pub attempted: bool,
+    live_revisions: HashMap<SessionKey, u64>,
 }
 
 #[derive(Default)]
 pub struct CloudBoard {
     orgs: RwLock<HashMap<String, OrgBoard>>,
+    revision: std::sync::atomic::AtomicU64,
 }
 
 impl CloudBoard {
@@ -100,14 +102,42 @@ impl CloudBoard {
         projects: Vec<RemoteProject>,
         notes: Vec<String>,
     ) {
-        let board = OrgBoard {
+        self.replace_after(org_id, u64::MAX, sessions, projects, notes);
+    }
+
+    /// Capture before starting the REST read, so frames arriving during it win.
+    pub fn begin_refresh(&self) -> u64 {
+        let _guard = self.orgs.read().ok();
+        self.revision.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn replace_after(
+        &self,
+        org_id: &str,
+        revision: u64,
+        sessions: Vec<RemoteSession>,
+        projects: Vec<RemoteProject>,
+        notes: Vec<String>,
+    ) {
+        let mut board = OrgBoard {
             sessions: sessions.into_iter().map(|s| (session_key(&s), s)).collect(),
             projects: projects.into_iter().map(|p| (p.id.clone(), p)).collect(),
             notes,
             loaded: true,
             attempted: true,
+            live_revisions: HashMap::new(),
         };
         if let Ok(mut orgs) = self.orgs.write() {
+            if let Some(current) = orgs.get(org_id) {
+                for (key, seen) in &current.live_revisions {
+                    if *seen > revision {
+                        if let Some(session) = current.sessions.get(key) {
+                            board.sessions.insert(key.clone(), session.clone());
+                            board.live_revisions.insert(key.clone(), *seen);
+                        }
+                    }
+                }
+            }
             orgs.insert(org_id.to_string(), board);
         }
     }
@@ -120,10 +150,14 @@ impl CloudBoard {
     /// false so a refresh still runs.
     pub fn upsert(&self, org_id: &str, session: RemoteSession) {
         if let Ok(mut orgs) = self.orgs.write() {
-            orgs.entry(org_id.to_string())
-                .or_default()
-                .sessions
-                .insert(session_key(&session), session);
+            let revision = self
+                .revision
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let board = orgs.entry(org_id.to_string()).or_default();
+            let key = session_key(&session);
+            board.live_revisions.insert(key.clone(), revision);
+            board.sessions.insert(key, session);
         }
     }
 
@@ -217,6 +251,36 @@ mod tests {
 
     fn key(project: &str, id: &str) -> SessionKey {
         (project.into(), id.into())
+    }
+
+    #[test]
+    fn a_refresh_cannot_replace_a_frame_received_after_it_started() {
+        let board = CloudBoard::new();
+        let revision = board.begin_refresh();
+        board.upsert("org", session("one", "project", "new"));
+        board.replace_after(
+            "org",
+            revision,
+            vec![session("one", "project", "old")],
+            vec![],
+            vec![],
+        );
+        assert_eq!(
+            board.snapshot("org").sessions[&key("project", "one")].last_activity_at,
+            "new"
+        );
+        let revision = board.begin_refresh();
+        board.replace_after(
+            "org",
+            revision,
+            vec![session("one", "project", "newer")],
+            vec![],
+            vec![],
+        );
+        assert_eq!(
+            board.snapshot("org").sessions[&key("project", "one")].last_activity_at,
+            "newer"
+        );
     }
 
     #[test]

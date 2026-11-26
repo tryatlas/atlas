@@ -90,6 +90,7 @@ pub struct AgentSessionMeta {
 /// prompt was recorded earlier still lands in the same file.
 pub struct TranscriptState {
     open: Mutex<HashMap<String, StoredTranscript>>,
+    write: Mutex<()>,
     /// Where [`save`]/[`read`] put their files. Held so a buffer can be seeded
     /// from the existing transcript — see [`TranscriptState::note_prompt`].
     config_dir: PathBuf,
@@ -99,6 +100,7 @@ impl TranscriptState {
     pub fn new(config_dir: PathBuf) -> Self {
         Self {
             open: Mutex::new(HashMap::new()),
+            write: Mutex::new(()),
             config_dir,
         }
     }
@@ -269,6 +271,16 @@ impl TranscriptState {
     /// conversation it belonged to.
     pub fn snapshot(&self, session_id: &str) -> Option<StoredTranscript> {
         self.open.lock().get(session_id).cloned()
+    }
+
+    /// Take the latest snapshot only after obtaining the disk writer. Older
+    /// queued tasks therefore cannot publish an older turn after a new one.
+    pub fn save_latest(&self, session_id: &str) -> std::io::Result<()> {
+        let _write = self.write.lock();
+        if let Some(snapshot) = self.snapshot(session_id) {
+            save(&self.config_dir, &snapshot)?;
+        }
+        Ok(())
     }
 
     /// Whether a buffer exists for `session_id` — i.e. `agents_send` recorded a

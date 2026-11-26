@@ -97,18 +97,11 @@ pub fn bind(store: &Store, workspace_id: &str, root: &Path, mode: ProjectMode) -
 /// producing Checkpoints without a restart or a re-bind, and it can only do that
 /// once the fingerprint it had no way to know is filled in.
 pub fn refresh_detection(store: &Store, root: &Path) -> Result<Option<Binding>> {
-    let Some(existing) = store.binding()? else {
+    let Some(_) = store.binding()? else {
         return Ok(None);
     };
     let detection = detect(root);
-    store.upsert_binding(
-        &existing.workspace_id,
-        &detection.root,
-        existing.mode,
-        detection.root_commit_sha.as_deref(),
-        detection.is_shallow,
-        detection.git_url.as_deref(),
-    )?;
+    store.refresh_binding_detection(&detection)?;
     store.binding()
 }
 

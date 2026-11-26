@@ -6,10 +6,9 @@
  * or a bug report — and **Markdown** is the record as a person reads it, which
  * is what gets pasted into a ticket or a review.
  *
- * Neither redacts anything further. Scrubbing already happened before
- * persistence, so what is on screen is what leaves — and quietly removing more
- * on the way out would produce an export that does not match the Session it
- * claims to be.
+ * Both formats hydrate the complete persisted payloads before writing; the
+ * screen can show previews while the export preserves the full Session.
+ * Scrubbing already happened before persistence, so neither redacts further.
  */
 
 import { invoke } from "@tauri-apps/api/core";
@@ -19,8 +18,54 @@ import { agentMeta } from "@/features/agents/lib/agent-meta";
 import { agentLabel, formatDuration, prettyModel, tokenLabel } from "./board";
 import type { SessionDetail, TimelineEntry } from "../types";
 import { formatDateTime, formatTime } from "@/lib/format-time";
+import { cloudPayload, localPayload } from "./payload-api";
+import type { PayloadPart } from "./session-timeline";
 
 export type ExportFormat = "json" | "md";
+
+export interface ExportSource {
+  projectPath: string;
+  remoteProjectId: string | null;
+  entriesReady: boolean;
+}
+
+/** Resolve every preview before writing. A failed read leaves no partial export. */
+export async function completeSession(
+  detail: SessionDetail,
+  source: ExportSource,
+): Promise<SessionDetail> {
+  if (!source.entriesReady) throw new Error("Wait for the complete timeline before exporting.");
+  const entries: TimelineEntry[] = [];
+  const expand = async (entry: TimelineEntry): Promise<TimelineEntry> => {
+    const full = { ...entry };
+    const payload = async (part: PayloadPart, ref: string | null): Promise<string> => {
+      const value = ref
+        ? await localPayload(source.projectPath, ref)
+        : source.remoteProjectId
+          ? await cloudPayload(source.remoteProjectId, detail.summary.id, entry.id, part)
+          : null;
+      if (!value) throw new Error(`The full ${part} for entry ${entry.id} is unavailable.`);
+      return value.text ?? `[Binary payload: ${value.bytes} bytes]`;
+    };
+    if (entry.truncated || entry.bodyRef) {
+      full.text = await payload("body", entry.bodyRef);
+      full.truncated = false;
+    }
+    if (entry.kind === "tool_call") {
+      if (entry.argumentsRef || (source.remoteProjectId && entry.arguments !== null)) {
+        full.arguments = await payload("arguments", entry.argumentsRef);
+      }
+      if (entry.resultRef || (source.remoteProjectId && entry.result !== null)) {
+        full.result = await payload("result", entry.resultRef);
+      }
+    }
+    return full;
+  };
+  for (let start = 0; start < detail.entries.length; start += 4) {
+    entries.push(...(await Promise.all(detail.entries.slice(start, start + 4).map(expand))));
+  }
+  return { ...detail, entries };
+}
 
 /**
  * A filename someone can find again.
@@ -43,7 +88,12 @@ function filename(detail: SessionDetail, format: ExportFormat): string {
  * Resolves `false` when the dialog is dismissed, which is not an error and must
  * not be reported as one.
  */
-export async function exportSession(detail: SessionDetail, format: ExportFormat): Promise<boolean> {
+export async function exportSession(
+  detail: SessionDetail,
+  format: ExportFormat,
+  source: ExportSource,
+): Promise<boolean> {
+  if (!source.entriesReady) throw new Error("Wait for the complete timeline before exporting.");
   const path = await save({
     defaultPath: filename(detail, format),
     filters: [
@@ -53,11 +103,12 @@ export async function exportSession(detail: SessionDetail, format: ExportFormat)
     ],
   });
   if (!path) return false;
+  const complete = await completeSession(detail, source);
   // `write_file_content` rather than the fs plugin: the plugin is not in the
   // capability set, and this command is already how the canvas export writes.
   await invoke("write_file_content", {
     path,
-    content: format === "json" ? toJson(detail) : toMarkdown(detail),
+    content: format === "json" ? toJson(complete) : toMarkdown(complete),
   });
   return true;
 }

@@ -11,8 +11,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { convertFileSrc } from "@tauri-apps/api/core";
-import { allowAssetDir, readFileBase64 } from "@/features/editor/lib/editor-fs-api";
+import { useLocalMedia } from "@/features/media/lib/use-local-media";
 import {
   BookOpen,
   Boxes,
@@ -301,87 +300,38 @@ function mediaKindOf(path: string): "image" | "video" | null {
   return null;
 }
 
-function imageMime(path: string): string {
-  switch (path.split(".").pop()?.toLowerCase() ?? "") {
-    case "jpg":
-    case "jpeg":
-      return "image/jpeg";
-    case "gif":
-      return "image/gif";
-    case "webp":
-      return "image/webp";
-    case "svg":
-      return "image/svg+xml";
-    case "bmp":
-      return "image/bmp";
-    case "avif":
-      return "image/avif";
-    case "heic":
-    case "heif":
-      return "image/heic";
-    default:
-      return "image/png";
-  }
-}
-
-/** Images come in as base64 (small, and the asset protocol 403s `.atlas`
- *  paths); video streams through `convertFileSrc` once its directory is
- *  allow-listed, so a whole video is never read into memory. */
-async function mediaSrc(path: string, media: "image" | "video"): Promise<string | null> {
-  if (media === "image") {
-    try {
-      const b64 = await readFileBase64(path);
-      return `data:${imageMime(path)};base64,${b64}`;
-    } catch {
-      return null;
-    }
-  }
-  const i = path.lastIndexOf("/");
-  try {
-    await allowAssetDir(i > 0 ? path.slice(0, i) : path);
-  } catch {
-    /* may already be allowed, or denied — try to render anyway */
-  }
-  return convertFileSrc(path);
-}
-
 /** A preview card above a media chip after a short hover, portalled to the
  *  body and clamped into the viewport. Nothing loads until the hover lands. */
 function useMediaPreview(path: string | null, media: "image" | "video" | null) {
-  const [card, setCard] = useState<{ src: string; left: number; bottom: number } | null>(null);
-  const hovering = useRef(false);
+  const [preview, setPreview] = useState<{ path: string; left: number; bottom: number } | null>(
+    null,
+  );
   const timer = useRef<number | null>(null);
-
+  const { url } = useLocalMedia(preview?.path === path ? path : null, media ?? "image");
   useEffect(
     () => () => {
-      hovering.current = false;
       if (timer.current) window.clearTimeout(timer.current);
     },
-    [],
+    [path, media],
   );
-
+  const card = url && preview?.path === path ? { ...preview, src: url } : null;
   if (!path || !media) return { onEnter: undefined, onLeave: undefined, card: null };
-
   const onEnter = (e: React.MouseEvent<HTMLElement>) => {
     const anchor = e.currentTarget;
-    hovering.current = true;
     if (timer.current) window.clearTimeout(timer.current);
-    timer.current = window.setTimeout(async () => {
-      const src = await mediaSrc(path, media);
-      if (!src || !hovering.current) return;
+    timer.current = window.setTimeout(() => {
       const r = anchor.getBoundingClientRect();
-      setCard({
-        src,
+      setPreview({
+        path,
         left: Math.max(8, Math.min(r.left, window.innerWidth - 436)),
         bottom: Math.max(8, window.innerHeight - r.top + 6),
       });
     }, 200);
   };
   const onLeave = () => {
-    hovering.current = false;
     if (timer.current) window.clearTimeout(timer.current);
     timer.current = null;
-    setCard(null);
+    setPreview(null);
   };
 
   return {

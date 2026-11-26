@@ -17,6 +17,7 @@ import {
   installAgent,
   installKind,
   removeAgent,
+  restartAgentToApply,
   updateAgentTo,
   useInstalls,
   type AgentItem,
@@ -161,6 +162,18 @@ function StatusRow({ item }: { item: AgentItem }) {
         control={
           <Button size="sm" onClick={() => void configureAgent(item, { enabled: true })}>
             Turn on
+          </Button>
+        }
+      />
+    );
+  } else if (item.catalog?.restartToApply) {
+    row = (
+      <SettingsRow
+        title="Restart to apply"
+        description="It's still running with the settings it started with. Restarting stops it and starts it again; open chats reconnect on their next message."
+        control={
+          <Button size="sm" onClick={() => void restartAgentToApply(item)}>
+            Restart {item.name}
           </Button>
         }
       />

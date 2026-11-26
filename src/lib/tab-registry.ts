@@ -159,15 +159,6 @@ export const TAB_REGISTRY = {
     launcher: null,
     data: shape<NoData>(),
   },
-  browser: {
-    placement: { kind: "surface", minWidth: 360 },
-    scope: "project",
-    mount: "persistent-idle-expensive",
-    multiplicity: "one-per-column",
-    fileBacked: false,
-    launcher: { label: "Browser", key: "B", order: 2 },
-    data: shape<{ url?: string }>(),
-  },
   // Retired; a saved one still renders its placeholder.
   tasks: {
     placement: { kind: "surface", minWidth: 240 },
@@ -186,7 +177,7 @@ export const TAB_REGISTRY = {
     mount: "persistent",
     multiplicity: "per-id",
     fileBacked: true,
-    launcher: { label: "New file", key: "N", order: 3 },
+    launcher: { label: "New file", key: "N", order: 2 },
     data: shape<{ filePath?: string; editing?: boolean }>(),
   },
   // The project tree: used while a session works, and a tree is a column's
@@ -198,7 +189,7 @@ export const TAB_REGISTRY = {
     mount: "active",
     multiplicity: "one",
     fileBacked: false,
-    launcher: { label: "Files", key: "F", order: 4 },
+    launcher: { label: "Files", key: "F", order: 3 },
     data: shape<NoData>(),
   },
   knowledge: {
@@ -290,7 +281,7 @@ export const TAB_REGISTRY = {
     mount: "active",
     multiplicity: "per-id",
     fileBacked: false,
-    launcher: { label: "Pull requests", key: "P", order: 6 },
+    launcher: { label: "Pull requests", key: "P", order: 5 },
     data: shape<{ repoPath: string }>(),
   },
   // One session's linked pull requests (id is
@@ -313,7 +304,7 @@ export const TAB_REGISTRY = {
     mount: "active",
     multiplicity: "one",
     fileBacked: false,
-    launcher: { label: "Source control", key: "G", order: 5 },
+    launcher: { label: "Source control", key: "G", order: 4 },
     data: shape<NoData>(),
   },
   log: {
@@ -322,7 +313,7 @@ export const TAB_REGISTRY = {
     mount: "active",
     multiplicity: "one-per-column",
     fileBacked: false,
-    launcher: { label: "Log", key: "L", order: 9 },
+    launcher: { label: "Log", key: "L", order: 8 },
     data: shape<NoData>(),
   },
   // The file viewers, one per FILE each (id is `<type>:<path>`), so opening a
@@ -422,7 +413,7 @@ export const TAB_REGISTRY = {
     mount: "persistent",
     multiplicity: "one",
     fileBacked: false,
-    launcher: { label: "Ask Atlas", key: "O", order: 8 },
+    launcher: { label: "Ask Atlas", key: "O", order: 7 },
     data: shape<NoData>(),
   },
   // One per DRAFT (id is `comms-draft-<id>`): finding it by type would focus
@@ -456,7 +447,7 @@ export const TAB_REGISTRY = {
     mount: "persistent",
     multiplicity: "one",
     fileBacked: false,
-    launcher: { label: "Team chat", key: "C", order: 7 },
+    launcher: { label: "Team chat", key: "C", order: 6 },
     data: shape<NoData>(),
   },
 } as const satisfies Record<string, TabTypeEntry>;

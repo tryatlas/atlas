@@ -152,6 +152,15 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
     let client = HttpClientBuilder::new()
         .without_redirects()
         .build_direct()?;
+    let premature = client
+        .get(format!("http://127.0.0.1:{login_port}/success"))
+        .send()
+        .await?;
+    assert_eq!(
+        premature.status(),
+        400,
+        "success cannot complete sign-in before the verified callback"
+    );
     let url = format!(
         "http://127.0.0.1:{login_port}/auth/callback?code=abc&state=test_state_123.onboarding_entrypoint=life_sciences"
     );

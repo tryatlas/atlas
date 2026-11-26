@@ -1,4 +1,4 @@
-import { useState, Suspense } from "react";
+import { Suspense } from "react";
 import { House } from "lucide-react";
 import { PaneHeader } from "@/components/titlebar";
 import { WelcomeScreen } from "@/features/app/components/welcome-screen";
@@ -22,18 +22,15 @@ export function ProjectlessCenter() {
   const tabs = useLayoutStore((s) => s.tabs);
   const activeByGroup = useLayoutStore((s) => s.activeByGroup);
   const focusedGroupId = useLayoutStore((s) => s.focusedGroupId);
-  const { setActiveTab } = useLayoutStore((s) => s.actions);
+  const { setActiveTab, showProjectlessHome } = useLayoutStore((s) => s.actions);
   // The only column: the leftmost and the rightmost.
   const chrome = columnChrome(true, true);
-  // Home is LOCAL state, not a store id: `setActiveTab` validates ids and
-  // falls back to `tabs[0]` on a miss, so a sentinel id would re-activate
-  // the very tab the user clicked away from.
-  const [atHome, setAtHome] = useState(false);
 
   const allowed = navigationTabs(tabs, focusedGroupId, true);
   const storeActive = activeByGroup[focusedGroupId] ?? null;
   const activeIndex = allowed.findIndex((t) => t.id === storeActive);
-  const active = atHome ? null : (allowed.find((t) => t.id === storeActive) ?? null);
+  const active = allowed.find((t) => t.id === storeActive) ?? null;
+  const atHome = active === null;
   // The strip's one Tab stop: the tab focus is on, else the active one.
   const { focusedId, listProps } = useTabListFocus();
   const stopId =
@@ -66,7 +63,7 @@ export function ProjectlessCenter() {
               tabStop={stopId === HOME_TAB.id}
               focused
               running={false}
-              onSelect={() => setAtHome(true)}
+              onSelect={showProjectlessHome}
             />
             {allowed.map((tab, index) => (
               <PaneTab
@@ -80,7 +77,6 @@ export function ProjectlessCenter() {
                 focused
                 running={false}
                 onSelect={() => {
-                  setAtHome(false);
                   setActiveTab(tab.id);
                 }}
               />

@@ -695,7 +695,7 @@ fn message_entry(store: &Store, message: &Message) -> Result<Option<TimelineEntr
 }
 
 fn tool_call_entry(
-    store: &Store,
+    _store: &Store,
     call: &ToolCall,
     touches: &[crate::model::FileTouch],
 ) -> Result<TimelineEntry> {
@@ -718,12 +718,9 @@ fn tool_call_entry(
     entry.result_ref = call.result_ref.clone();
     entry.result_binary = call.result_binary;
     if !call.result_binary {
-        entry.result = match store.tool_call_result(call) {
-            Ok(Some(bytes)) if bytes.len() as i64 <= INLINE_LIMIT_BYTES => {
-                String::from_utf8(bytes).ok()
-            }
-            _ => call.result.clone(),
-        };
+        // Spilled results already carry a reference for the detail fetch. Do
+        // not read and hash them merely to discard them at the inline limit.
+        entry.result = call.result.clone();
     }
     Ok(entry)
 }

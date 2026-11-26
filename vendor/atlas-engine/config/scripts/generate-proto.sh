@@ -3,8 +3,8 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "$script_dir/../../.." && pwd)"
-proto_dir="$repo_root/atlas-engine-rs/config/src/thread_config/proto"
+engine_root="$(cd "$script_dir/../.." && pwd)"
+proto_dir="$engine_root/config/src/thread_config/proto"
 generated="$proto_dir/atlas_engine.thread_config.v1.rs"
 tmpdir="$(mktemp -d)"
 
@@ -14,8 +14,8 @@ cleanup() {
 trap cleanup EXIT
 
 (
-    cd "$repo_root/atlas-engine-rs"
-    CARGO_TARGET_DIR="$tmpdir/target" cargo run \
+    cd "$engine_root"
+    cargo run --locked \
         -p atlas-engine-config \
         --example generate-proto \
         -- "$proto_dir"
@@ -37,3 +37,10 @@ awk '
     { print; previous = $0 }
 ' "$generated" > "$tmpdir/formatted.rs"
 mv "$tmpdir/formatted.rs" "$generated"
+
+# prost replaces the whole file, including the vendored source's notice.
+{
+    printf '%s\n' '// Modified by Atlas from upstream OpenAI Codex (Apache-2.0). See CONTEXT.md.'
+    cat "$generated"
+} > "$tmpdir/noticed.rs"
+mv "$tmpdir/noticed.rs" "$generated"

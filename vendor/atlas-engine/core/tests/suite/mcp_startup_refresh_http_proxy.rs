@@ -201,7 +201,7 @@ async fn skill_mcp_dependency_oauth_uses_configured_http_client() -> Result<()> 
         let _apps_server = AppsTestServer::mount(&proxy).await?;
         let challenge = "Bearer resource_metadata=\"http://mcp-proxy.invalid/oauth-resource\"";
         Mock::given(method("GET"))
-            .and(path("/api/atlas-agent/ps/mcp"))
+            .and(path("/api/codex/ps/mcp"))
             .respond_with(ResponseTemplate::new(401).insert_header("WWW-Authenticate", challenge))
             .mount(&proxy)
             .await;

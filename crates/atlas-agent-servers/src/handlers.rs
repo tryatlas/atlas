@@ -73,7 +73,15 @@ pub trait DispatchWorkItem: Send {
 pub type DispatchWork = Box<dyn DispatchWorkItem>;
 
 /// The sending half of a connection's dispatch queue.
-pub type DispatchTx = tokio::sync::mpsc::UnboundedSender<DispatchWork>;
+pub type DispatchTx = tokio::sync::mpsc::Sender<DispatchWork>;
+
+/// How many inbound messages may wait for the drain (#92). When the queue is
+/// full, the closure enqueueing the next one waits — which stops the RPC
+/// crate reading stdout, so an agent that floods the pipe is slowed to the
+/// pace Atlas applies its messages at instead of growing memory without
+/// bound. The drain never waits on anything but its own work, so a full queue
+/// always empties.
+pub const DISPATCH_QUEUE_CAPACITY: usize = 1024;
 
 struct RequestWork<Req, Res>
 where
@@ -133,11 +141,12 @@ fn dispatch_queue_closed_error() -> acp::Error {
     acp::Error::internal_error().data("ACP dispatch queue closed")
 }
 
-/// Queue a request for the ordered drain and return immediately.
+/// Queue a request for the ordered drain.
 ///
-/// Called from inside the RPC crate's serial inbound loop, so it must not
-/// block: whatever it does happens before the NEXT message is parsed.
-pub fn enqueue_request<Req, Res>(
+/// Called from inside the RPC crate's serial inbound loop: whatever it does
+/// happens before the NEXT message is parsed. It waits only while the queue
+/// is full ([`DISPATCH_QUEUE_CAPACITY`]).
+pub async fn enqueue_request<Req, Res>(
     dispatch_tx: &DispatchTx,
     request: Req,
     responder: Responder<Res>,
@@ -151,12 +160,16 @@ pub fn enqueue_request<Req, Res>(
         responder,
         handler,
     });
-    if let Err(err) = dispatch_tx.send(work) {
+    enqueue(dispatch_tx, work).await;
+}
+
+async fn enqueue(dispatch_tx: &DispatchTx, work: DispatchWork) {
+    if let Err(err) = dispatch_tx.send(work).await {
         err.0.reject();
     }
 }
 
-pub fn enqueue_notification<Notif>(
+pub async fn enqueue_notification<Notif>(
     dispatch_tx: &DispatchTx,
     notification: Notif,
     handler: fn(Notif, &ClientContext),
@@ -167,34 +180,39 @@ pub fn enqueue_notification<Notif>(
         notification,
         handler,
     });
-    if let Err(err) = dispatch_tx.send(work) {
-        err.0.reject();
-    }
+    enqueue(dispatch_tx, work).await;
 }
 
-struct BarrierWork<F: FnOnce() + Send + 'static> {
+struct BarrierWork<F: FnOnce(Option<&ClientContext>) + Send + 'static> {
     then: F,
 }
 
-impl<F: FnOnce() + Send + 'static> DispatchWorkItem for BarrierWork<F> {
-    fn run(self: Box<Self>, _ctx: &ClientContext) {
-        (self.then)();
+impl<F: FnOnce(Option<&ClientContext>) + Send + 'static> DispatchWorkItem for BarrierWork<F> {
+    fn run(self: Box<Self>, ctx: &ClientContext) {
+        (self.then)(Some(ctx));
     }
 
     fn reject(self: Box<Self>) {
         // Nothing left to wait behind: the queue is gone.
-        (self.then)();
+        (self.then)(None);
     }
 }
 
 /// Run `then` on the drain once every message queued before it has been
 /// handled: the end of a `session/load` replay is ordered behind the replay's
 /// own frames this way. Runs at once if the queue is gone.
-pub fn enqueue_barrier(dispatch_tx: &DispatchTx, then: impl FnOnce() + Send + 'static) {
+pub async fn enqueue_barrier(dispatch_tx: &DispatchTx, then: impl FnOnce() + Send + 'static) {
+    enqueue_on_drain(dispatch_tx, move |_ctx| then()).await;
+}
+
+/// [`enqueue_barrier`], handed the drain's context — `None` when the queue is
+/// gone and `then` runs at once instead.
+pub async fn enqueue_on_drain(
+    dispatch_tx: &DispatchTx,
+    then: impl FnOnce(Option<&ClientContext>) + Send + 'static,
+) {
     let work: DispatchWork = Box::new(BarrierWork { then });
-    if let Err(err) = dispatch_tx.send(work) {
-        err.0.reject();
-    }
+    enqueue(dispatch_tx, work).await;
 }
 
 /// Start one connection's ordered drain and hand back its sender.
@@ -205,7 +223,7 @@ pub fn enqueue_barrier(dispatch_tx: &DispatchTx, then: impl FnOnce() + Send + 's
 /// returns, so the queue keeps moving. The task ends when the last sender is
 /// dropped, which happens when the connection's handler closures are dropped.
 pub fn spawn_dispatch_queue(ctx: ClientContext) -> DispatchTx {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DispatchWork>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<DispatchWork>(DISPATCH_QUEUE_CAPACITY);
     tokio::spawn(async move {
         while let Some(work) = rx.recv().await {
             // A panicking handler must not take the drain down with it: the
@@ -258,10 +276,12 @@ pub fn handle_request_permission(
 
     let cancellation = responder.cancellation();
     let tool_call_id = args.tool_call.tool_call_id.clone();
+    let session_id = args.session_id.clone();
+    let sessions = ctx.sessions.clone();
 
     // The registration is the synchronous phase: once this returns, the prompt
     // exists and the drain can move on to whatever the agent said next.
-    let waiter = {
+    let (waiter, grant) = {
         let mut thread = lock(&thread);
         // No turn running: this request crossed the user's Stop on the wire
         // (Stop clears the turn, then sends `session/cancel`), or came after
@@ -281,11 +301,23 @@ pub fn handle_request_permission(
             ));
             return;
         }
-        thread.request_tool_call_authorization(
+        // An execute call the user allows here is one Atlas need not ask
+        // about again when the agent runs it through `terminal/create` (#28).
+        // The kind is the request's own, else what the thread already knows
+        // of the call.
+        let executes = args.tool_call.fields.kind == Some(acp::ToolKind::Execute)
+            || (args.tool_call.fields.kind.is_none()
+                && thread.entries().iter().any(|entry| {
+                    matches!(entry, atlas_acp_thread::AgentThreadEntry::ToolCall(call)
+                        if call.id == tool_call_id && call.kind == acp::ToolKind::Execute)
+                }));
+        let grant = thread.active_turn().filter(|_| executes);
+        let waiter = thread.request_tool_call_authorization(
             args.tool_call,
             PermissionOptions::Flat(args.options),
             AuthorizationKind::PermissionGrant,
-        )
+        );
+        (waiter, grant)
     };
     let waiter = match waiter {
         Ok(waiter) => waiter,
@@ -300,6 +332,9 @@ pub fn handle_request_permission(
             .await
         {
             Ok(outcome) => {
+                if let Some(turn) = grant.filter(|_| outcome_allows(&outcome)) {
+                    sessions.grant_execution(&session_id, turn, tool_call_id);
+                }
                 let _ = responder.respond(acp::RequestPermissionResponse::new(outcome.into()));
             }
             Err(err) => {
@@ -572,7 +607,7 @@ fn resolve_within_roots(path: &Path, roots: &[PathBuf]) -> anyhow::Result<PathBu
     // symlink planted INSIDE a root pointing out. Canonicalizing the deepest
     // existing ancestor of the target — following any symlink already on
     // disk — and re-joining the not-yet-existing tail closes both.
-    let resolved = canonicalize_deepest_ancestor(&normalize_lexically(path));
+    let resolved = canonicalize_deepest_ancestor(&normalize_lexically(path))?;
     for root in roots {
         // A root that is gone grants nothing. Falling back to a lexical form
         // here would compare a canonical target against a non-canonical root —
@@ -600,7 +635,7 @@ fn resolve_within_roots(path: &Path, roots: &[PathBuf]) -> anyhow::Result<PathBu
 /// that exists in full this IS `canonicalize`; for a write's target it
 /// resolves everything up to the missing leaf — which is exactly the part a
 /// planted symlink could bend.
-fn canonicalize_deepest_ancestor(path: &Path) -> PathBuf {
+fn canonicalize_deepest_ancestor(path: &Path) -> anyhow::Result<PathBuf> {
     let mut existing = path.to_path_buf();
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     loop {
@@ -610,17 +645,27 @@ fn canonicalize_deepest_ancestor(path: &Path) -> PathBuf {
                 for part in tail.iter().rev() {
                     out.push(part);
                 }
-                return out;
+                return Ok(out);
             }
-            Err(_) => match (existing.file_name(), existing.parent()) {
-                (Some(name), Some(parent)) => {
-                    tail.push(name.to_os_string());
-                    existing = parent.to_path_buf();
+            Err(error) => {
+                // A dangling link is an existing object, not a missing tail.
+                // Never append it unchecked and let open(O_CREAT) follow it.
+                if std::fs::symlink_metadata(&existing).is_ok() {
+                    return Err(error.into());
                 }
-                // Ran out of parents without anything existing — nothing to
-                // resolve; the lexical form is all there is.
-                _ => return path.to_path_buf(),
-            },
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(error.into());
+                }
+                match (existing.file_name(), existing.parent()) {
+                    (Some(name), Some(parent)) => {
+                        tail.push(name.to_os_string());
+                        existing = parent.to_path_buf();
+                    }
+                    // Ran out of parents without anything existing — nothing to
+                    // resolve; the lexical form is all there is.
+                    _ => return Err(error.into()),
+                }
+            }
         }
     }
 }
@@ -725,6 +770,25 @@ mod fs_bound_tests {
         }
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_or_cyclic_symlink_is_not_a_missing_write_target() {
+        let root = test_root();
+        let outside = test_root();
+        std::os::unix::fs::symlink(outside.join("missing.txt"), root.join("file")).unwrap();
+        std::os::unix::fs::symlink(outside.join("missing-dir"), root.join("directory")).unwrap();
+        std::os::unix::fs::symlink("cycle", root.join("cycle")).unwrap();
+        for path in ["file", "directory/new.txt", "cycle/new.txt"] {
+            assert!(
+                resolve_within_roots(&root.join(path), std::slice::from_ref(&root)).is_err(),
+                "accepted {path}"
+            );
+        }
+        assert!(!outside.join("missing.txt").exists());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
@@ -998,12 +1062,16 @@ mod fs_bound_tests {
 
 pub fn handle_session_notification(notification: acp::SessionNotification, ctx: &ClientContext) {
     let Ok(thread) = ctx.sessions.thread(&notification.session_id) else {
-        // Not an error to answer — notifications have no response — but worth
-        // saying, because it means an update was dropped.
-        tracing::warn!(
-            "received session notification for unknown session: {:?}",
-            notification.session_id
-        );
+        // A session Atlas does not know yet may be the one a `session/new`
+        // in flight is about to answer with: an agent may announce its
+        // commands before it answers. Kept until that answer is registered,
+        // and applied then, in order (#12).
+        let session_id = notification.session_id.clone();
+        if !ctx.sessions.park_update(notification) {
+            // Not an error to answer — notifications have no response — but
+            // worth saying, because it means an update was dropped.
+            tracing::warn!("received session notification for unknown session: {session_id:?}");
+        }
         return;
     };
 
@@ -1025,14 +1093,25 @@ pub fn handle_session_notification(notification: acp::SessionNotification, ctx: 
                 .with_session(&notification.session_id, |session| {
                     // An agent whose modes live in a `category: "mode"` select
                     // (OpenCode — see `session_modes_of`) reports a mode change
-                    // here, not as `current_mode_update`. Mirror it onto the
-                    // mode state the pill reads, but only to a mode that state
-                    // knows: the agent's own `modes` wire stays authoritative
-                    // for what is selectable.
-                    if let (Some(modes), Some(select)) = (
+                    // here, not as `current_mode_update`, and a change to the
+                    // LIST of modes too: that select is the whole of its mode
+                    // state, so it replaces the session's, list and current
+                    // alike (#43).
+                    let from_config = session
+                        .modes_from_config
+                        .as_ref()
+                        .and_then(|id| crate::connection::mode_select_by_id(&options, id));
+                    if let (Some(modes), Some(select)) = (&session.session_modes, from_config) {
+                        *lock(modes) = select;
+                    } else if let (Some(modes), Some(select), None) = (
                         &session.session_modes,
                         crate::connection::mode_select_of(&options),
+                        &session.modes_from_config,
                     ) {
+                        // An agent with its own `modes` wire that also sends
+                        // a mode select: mirror the current mode, but only to
+                        // a mode that state knows — its `modes` wire stays
+                        // authoritative for what is selectable.
                         let mut modes = lock(modes);
                         if modes
                             .available_modes
@@ -1042,9 +1121,27 @@ pub fn handle_session_notification(notification: acp::SessionNotification, ctx: 
                             modes.current_mode_id = select.current_mode_id;
                         }
                     }
-                    if let Some(config) = &session.config_options {
-                        *lock(&config.config_options) = options;
-                        config.notify();
+                    if session.session_modes.is_none() {
+                        if let Some((config_id, modes)) =
+                            crate::connection::mode_select_with_id(&options)
+                        {
+                            session.session_modes = Some(Arc::new(Mutex::new(modes)));
+                            session.modes_from_config = Some(config_id);
+                        }
+                    }
+                    // Options first announced after the session opened are
+                    // stored all the same: an agent need not send any with
+                    // `session/new` (#37).
+                    match &session.config_options {
+                        Some(config) => {
+                            *lock(&config.config_options) = options;
+                            config.notify();
+                        }
+                        None => {
+                            session.config_options = Some(crate::session::ConfigOptions::new(
+                                Arc::new(Mutex::new(options)),
+                            ));
+                        }
                     }
                 });
         }
@@ -1142,7 +1239,24 @@ fn outcome_allows(outcome: &RequestPermissionOutcome) -> bool {
 /// permission prompt cannot render meaningfully — the user approves a command
 /// line, not a preload.
 fn env_is_denied(name: &str) -> bool {
-    name.starts_with("DYLD_") || name.starts_with("LD_")
+    let name = name.to_ascii_uppercase();
+    name.starts_with("DYLD_")
+        || name.starts_with("LD_")
+        || matches!(
+            name.as_str(),
+            "BASH_ENV"
+                | "ENV"
+                | "NODE_OPTIONS"
+                | "NODE_PATH"
+                | "PYTHONSTARTUP"
+                | "PYTHONPATH"
+                | "PERL5OPT"
+                | "PERL5LIB"
+                | "RUBYOPT"
+                | "RUBYLIB"
+                | "GIT_SSH_COMMAND"
+                | "GIT_EXTERNAL_DIFF"
+        )
 }
 
 /// Where a `terminal/create` runs: the directory the agent named, or the
@@ -1210,7 +1324,12 @@ pub fn handle_create_terminal(
         .filter(|env| !env_is_denied(&env.name))
         .map(|env| (env.name, env.value))
         .collect();
-    let byte_limit = args.output_byte_limit.unwrap_or(DEFAULT_OUTPUT_BYTE_LIMIT);
+    // The agent's limit, but never past Atlas's own ceiling: the buffer is
+    // held in memory for as long as the terminal lives (#92).
+    let output_byte_limit = args
+        .output_byte_limit
+        .map(|limit| limit.min(MAX_OUTPUT_BYTE_LIMIT));
+    let byte_limit = output_byte_limit.unwrap_or(DEFAULT_OUTPUT_BYTE_LIMIT);
 
     // The cwd is held to the same rule as fs reads/writes: inside a granted
     // root or nowhere. Without this, "run `git status` in /Users/x/.ssh" was
@@ -1231,6 +1350,12 @@ pub fn handle_create_terminal(
     // decorative, since an agent denied a write could simply shell one out.
     // The same authorization machinery every other permission uses carries
     // this prompt, so session modes (auto-allow etc.) behave identically.
+    //
+    // Unless the agent already asked: when the user allowed an execute call
+    // through the agent's own `session/request_permission` in this turn,
+    // that answer covers the command it runs, and a second "Run …?" for the
+    // same action is only noise (#28, decided). ACP gives `terminal/create`
+    // no tool call id, so the grant spent is the turn's oldest unspent one.
     let tool_call_id = acp::ToolCallId::new(format!("terminal-{}", uuid::Uuid::new_v4()));
     let mut fields = acp::ToolCallUpdateFields::default();
     fields.kind = Some(acp::ToolKind::Execute);
@@ -1239,81 +1364,103 @@ pub fn handle_create_terminal(
     } else {
         format!("Run `{label}`")
     });
-    let waiter = {
+    fields.raw_input = Some(
+        serde_json::json!({"command": args.command, "args": args.args, "env": env, "cwd": cwd}),
+    );
+    let (waiter, turn) = {
         let mut thread_guard = lock(&thread);
-        thread_guard.request_tool_call_authorization(
-            acp::ToolCallUpdate::new(tool_call_id.clone(), fields),
-            PermissionOptions::Flat(vec![
-                acp::PermissionOption::new(
-                    "allow_once",
-                    "Allow once",
-                    acp::PermissionOptionKind::AllowOnce,
-                ),
-                acp::PermissionOption::new(
-                    "reject_once",
-                    "Reject",
-                    acp::PermissionOptionKind::RejectOnce,
-                ),
-            ]),
-            AuthorizationKind::PermissionGrant,
-        )
-    };
-    let waiter = match waiter {
-        Ok(waiter) => waiter,
-        Err(err) => return respond_err(responder, err),
+        let Some(turn) = thread_guard.active_turn() else {
+            return respond_err(responder, acp::Error::request_cancelled());
+        };
+        if ctx.sessions.spend_execution_grant(&args.session_id, turn) {
+            (None, turn)
+        } else {
+            let waiter = thread_guard.request_tool_call_authorization(
+                acp::ToolCallUpdate::new(tool_call_id.clone(), fields),
+                PermissionOptions::Flat(vec![
+                    acp::PermissionOption::new(
+                        "allow_once",
+                        "Allow once",
+                        acp::PermissionOptionKind::AllowOnce,
+                    ),
+                    acp::PermissionOption::new(
+                        "reject_once",
+                        "Reject",
+                        acp::PermissionOptionKind::RejectOnce,
+                    ),
+                ]),
+                AuthorizationKind::PermissionGrant,
+            );
+            match waiter {
+                Ok(waiter) => (Some(waiter), turn),
+                Err(err) => return respond_err(responder, err),
+            }
+        }
     };
 
     let cancellation = responder.cancellation();
     let command = args.command.clone();
-    let cmd_args = args.args.clone();
-    let output_byte_limit = args.output_byte_limit;
+    let cmd_args = args.args;
     tokio::spawn(async move {
-        let outcome = match cancellation
-            .run_until_cancelled(async { Ok(waiter.await) })
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                // The agent gave up on the turn — take the prompt down.
-                if err.code == acp::ErrorCode::RequestCancelled {
-                    lock(&thread).cancel_tool_call_authorization(&tool_call_id);
+        if let Some(waiter) = waiter {
+            let outcome = match cancellation
+                .run_until_cancelled(async { Ok(waiter.await) })
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    // The agent gave up on the turn — take the prompt down.
+                    if err.code == acp::ErrorCode::RequestCancelled {
+                        lock(&thread).cancel_tool_call_authorization(&tool_call_id);
+                    }
+                    respond_err(responder, err);
+                    return;
                 }
-                respond_err(responder, err);
+            };
+            if !outcome_allows(&outcome) {
+                respond_err(responder, user_declined());
                 return;
             }
-        };
-
-        let allowed = outcome_allows(&outcome);
-        if !allowed {
-            respond_err(
-                responder,
-                acp::Error::internal_error().data("the user declined to run this command"),
-            );
-            return;
         }
 
-        // Register-before-respond still holds: the agent cannot name this
-        // terminal until the response below hands it the id.
-        let spawned = CommandTerminal::spawn(&command, &cmd_args, &env, Some(&cwd), byte_limit);
-        let terminal = match spawned {
-            Ok(terminal) => Arc::new(terminal),
-            Err(err) => {
+        // The final turn check and process creation share the turn lock:
+        // once Stop has retired that turn, this task cannot spawn on its behalf.
+        // PTY/process creation is blocking and belongs on the blocking pool.
+        let spawning_thread = thread.clone();
+        let spawned = tokio::task::spawn_blocking(move || {
+            let mut thread_guard = lock(&spawning_thread);
+            if thread_guard.active_turn() != Some(turn) {
+                return Err(acp::Error::request_cancelled());
+            }
+            let terminal = Arc::new(
+                CommandTerminal::spawn(&command, &cmd_args, &env, Some(&cwd), byte_limit)
+                    .map_err(|error| acp::Error::internal_error().data(error.to_string()))?,
+            );
+            let terminal_id = acp::TerminalId::new(uuid::Uuid::new_v4().to_string());
+            thread_guard.on_terminal_provider_event(TerminalProviderEvent::Created {
+                terminal_id: terminal_id.clone(),
+                label,
+                cwd: Some(cwd),
+                output_byte_limit,
+                terminal: Some(terminal.clone()),
+            });
+            Ok((terminal, terminal_id))
+        })
+        .await;
+        let (terminal, terminal_id) = match spawned {
+            Ok(Ok(spawned)) => spawned,
+            Ok(Err(error)) => {
+                respond_err(responder, error);
+                return;
+            }
+            Err(error) => {
                 respond_err(
                     responder,
-                    acp::Error::internal_error().data(err.to_string()),
+                    acp::Error::internal_error().data(error.to_string()),
                 );
                 return;
             }
         };
-
-        let terminal_id = acp::TerminalId::new(uuid::Uuid::new_v4().to_string());
-        lock(&thread).on_terminal_provider_event(TerminalProviderEvent::Created {
-            terminal_id: terminal_id.clone(),
-            label,
-            cwd: Some(cwd),
-            output_byte_limit,
-            terminal: Some(terminal.clone()),
-        });
         follow_terminal_output(thread, terminal, terminal_id.clone());
 
         let _ = responder.respond(acp::CreateTerminalResponse::new(terminal_id));
@@ -1484,6 +1631,21 @@ pub fn handle_wait_for_terminal_exit(
     });
 }
 
+/// The ceiling on a terminal's `outputByteLimit` (#92). An agent may ask for
+/// less; asking for more gets this.
+pub const MAX_OUTPUT_BYTE_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// The JSON-RPC code of a command the user declined to run: in the range
+/// JSON-RPC leaves to the implementation, next to ACP's own `-32000` and
+/// `-32002`. Not `-32603`: nothing went wrong in the client, the user said no,
+/// and an agent reading "internal error" retries or reports a bug.
+pub const USER_DECLINED_CODE: i32 = -32001;
+
+/// The refusal an agent hears when the user declines its command (#28).
+fn user_declined() -> acp::Error {
+    acp::Error::new(USER_DECLINED_CODE, "The user declined to run this command.")
+}
+
 fn unknown_terminal(terminal_id: &acp::TerminalId) -> acp::Error {
     acp::Error::internal_error().data(format!("unknown terminal: {terminal_id}"))
 }
@@ -1532,14 +1694,15 @@ mod dispatch_barrier_tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let tx = spawn_dispatch_queue(ctx());
         for frame in ["replay 1", "replay 2", "replay 3"] {
-            tx.send(Box::new(Push(seen.clone(), frame))).unwrap();
+            assert!(tx.send(Box::new(Push(seen.clone(), frame))).await.is_ok());
         }
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let order = seen.clone();
         enqueue_barrier(&tx, move || {
             lock(&order).push("end replay");
             let _ = done_tx.send(());
-        });
+        })
+        .await;
         done_rx.await.unwrap();
         assert_eq!(
             *lock(&seen),
@@ -1547,14 +1710,35 @@ mod dispatch_barrier_tests {
         );
     }
 
-    #[test]
-    fn a_barrier_on_a_closed_queue_runs_at_once() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DispatchWork>();
+    #[tokio::test]
+    async fn a_barrier_on_a_closed_queue_runs_at_once() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<DispatchWork>(1);
         drop(rx);
         let ran = Arc::new(Mutex::new(false));
         let flag = ran.clone();
-        enqueue_barrier(&tx, move || *lock(&flag) = true);
+        enqueue_barrier(&tx, move || *lock(&flag) = true).await;
         assert!(*lock(&ran));
+    }
+
+    /// #92: the queue is bounded. A full queue makes the enqueue wait — the
+    /// RPC crate's reader with it — rather than grow without limit, and the
+    /// wait ends as the drain catches up.
+    #[tokio::test]
+    async fn a_full_queue_makes_the_reader_wait() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DispatchWork>(DISPATCH_QUEUE_CAPACITY);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        for _ in 0..DISPATCH_QUEUE_CAPACITY {
+            enqueue(&tx, Box::new(Push(seen.clone(), "queued"))).await;
+        }
+        let blocked = enqueue(&tx, Box::new(Push(seen.clone(), "one more")));
+        tokio::pin!(blocked);
+        assert!(
+            futures::poll!(blocked.as_mut()).is_pending(),
+            "a full queue holds the next message back"
+        );
+        drop(rx.recv().await);
+        blocked.await;
+        assert_eq!(rx.len(), DISPATCH_QUEUE_CAPACITY);
     }
 }
 
@@ -1570,6 +1754,16 @@ mod terminal_gate_tests {
             "DYLD_LIBRARY_PATH",
             "LD_PRELOAD",
             "LD_AUDIT",
+            "BASH_ENV",
+            "ENV",
+            "NODE_OPTIONS",
+            "node_options",
+            "NODE_PATH",
+            "PYTHONSTARTUP",
+            "PYTHONPATH",
+            "PERL5OPT",
+            "RUBYOPT",
+            "GIT_SSH_COMMAND",
         ] {
             assert!(env_is_denied(denied), "{denied} must be dropped");
         }

@@ -34,6 +34,10 @@ pub(crate) fn launcher() -> Option<BundledBwrapLauncher> {
 }
 
 impl BundledBwrapLauncher {
+    pub(crate) fn program(&self) -> &Path {
+        self.program.as_path()
+    }
+
     pub(crate) fn exec(&self, argv: Vec<String>, preserved_files: Vec<File>) -> ! {
         let bwrap_file = File::open(self.program.as_path()).unwrap_or_else(|err| {
             panic!(

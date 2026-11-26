@@ -156,6 +156,32 @@ pub struct SessionRow {
     pub ledgered: bool,
 }
 
+/// Complete, compact identity list for range/facet counts. The detailed table
+/// is capped separately; ratios must never use that display limit.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionIdentity {
+    pub session_id: String,
+    pub project_path: String,
+    pub agent: String,
+    pub model: String,
+    pub started_ms: i64,
+    pub last_activity_ms: Option<i64>,
+}
+
+impl From<&SessionRow> for SessionIdentity {
+    fn from(row: &SessionRow) -> Self {
+        Self {
+            session_id: row.session_id.clone(),
+            project_path: row.project_path.clone(),
+            agent: row.agent.clone(),
+            model: row.model.clone(),
+            started_ms: row.started_ms,
+            last_activity_ms: row.last_activity_ms,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ByokDay {
@@ -192,6 +218,7 @@ pub struct UsageDashboard {
     pub daily: Vec<DailyBucket>,
     /// Most-recent first, capped at [`SESSION_ROW_CAP`].
     pub sessions: Vec<SessionRow>,
+    pub session_identities: Vec<SessionIdentity>,
     pub sessions_total: u64,
     pub byok_daily: Vec<ByokDay>,
     pub byok_since: Option<String>,
@@ -657,6 +684,11 @@ pub async fn usage_dashboard(
             })
             .collect();
         let assembled = assemble(folds);
+        let session_identities = assembled
+            .sessions
+            .iter()
+            .map(SessionIdentity::from)
+            .collect();
         let (sessions, sessions_total) = cap_sessions(assembled.sessions);
 
         let byok = byok_path
@@ -684,6 +716,7 @@ pub async fn usage_dashboard(
             models: assembled.models,
             daily: assembled.daily,
             sessions,
+            session_identities,
             sessions_total,
             byok_daily: byok.daily,
             byok_since: byok.since,

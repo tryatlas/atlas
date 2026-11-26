@@ -14,7 +14,6 @@
  * a plain Map keyed by project id, capped LRU.
  */
 
-import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { useGitStore } from "@/features/git/stores/git-store";
 import { useKnowledgeStore } from "@/features/knowledge/stores/knowledge-store";
 import { useKnowledgeMetaStore } from "@/features/knowledge/stores/knowledge-meta-store";
@@ -30,8 +29,6 @@ interface Snapshot {
   git: Record<string, unknown>;
   knowledge: Record<string, unknown>;
   knowledgeMeta: Record<string, unknown>;
-  /** Hash of the persist-relevant slices, for write dedup. */
-  persistHash: string;
   /** Monotonic touch counter for LRU. */
   touchedAt: number;
 }
@@ -79,13 +76,6 @@ function refSlice(state: unknown): Record<string, unknown> {
   return data;
 }
 
-/** Cheap, stable string hash (djb2). */
-function hashString(s: string): string {
-  let h = 5381;
-  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
-  return (h >>> 0).toString(36);
-}
-
 /**
  * Capture the active stores into the cache under `projectId`. Synchronous +
  * cheap (a few JSON clones). Call this BEFORE resetting the stores on a switch.
@@ -103,25 +93,10 @@ export function captureSnapshot(projectId: string): void {
   const knowledge = refSlice(useKnowledgeStore.getState());
   const knowledgeMeta = dataSlice(useKnowledgeMetaStore.getState());
 
-  // Tabs/split layout drive the persisted editor-state, so dedup on the
-  // mirror's persisted fields only (NOT viewsByWs, which is the whole map) —
-  // and ONLY on those fields. Knowledge/meta used to be stringified into this
-  // hash too, which cost a second full pass over the vault per switch and made
-  // note edits force editor-state disk writes that had nothing to do with the
-  // editor state being written.
-  const ls = useLayoutStore.getState();
-  const layoutForHash = {
-    tabs: ls.tabs.map((t) => ({ id: t.id, type: t.type, groupId: t.groupId, data: t.data })),
-    groupOrder: ls.groupOrder,
-    activeByGroup: ls.activeByGroup,
-    focusedGroupId: ls.focusedGroupId,
-  };
-
   const snapshot: Snapshot = {
     git,
     knowledge,
     knowledgeMeta,
-    persistHash: hashString(JSON.stringify(layoutForHash)),
     touchedAt: ++clock,
   };
 
@@ -167,14 +142,6 @@ export function clearPanelStores(): void {
   useGitStore.setState(dataSlice(useGitStore.getInitialState()));
   useKnowledgeStore.setState(dataSlice(useKnowledgeStore.getInitialState()));
   useKnowledgeMetaStore.setState(dataSlice(useKnowledgeMetaStore.getInitialState()));
-}
-
-/**
- * The persist hash captured for this project, or null if no snapshot. Used by
- * the flush coordinator to skip redundant disk writes when nothing changed.
- */
-export function persistHashOf(projectId: string): string | null {
-  return cache.get(projectId)?.persistHash ?? null;
 }
 
 /** Evict the least-recently-restored snapshot when over the cap. The `keep`

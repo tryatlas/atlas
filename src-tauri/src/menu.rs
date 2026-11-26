@@ -1,4 +1,4 @@
-//! Native macOS application menu, built from `src-tauri/menu.json`.
+//! Native application menu, built from `src-tauri/menu.json`.
 //!
 //! The menu model is shared: the frontend draws the same menus inside the
 //! Windows/Linux titlebar (`src/features/menu/`), so the two cannot list
@@ -9,18 +9,14 @@
 //!
 //! Why Atlas ships its own menu at all: without one Tauri installs its
 //! *default* menu, whose Window ▸ Close (Cmd+W) calls `performClose:` on the
-//! key window. In the main webview that is harmless — the keybinding
-//! dispatcher (`useActionHotkeys` in `App.tsx`) `preventDefault()`s every chord
-//! it handles, so WebKit reports the key equivalent as handled and the menu
-//! never fires. But the embedded browser (`commands::browser`) is a separate
-//! native child webview loading remote pages that don't preventDefault Cmd+W,
-//! so the chord fell through to the default Close item and tore down the whole
+//! key window. The keybinding dispatcher (`useActionHotkeys` in `App.tsx`)
+//! `preventDefault()`s every chord it handles, so WebKit reports the key
+//! equivalent as handled and the menu never fires; but a Cmd+W the dispatcher
+//! does not take would reach the default Close item and tear down the whole
 //! window. Here the chord belongs to the Close Tab item, which closes the tab.
 //!
-//! The same fallthrough is what makes every accelerator below useful: while
-//! the embedded browser has focus, the menu is the only thing that hears
-//! Atlas's chords. In the main webview the dispatcher still wins, so nothing
-//! runs twice. Accelerators follow the user's bindings
+//! In the main webview the dispatcher wins, so nothing runs twice. The menu
+//! items show the user's chords. Accelerators follow the user's bindings
 //! (`menu_set_accelerators`); items start without one until the renderer has
 //! read `keybindings.json`.
 
@@ -31,6 +27,8 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu, SubmenuBuilder};
 use tauri::Manager;
 
 /// The one event every custom menu item emits; the payload is the item id.
+pub const QUIT_MENU_ID: &str = "atlas-quit";
+
 pub const MENU_EVENT: &str = "atlas:menu-command";
 
 const MODEL_JSON: &str = include_str!("../menu.json");
@@ -61,8 +59,8 @@ pub enum ItemDef {
 /// selectors, which macOS routes straight to WKWebView's native editing undo
 /// WITHOUT dispatching a JS keydown — that shadowed CodeMirror's own history,
 /// so Cmd+Z did nothing in the code editor. Without them Cmd+Z reaches the
-/// page: CodeMirror undoes, and the embedded browser's text fields still undo
-/// through WebKit's built-in editing default.
+/// page: CodeMirror undoes, and plain text fields still undo through WebKit's
+/// built-in editing default.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum Role {
@@ -95,8 +93,29 @@ pub fn build(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     for def in model().menus {
         let mut submenu = SubmenuBuilder::with_id(app, def.id.as_str(), def.label.as_str());
         for item in &def.items {
+            #[cfg(not(target_os = "macos"))]
+            if matches!(
+                item,
+                ItemDef::Role {
+                    role: Role::Services
+                        | Role::Hide
+                        | Role::HideOthers
+                        | Role::ShowAll
+                        | Role::BringAllToFront
+                }
+            ) {
+                continue;
+            }
+
             submenu = match item {
                 ItemDef::Separator => submenu.separator(),
+                ItemDef::Role { role: Role::Quit } => submenu.item(&MenuItem::with_id(
+                    app,
+                    QUIT_MENU_ID,
+                    "Quit Atlas",
+                    true,
+                    Some("CmdOrCtrl+Q"),
+                )?),
                 ItemDef::Role { role } => submenu.item(&predefined(app, *role)?),
                 ItemDef::Action { id, label } | ItemDef::Command { id, label } => {
                     let entry = MenuItem::with_id(app, id.as_str(), label, true, None::<&str>)?;
@@ -118,7 +137,7 @@ fn predefined(app: &tauri::AppHandle, role: Role) -> tauri::Result<PredefinedMen
         Role::Hide => PredefinedMenuItem::hide(app, None),
         Role::HideOthers => PredefinedMenuItem::hide_others(app, None),
         Role::ShowAll => PredefinedMenuItem::show_all(app, None),
-        Role::Quit => PredefinedMenuItem::quit(app, None),
+        Role::Quit => unreachable!("Quit is a custom item so persistence can finish before exit"),
         Role::Cut => PredefinedMenuItem::cut(app, None),
         Role::Copy => PredefinedMenuItem::copy(app, None),
         Role::Paste => PredefinedMenuItem::paste(app, None),

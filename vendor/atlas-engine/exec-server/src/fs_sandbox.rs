@@ -32,7 +32,9 @@ use crate::local_file_system::current_sandbox_cwd;
 use crate::rpc::internal_error;
 use crate::rpc::invalid_request;
 
-const FS_HELPER_ENV_ALLOWLIST: &[&str] = &["PATH", "TMPDIR", "TMP", "TEMP"];
+// APPDIR lets the helper distinguish the AppImage's bundled bubblewrap from
+// the system binary even though its environment intentionally omits other app state.
+const FS_HELPER_ENV_ALLOWLIST: &[&str] = &["PATH", "TMPDIR", "TMP", "TEMP", "APPDIR"];
 #[cfg(debug_assertions)]
 const FS_HELPER_BAZEL_BWRAP_ENV_ALLOWLIST: &[&str] = &[
     "CARGO_BIN_EXE_bwrap",
@@ -313,11 +315,16 @@ async fn run_command(
         .stdin
         .take()
         .ok_or_else(|| internal_error("failed to open fs sandbox helper stdin".to_string()))?;
-    stdin.write_all(&request_json).await.map_err(io_error)?;
-    stdin.shutdown().await.map_err(io_error)?;
-    drop(stdin);
-
-    let output = wait_for_helper_output(child).await?;
+    let write_request = async move {
+        stdin.write_all(&request_json).await?;
+        stdin.shutdown().await?;
+        Ok::<_, std::io::Error>(())
+    };
+    // Always reap the helper and retain its stderr/status when it exits before
+    // consuming stdin. Concurrent draining also avoids full-pipe deadlocks.
+    let (write_result, output_result) = tokio::join!(write_request, wait_for_helper_output(child));
+    let output = output_result?;
+    write_result.map_err(io_error)?;
     let response: FsHelperResponse = serde_json::from_slice(&output.stdout).map_err(json_error)?;
     match response {
         FsHelperResponse::Ok(payload) => Ok(payload),
@@ -423,6 +430,42 @@ mod tests {
     use super::helper_env_key_is_allowed;
     use super::helper_read_roots;
     use super::sandbox_cwd;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn early_helper_exit_retains_stderr_when_stdin_is_not_consumed() {
+        let cwd = AbsolutePathBuf::from_absolute_path(std::env::current_dir().unwrap()).unwrap();
+        let cwd = PathUri::from_abs_path(&cwd);
+        let request = atlas_engine_sandboxing::SandboxExecRequest {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf 'sandbox denied this operation' >&2; exit 17".into(),
+            ],
+            cwd: cwd.clone(),
+            sandbox_policy_cwd: cwd,
+            env: HashMap::new(),
+            network: None,
+            network_environment_id: None,
+            sandbox: atlas_engine_sandboxing::SandboxType::None,
+            windows_sandbox_level: Default::default(),
+            windows_sandbox_private_desktop: false,
+            permission_profile: PermissionProfile::Disabled,
+            arg0: None,
+        };
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::run_command(request, vec![b'x'; 1024 * 1024]),
+        )
+        .await
+        .expect("failed helper must be reaped")
+        .unwrap_err();
+        assert!(error.message.contains("17"), "{error:?}");
+        assert!(
+            error.message.contains("sandbox denied this operation"),
+            "{error:?}"
+        );
+    }
 
     #[test]
     fn helper_permissions_enable_minimal_reads_for_restricted_profile() {

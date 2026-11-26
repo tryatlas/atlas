@@ -2053,7 +2053,12 @@ impl ConfigManager {
             Err(e) => return Err(ConfigError::Io(e.to_string())),
         };
         if raw == self.last_raw {
-            return Ok(false);
+            let recovered = !matches!(self.status, ConfigStatus::Ok);
+            self.status = ConfigStatus::Ok;
+            if recovered {
+                self.generation += 1;
+            }
+            return Ok(recovered);
         }
         let fresh = match Self::from_raw(self.path.clone(), &raw) {
             Ok(fresh) => fresh,
@@ -2065,7 +2070,7 @@ impl ConfigManager {
             }
         };
         if fresh.last_raw != raw {
-            atlas_fs::replace_file(&self.path, &fresh.last_raw)
+            atlas_fs::replace_file_follow_symlink(&self.path, &fresh.last_raw)
                 .map_err(|error| ConfigError::Io(error.to_string()))?;
         }
         self.document = fresh.document;
@@ -2175,7 +2180,8 @@ impl ConfigManager {
             }
             _ => {}
         }
-        atlas_fs::replace_file(&self.path, text).map_err(|e| ConfigError::Io(e.to_string()))?;
+        atlas_fs::replace_file_follow_symlink(&self.path, text)
+            .map_err(|e| ConfigError::Io(e.to_string()))?;
         Ok(true)
     }
 
@@ -2196,7 +2202,8 @@ impl ConfigManager {
         let settings = AppSettings::default();
         let document = document_for(&settings);
         let text = document.to_string();
-        atlas_fs::replace_file(&self.path, &text).map_err(|e| ConfigError::Io(e.to_string()))?;
+        atlas_fs::replace_file_follow_symlink(&self.path, &text)
+            .map_err(|e| ConfigError::Io(e.to_string()))?;
 
         self.document = document;
         self.effective = settings.clone();
@@ -2216,7 +2223,8 @@ impl ConfigManager {
     fn create_fresh_with(path: PathBuf, mut settings: AppSettings) -> Result<Self, ConfigError> {
         let document = document_for(&settings);
         let text = document.to_string();
-        atlas_fs::replace_file(&path, &text).map_err(|e| ConfigError::Io(e.to_string()))?;
+        atlas_fs::replace_file_follow_symlink(&path, &text)
+            .map_err(|e| ConfigError::Io(e.to_string()))?;
         fallback_unknown_theme(&mut settings);
         Ok(Self {
             path,

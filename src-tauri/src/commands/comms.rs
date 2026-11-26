@@ -670,14 +670,27 @@ pub fn comms_read(app: AppHandle, conv_id: String, seq: i64) -> Result<(), Strin
 
 /// Subscribe the socket to a draft (answered with a `draftOpened` event).
 #[tauri::command]
-pub fn comms_draft_open(app: AppHandle, draft_id: String) -> Result<(), String> {
+pub fn comms_draft_open(
+    app: AppHandle,
+    draft_id: String,
+    account_id: Option<String>,
+    org_id: Option<String>,
+) -> Result<(), String> {
+    super::spaces::check_optional_scope(&app, account_id.as_deref(), org_id.as_deref())?;
     manager(&app)?.draft_open(&draft_id);
     Ok(())
 }
 
 /// Opaque base64 Yjs bytes; the renderer owns debounce and retention.
 #[tauri::command]
-pub fn comms_draft_update(app: AppHandle, draft_id: String, update: String) -> Result<(), String> {
+pub fn comms_draft_update(
+    app: AppHandle,
+    draft_id: String,
+    update: String,
+    account_id: Option<String>,
+    org_id: Option<String>,
+) -> Result<(), String> {
+    super::spaces::check_optional_scope(&app, account_id.as_deref(), org_id.as_deref())?;
     manager(&app)?.draft_update(&draft_id, &update);
     Ok(())
 }
@@ -687,7 +700,10 @@ pub fn comms_draft_awareness(
     app: AppHandle,
     draft_id: String,
     state: String,
+    account_id: Option<String>,
+    org_id: Option<String>,
 ) -> Result<(), String> {
+    super::spaces::check_optional_scope(&app, account_id.as_deref(), org_id.as_deref())?;
     manager(&app)?.draft_awareness(&draft_id, &state);
     Ok(())
 }
@@ -941,8 +957,10 @@ pub async fn comms_save_transcript(
     crate::commands::save_guard::guard_save_dest(&dest)?;
     let mgr = manager(&app)?;
     let bytes = mgr.download_transcript(&call_id).await.map_err(map_err)?;
-    std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
-    Ok(())
+    tokio::task::spawn_blocking(move || std::fs::write(&dest, &bytes))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -975,8 +993,10 @@ pub async fn comms_save_recording(
         .download_recording(&url, &download_id)
         .await
         .map_err(map_err)?;
-    std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
-    Ok(())
+    tokio::task::spawn_blocking(move || std::fs::write(&dest, &bytes))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 /// Fetch a recording track into the local cache and return its path.
@@ -1009,19 +1029,20 @@ pub async fn comms_fetch_recording(
         .app_cache_dir()
         .map_err(|e| e.to_string())?
         .join("comms-recordings");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("{track_id}.{ext}"));
-    if atlas_fs::cache_file_present(&path) {
-        return Ok(path.to_string_lossy().into_owned());
+    if let Some(hit) = super::spaces::cache_lookup(dir, path.clone()).await? {
+        return Ok(hit);
     }
     let bytes = mgr
         .download_recording(&url, &track_id)
         .await
         .map_err(map_err)?;
-    // A cache of a download: atomic, but not flushed to disk.
-    atlas_fs::replace_cache_file(&path, &bytes).map_err(|e| e.to_string())?;
-    Ok(path.to_string_lossy().into_owned())
+    // A cache of a download: atomic, but not flushed to disk, and pruned.
+    super::spaces::cache_store(path, bytes, RECORDING_CACHE_MAX_BYTES).await
 }
+
+/// Byte ceiling for the call-recording playback cache.
+const RECORDING_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// The base the renderer would show in a diagnostics panel. Never a token.
 #[tauri::command]
@@ -1061,9 +1082,11 @@ async fn cache_attachment(
         .app_cache_dir()
         .map_err(|e| e.to_string())?
         .join("comms-attachments");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("{file_id}.{ext}"));
-    if atlas_fs::cache_file_present(&path) {
+    if super::spaces::cache_lookup(dir, path.clone())
+        .await?
+        .is_some()
+    {
         return Ok(path);
     }
 
@@ -1082,7 +1105,7 @@ async fn cache_attachment(
     };
     // Replaced whole, so a crash mid-download never leaves a plausible file.
     // Not flushed to disk: the attachment can be downloaded again.
-    atlas_fs::replace_cache_file(&path, &bytes).map_err(|e| e.to_string())?;
+    super::spaces::cache_store(path.clone(), bytes, super::spaces::MEDIA_CACHE_MAX_BYTES).await?;
     Ok(path)
 }
 

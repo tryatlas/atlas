@@ -3,65 +3,50 @@
 
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-minimum_supported_release="$(
-  sed -n 's/^pub const MINIMUM_SUPPORTED_ATLAS_AGENT_VERSION: &str = "\([^"]*\)";$/\1/p' \
-    "${repo_root}/atlas-engine-rs/exec-server-protocol/src/lib.rs"
-)"
-: "${minimum_supported_release:?minimum supported Atlas Agent release is missing}"
+engine_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# Atlas has its own Noise domain and executable layout. A Codex release is not
+# an Atlas protocol baseline. Pass a prior Atlas-compatible driver for skew;
+# without one, run the current/current protocol smoke check explicitly.
+baseline="${ATLAS_AGENT_TEST_RELEASED_ATLAS_ENGINE:-}"
+case "${1:-}" in
+  "" | --current-only) ;;
+  --baseline)
+    baseline="${2:?--baseline requires an Atlas-compatible executable}"
+    if [[ ! -x "${baseline}" ]]; then
+      echo "Baseline executable does not exist or is not executable: ${baseline}" >&2
+      exit 1
+    fi
+    baseline="$(cd "$(dirname "${baseline}")" && pwd)/$(basename "${baseline}")"
+    ;;
+  *)
+    echo "Usage: $0 [--current-only | --baseline /path/to/atlas-engine-driver]" >&2
+    exit 2
+    ;;
+esac
+if [[ "${1:-}" == "--current-only" ]]; then
+  baseline=""
+fi
 release_directory="$(mktemp -d "${TMPDIR:-/tmp}/atlas-engine-exec-server-skew.XXXXXX")"
 trap 'rm -rf "${release_directory:?}"' EXIT
 
-if [[ $# -eq 0 ]]; then
-  releases=(latest "${minimum_supported_release}")
-else
-  releases=("$@")
-fi
+cd "${engine_root}"
+cargo build --locked -p atlas-engine-app-server --bin atlas-engine-app-server
+cargo build --locked -p atlas-engine-exec-server --example remote-executor
+target_directory="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+export ATLAS_AGENT_TEST_APP_SERVER="${target_directory}/debug/atlas-engine-app-server"
+export ATLAS_AGENT_TEST_CURRENT_ATLAS_ENGINE="${release_directory}/current-engine"
+printf '#!/usr/bin/env bash\nset -euo pipefail\nmode="$1"; shift\ncase "$mode" in\n  app-server) exec %q "$@" ;;\n  exec-server) exec %q "$@" ;;\n  *) exit 2 ;;\nesac\n' \
+  "${ATLAS_AGENT_TEST_APP_SERVER}" "${target_directory}/debug/examples/remote-executor" > "${ATLAS_AGENT_TEST_CURRENT_ATLAS_ENGINE}"
+chmod 700 "${ATLAS_AGENT_TEST_CURRENT_ATLAS_ENGINE}"
 
-case "$(uname -s):$(uname -m)" in
-  Darwin:arm64) target="aarch64-apple-darwin" ;;
-  Darwin:x86_64) target="x86_64-apple-darwin" ;;
-  Linux:aarch64 | Linux:arm64) target="aarch64-unknown-linux-musl" ;;
-  Linux:x86_64) target="x86_64-unknown-linux-musl" ;;
-  *)
-    echo "Unsupported platform: $(uname -s) $(uname -m)" >&2
-    exit 1
-    ;;
-esac
-
-asset="atlas-engine-${target}.tar.gz"
-cd "${repo_root}/atlas-engine-rs"
-cargo build -p atlas-engine-cli --bin atlas-agent
-export ATLAS_AGENT_TEST_CURRENT_ATLAS_ENGINE="${CARGO_TARGET_DIR:-${repo_root}/atlas-engine-rs/target}/debug/atlas-agent"
-
-echo "Testing current Atlas Agent compatibility through authenticated Noise"
+echo "Testing the current Atlas engine in both Noise relay roles"
 export ATLAS_AGENT_TEST_RELEASED_ATLAS_ENGINE="${ATLAS_AGENT_TEST_CURRENT_ATLAS_ENGINE}"
-just test -p atlas-engine-exec-server --test relay version_skew --test-threads 1
+cargo test --locked -p atlas-engine-exec-server --test relay version_skew -- --include-ignored --test-threads 1
 
-tested_release_version=""
-for release in "${releases[@]}"; do
-  release="${release#rust-v}"
-  if [[ "${release}" == "${tested_release_version}" ]]; then
-    echo "Skipping Atlas Agent ${release}; this release was already tested"
-    continue
-  fi
-
-  if [[ "${release}" == "latest" ]]; then
-    release_url="https://github.com/openai/codex/releases/latest/download/${asset}"
-  else
-    release_url="https://github.com/openai/codex/releases/download/rust-v${release}/${asset}"
-  fi
-
-  binary_directory="${release_directory}/${release}"
-  mkdir -p "${binary_directory}"
-  echo "Downloading released Atlas Agent from ${release_url}"
-  curl -fsSL "${release_url}" -o "${binary_directory}/${asset}"
-  tar -xzf "${binary_directory}/${asset}" -C "${binary_directory}"
-
-  export ATLAS_AGENT_TEST_RELEASED_ATLAS_ENGINE="${binary_directory}/atlas-engine-${target}"
-  release_output="$("${ATLAS_AGENT_TEST_RELEASED_ATLAS_ENGINE}" --version)"
-  echo "${release_output}"
-  tested_release_version="${release_output##* }"
-
-  just test -p atlas-engine-exec-server --test relay version_skew --test-threads 1
-done
+if [[ -n "${baseline}" ]]; then
+  echo "Testing Atlas version skew against ${baseline}"
+  export ATLAS_AGENT_TEST_RELEASED_ATLAS_ENGINE="${baseline}"
+  cargo test --locked -p atlas-engine-exec-server --test relay version_skew -- --include-ignored --test-threads 1
+else
+  echo "Current/current protocol smoke check completed; use --baseline for version-skew coverage."
+fi

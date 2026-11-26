@@ -10,6 +10,7 @@
 import { useChatCommentsStore } from "../stores/chat-comments-store";
 import { useChatStore } from "../stores/chat-store";
 import { emitWindowEvent } from "@/lib/window-events";
+import type { ChatMessage } from "@/types/agent";
 
 export interface ChatJumpDetail {
   index: number;
@@ -45,23 +46,38 @@ export function jumpToCommentAnchor(
   const state = useChatCommentsStore.getState().byTab[tabId];
   const chatKey = state?.anchors.chatKeyByRowId.get(anchorId);
   if (!chatKey) return;
-  let index = messages.findIndex((m) => m.id === chatKey);
-  let rowId: string;
+  const index = messages.findIndex((m) => m.id === chatKey);
   if (index >= 0) {
-    const m = messages[index];
-    rowId = m.role === "user" ? `u:${m.id}` : m.mode === "thinking" ? `th:${m.id}` : `p:${m.id}`;
+    dispatchJump(messageJump(messages, index, tabId));
   } else {
-    index = messages.findIndex((m) => m.toolCalls.some((tc) => tc.id === chatKey));
-    if (index < 0) return;
-    rowId = `mk:${chatKey}`;
+    const at = messages.findIndex((m) => m.toolCalls.some((tc) => tc.id === chatKey));
+    if (at < 0) return;
+    dispatchJump(messageJump(messages, at, tabId, `mk:${chatKey}`));
   }
+  focusThreadFor(tabId, anchorId);
+}
+
+/**
+ * The jump to message `index` of a thread: addressed by its turn's first
+ * message, as every jump is, plus the row that draws it and the turn's fold
+ * that may hide it — so a message mid-turn (an answer after a thought or a
+ * tool call) lands on its own row instead of nowhere. `rowId` overrides the
+ * message's own row, for a tool call inside it.
+ */
+export function messageJump(
+  messages: ReadonlyArray<ChatMessage>,
+  index: number,
+  tabId: string,
+  rowId?: string,
+): ChatJumpDetail {
+  const m = messages[index];
+  const own = m.role === "user" ? `u:${m.id}` : m.mode === "thinking" ? `th:${m.id}` : `p:${m.id}`;
   let start = index;
-  if (messages[index].role !== "user") {
+  if (m.role !== "user") {
     while (start > 0 && messages[start - 1].role !== "user") start -= 1;
   }
   const turnId = `t:${messages[start].id}`;
-  dispatchJump({ index: start, tabId, highlightRowIds: [rowId, `wk:${turnId}`] });
-  focusThreadFor(tabId, anchorId);
+  return { index: start, tabId, highlightRowIds: [rowId ?? own, `wk:${turnId}`] };
 }
 
 function focusThreadFor(tabId: string, rowId: string): void {

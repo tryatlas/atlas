@@ -45,19 +45,15 @@ atlas-fs = { path = "../crates/atlas-fs" }
 # builds regardless of this feature. Add `devtools` back here only if you
 # need to debug a production-only issue and accept the binary-size and
 # attack-surface cost.
-# `unstable` enables the multiwebview API (`Window::add_child`) used to embed a
-# real WebKit child webview inside the browser tab (see `commands::browser`).
-# Pinned to the 2.11.1 already in the lockfile — no new resolution.
+# `unstable` enabled the multiwebview API (`Window::add_child`) for the removed
+# browser tab's child webview. Nothing uses it now, but dropping it changes how
+# the main webview is built on macOS (see `arrow_keys.rs`), so it goes in its
+# own change with native QA. Pinned to the 2.11.1 already in the lockfile.
 tauri = { version = "2", features = ["protocol-asset", "macos-private-api", "unstable"] }
 # Used to embed KB cover images as `data:` URLs (covers live under the
 # hidden `.atlas/` dir, which the asset protocol won't serve). Pinned to the
 # version already in the lockfile so no new resolution is pulled in.
 base64 = "0.23"
-# Allowlist HTML sanitizer (html5ever-based) for the browser reader. Replaces
-# a hand-rolled string-level denylist whose bypass list kept growing —
-# <meta refresh>, <base>, unquoted javascript: hrefs, `</script >` variants.
-# A real parser closes the class, not the instance.
-ammonia = "4"
 # Plugin selection — only what JS actually invokes is kept. The Atlas
 # Rust command surface does all its own fs/shell/http work via the std,
 # reqwest, etc. directly; the JS side only touches: `dialog` (Open
@@ -180,8 +176,8 @@ dirs = "7"
 # lockfile via the engine tree, so no new resolution.
 dunce = "1"
 sha2 = "0.10"
-# URL parsing for the embedded browser (`commands::browser`). Already in the
-# lockfile transitively via tauri/reqwest; declared here to name the type.
+# URL parsing (file URIs, GitHub and gateway URLs, the public-host check).
+# Already in the lockfile transitively via tauri/reqwest.
 url = "2"
 # `rustls` (not `native-tls`): TLS is rustls on aws-lc-rs, with certificates
 # verified by rustls-platform-verifier (reqwest 0.13's default; 0.12's
@@ -235,10 +231,6 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["html
 # the agent runtime moved to the separate `rig-agent` crate, which Atlas does not
 # use — modelchat / memory_summarize drive `Model::stream` directly.
 rig-core = { version = "0.45.0", features = ["reqwest"] }
-# Loads a `.env` (cwd) at startup so source / fork builds can point telemetry at
-# their own PostHog OSS project via `POSTHOG_KEY`/`POSTHOG_HOST` without a
-# rebuild. Tiny, zero transitive deps. See `crate::telemetry`.
-dotenvy = "0.15"
 # Semver comparison for the auto-updater's version gate (PostHog `version`
 # remote-config value vs the running `CARGO_PKG_VERSION`). See
 # `crate::commands::updater`.
@@ -258,6 +250,8 @@ unicode-normalization = "0.1"
 # `renameat2(RENAME_NOREPLACE)`) in `commands::fs`. The workspace's libc,
 # already linked through the engine.
 libc = { workspace = true }
+# Private, self-cleaning build directories for knowledge-server exports.
+tempfile = "3"
 
 [dev-dependencies]
 # The shared scripted `AgentConnection`; the feature is for tests only.
@@ -271,8 +265,6 @@ rmcp = { workspace = true, features = ["client", "transport-streamable-http-clie
 # (`src/command_seam/`). A feature of the dependency above, for tests only:
 # with resolver 2 it is not in the graph of a normal or release build.
 tauri = { version = "2", features = ["test"] }
-# Self-deleting temp dirs for the state/config tests.
-tempfile = "3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Read the Windows Installer's uninstall entry for Atlas: the auto-updater
@@ -289,6 +281,8 @@ windows = { version = "0.62", features = [
   # `GetLogicalDrives`/`GetDriveTypeW`: the drives the "Add project" folder
   # browser offers (`crate::commands::project_sources::project_locations`).
   "Win32_Storage_FileSystem",
+  "Win32_System_DataExchange",
+  "Win32_UI_Shell",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

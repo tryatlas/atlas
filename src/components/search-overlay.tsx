@@ -85,8 +85,10 @@ export function SearchOverlay({
       setTruncated(res.truncated);
       setError(null);
       setSelectedIndex(0);
-      addSearchHistory(searchQuery.trim());
-      if (currentProject) saveSession(currentProject.path);
+      // `rootPath` is the project searched, which may no longer be the open
+      // one: the store drops a query for a project it no longer holds.
+      addSearchHistory(rootPath, searchQuery.trim());
+      void saveSession(rootPath);
     } catch (e) {
       if (seq !== searchSeq.current) return;
       setResults([]);

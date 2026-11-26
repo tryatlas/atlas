@@ -21,6 +21,7 @@ fn snapshot(is_draft: bool, title: Option<&str>, dirs: &[&str]) -> ThreadSnapsho
         is_draft,
         title: title.map(Arc::from),
         work_dirs: dirs.iter().map(PathBuf::from).collect(),
+        replayed: false,
     }
 }
 
@@ -204,7 +205,7 @@ fn a_send_records_when_the_user_last_interacted() {
     );
     let sent_at = chrono::Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
 
-    recorder.note_interaction(&session, sent_at);
+    recorder.note_interaction(&"atlas-agent".into(), &session, sent_at);
     store.flush().unwrap();
 
     assert_eq!(store.threads()[0].interacted_at, Some(sent_at));
@@ -278,7 +279,7 @@ fn a_chat_nobody_typed_into_leaves_nothing_behind() {
     assert_eq!(store.threads().len(), 1, "it is visible while it is open");
 
     // The tab closes without a message ever being sent.
-    recorder.forget(&session);
+    recorder.forget(&"atlas-agent".into(), &session);
     store.flush().unwrap();
 
     assert!(store.threads().is_empty(), "and it is not left as litter");
@@ -302,7 +303,7 @@ fn a_chat_that_was_used_survives_its_tab_closing() {
         snapshot(false, Some("Real work"), &["/tmp/atlas"]),
     );
 
-    recorder.forget(&session);
+    recorder.forget(&"atlas-agent".into(), &session);
     store.flush().unwrap();
 
     assert_eq!(store.threads().len(), 1);
@@ -349,6 +350,7 @@ fn everything_that_can_change_a_row_writes_one() {
                 stop_reason: acp::StopReason::EndTurn,
                 entries: 0..0,
                 worked_ms: None,
+                turn_seq: 0,
             },
         ),
         AcpThreadEvent::Error,
@@ -445,7 +447,7 @@ fn a_session_resumed_without_its_history_is_not_mistaken_for_a_draft() {
     );
 
     // …so closing the tab must not take it for an abandoned draft.
-    today.forget(&session);
+    today.forget(&"some-agent".into(), &session);
     store.flush().unwrap();
     assert_eq!(store.threads().len(), 1, "the history row survives");
 }
@@ -458,7 +460,7 @@ fn a_noted_branch_lands_on_the_sessions_row_and_an_unbound_session_is_ignored() 
     let session = acp::SessionId::new("ses-1");
 
     // Not bound yet: nothing to write to, and nothing is minted for it.
-    recorder.note_branch(&session, "main".into());
+    recorder.note_branch(&"atlas-agent".into(), &session, "main".into());
     assert!(store.threads().is_empty());
 
     recorder.record_connected(
@@ -466,8 +468,157 @@ fn a_noted_branch_lands_on_the_sessions_row_and_an_unbound_session_is_ignored() 
         &session,
         snapshot(false, None, &["/tmp/atlas"]),
     );
-    recorder.note_branch(&session, "discount-codes".into());
+    recorder.note_branch(&"atlas-agent".into(), &session, "discount-codes".into());
     store.flush().unwrap();
 
     assert_eq!(store.threads()[0].branch.as_deref(), Some("discount-codes"));
+}
+
+#[test]
+fn opening_an_old_session_does_not_stamp_it_updated_now() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir);
+    let recorder = ThreadRecorder::new(store.clone());
+    let session = acp::SessionId::new("old-1");
+    let last_active = chrono::Utc
+        .with_ymd_and_hms(2026, 3, 14, 15, 9, 26)
+        .unwrap();
+    store.insert_new_sessions(atlas_thread_metadata::importable_threads(
+        vec![atlas_acp_thread::AgentSessionInfo {
+            session_id: session.clone(),
+            work_dirs: Some(vec![PathBuf::from("/tmp/atlas")]),
+            title: Some("Old work".into()),
+            updated_at: Some(last_active),
+            created_at: None,
+            meta: None,
+        }],
+        &"some-agent".into(),
+        &Default::default(),
+        None,
+    ));
+    let updated_at = || {
+        store.flush().unwrap();
+        store.thread_for_session(&session).unwrap().updated_at
+    };
+
+    // Opening it: the session connects, the agent replays it, retitles it.
+    recorder.record_connected(
+        &"some-agent".into(),
+        &session,
+        snapshot(false, Some("Old work"), &["/tmp/atlas"]),
+    );
+    assert_eq!(updated_at(), last_active, "connecting is not activity");
+    let replayed = ThreadSnapshot {
+        replayed: true,
+        ..snapshot(false, Some("Old work"), &["/tmp/atlas"])
+    };
+    recorder.record(
+        &"some-agent".into(),
+        &session,
+        &AcpThreadEvent::NewEntry,
+        replayed,
+    );
+    assert_eq!(
+        updated_at(),
+        last_active,
+        "a replayed entry is not activity"
+    );
+    recorder.record(
+        &"some-agent".into(),
+        &session,
+        &AcpThreadEvent::TitleUpdated,
+        snapshot(false, Some("Old work, retitled"), &["/tmp/atlas"]),
+    );
+    assert_eq!(updated_at(), last_active, "a title is not activity");
+
+    // The user sends: now it moves.
+    recorder.record(
+        &"some-agent".into(),
+        &session,
+        &AcpThreadEvent::NewEntry,
+        snapshot(false, Some("Old work, retitled"), &["/tmp/atlas"]),
+    );
+    assert!(updated_at() > last_active, "a live entry is activity");
+}
+
+/// #86: ACP scopes a session id to its connection, so two agents can both
+/// answer `"1"`. They are two conversations with two history rows; neither's
+/// events, branch or tab closing may land on the other's row.
+#[test]
+fn two_agents_with_the_same_session_id_keep_separate_history_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir);
+    let recorder = ThreadRecorder::new(store.clone());
+    let session = acp::SessionId::new("1");
+    let (a, b) = ("agent-a".into(), "agent-b".into());
+
+    recorder.record(
+        &a,
+        &session,
+        &AcpThreadEvent::NewEntry,
+        snapshot(false, Some("A's work"), &["/tmp/a"]),
+    );
+    recorder.record(
+        &b,
+        &session,
+        &AcpThreadEvent::NewEntry,
+        snapshot(false, Some("B's work"), &["/tmp/b"]),
+    );
+    recorder.note_branch(&b, &session, "b-branch".into());
+    store.flush().unwrap();
+
+    let row_a = recorder
+        .thread_for_agent(&a, &session)
+        .expect("A has a row");
+    let row_b = recorder
+        .thread_for_agent(&b, &session)
+        .expect("B has a row");
+    assert_ne!(row_a, row_b, "one row per agent");
+    assert_eq!(store.threads().len(), 2);
+    let a_row = store.thread(row_a).unwrap();
+    assert_eq!(a_row.agent_id, a);
+    assert_eq!(a_row.display_title().as_ref(), "A's work");
+    assert_eq!(a_row.branch, None, "B's branch stays on B's row");
+    let b_row = store.thread(row_b).unwrap();
+    assert_eq!(b_row.agent_id, b);
+    assert_eq!(b_row.branch.as_deref(), Some("b-branch"));
+    assert_eq!(
+        store
+            .thread_for_agent_session(&b, &session)
+            .map(|t| t.thread_id),
+        Some(row_b)
+    );
+
+    // The bare id names two conversations, so it resolves to neither.
+    assert_eq!(recorder.thread_for(&session), None);
+    assert!(store.thread_for_session(&session).is_none());
+    assert!(!recorder.note_viewed(None, &session, chrono::Utc::now()));
+
+    // A fresh process (no live bindings) still finds each agent's row.
+    let later = ThreadRecorder::new(store.clone());
+    later.record_connected(&a, &session, snapshot(false, Some("A again"), &["/tmp/a"]));
+    store.flush().unwrap();
+    assert_eq!(store.threads().len(), 2, "no third row is minted");
+    assert_eq!(later.thread_for_agent(&a, &session), Some(row_a));
+}
+
+/// A draft of one agent closing must not take the other agent's row with it.
+#[test]
+fn forgetting_one_agents_draft_leaves_the_other_agents_session_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir);
+    let recorder = ThreadRecorder::new(store.clone());
+    let session = acp::SessionId::new("1");
+    let (a, b) = ("agent-a".into(), "agent-b".into());
+    recorder.record_connected(&a, &session, snapshot(true, None, &["/tmp/a"]));
+    recorder.record_connected(&b, &session, snapshot(true, None, &["/tmp/b"]));
+    store.flush().unwrap();
+    assert_eq!(store.threads().len(), 2);
+
+    recorder.forget(&a, &session);
+    store.flush().unwrap();
+
+    assert_eq!(store.threads().len(), 1);
+    assert_eq!(store.threads()[0].agent_id, b);
+    assert!(recorder.thread_for_agent(&b, &session).is_some());
 }

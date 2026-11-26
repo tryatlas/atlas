@@ -89,7 +89,7 @@ export function initWindowFocusTracking(): () => void {
     lastInteractionAt = Date.now();
   };
   window.addEventListener("pointerdown", onUserActivity, { passive: true });
-  window.addEventListener("keydown", onUserActivity, { passive: true });
+  window.addEventListener("keydown", onUserActivity, { passive: true, capture: true });
   window.addEventListener("wheel", onUserActivity, { passive: true });
 
   return () => {
@@ -97,7 +97,7 @@ export function initWindowFocusTracking(): () => void {
     unlistenFocus?.();
     document.removeEventListener("visibilitychange", onVisible);
     window.removeEventListener("pointerdown", onUserActivity);
-    window.removeEventListener("keydown", onUserActivity);
+    window.removeEventListener("keydown", onUserActivity, true);
     window.removeEventListener("wheel", onUserActivity);
   };
 }

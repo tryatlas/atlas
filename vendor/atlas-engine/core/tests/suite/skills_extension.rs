@@ -890,7 +890,7 @@ async fn explicit_only_orchestrator_skill_is_hidden_but_can_be_invoked() -> Resu
     .await;
 
     Mock::given(method("POST"))
-        .and(path_regex("^/api/atlas-agent/ps/mcp/?$"))
+        .and(path_regex("^/api/codex/ps/mcp/?$"))
         .and(|request: &Request| {
             serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| {
                 matches!(
@@ -1088,7 +1088,7 @@ async fn production_turn_aliases_discovered_singleton_orchestrator_root() -> Res
     .await;
 
     Mock::given(method("POST"))
-        .and(path_regex("^/api/atlas-agent/ps/mcp/?$"))
+        .and(path_regex("^/api/codex/ps/mcp/?$"))
         .and(|request: &Request| {
             serde_json::from_slice::<Value>(&request.body)
                 .is_ok_and(|body| body["method"].as_str() == Some("resources/list"))

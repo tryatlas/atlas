@@ -23,6 +23,7 @@ export interface CloudDraft {
 
 export type View =
   | { kind: "main" }
+  | { kind: "connect-confirm"; pick: ConnectPick; preview: ImportPreview }
   /** Cloud create: the import disclosure, with the registration still pending. */
   | {
       kind: "cloud-confirm";

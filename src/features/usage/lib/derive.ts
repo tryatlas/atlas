@@ -19,6 +19,7 @@ import {
   type Metric,
   type Metrics,
   type SessionRow,
+  type SessionIdentity,
   type UsageDashboard,
 } from "../types";
 import { epochToDay, inRange, spanDays, weekKey, type ResolvedRange } from "./date-range";
@@ -75,7 +76,7 @@ export function applyFacets<T extends { projectPath: string; agent: string; mode
   );
 }
 
-export function sessionsInRange(rows: SessionRow[], r: ResolvedRange): SessionRow[] {
+export function sessionsInRange<T extends SessionIdentity>(rows: T[], r: ResolvedRange): T[] {
   return rows.filter((s) => inRange(epochToDay(s.lastActivityMs ?? s.startedMs), r));
 }
 
@@ -344,7 +345,7 @@ export function dailyMetrics(rows: DailyBucket[], range: ResolvedRange): Metrics
 }
 
 /** Distinct sessions per day, dated the way the sessions table dates them. */
-export function sessionsPerDay(sessions: SessionRow[], range: ResolvedRange): number[] {
+export function sessionsPerDay(sessions: SessionIdentity[], range: ResolvedRange): number[] {
   const from =
     range.from ??
     sessions.reduce<string | null>((m, s) => {
@@ -415,7 +416,7 @@ export function deltaPct(now: number, prev: number | null | undefined): number |
 }
 
 /** Distinct sessions behind a set of daily rows — from `sessions[]`, which carries the ids. */
-export function distinctSessions(sessions: SessionRow[]): number {
+export function distinctSessions(sessions: SessionIdentity[]): number {
   return new Set(sessions.map((s) => s.sessionId)).size;
 }
 

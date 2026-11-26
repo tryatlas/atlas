@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 import { Node, mergeAttributes } from "@tiptap/core";
 import {
   NodeViewWrapper,
@@ -124,8 +125,8 @@ function CalloutView({ node, updateAttributes }: NodeViewProps) {
           onFocus={(e) => e.currentTarget.select()}
           onBlur={(e) => commit(e.currentTarget.value)}
           onKeyDown={(e) => {
-            if (e.nativeEvent.isComposing) return;
-            if (e.key === "Enter") {
+            if (isComposingKey(e)) return;
+            if (e.key === "Enter" && !isComposingKey(e)) {
               e.preventDefault();
               commit(e.currentTarget.value);
             } else if (e.key === "Escape") {

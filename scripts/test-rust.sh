@@ -57,12 +57,44 @@ cargo test --locked -p atlas --lib
 # list; tests/ci-coverage.test.ts checks it.
 echo "==> engine dialect + edited engine crates"
 cargo test --locked \
+  -p atlas-engine-analytics \
   -p atlas-engine-api \
+  -p atlas-engine-app-server-protocol \
+  -p atlas-engine-apply-patch \
+  -p atlas-engine-backend-client \
+  -p atlas-engine-config \
+  -p atlas-engine-core-plugins \
+  -p atlas-engine-exec-server \
+  -p atlas-engine-external-agent-migration \
+  -p atlas-engine-feedback \
+  -p atlas-engine-file-watcher \
+  -p atlas-engine-git-utils \
+  -p atlas-engine-hooks \
+  -p atlas-engine-linux-sandbox \
+  -p atlas-engine-login \
+  -p atlas-engine-mcp \
   -p atlas-engine-model-provider \
   -p atlas-engine-models-manager \
-  -p atlas-engine-protocol \
+  -p atlas-engine-network-proxy \
   -p atlas-engine-otel \
-  -p atlas-engine-feedback \
-  -p atlas-engine-analytics \
+  -p atlas-engine-protocol \
+  -p atlas-engine-rmcp-client \
+  -p atlas-engine-rollout \
+  -p atlas-engine-rollout-trace \
+  -p atlas-engine-sandboxing \
   -p atlas-engine-shell-command \
-  -p atlas-engine-config
+  -p atlas-engine-shell-escalation \
+  -p atlas-engine-skills \
+  -p atlas-engine-skills-extension \
+  -p atlas-engine-utils-cargo-bin \
+  -p atlas-engine-utils-pty \
+  -p atlas-engine-windows-sandbox
+
+# Atlas runs the full core/app-server unit suites and the supported integration
+# paths. Other upstream integration fixtures require the removed analytics
+# sender, opt-in AWS support or standalone CLI helpers (see ci.yml).
+cargo test --locked -p atlas-engine-core --lib
+cargo test --locked -p atlas-engine-app-server --lib
+cargo test --locked -p atlas-engine-core --test all -- suite::compact::
+cargo test --locked -p atlas-engine-app-server --test all -- \
+  suite::v2::turn_interrupt:: suite::v2::mcp_server_status::

@@ -37,6 +37,9 @@ pub struct ThreadSnapshot {
     /// The agent's title for the thread, if it has produced one.
     pub title: Option<Arc<str>>,
     pub work_dirs: Vec<PathBuf>,
+    /// The thread's newest entry came from the agent replaying a stored
+    /// conversation (`session/load`), not from anything happening now.
+    pub replayed: bool,
 }
 
 /// Whether this event could have changed anything the store keeps.
@@ -75,6 +78,19 @@ pub fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
     }
 }
 
+/// Whether the event is something happening in the conversation, which moves
+/// its row's `updated_at`. A title or folder change, or the agent's process
+/// exiting, is not: those arrive on opening an old session too, and would
+/// stamp it "updated just now".
+fn is_activity(event: &AcpThreadEvent) -> bool {
+    !matches!(
+        event,
+        AcpThreadEvent::TitleUpdated
+            | AcpThreadEvent::WorkingDirectoriesUpdated
+            | AcpThreadEvent::LoadError(_)
+    )
+}
+
 /// What a thread event means for the session's lifecycle, beyond its row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleSignal {
@@ -101,18 +117,22 @@ pub fn lifecycle_signal(event: &AcpThreadEvent) -> Option<LifecycleSignal> {
     }
 }
 
+/// A live session's key. ACP scopes a session id to its connection, so two
+/// agents can both answer `"1"` (#86): the binding is filed under both.
+type Binding = (AgentId, acp::SessionId);
+
 /// Keeps every live conversation's history row current.
 ///
 /// Cheap to clone; every clone feeds the same store.
 #[derive(Clone)]
 pub struct ThreadRecorder {
     store: ThreadMetadataStore,
-    /// Which thread each live session belongs to.
+    /// Which thread each live session belongs to, per agent.
     ///
     /// Needed because a draft's session id is deliberately not persisted: with
     /// nothing in the store to look the session up by, this is the only thing
     /// that stops every event of a draft from minting a new row.
-    threads: Arc<Mutex<HashMap<acp::SessionId, ThreadId>>>,
+    threads: Arc<Mutex<HashMap<Binding, ThreadId>>>,
 }
 
 impl ThreadRecorder {
@@ -132,8 +152,9 @@ impl ThreadRecorder {
     /// What opening a **draft** row calls: the row has no session id to be
     /// found by, so without this the first event of the new session would mint
     /// a second row and leave the one the user clicked orphaned.
-    pub fn adopt(&self, session_id: acp::SessionId, thread_id: ThreadId) {
-        self.lock().insert(session_id, thread_id);
+    pub fn adopt(&self, agent_id: &AgentId, session_id: acp::SessionId, thread_id: ThreadId) {
+        self.lock()
+            .insert((agent_id.clone(), session_id), thread_id);
     }
 
     /// The conversation is connected and has a session.
@@ -146,7 +167,9 @@ impl ThreadRecorder {
         session_id: &acp::SessionId,
         snapshot: ThreadSnapshot,
     ) {
-        self.upsert(agent_id, session_id, snapshot);
+        // Opening or attaching is not activity: an existing row keeps the
+        // time of its last real activity, a new one starts at now.
+        self.upsert(agent_id, session_id, snapshot, false);
     }
 
     /// Record one thread event.
@@ -167,7 +190,8 @@ impl ThreadRecorder {
         if !affects_thread_metadata(event) {
             return;
         }
-        let thread_id = self.upsert(agent_id, session_id, snapshot);
+        let activity = !snapshot.replayed && is_activity(event);
+        let thread_id = self.upsert(agent_id, session_id, snapshot, activity);
         match lifecycle_signal(event) {
             Some(LifecycleSignal::TurnCompleted(at)) => {
                 self.store.note_turn_completed(thread_id, at);
@@ -182,16 +206,26 @@ impl ThreadRecorder {
     /// The session's turn failed somewhere its thread does not report — the
     /// send itself was refused. A raised hand, like any failure: a snoozed
     /// session wakes for it.
-    pub fn note_failure(&self, session_id: &acp::SessionId, at: DateTime<Utc>) {
-        if let Some(thread_id) = self.thread_for(session_id) {
+    pub fn note_failure(&self, agent_id: &AgentId, session_id: &acp::SessionId, at: DateTime<Utc>) {
+        if let Some(thread_id) = self.thread_for_agent(agent_id, session_id) {
             self.store.raise_hand(thread_id, at);
         }
     }
 
     /// The user opened or focused the session. Clears unread and "woke".
-    /// Answers whether the session has a row to mark.
-    pub fn note_viewed(&self, session_id: &acp::SessionId, at: DateTime<Utc>) -> bool {
-        match self.thread_for(session_id) {
+    /// Answers whether the session has a row to mark. Without the agent, an
+    /// id two agents share marks nothing ([`Self::thread_for`]).
+    pub fn note_viewed(
+        &self,
+        agent_id: Option<&AgentId>,
+        session_id: &acp::SessionId,
+        at: DateTime<Utc>,
+    ) -> bool {
+        let thread = match agent_id {
+            Some(agent_id) => self.thread_for_agent(agent_id, session_id),
+            None => self.thread_for(session_id),
+        };
+        match thread {
             Some(thread_id) => {
                 self.store.mark_viewed(thread_id, at);
                 true
@@ -200,23 +234,56 @@ impl ThreadRecorder {
         }
     }
 
-    /// The row a live session writes to, without minting one: its binding,
-    /// else the row carrying its session id. A draft is found through its
-    /// binding, since its session id is never persisted.
-    pub fn thread_for(&self, session_id: &acp::SessionId) -> Option<ThreadId> {
-        let bound = self.lock().get(session_id).copied();
+    /// The row one agent's live session writes to, without minting one: its
+    /// binding, else the row carrying its session id under that agent. A
+    /// draft is found through its binding, since its session id is never
+    /// persisted.
+    pub fn thread_for_agent(
+        &self,
+        agent_id: &AgentId,
+        session_id: &acp::SessionId,
+    ) -> Option<ThreadId> {
+        let bound = self
+            .lock()
+            .get(&(agent_id.clone(), session_id.clone()))
+            .copied();
         bound.or_else(|| {
             self.store
-                .thread_for_session(session_id)
+                .thread_for_agent_session(agent_id, session_id)
                 .map(|thread| thread.thread_id)
         })
     }
 
+    /// [`Self::thread_for_agent`] by the bare session id, for a caller that
+    /// does not know the agent. Answers only when exactly one agent's session
+    /// carries the id: two agents can mint the same one (#86), and guessing
+    /// would mark or write the wrong conversation.
+    pub fn thread_for(&self, session_id: &acp::SessionId) -> Option<ThreadId> {
+        let bound: Vec<ThreadId> = self
+            .lock()
+            .iter()
+            .filter(|((_, id), _)| id == session_id)
+            .map(|(_, thread_id)| *thread_id)
+            .collect();
+        match bound.as_slice() {
+            [only] => Some(*only),
+            [] => self
+                .store
+                .thread_for_session(session_id)
+                .map(|thread| thread.thread_id),
+            _ => None,
+        }
+    }
+
     /// The user sent or queued a message Separate from [`ThreadRecorder::record`] because the send
     /// path knows this and the thread's own events do not.
-    pub fn note_interaction(&self, session_id: &acp::SessionId, at: DateTime<Utc>) {
-        let thread_id = self.lock().get(session_id).copied();
-        if let Some(thread_id) = thread_id {
+    pub fn note_interaction(
+        &self,
+        agent_id: &AgentId,
+        session_id: &acp::SessionId,
+        at: DateTime<Utc>,
+    ) {
+        if let Some(thread_id) = self.bound(agent_id, session_id) {
             self.store.update_interacted_at(thread_id, at);
         }
     }
@@ -225,9 +292,8 @@ impl ThreadRecorder {
     /// [`ThreadRecorder::note_interaction`], something only the host can know:
     /// it reads git, the thread's events do not carry it. A session not bound
     /// to a row is ignored.
-    pub fn note_branch(&self, session_id: &acp::SessionId, branch: Arc<str>) {
-        let thread_id = self.lock().get(session_id).copied();
-        if let Some(thread_id) = thread_id {
+    pub fn note_branch(&self, agent_id: &AgentId, session_id: &acp::SessionId, branch: Arc<str>) {
+        if let Some(thread_id) = self.bound(agent_id, session_id) {
             self.store.update_branch(thread_id, Some(branch));
         }
     }
@@ -235,9 +301,8 @@ impl ThreadRecorder {
     /// The model the session's turn runs on. Like the branch, the host's to
     /// know: the thread's events do not carry it. A session not bound to a
     /// row is ignored.
-    pub fn note_model(&self, session_id: &acp::SessionId, model: Arc<str>) {
-        let thread_id = self.lock().get(session_id).copied();
-        if let Some(thread_id) = thread_id {
+    pub fn note_model(&self, agent_id: &AgentId, session_id: &acp::SessionId, model: Arc<str>) {
+        if let Some(thread_id) = self.bound(agent_id, session_id) {
             self.store.update_model(thread_id, Some(model));
         }
     }
@@ -249,8 +314,8 @@ impl ThreadRecorder {
     /// empty chat is litter, and Atlas cannot re-find it anyway. Atlas mints a fresh ACP session per tab
     /// mount, so a persisted draft row is unreachable the moment its session
     /// is gone. (Spec #15: "abandoned empty chats don't litter my history".)
-    pub fn forget(&self, session_id: &acp::SessionId) {
-        let thread_id = self.lock().remove(session_id);
+    pub fn forget(&self, agent_id: &AgentId, session_id: &acp::SessionId) {
+        let thread_id = self.lock().remove(&(agent_id.clone(), session_id.clone()));
         if let Some(thread_id) = thread_id {
             if self.store.thread(thread_id).is_some_and(|t| t.is_draft()) {
                 self.store.delete(thread_id);
@@ -258,13 +323,20 @@ impl ThreadRecorder {
         }
     }
 
+    fn bound(&self, agent_id: &AgentId, session_id: &acp::SessionId) -> Option<ThreadId> {
+        self.lock()
+            .get(&(agent_id.clone(), session_id.clone()))
+            .copied()
+    }
+
     fn upsert(
         &self,
         agent_id: &AgentId,
         session_id: &acp::SessionId,
         snapshot: ThreadSnapshot,
+        activity: bool,
     ) -> ThreadId {
-        let thread_id = self.resolve(session_id);
+        let thread_id = self.resolve(agent_id, session_id);
         let folder_paths = PathList::new(&snapshot.work_dirs);
         self.store.record_live_update(LiveThreadUpdate {
             thread_id,
@@ -274,28 +346,31 @@ impl ThreadRecorder {
             title: snapshot.title,
             worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
             remote_connection: None,
+            activity,
         });
         thread_id
     }
 
     /// Which row this session writes to: the one it is already bound to, else
-    /// the one that already carries this session id (a resumed thread, or a
-    /// row this process imported), else a new one.
-    fn resolve(&self, session_id: &acp::SessionId) -> ThreadId {
+    /// the one that already carries this session id under this agent (a
+    /// resumed thread, or a row this process imported), else a new one.
+    /// Another agent's row with the same session id is never it (#86).
+    fn resolve(&self, agent_id: &AgentId, session_id: &acp::SessionId) -> ThreadId {
         let mut bound = self.lock();
-        if let Some(thread_id) = bound.get(session_id) {
+        let key = (agent_id.clone(), session_id.clone());
+        if let Some(thread_id) = bound.get(&key) {
             return *thread_id;
         }
         let thread_id = self
             .store
-            .thread_for_session(session_id)
+            .thread_for_agent_session(agent_id, session_id)
             .map(|thread| thread.thread_id)
             .unwrap_or_else(ThreadId::new);
-        bound.insert(session_id.clone(), thread_id);
+        bound.insert(key, thread_id);
         thread_id
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<acp::SessionId, ThreadId>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Binding, ThreadId>> {
         self.threads.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }

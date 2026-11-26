@@ -376,6 +376,7 @@ mod windows_impl {
     use atlas_engine_utils_absolute_path::AbsolutePathBuf;
     use std::collections::HashMap;
     use std::io;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle};
     use std::path::Path;
     use std::ptr;
     use std::sync::Arc;
@@ -438,31 +439,48 @@ mod windows_impl {
     }
 
     unsafe fn setup_stdio_pipes() -> io::Result<PipeHandles> {
-        let mut in_r: HANDLE = 0;
-        let mut in_w: HANDLE = 0;
-        let mut out_r: HANDLE = 0;
-        let mut out_w: HANDLE = 0;
-        let mut err_r: HANDLE = 0;
-        let mut err_w: HANDLE = 0;
-        if CreatePipe(&mut in_r, &mut in_w, ptr::null_mut(), 0) == 0 {
-            return Err(io::Error::from_raw_os_error(GetLastError() as i32));
+        fn pair() -> io::Result<(OwnedHandle, OwnedHandle)> {
+            let mut read: HANDLE = 0;
+            let mut write: HANDLE = 0;
+            if unsafe { CreatePipe(&mut read, &mut write, ptr::null_mut(), 0) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(unsafe {
+                (
+                    OwnedHandle::from_raw_handle(read as _),
+                    OwnedHandle::from_raw_handle(write as _),
+                )
+            })
         }
-        if CreatePipe(&mut out_r, &mut out_w, ptr::null_mut(), 0) == 0 {
-            return Err(io::Error::from_raw_os_error(GetLastError() as i32));
+        let (in_r, in_w) = pair()?;
+        let (out_r, out_w) = pair()?;
+        let (err_r, err_w) = pair()?;
+        for handle in [&in_r, &out_w, &err_w] {
+            if unsafe {
+                SetHandleInformation(
+                    handle.as_raw_handle() as HANDLE,
+                    HANDLE_FLAG_INHERIT,
+                    HANDLE_FLAG_INHERIT,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
         }
-        if CreatePipe(&mut err_r, &mut err_w, ptr::null_mut(), 0) == 0 {
-            return Err(io::Error::from_raw_os_error(GetLastError() as i32));
-        }
-        if SetHandleInformation(in_r, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
-            return Err(io::Error::from_raw_os_error(GetLastError() as i32));
-        }
-        if SetHandleInformation(out_w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
-            return Err(io::Error::from_raw_os_error(GetLastError() as i32));
-        }
-        if SetHandleInformation(err_w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
-            return Err(io::Error::from_raw_os_error(GetLastError() as i32));
-        }
-        Ok(((in_r, in_w), (out_r, out_w), (err_r, err_w)))
+        Ok((
+            (
+                in_r.into_raw_handle() as HANDLE,
+                in_w.into_raw_handle() as HANDLE,
+            ),
+            (
+                out_r.into_raw_handle() as HANDLE,
+                out_w.into_raw_handle() as HANDLE,
+            ),
+            (
+                err_r.into_raw_handle() as HANDLE,
+                err_w.into_raw_handle() as HANDLE,
+            ),
+        ))
     }
 
     pub struct CaptureResult {
@@ -573,7 +591,7 @@ mod windows_impl {
         let ((in_r, in_w), (out_r, out_w), (err_r, err_w)) = (stdin_pair, stdout_pair, stderr_pair);
         let spawn_res = unsafe {
             create_process_as_user(
-                security.h_token,
+                security.h_token.as_raw_handle() as HANDLE,
                 &command,
                 cwd,
                 &env_map,
@@ -593,7 +611,6 @@ mod windows_impl {
                     CloseHandle(out_w);
                     CloseHandle(err_r);
                     CloseHandle(err_w);
-                    CloseHandle(security.h_token);
                 }
                 return Err(err);
             }
@@ -696,7 +713,6 @@ mod windows_impl {
             if pi.hProcess != 0 {
                 CloseHandle(pi.hProcess);
             }
-            CloseHandle(security.h_token);
         }
         let _ = t_out.join();
         let _ = t_err.join();

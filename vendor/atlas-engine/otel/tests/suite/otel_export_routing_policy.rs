@@ -273,14 +273,18 @@ fn otel_export_routing_policy_routes_tool_result_log_and_trace_events() {
 
     let tool_log = find_log_by_event_name(&logs, "atlas_agent.tool_result");
     let tool_log_attrs = log_attributes(&tool_log.record);
+    assert!(!tool_log_attrs.contains_key("arguments"));
+    assert!(!tool_log_attrs.contains_key("output"));
     assert_eq!(
-        tool_log_attrs.get("arguments").map(String::as_str),
-        Some("secret arguments")
+        tool_log_attrs.get("arguments_length").map(String::as_str),
+        Some("16")
     );
     assert_eq!(
-        tool_log_attrs.get("output").map(String::as_str),
-        Some("secret output\nsecond line")
+        tool_log_attrs.get("output_length").map(String::as_str),
+        Some("25")
     );
+    assert!(!format!("{logs:?}").contains("secret arguments"));
+    assert!(!format!("{logs:?}").contains("secret output"));
     assert_eq!(
         tool_log_attrs.get("mcp_server").map(String::as_str),
         Some("internal-mcp")

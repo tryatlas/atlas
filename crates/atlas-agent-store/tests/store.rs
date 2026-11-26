@@ -204,14 +204,16 @@ async fn every_rebuild_bumps_the_update_generation() {
         .store
         .set_settings(settings(&[("some-cli", AgentServerSettings::registry())]))
         .await;
-    assert_eq!(*updates.borrow_and_update(), 1);
+    // Publish the settings immediately, then rebuild with the refreshed
+    // registry. Both are observable even when the cached registry was current.
+    assert_eq!(*updates.borrow_and_update(), 2);
 
     // An identical map is not a change, so it is not a rebuild.
     fixture
         .store
         .set_settings(settings(&[("some-cli", AgentServerSettings::registry())]))
         .await;
-    assert_eq!(*updates.borrow_and_update(), 1);
+    assert_eq!(*updates.borrow_and_update(), 2);
 }
 
 // ------------------------------------------------------------ custom entries
@@ -266,6 +268,7 @@ async fn env_layers_from_least_to_most_specific() {
                 model_order: Vec::new(),
                 custom_models: Vec::new(),
                 secret_env: Vec::new(),
+                seeded_defaults: Vec::new(),
             },
         )]))
         .await;
@@ -301,6 +304,46 @@ async fn env_layers_from_least_to_most_specific() {
             .default_mode
             .as_deref(),
         Some("ask")
+    );
+}
+
+/// A seeded launch default is an ordinary Variable at launch: a blank one
+/// reaches the agent as an empty value (not left to inherit the host's), and
+/// it beats the project and BYOK layers below it.
+#[tokio::test]
+async fn a_seeded_blank_variable_reaches_the_agent_empty() {
+    let fixture = fixture(vec![]);
+    fixture.store.set_byok_env(HashMap::from([(
+        "ANTHROPIC_API_KEY".to_string(),
+        "from-shell".to_string(),
+    )]));
+    let mut entry = AgentServerSettings::custom("/opt/agent", vec![]);
+    assert!(atlas_agent_store::launch_defaults::seed(
+        "claude-acp",
+        &mut entry,
+        atlas_agent_store::SeedConditions {
+            atlas_only_memory: true,
+        },
+    ));
+    fixture
+        .store
+        .set_settings(settings(&[("claude-acp", entry)]))
+        .await;
+
+    let env = fixture
+        .store
+        .agent_server(&AgentId::new("claude-acp"))
+        .unwrap()
+        .get_command(vec![], HashMap::new())
+        .await
+        .unwrap()
+        .env
+        .unwrap();
+    assert_eq!(env.get("ANTHROPIC_API_KEY").map(String::as_str), Some(""));
+    assert_eq!(
+        env.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY")
+            .map(String::as_str),
+        Some("1")
     );
 }
 

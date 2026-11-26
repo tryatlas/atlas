@@ -15,12 +15,12 @@
 //
 // # The path to real data
 //
-// Every skill install already captures a `skill_downloaded` PostHog event
-// (`commands/skills.rs`), the same way an agent install captures
-// `acp_agent_installed`. Neither is READ back yet — Atlas's PostHog client is
-// write-only (capture), and querying would need a separate read credential. When
-// that lands, a backend rollup replaces `installTrend` wholesale: the chart
-// component only ever sees `{ points, total, up }`.
+// Atlas's own telemetry cannot supply it. A skill install captures a
+// `skill_downloaded` PostHog event (`commands/skills.rs`), but that event
+// deliberately names neither the skill nor its source repo (TELEMETRY.md: no
+// repository names), so it counts installs and nothing per skill. Real per-skill
+// data has to come from the registry; when it does, it replaces `installTrend`
+// wholesale: the chart component only ever sees `{ points, total, up }`.
 
 /** Weekly buckets over ~6 months. Weekly rather than monthly because the mark is
  *  an area curve: six points would render as a coarse zig-zag, and the shape is

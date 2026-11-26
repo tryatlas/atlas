@@ -31,8 +31,9 @@ export type KeymapAnswer = PresetId | "atlas" | "later";
 export function KeymapStep({ onChosen }: { onChosen?: (answer: KeymapAnswer) => void }) {
   const { completeOnboarding } = useKeybindingsStore((s) => s.actions);
   const choose = (preset: PresetId | null, answer: KeymapAnswer = preset ?? "atlas") => {
-    onChosen?.(answer);
-    void completeOnboarding(preset);
+    void completeOnboarding(preset)
+      .then(() => onChosen?.(answer))
+      .catch(() => {});
   };
 
   return (

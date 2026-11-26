@@ -42,13 +42,21 @@
 import { toast } from "sonner";
 import { logEvent } from "@/features/log/lib/log";
 import { noteSessionSent } from "@/features/tips/lib/session-sent";
-import { pluginIdForAgent, type ChatSession, type PendingSend } from "@/types/agent";
+import {
+  isBusyAgentStatus,
+  pluginIdForAgent,
+  type ChatSession,
+  type PendingSend,
+} from "@/types/agent";
 import type { ImageAttachment, SessionKey } from "@/types/agents";
 import { grantLocksComposer, hasNoAiGrant } from "../stores/ai-grant-store";
-import { useChatStore } from "../stores/chat-store";
-import { isSendHeldElsewhere } from "../stores/live-elsewhere-store";
+import { queueItemsOf, useChatStore, type QueueItem } from "../stores/chat-store";
 import { useRcStore } from "../stores/rc-store";
-import { rebindDisconnectedSession } from "./agent-rebind";
+import {
+  restartDisconnectedSession,
+  restartFailedNotice,
+  type RebindOutcome,
+} from "./agent-rebind";
 import { agents, resetAgent } from "./agents-api";
 import type { MentionData } from "./mentions";
 import { trustedMentionPaths } from "./picked-mentions";
@@ -70,6 +78,7 @@ export type AgentsPort = Pick<
   | "queueClear"
   | "queuePause"
   | "queueDrain"
+  | "queueResume"
 >;
 
 type ChatState = ReturnType<typeof useChatStore.getState>;
@@ -77,14 +86,12 @@ type ChatState = ReturnType<typeof useChatStore.getState>;
 export interface SessionSendDeps {
   agents: AgentsPort;
   /** The chat store, read at an action boundary. */
-  chat: () => Pick<ChatState, "sessions" | "queues" | "queueIds" | "actions">;
+  chat: () => Pick<ChatState, "sessions" | "queues" | "queueIds" | "queueContent" | "actions">;
   /** What other stores know about a session: live elsewhere, the grant hold,
    *  a remote driver. */
-  ambient: (
-    session: ChatSession | undefined,
-  ) => Pick<SendState, "heldElsewhere" | "grantHold" | "remoteDriving">;
-  /** Restart a session whose agent process died; `false` if it could not. */
-  rebind: (tabId: string) => Promise<boolean>;
+  ambient: (session: ChatSession | undefined) => Pick<SendState, "grantHold" | "remoteDriving">;
+  /** Restart a session whose agent process died, and say why if it could not. */
+  rebind: (tabId: string) => Promise<RebindOutcome>;
   /** Forget the cached agent of a plugin whose connection was just killed. */
   forgetAgent: (pluginId: string) => void;
   /** What the agent is sent for a message, and for a queued prompt. */
@@ -116,7 +123,6 @@ export interface SendOptions {
  *  render subscribed to. */
 export interface DrainView {
   session: SendSession | undefined;
-  heldElsewhere: boolean;
   grantHold: boolean;
 }
 
@@ -133,14 +139,26 @@ export interface SessionSend {
    *  caller. */
   watch(tabId: string, opts?: Pick<SendOptions, "kickBind">): { tick(view: DrainView): void };
 
-  /** Park `text` behind the running turn. Never sent by itself. */
-  enqueue(tabId: string, text: string, mentions: readonly MentionData[]): void;
+  /** Park a message behind the running turn. Never sent by itself. Its
+   *  mentions and images go with it: the agent is sent what a direct send
+   *  would have sent. */
+  enqueue(
+    tabId: string,
+    text: string,
+    mentions: readonly MentionData[],
+    attachments?: ImageAttachment[],
+  ): void;
   /** Take the strip's `index`-th item out (its chip's ✕, or "edit"). */
   removeQueued(tabId: string, index: number): void;
   /** Discard everything queued for the tab, leaving a running turn alone. */
   clearQueued(tabId: string): void;
+  /** Resume a queue a failed turn halted (ACP audit finding 77). */
+  resumeQueue(tabId: string): Promise<void>;
   /** Take every queued prompt's text out of the queue. */
   takeQueued(tabId: string): string[];
+  /** Take every queued prompt out of the queue whole — text, mentions and
+   *  images — for an agent switch to hand to the agent the tab ends up on. */
+  takeQueuedMessages(tabId: string): OutgoingMessage[];
   /** Hand the bound session every local item, then — with `drain` — start the head. */
   flushLocal(tabId: string, opts: { drain: boolean }): Promise<void>;
   /** The session Rust can hold this tab's queue for, or `null` while there is none. */
@@ -153,18 +171,26 @@ export interface SessionSend {
   reset(): void;
 }
 
+/** One send composing its prompt (`SessionSend.dispatch`). */
+interface Composing {
+  /** A Stop arrived: do not send it. */
+  aborted: boolean;
+  /** A turn was already running when it started. */
+  wasBusy: boolean;
+}
+
 /** Why a tab's queue is held: the send gate, or an agent switch waiting on
  *  its `/remember` turn. */
 export type QueueHoldReason = "gate" | "switch";
 
 const PENDING = "pending:";
 
+/** `addToRust`'s answer for an add the strip let go of while it composed. */
+const STALE_ADD = Symbol("stale-add");
+
 /** A strip item whose add has not been confirmed yet. */
 const isPendingQueueId = (id: string | null | undefined): id is string =>
   !!id && id.startsWith(PENDING);
-
-const RESTART_FAILED =
-  "The agent could not be restarted. Check its runtime (Node/npx) and try again.";
 
 /** A new session's title, from its first message: the words, without the
  *  `@ctx:` tokens of an ask (else the first context's label). */
@@ -188,6 +214,15 @@ export function createSessionSend(deps: SessionSendDeps): SessionSend {
   const holdReasons = new Map<string, Set<QueueHoldReason>>();
   /** The last pause state told to Rust, per tab, as `session:paused`. */
   const pushedPause = new Map<string, string>();
+  /** Tabs whose dead agent a send is restarting right now. */
+  const restarting = new Set<string>();
+  /** Sends whose prompt is still being composed, per tab. Nothing is on the
+   *  wire yet, so a Stop meanwhile aborts the send itself (`dispatch`). */
+  const composing = new Map<string, Set<Composing>>();
+  /** Each tab's queue release in flight (`releaseQueue`). */
+  const releasing = new Map<string, Promise<void>>();
+  /** Tabs that asked for another release while one was in flight. */
+  const releaseAgain = new Set<string>();
 
   const nextMarker = () => `${PENDING}${++pendingSeq}`;
 
@@ -213,26 +248,73 @@ export function createSessionSend(deps: SessionSendDeps): SessionSend {
 
   /** Bound: into Rust's queue (shown at once, confirmed by `queue_changed`).
    *  Not bound: held locally until the bind. Rust drains it when the turn ends. */
-  function enqueue(tabId: string, text: string, mentions: readonly MentionData[]): void {
+  function enqueue(
+    tabId: string,
+    text: string,
+    mentions: readonly MentionData[],
+    attachments?: ImageAttachment[],
+  ): void {
     const { actions } = deps.chat();
     const key = queueKey(tabId);
     if (!key) {
-      actions.enqueueMessage(tabId, text, mentions);
+      actions.enqueueMessage(tabId, text, mentions, null, attachments);
       return;
     }
     const marker = nextMarker();
-    actions.enqueueMessage(tabId, text, mentions, marker);
-    void addToRust(tabId, key, inlineQueuedText(text, mentions), marker);
+    actions.enqueueMessage(tabId, text, mentions, marker, attachments);
+    void addToRust(
+      tabId,
+      key,
+      {
+        text: inlineQueuedText(text, mentions),
+        id: marker,
+        content: {
+          text,
+          mentions: [...mentions],
+          ...(attachments?.length ? { attachments } : {}),
+        },
+      },
+      marker,
+    );
   }
 
+  /** Hand Rust one strip item. One the window wrote goes as a direct send
+   *  would: composed (`wirePrompt`: mentioned files as resource links, notes'
+   *  bodies, pastes in full) with its images (ACP audit finding 80). The strip
+   *  text is what the chip shows and what an Edit hands back. One known only
+   *  by its text goes as that text. */
   async function addToRust(
     tabId: string,
     key: SessionKey,
-    text: string,
+    item: QueueItem,
     marker: string,
   ): Promise<boolean> {
     try {
-      const id = await deps.agents.queueAdd(key, text, deps.queuedPrompt(text));
+      const { content } = item;
+      const id = content
+        ? await (async () => {
+            const wire = await deps.wirePrompt(key.session_id, content.text, content.mentions);
+            // Composing is a round trip. If the strip let go of this add
+            // meanwhile — taken out, or turned local again because the session
+            // it was for is gone — it is not sent: the next flush hands the
+            // item to the session the tab is on now, once.
+            // (A strip cleared outright withdrew its markers: see `withdrawn`.)
+            const ids = deps.chat().queueIds?.[tabId];
+            if (ids && !ids.includes(marker)) return STALE_ADD;
+            return deps.agents.queueAdd(
+              key,
+              item.text,
+              wire.prompt,
+              content.attachments,
+              wire.resourceLinks,
+              wire.pastedTexts,
+            );
+          })()
+        : await deps.agents.queueAdd(key, item.text, deps.queuedPrompt(item.text));
+      if (id === STALE_ADD) {
+        withdrawn.delete(marker);
+        return true;
+      }
       if (withdrawn.delete(marker)) {
         if (typeof id === "string") void deps.agents.queueRemove(key, id).catch(() => {});
         return true;
@@ -250,6 +332,15 @@ export function createSessionSend(deps: SessionSendDeps): SessionSend {
     }
   }
 
+  // The manager retains the queue when its adapter dies. Removing user work
+  // must address that retained session even while new sends cannot.
+  function storedQueueKey(tabId: string): SessionKey | null {
+    const session = deps.chat().sessions[tabId];
+    return session?.acpAgentId && session.acpSessionId
+      ? { agent_id: session.acpAgentId, session_id: session.acpSessionId }
+      : null;
+  }
+
   function removeQueued(tabId: string, index: number): void {
     const chat = deps.chat();
     const id = chat.queueIds[tabId]?.[index] ?? null;
@@ -259,8 +350,22 @@ export function createSessionSend(deps: SessionSendDeps): SessionSend {
       withdrawn.add(id);
       return;
     }
-    const key = queueKey(tabId);
+    const key = storedQueueKey(tabId);
     if (key) void deps.agents.queueRemove(key, id).catch(() => {});
+  }
+
+  /** "Queue paused — Resume": lift the halt a failed turn put on the queue
+   *  and run its head (audit #77). The strip's notice goes once Rust has
+   *  lifted the halt; a refused resume leaves it there to try again. */
+  async function resumeQueue(tabId: string): Promise<void> {
+    const key = storedQueueKey(tabId);
+    if (!key) return;
+    try {
+      await deps.agents.queueResume(key);
+    } catch {
+      return;
+    }
+    deps.chat().actions.clearQueueHalt(tabId);
   }
 
   /** Rust's queue and any local items. */
@@ -268,15 +373,29 @@ export function createSessionSend(deps: SessionSendDeps): SessionSend {
     const chat = deps.chat();
     for (const id of chat.queueIds[tabId] ?? []) if (isPendingQueueId(id)) withdrawn.add(id);
     chat.actions.clearQueue(tabId);
-    const key = queueKey(tabId);
+    const key = storedQueueKey(tabId);
     if (key) void deps.agents.queueClear(key).catch(() => {});
   }
 
   /** An agent switch hands them to the agent the tab ends up on. */
   function takeQueued(tabId: string): string[] {
-    const texts = [...(deps.chat().queues[tabId] ?? [])];
-    if (texts.length) clearQueued(tabId);
-    return texts;
+    return takeQueuedMessages(tabId).map((m) => m.content);
+  }
+
+  /** Whole: an item the window wrote comes back as it was sent; one known
+   *  only by its text (a remote driver's) comes back as that text. */
+  function takeQueuedMessages(tabId: string): OutgoingMessage[] {
+    const items = queueItemsOf(deps.chat(), tabId);
+    if (items.length) clearQueued(tabId);
+    return items.map(({ text, content }) =>
+      content
+        ? {
+            content: content.text,
+            mentions: [...content.mentions],
+            ...(content.attachments?.length ? { attachments: content.attachments } : {}),
+          }
+        : { content: text, mentions: [] },
+    );
   }
 
   /** In order, then — with `drain` — start the head if the session is idle
@@ -285,19 +404,17 @@ export function createSessionSend(deps: SessionSendDeps): SessionSend {
     const key = queueKey(tabId);
     if (!key) return;
     const chat = deps.chat();
-    const texts = chat.queues[tabId] ?? [];
-    const ids = chat.queueIds[tabId] ?? [];
-    const local: Array<{ text: string; marker: string }> = [];
-    texts.forEach((text, i) => {
-      if (ids[i] === null || ids[i] === undefined) {
+    const local: Array<{ item: QueueItem; marker: string }> = [];
+    queueItemsOf(chat, tabId).forEach((item, i) => {
+      if (item.id === null) {
         const marker = nextMarker();
         chat.actions.setQueueItemIdAt(tabId, i, marker);
-        local.push({ text, marker });
+        local.push({ item, marker });
       }
     });
     // One at a time: the queue's order is the order they were typed in.
-    for (const { text, marker } of local) {
-      if (!(await addToRust(tabId, key, text, marker))) return;
+    for (const { item, marker } of local) {
+      if (!(await addToRust(tabId, key, item, marker))) return;
     }
     if (opts.drain) await deps.agents.queueDrain(key).catch(() => null);
   }
@@ -335,8 +452,10 @@ export function createSessionSend(deps: SessionSendDeps): SessionSend {
 
   // ── Send ──────────────────────────────────────────────────────────────────
 
-  function restartFailed(tabId: string): void {
-    deps.chat().actions.addMessage(tabId, "assistant", RESTART_FAILED);
+  function restartFailed(tabId: string, error: string | null): void {
+    // `null`: the restart was let go (the tab moved on), not refused.
+    if (error === null) return;
+    deps.chat().actions.addMessage(tabId, "assistant", restartFailedNotice(error));
   }
 
   /** Draw the user's bubble and, for a session's first message, title it. */
@@ -373,35 +492,43 @@ export function createSessionSend(deps: SessionSendDeps): SessionSend {
     message: OutgoingMessage,
     opts: SendOptions = {},
   ): Promise<void> {
+    noteSessionSent(projectPathForTab(tabId));
+    await carryOut(tabId, message, opts, false);
+  }
+
+  async function carryOut(
+    tabId: string,
+    message: OutgoingMessage,
+    opts: SendOptions,
+    rebound: boolean,
+  ): Promise<void> {
     const { content, mentions, attachments } = message;
     const recorded = opts.recorded === true;
-    noteSessionSent(projectPathForTab(tabId));
-
-    let decision = decide(state(tabId), { kind: "send", recorded });
-    if (decision.do === "rebind") {
-      if (!(await deps.rebind(tabId))) {
-        restartFailed(tabId);
-        return;
-      }
-      decision = decide(state(tabId), { kind: "send", recorded, rebound: true });
-    }
+    const decision = decide(state(tabId), { kind: "send", recorded, rebound });
     const { actions } = deps.chat();
     switch (decision.do) {
-      case "queue":
-        enqueue(tabId, content, mentions);
+      case "rebind":
+        await restartAndSend(tabId, message, opts);
         return;
-      case "keep-held":
-        actions.setPendingSend(tabId, {
-          content,
-          mentions,
-          attachments,
-          clientMessageId: opts.clientMessageId,
-        });
-        // Not "Starting…": nothing is starting until the user says so.
-        actions.updateSessionStatus(tabId, "idle");
+      case "queue":
+        // A message whose bubble is already drawn stays held instead: a
+        // queued prompt reaches the agent as text alone, so it would be drawn
+        // a second time and lose its images. The gate's release (`justResumed`)
+        // sends it.
+        if (recorded) {
+          actions.setPendingSend(tabId, {
+            content,
+            mentions,
+            attachments,
+            clientMessageId: opts.clientMessageId,
+          });
+          actions.updateSessionStatus(tabId, "idle");
+          return;
+        }
+        enqueue(tabId, content, mentions, attachments);
         return;
       case "hold-first": {
-        const clientMessageId = record(tabId, message, true);
+        const clientMessageId = recorded ? opts.clientMessageId : record(tabId, message, true);
         actions.updateSessionStatus(tabId, "running");
         actions.setPendingSend(tabId, { content, mentions, attachments, clientMessageId });
         // A bind that was abandoned (Stop while starting) is not re-run by
@@ -415,6 +542,88 @@ export function createSessionSend(deps: SessionSendDeps): SessionSend {
       default:
         return;
     }
+  }
+
+  /**
+   * A send into a session whose agent process died (ACP audit finding 62 and 79). The bubble is
+   * drawn now, and the message is held on the session — content, mentions,
+   * images and that bubble's id — while the agent restarts, so it is on
+   * screen as "Starting …" rather than gone from the composer with nothing to
+   * show for it. It goes out once the restart lands. If the restart fails it
+   * stays held, idle, beside a notice that gives the real cause, and the next
+   * successful restart (a send, or the Restart banner: `reconnected` in
+   * `send-gate.ts`) sends it.
+   *
+   * A message sent while a restart is running, or while an earlier message
+   * waits on one that failed, queues behind it: it never cancels or races the
+   * first.
+   */
+  async function restartAndSend(
+    tabId: string,
+    message: OutgoingMessage,
+    opts: SendOptions,
+  ): Promise<void> {
+    const { actions, sessions } = deps.chat();
+    if (sessions[tabId]?.pendingSend || restarting.has(tabId)) {
+      enqueue(tabId, message.content, message.mentions);
+      if (!restarting.has(tabId)) await restartHeld(tabId, opts);
+      return;
+    }
+    const clientMessageId = opts.recorded
+      ? (opts.clientMessageId ?? lastUserBubbleId(tabId))
+      : record(tabId, message, false);
+    actions.setPendingSend(tabId, {
+      content: message.content,
+      mentions: message.mentions,
+      attachments: message.attachments,
+      clientMessageId,
+    });
+    await restartHeld(tabId, opts);
+  }
+
+  /** Restart the tab's agent for the message held on it, then send that. */
+  async function restartHeld(tabId: string, opts: SendOptions): Promise<void> {
+    const held = deps.chat().sessions[tabId]?.pendingSend;
+    if (!held) return;
+    restarting.add(tabId);
+    // "Starting …" while it respawns; the composer queues what is typed meanwhile.
+    deps.chat().actions.updateSessionStatus(tabId, "running");
+    let outcome: RebindOutcome;
+    try {
+      outcome = await deps.rebind(tabId);
+    } finally {
+      restarting.delete(tabId);
+    }
+    const now = deps.chat().sessions[tabId]?.pendingSend;
+    // Stop let go of it meanwhile (`abandon-start`), or an agent switch took it.
+    const stillHeld =
+      !!now && now.clientMessageId === held.clientMessageId && now.content === held.content;
+    if (!stillHeld) return;
+    const { actions } = deps.chat();
+    if (!outcome.ok) {
+      actions.updateSessionStatus(tabId, "idle");
+      restartFailed(tabId, outcome.error);
+      return;
+    }
+    actions.setPendingSend(tabId, undefined);
+    await carryOut(
+      tabId,
+      held,
+      { recorded: true, clientMessageId: held.clientMessageId, kickBind: opts.kickBind },
+      true,
+    );
+    // What was typed during the restart is local; hand it to the session,
+    // parked behind the turn that just started.
+    await flushLocal(tabId, { drain: false });
+  }
+
+  /** The newest user bubble's id: a held send's, when its caller lost it. */
+  function lastUserBubbleId(tabId: string): string | undefined {
+    const rows = deps.chat().sessions[tabId]?.messages ?? [];
+    for (let i = rows.length - 1; i >= 0; i--) {
+      if (rows[i].role === "user") return rows[i].clientMessageId;
+    }
+    return undefined;
   }
 
   async function dispatch(
@@ -432,22 +641,37 @@ export function createSessionSend(deps: SessionSendDeps): SessionSend {
     // than drawing the prompt a second time. A held send's bubble was drawn
     // when it was held; the caller passes its id, or it is the newest one.
     let clientMessageId = opts.clientMessageId;
-    if (opts.recorded && !clientMessageId) {
-      const rows = bound.messages;
-      for (let i = rows.length - 1; i >= 0; i--) {
-        if (rows[i].role === "user") {
-          clientMessageId = rows[i].clientMessageId;
-          break;
-        }
-      }
-    }
+    if (opts.recorded && !clientMessageId) clientMessageId = lastUserBubbleId(tabId);
     if (!opts.recorded) clientMessageId = record(tabId, message, false);
+    // A turn already running is the case for a chip or a permission answer:
+    // a Stop during this one's composition stops that turn too.
+    const mine: Composing = { aborted: false, wasBusy: isBusyAgentStatus(bound.status) };
     // Idempotent for a held send (already running while it started), and it
     // re-asserts the state if a fresh session's initial `idle` status landed
     // between the bind and this dispatch.
     deps.chat().actions.updateSessionStatus(tabId, "running");
 
-    const wire = await deps.wirePrompt(key.session_id, content, mentions);
+    const inFlight = composing.get(tabId) ?? new Set<Composing>();
+    composing.set(tabId, inFlight);
+    inFlight.add(mine);
+    let wire: WirePrompt;
+    try {
+      wire = await deps.wirePrompt(key.session_id, content, mentions);
+    } finally {
+      inFlight.delete(mine);
+      if (inFlight.size === 0 && composing.get(tabId) === inFlight) composing.delete(tabId);
+    }
+    // Stopped while the prompt was being composed (ACP audit finding 84): nothing reached the
+    // agent, so nothing goes now. The bubble stays, as for a cancelled turn.
+    if (mine.aborted) {
+      logEvent({
+        source: "agent",
+        kind: "send-aborted",
+        summary: "stopped before the prompt was sent",
+        payload: { tabId },
+      });
+      return;
+    }
 
     // Non-blocking send: returns the instant the prompt is queued onto the
     // SessionWorker. The atlas:agents `turn_finished` delta flips status
@@ -488,6 +712,20 @@ export function createSessionSend(deps: SessionSendDeps): SessionSend {
     const s = sessions[tabId];
     const decision = decide(state(tabId), { kind: "stop" });
     if (!s) return;
+    // A send still composing its prompt is aborted before it reaches the
+    // wire (ACP audit finding 84). With no turn running before it, that is the whole Stop:
+    // there is nothing for the agent to cancel.
+    const inFlight = composing.get(tabId);
+    if (inFlight?.size) {
+      const onlyComposing = [...inFlight].every((c) => !c.wasBusy);
+      for (const c of inFlight) c.aborted = true;
+      composing.delete(tabId);
+      if (onlyComposing && decision.do === "cancel") {
+        clearQueued(tabId);
+        actions.updateSessionStatus(tabId, "idle");
+        return;
+      }
+    }
     switch (decision.do) {
       case "abandon-start": {
         // The CONNECT the message was waiting on may be wedged, and the next
@@ -556,14 +794,42 @@ export function createSessionSend(deps: SessionSendDeps): SessionSend {
    *  busy, or held). A session whose agent process died is respawned first —
    *  the queue survives the restart in Rust, and the turn that left it there
    *  is what the old drain re-sent through a rebind. */
-  async function releaseQueue(tabId: string): Promise<void> {
+  function releaseQueue(tabId: string): Promise<void> {
+    // One release per tab at a time. Two drain edges close together (a turn
+    // ending as its agent dies, then the restart's rebind) each started one;
+    // the second flushed the restarted session's items while the first was
+    // still in its rebind, and the first then marked them all local again
+    // and handed every one to the new session a second time. A release asked
+    // for meanwhile runs once more after the one in flight, so the edge that
+    // asked is still answered.
+    const running = releasing.get(tabId);
+    if (running) {
+      releaseAgain.add(tabId);
+      return running;
+    }
+    const release = (async () => {
+      try {
+        do {
+          releaseAgain.delete(tabId);
+          await releaseOnce(tabId);
+        } while (releaseAgain.has(tabId));
+      } finally {
+        releasing.delete(tabId);
+      }
+    })();
+    releasing.set(tabId, release);
+    return release;
+  }
+
+  async function releaseOnce(tabId: string): Promise<void> {
     const s = deps.chat().sessions[tabId];
     if (!s?.acpSessionId) return;
     if (s.disconnected) {
       if ((deps.chat().queues[tabId]?.length ?? 0) === 0) return;
       const before = s.acpSessionId;
-      if (!(await deps.rebind(tabId))) {
-        restartFailed(tabId);
+      const outcome = await deps.rebind(tabId);
+      if (!outcome.ok) {
+        restartFailed(tabId, outcome.error);
         return;
       }
       // Restarted onto a different session: the ids named the old one's
@@ -634,7 +900,9 @@ export function createSessionSend(deps: SessionSendDeps): SessionSend {
     enqueue,
     removeQueued,
     clearQueued,
+    resumeQueue,
     takeQueued,
+    takeQueuedMessages,
     flushLocal,
     queueKey,
     setHold,
@@ -644,6 +912,10 @@ export function createSessionSend(deps: SessionSendDeps): SessionSend {
       withdrawn.clear();
       holdReasons.clear();
       pushedPause.clear();
+      restarting.clear();
+      composing.clear();
+      releasing.clear();
+      releaseAgain.clear();
     },
   };
 }
@@ -653,14 +925,13 @@ export const sessionSend = createSessionSend({
   agents,
   chat: () => useChatStore.getState(),
   ambient: (session) => ({
-    heldElsewhere: isSendHeldElsewhere(session?.acpSessionId),
     grantHold: grantLocksComposer(hasNoAiGrant(), session?.agentType ?? "", false),
     remoteDriving:
       drivenElsewhere(useRcStore.getState().bySession[session?.acpSessionId ?? ""]) !== null,
   }),
   // Called through, not captured: a test that mocks one of these modules
   // narrowly need not define what its code path never reaches.
-  rebind: (tabId) => rebindDisconnectedSession(tabId),
+  rebind: (tabId) => restartDisconnectedSession(tabId),
   forgetAgent: (pluginId) => resetAgent(pluginId),
   wirePrompt: (acpSessionId, content, mentions) =>
     composeWirePrompt(acpSessionId, content, mentions),

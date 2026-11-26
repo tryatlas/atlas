@@ -33,6 +33,7 @@ import { openConfigFile } from "@/features/settings/lib/atlas-config-api";
 import { openGitPanel } from "@/features/git/lib/open-git-panel";
 import { openSettingsSection } from "@/features/settings/lib/open-settings";
 import { openUpdatePrompt, restartToUpdate } from "@/features/updater/lib/restart-to-update";
+import { updater } from "@/features/updater/lib/updater-api";
 import {
   catalogEntry,
   isTabTarget,
@@ -110,7 +111,9 @@ function jumpTo(t: NotificationTarget): unknown {
 export { notificationToastId };
 
 registerNotificationAction(OPEN_ACTION_ID, ({ target }) => openNotificationTarget(target));
-registerNotificationAction(RESTART_ACTION_ID, () => restartToUpdate());
+registerNotificationAction(RESTART_ACTION_ID, () => restartToUpdate(), {
+  stillApplies: async () => (await updater.state()).phase === "ready",
+});
 
 // A click on an OS banner opens its exact source (thread tab or terminal pane),
 // across projects. Registered at module load so a click that launched the app
@@ -201,6 +204,10 @@ async function showBanner(d: NotificationDecision, agentType: string | undefined
 }
 
 /** Perform a decision. Returns false when it was a duplicate. */
+export function forgetNotification(dedupeKey: string): void {
+  announced.delete(dedupeKey);
+}
+
 export function deliverNotification(d: NotificationDecision): boolean {
   if (announced.has(d.dedupeKey)) return false;
   announced.add(d.dedupeKey);

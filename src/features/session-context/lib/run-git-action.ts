@@ -93,7 +93,7 @@ export function continueGitAction(
   request: { path: string; action: GitAction; sessionId: string | null; featureBranch: boolean },
 ): void {
   if (actionSteps(request.action).commit) {
-    useSessionDetailsStore.getState().actions.promptGitAction({ kind: "commit", ...request });
+    useSessionDetailsStore.getState().actions.promptGitAction({ ...request, kind: "commit" });
     return;
   }
   void runGitAction(client, request);

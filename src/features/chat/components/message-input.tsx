@@ -15,13 +15,18 @@ import { useAppStore } from "@/features/app/stores/app-store";
 // defeat the dynamic `import("./chat-input")` boundary.
 import type { MentionData } from "../lib/mentions";
 import { submitButtonState } from "../lib/composer-submit";
+import { queuePausedByFailure } from "../lib/queue-halt";
 import { useComposerGates } from "../hooks/use-composer-gates";
 import { useComposerText } from "../hooks/use-composer-text";
 import { useLazyComposerChunks } from "../hooks/use-lazy-composer-chunks";
 import { useComposerImages } from "../hooks/use-composer-images";
 import { useComposerAttachments } from "../hooks/use-composer-attachments";
 import { useComposerDropZone } from "../hooks/use-composer-file-drop";
-import { useChatInputFocusedSignal, useComposerFocus } from "../hooks/use-composer-focus";
+import {
+  useChatInputFocusedSignal,
+  useChatInputStartedSignal,
+  useComposerFocus,
+} from "../hooks/use-composer-focus";
 import { useComposerPickers } from "../hooks/use-composer-pickers";
 import { useComposerEvents } from "../hooks/use-composer-events";
 import { useComposerSubmit } from "../hooks/use-composer-submit";
@@ -69,11 +74,12 @@ export function MessageInput({
 }: MessageInputProps) {
   // The session's agent and every gate on the send (`use-composer-gates.ts`).
   const gates = useComposerGates({ tabId, running, disabledProp });
-  const { agentType, disabled, modeUnrestored, heldForTerminal, remoteDriving } = gates;
+  const { agentType, disabled, modeUnrestored, remoteDriving } = gates;
   // Settings → General → "Enter to send". Narrow selector so a toggle flip
   // only re-renders composers, not the whole settings surface.
   const enterToSend = useSettingsStore((s) => s.settings.enterToSend);
   const queue = useChatStore((s) => s.queues[tabId] ?? EMPTY_QUEUE);
+  const queueHalted = useChatStore((s) => s.sessions[tabId]?.queueHalted);
 
   const inputRef = useRef<ChatInputHandle>(null);
   const projectPath = useAppStore((s) => s.currentProject?.path ?? null);
@@ -89,6 +95,16 @@ export function MessageInput({
   const { LazyChatInput, LazyMentionPicker, LazySlashPicker } = useLazyComposerChunks();
 
   const handleFocusCapture = useChatInputFocusedSignal(tabId, disabled);
+  // Writing is what starts the tab's agent session; showing and focusing do
+  // not (`useChatInputStartedSignal`).
+  const { noteBlank, noteWritten } = useChatInputStartedSignal(tabId, disabled, !hasText);
+  const onEmptyEdge = useCallback(
+    (blank: boolean) => {
+      onEmptyChange(blank);
+      noteBlank(blank);
+    },
+    [onEmptyChange, noteBlank],
+  );
 
   const composerRef = useRef<HTMLDivElement>(null);
   // Images staged for the next send (`use-composer-images.ts`).
@@ -97,6 +113,10 @@ export function MessageInput({
     inputRef,
     mirrorDraft: draft.onDocChange,
   });
+  const onDocChange = useCallback(() => {
+    handleDocChange();
+    noteWritten();
+  }, [handleDocChange, noteWritten]);
   // Every way something gets attached (`use-composer-attachments.ts`).
   const attach = useComposerAttachments({
     tabId,
@@ -178,7 +198,6 @@ export function MessageInput({
     running,
     remoteDriving,
     modeUnrestored,
-    heldForTerminal,
     onSend,
     onStop,
   });
@@ -189,7 +208,6 @@ export function MessageInput({
     hasText,
     disabled,
     modeUnrestored,
-    heldForTerminal,
     remoteDriving,
   });
 
@@ -208,7 +226,12 @@ export function MessageInput({
           <ComposerQueue
             queue={queue}
             remoteDriving={remoteDriving}
-            onEdit={editQueued}
+            paused={queuePausedByFailure(queueHalted, queue.length)}
+            onResume={() => void sessionSend.resumeQueue(tabId)}
+            onEdit={(text, i) => {
+              const images = editQueued(text, i);
+              if (images.length) setStagedImages((prev) => [...prev, ...images]);
+            }}
             onRemove={(i) => sessionSend.removeQueued(tabId, i)}
           />
         )}
@@ -226,7 +249,7 @@ export function MessageInput({
           composerRef={composerRef}
           collapsed={collapsed}
           collapsible={collapsible}
-          locked={githubSyncing !== null}
+          locked={githubSyncing !== null && !running}
           onFocusCapture={() => {
             setComposerFocused(true);
             handleFocusCapture();
@@ -250,8 +273,8 @@ export function MessageInput({
                     initialValue={valueRef.current}
                     placeholder={effectivePlaceholder}
                     projectPath={projectPath}
-                    onEmptyChange={onEmptyChange}
-                    onDocChange={handleDocChange}
+                    onEmptyChange={onEmptyEdge}
+                    onDocChange={onDocChange}
                     onSubmit={submit}
                     enterToSend={enterToSend}
                     onMentionTrigger={pickers.setTrigger}

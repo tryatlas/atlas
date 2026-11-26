@@ -902,7 +902,7 @@ export function requestPermissionPlan(): Promise<void> {
   return raisePermission({
     transcriptCall: tool.other("ExitPlanMode", { plan: PLAN_MARKDOWN }, { id, status: "pending" }),
     title: "Exit plan mode",
-    kind: "think",
+    kind: "switch_mode",
     rawInput: { plan: PLAN_MARKDOWN },
     options: exitPlanOptions(),
     result: (allowed) => (allowed ? "Plan approved." : "Plan rejected — staying in plan mode."),
@@ -1172,6 +1172,7 @@ export interface AgentResponses {
   agents_queue_clear: Unit;
   agents_queue_pause: Unit;
   agents_queue_drain: number | null;
+  agents_queue_resume: number | null;
   agents_queue_send_now: Unit;
   agents_set_hold: Unit;
 }
@@ -1319,6 +1320,8 @@ export const agentHandlers: TypedHandlers<AgentResponses> = {
     return null;
   },
   agents_queue_drain: ({ key }) => drainQueue(sessionOrThrow(key)),
+  // The fake never fails a turn, so its queue is never halted: resuming is a drain.
+  agents_queue_resume: ({ key }) => drainQueue(sessionOrThrow(key)),
   agents_queue_send_now: ({ key, itemId }) => {
     const s = sessionOrThrow(key);
     const q = queueOf(s.key.session_id);

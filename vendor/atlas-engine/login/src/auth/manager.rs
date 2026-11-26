@@ -2326,6 +2326,35 @@ impl AuthManager {
         self.auth_cached()
     }
 
+    /// Resolve credentials for a request without turning a failed external
+    /// token mint into an anonymous request or erasing the last known account.
+    pub async fn auth_for_request(&self) -> Result<Option<AtlasEngineAuth>, RefreshTokenError> {
+        let Some(external_auth) = self.external_auth_provider() else {
+            return Ok(self.auth().await);
+        };
+        let cached_auth = self.auth_cached();
+        if let Some(error) = cached_auth
+            .as_ref()
+            .and_then(|auth| self.refresh_failure_for_auth(auth))
+        {
+            return Err(RefreshTokenError::Permanent(error));
+        }
+        match self.resolve_external_auth(external_auth.as_ref()).await {
+            Ok(auth) => {
+                self.commit_external_auth(auth.clone())?;
+                Ok(Some(auth))
+            }
+            Err(error) => {
+                if let RefreshTokenError::Permanent(failure) = &error
+                    && let Some(auth) = cached_auth.as_ref()
+                {
+                    self.record_permanent_refresh_failure_if_unchanged(auth, failure);
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub async fn agent_identity_auth(
         &self,
         policy: AgentIdentityAuthPolicy,
@@ -2506,7 +2535,7 @@ impl AuthManager {
                             }
                             cached_auth
                         }
-                        RefreshTokenError::Transient(_) => None,
+                        RefreshTokenError::Transient(_) => cached_auth,
                     }
                 }
             };

@@ -4,14 +4,100 @@ use std::path::Path;
 const DEFAULT_EMPTY: &str =
     r#"{"version":2,"viewport":{"x":0,"y":0,"zoom":1},"nodes":[],"edges":[]}"#;
 
+fn validate_canvas(raw: &str) -> Result<(), String> {
+    use serde_json::Value;
+    let value: Value = serde_json::from_str(raw).map_err(|e| format!("read canvas.json: {e}"))?;
+    let board = |value: &Value| {
+        let viewport = value.get("viewport").is_none_or(|viewport| {
+            ["x", "y", "zoom"]
+                .iter()
+                .all(|key| viewport[*key].as_f64().is_some_and(f64::is_finite))
+                && viewport["zoom"].as_f64().is_some_and(|zoom| zoom > 0.0)
+        });
+        value["nodes"]
+            .as_array()
+            .is_some_and(|nodes| nodes.iter().all(|node| node["id"].is_string()))
+            && value.get("edges").is_none_or(|edges| {
+                edges.as_array().is_some_and(|edges| {
+                    edges.iter().all(|edge| {
+                        ["id", "source", "target"]
+                            .iter()
+                            .all(|key| edge[*key].is_string())
+                    })
+                })
+            })
+            && viewport
+    };
+    let valid = match value.get("version").and_then(Value::as_u64) {
+        Some(1..=3) => board(&value),
+        None if value.get("version").is_none() => board(&value),
+        Some(4) => (|| {
+            let (Some(pages), Some(tree), Some(active)) = (
+                value["pages"].as_array(),
+                value["tree"].as_array(),
+                value["activePageId"].as_str(),
+            ) else {
+                return false;
+            };
+            let page_ids: std::collections::HashSet<_> = pages
+                .iter()
+                .filter_map(|page| page["id"].as_str())
+                .collect();
+            let tree_ids: std::collections::HashSet<_> = tree
+                .iter()
+                .filter_map(|entry| entry["id"].as_str())
+                .collect();
+            !pages.is_empty()
+                && page_ids.len() == pages.len()
+                && tree_ids.len() == tree.len()
+                && page_ids.contains(active)
+                && pages.iter().all(|page| {
+                    page["id"].as_str().is_some_and(|id| !id.is_empty())
+                        && board(page)
+                        && tree
+                            .iter()
+                            .any(|entry| entry["id"] == page["id"] && entry["kind"] == "page")
+                })
+                && tree.iter().all(|entry| {
+                    entry["id"].is_string()
+                        && entry["name"].is_string()
+                        && (entry["parentId"].is_null() || entry["parentId"].is_string())
+                        && entry["order"].as_f64().is_some_and(f64::is_finite)
+                        && match entry["kind"].as_str() {
+                            Some("folder") => true,
+                            Some("page") => {
+                                entry["id"].as_str().is_some_and(|id| page_ids.contains(id))
+                            }
+                            _ => false,
+                        }
+                })
+        })(),
+        _ => false,
+    };
+    if !valid {
+        return Err(
+            "canvas.json has an invalid or unsupported format. Repair it and reload before saving."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn read_canvas(path: &Path) -> Result<String, String> {
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DEFAULT_EMPTY.into(),
+        Err(e) => return Err(format!("read canvas.json: {e}")),
+    };
+    validate_canvas(&raw)?;
+    Ok(raw)
+}
+
 #[tauri::command]
 pub async fn load_canvas(project_path: String) -> Result<String, String> {
     tokio::task::spawn_blocking(move || -> Result<String, String> {
         let path = atlas_profile::dir_in(Path::new(&project_path)).join("canvas.json");
-        if !path.exists() {
-            return Ok(DEFAULT_EMPTY.to_string());
-        }
-        fs::read_to_string(&path).map_err(|e| e.to_string())
+        read_canvas(&path)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -21,6 +107,10 @@ pub async fn load_canvas(project_path: String) -> Result<String, String> {
 pub async fn save_canvas(project_path: String, payload: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         let final_path = atlas_profile::dir_in(Path::new(&project_path)).join("canvas.json");
+        static WRITE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _guard = WRITE_LOCK.lock();
+        validate_canvas(&payload)?;
+        read_canvas(&final_path)?;
         // Replaced whole: no partial write on a crash.
         atlas_fs::replace_file(&final_path, &payload).map_err(|e| e.to_string())
     })
@@ -163,6 +253,26 @@ mod save_tests {
     use super::{load_canvas, save_canvas};
 
     #[tokio::test]
+    async fn a_failed_load_cannot_be_overwritten_by_a_default_canvas() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().to_string_lossy().to_string();
+        let path = atlas_profile::dir_in(project.path()).join("canvas.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for original in ["{ damaged", "null", r#"{"version":99,"pages":[]}"#] {
+            std::fs::write(&path, original).unwrap();
+            assert!(save_canvas(root.clone(), super::DEFAULT_EMPTY.into())
+                .await
+                .is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+        std::fs::write(&path, super::DEFAULT_EMPTY).unwrap();
+        save_canvas(root.clone(), super::DEFAULT_EMPTY.into())
+            .await
+            .unwrap();
+        assert_eq!(load_canvas(root).await.unwrap(), super::DEFAULT_EMPTY);
+    }
+
+    #[tokio::test]
     async fn a_saved_canvas_loads_back_and_leaves_only_its_file() {
         let project = tempfile::tempdir().unwrap();
         let root = project.path().to_string_lossy().to_string();
@@ -171,11 +281,14 @@ mod save_tests {
         save_canvas(root.clone(), r#"{"nodes":[]}"#.into())
             .await
             .unwrap();
-        save_canvas(root.clone(), r#"{"nodes":[1]}"#.into())
+        save_canvas(root.clone(), r#"{"nodes":[{"id":"note"}]}"#.into())
             .await
             .unwrap();
 
-        assert_eq!(load_canvas(root).await.unwrap(), r#"{"nodes":[1]}"#);
+        assert_eq!(
+            load_canvas(root).await.unwrap(),
+            r#"{"nodes":[{"id":"note"}]}"#
+        );
         assert_eq!(
             crate::commands::file_names_in(&atlas_profile::dir_in(project.path())),
             ["canvas.json"]

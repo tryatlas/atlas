@@ -57,6 +57,10 @@ pub enum AgentServerSettings {
         /// Variables whose values live in the OS keychain, not in this file.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         secret_env: Vec<String>,
+        /// The launch defaults ([`crate::launch_defaults`]) already written
+        /// into this entry, so one the user deletes stays deleted.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        seeded_defaults: Vec<String>,
     },
     /// An agent installed from the registry. The key is its registry id; the
     /// distribution, version and command all come from the registry index, so
@@ -96,6 +100,10 @@ pub enum AgentServerSettings {
         /// Variables whose values live in the OS keychain, not in this file.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         secret_env: Vec<String>,
+        /// The launch defaults ([`crate::launch_defaults`]) already written
+        /// into this entry, so one the user deletes stays deleted.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        seeded_defaults: Vec<String>,
     },
 }
 
@@ -115,6 +123,7 @@ impl AgentServerSettings {
             model_order: Vec::new(),
             custom_models: Vec::new(),
             secret_env: Vec::new(),
+            seeded_defaults: Vec::new(),
         }
     }
 
@@ -133,6 +142,7 @@ impl AgentServerSettings {
             model_order: Vec::new(),
             custom_models: Vec::new(),
             secret_env: Vec::new(),
+            seeded_defaults: Vec::new(),
         }
     }
 
@@ -208,6 +218,27 @@ impl AgentServerSettings {
     pub fn secret_env(&self) -> &[String] {
         match self {
             Self::Custom { secret_env, .. } | Self::Registry { secret_env, .. } => secret_env,
+        }
+    }
+
+    /// What [`crate::launch_defaults::seed`] reads and writes: the plain
+    /// variables, the sensitive names, and the defaults already seeded.
+    pub(crate) fn seeding_mut(
+        &mut self,
+    ) -> (&mut HashMap<String, String>, &[String], &mut Vec<String>) {
+        match self {
+            Self::Custom {
+                env,
+                secret_env,
+                seeded_defaults,
+                ..
+            }
+            | Self::Registry {
+                env,
+                secret_env,
+                seeded_defaults,
+                ..
+            } => (env, secret_env, seeded_defaults),
         }
     }
 

@@ -416,6 +416,15 @@ impl EngineSettings {
             // legacy alias, `memory_tool`, which sorts after `memories` and is
             // applied after it, so the alias is pinned off too; the
             // `memories.*` switches no alias reaches back that up.
+            // The engine's plugin system is ChatGPT's marketplace: featured
+            // ids, a curated repo, remote catalogues, all served from
+            // `chatgpt_base_url`, which defaults to chatgpt.com. On, it sent
+            // `GET …/plugins/featured` on every engine start. Atlas uses none
+            // of it (skills come from `~/.agents/skills`, ADR-0005; tools from
+            // MCP servers), and Atlas never contacts ChatGPT. Pinned off here,
+            // in the session-flags layer, so no repo config turns it back on;
+            // the featured fetch itself also refuses a ChatGPT host.
+            ("features.plugins".to_string(), TomlValue::Boolean(false)),
             ("features.memories".to_string(), TomlValue::Boolean(false)),
             (
                 "features.memory_tool".to_string(),
@@ -648,6 +657,34 @@ mod tests {
         );
         assert_eq!(config.multi_agent_v2.max_concurrent_threads_per_session, 3);
         assert_eq!(config.multi_agent_v2.max_wait_timeout_ms, 120_000);
+    }
+
+    /// The engine's plugins feature fetched ChatGPT's featured-plugin list
+    /// from chatgpt.com on every start. It stays off even when the home
+    /// config asks for it.
+    #[tokio::test]
+    async fn the_engines_chatgpt_plugin_marketplace_stays_off() {
+        use atlas_engine_features::Feature;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let s = settings(tmp.path());
+        assert_eq!(
+            s.cli_overrides()
+                .iter()
+                .find(|(k, _)| k == "features.plugins")
+                .map(|(_, v)| v.clone()),
+            Some(TomlValue::Boolean(false)),
+        );
+        std::fs::create_dir_all(s.home.path()).expect("engine home");
+        std::fs::write(
+            s.home.path().join("config.toml"),
+            "[features]\nplugins = true\n",
+        )
+        .expect("config file");
+
+        let config = s.build_config(None).await.expect("config loads");
+        assert!(!config.features.enabled(Feature::Plugins));
+        assert!(!config.plugins_config_input().plugins_enabled);
     }
 
     /// The legacy alias `features.memory_tool` is applied after the canonical

@@ -141,3 +141,52 @@ describe("resolvePinIndex", () => {
     );
   });
 });
+
+// Pins on reopen: the live stream and the snapshot name the same message
+// differently, a pin placed before the bind was tab-scoped, and a rewind hands
+// a rewound message's positional id to the next one sent.
+describe("pins across a reopen and a rewind", () => {
+  const t1 = "2026-09-09T11:00:00.000Z";
+  const msg = (id: string, content: string, timestamp = t1) =>
+    ({
+      id,
+      role: "user",
+      content,
+      toolCalls: [],
+      fileChanges: [],
+      plan: null,
+      timestamp,
+    }) as ChatMessage;
+
+  it("does not follow a reused id to a different message", () => {
+    const messages = [msg("msg-0", "first"), msg("msg-1", "sent after the rewind")];
+    expect(resolvePinIndex(messages, pin("msg-1", "rewound away", t1))).toBe(-1);
+  });
+
+  it("re-points a pin at the id its message has now", () => {
+    const { toggle, reconcile } = useChatPinsStore.getState().actions;
+    toggle("s:abc", pin("live-uuid", "hello"));
+    reconcile("s:abc", [msg("msg-0", "hello")]);
+    expect(pinsFor(useChatPinsStore.getState(), "s:abc").map((p) => p.messageId)).toEqual([
+      "msg-0",
+    ]);
+  });
+
+  it("leaves the scope untouched when nothing moved", () => {
+    const { toggle, reconcile } = useChatPinsStore.getState().actions;
+    toggle("s:abc", pin("msg-0", "hello"));
+    const before = useChatPinsStore.getState().pins;
+    reconcile("s:abc", [msg("msg-0", "hello")]);
+    expect(useChatPinsStore.getState().pins).toBe(before);
+  });
+
+  it("moves a tab's pins to its session when it binds", () => {
+    const { toggle, adopt } = useChatPinsStore.getState().actions;
+    toggle("t:tab-1", pin("m1"));
+    toggle("s:abc", pin("m2"));
+    adopt("t:tab-1", "s:abc");
+    const state = useChatPinsStore.getState();
+    expect(pinsFor(state, "t:tab-1")).toEqual([]);
+    expect(pinsFor(state, "s:abc").map((p) => p.messageId)).toEqual(["m1", "m2"]);
+  });
+});

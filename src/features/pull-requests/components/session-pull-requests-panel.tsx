@@ -17,6 +17,7 @@
 // travels by context, so neither a key press nor one link's change redraws
 // the rest.
 
+import { isMac } from "@/lib/platform";
 import { memo, use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueries } from "@tanstack/react-query";
 import { Eye, Layers, Link2, MoreHorizontal, Plus, type LucideIcon } from "lucide-react";
@@ -248,7 +249,7 @@ function SessionPullRequestRowImpl({
           if (event.button === 1) onOpen(link, true);
         }}
         aria-label={`${state.label} pull request #${link.number}: ${title}`}
-        title={`${link.url}\n${LINK_SOURCE_LABEL[link.source]} · ⌘-click opens on GitHub`}
+        title={`${link.url}\n${LINK_SOURCE_LABEL[link.source]} · ${isMac ? "⌘" : "Ctrl"}-click opens on GitHub`}
         className="absolute inset-0 cursor-pointer rounded focus-visible:outline-none"
       />
       {depth > 0 ? (

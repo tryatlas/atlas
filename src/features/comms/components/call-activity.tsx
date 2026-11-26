@@ -1,4 +1,4 @@
-import { memo, useCallback, useState } from "react";
+import { memo, useCallback, useEffect, useState } from "react";
 import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
@@ -6,7 +6,7 @@ import { comms, parseRefusal } from "../lib/comms-api";
 import { copyShareLink, memberCallUrl } from "../lib/call-links";
 import { useCommsStore } from "../stores/comms-store";
 import { AudioPlayer } from "./audio-player";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { useLocalMedia } from "@/features/media/lib/use-local-media";
 import { formatBytes } from "../lib/derive";
 import type { ChatCall, OrgMemberProfile, RecordingTrack } from "../types";
 import { CallActivityView } from "./views/call-activity-view";
@@ -60,7 +60,7 @@ export const CallActivity = memo(function CallActivity({
         status: loading ? "loading" : tracks !== null ? "ready" : "idle",
         tracks: tracks ?? EMPTY_TRACKS,
       }}
-      renderTrack={(t) => <TrackRow key={t.id} track={t} />}
+      renderTrack={(t) => <TrackRow key={t.id} callId={call.id} track={t} />}
       onCopyLink={() => void copyShareLink(orgId, call)}
       onJoin={() => void joinCall(orgId, call.id)}
       onSaveTranscript={() => void saveTranscript(call.id)}
@@ -78,29 +78,33 @@ const EMPTY_TRACKS: RecordingTrack[] = [];
  * file into the local cache first (the arc in the play button is that
  * download) and the `<audio>` element points at the cached copy.
  */
-function TrackRow({ track }: { track: RecordingTrack }) {
+function TrackRow({ callId, track }: { callId: string; track: RecordingTrack }) {
   const progress = useCommsStore((s) => s.downloads[track.id]);
   const [path, setPath] = useState<string | null>(null);
 
   const fetchLocal = useCallback(() => {
-    comms
-      .fetchRecording(track.url, track.id, track.filename)
+    freshTrack(callId, track.id)
+      .then((fresh) => comms.fetchRecording(fresh.url, fresh.id, fresh.filename))
       .then((p) => setPath(p))
       .catch((e) => {
         console.warn("comms: recording buffer failed:", track.id, e);
         toast.error("Could not load that recording.");
       });
-  }, [track.url, track.id, track.filename]);
+  }, [callId, track.id]);
 
+  const media = useLocalMedia(path, "audio");
+  useEffect(() => {
+    if (media.error) toast.error("Could not play that recording.");
+  }, [media.error]);
   return (
     <AudioPlayer
-      src={path ? convertFileSrc(path) : null}
+      src={media.url}
       filename={track.filename}
       subtitle={formatBytes(track.bytes)}
       buffering={progress !== undefined}
       bufferProgress={progress}
       onRequestSrc={fetchLocal}
-      onDownload={() => void saveTrack(track)}
+      onDownload={() => void saveTrack(callId, track)}
     />
   );
 }
@@ -125,11 +129,19 @@ async function saveTranscript(callId: string): Promise<void> {
   }
 }
 
-async function saveTrack(track: RecordingTrack): Promise<void> {
+async function freshTrack(callId: string, trackId: string): Promise<RecordingTrack> {
+  const recording = await comms.callRecordings(callId);
+  const track = recording.tracks.find((item) => item.id === trackId);
+  if (!track) throw new Error("This recording is no longer available.");
+  return track;
+}
+
+async function saveTrack(callId: string, track: RecordingTrack): Promise<void> {
   try {
     const dest = await saveFileDialog({ defaultPath: track.filename });
     if (!dest) return;
-    await comms.saveRecording(track.url, dest, track.id);
+    const fresh = await freshTrack(callId, track.id);
+    await comms.saveRecording(fresh.url, dest, fresh.id);
     toast.success("Recording saved.");
   } catch (e) {
     console.warn("comms: save recording failed:", track.id, e);

@@ -45,12 +45,12 @@ const UNIFIED_EXEC_OUTPUT_DELTA_MAX_BYTES: usize = 8192;
 /// Spawn a background task that continuously reads from the PTY, appends to the
 /// shared transcript, and emits ExecCommandOutputDelta events on UTF‑8
 /// boundaries.
-pub(crate) fn start_streaming_output(
+pub(crate) async fn start_streaming_output(
     process: &UnifiedExecProcess,
     context: &UnifiedExecContext,
     transcript: Arc<Mutex<HeadTailBuffer>>,
 ) {
-    let mut receiver = process.output_receiver();
+    let (initial_output, mut receiver) = process.output_receiver().await;
     let output_drained = process.output_drained_notify();
     let exit_token = process.cancellation_token();
     let OutputHandles {
@@ -68,6 +68,16 @@ pub(crate) fn start_streaming_output(
 
         let mut pending = VecDeque::<u8>::new();
         let mut emitted_deltas: usize = 0;
+        process_chunk(
+            &mut pending,
+            &transcript,
+            &call_id,
+            &session_ref,
+            &turn_ref,
+            &mut emitted_deltas,
+            initial_output,
+        )
+        .await;
 
         let mut grace_sleep: Option<Pin<Box<Sleep>>> = None;
         let output_closed_notified = output_closed_notify.notified();
@@ -151,6 +161,24 @@ pub(crate) fn start_streaming_output(
                     chunk,
                 )
                 .await;
+            }
+        }
+        // EOF (or the bounded trailing grace) is the only point where a
+        // genuinely incomplete final character may be emitted lossily.
+        if !pending.is_empty() {
+            let tail: Vec<_> = pending.drain(..).collect();
+            transcript.lock().await.push_chunk(tail.clone());
+            if emitted_deltas < MAX_EXEC_OUTPUT_DELTAS_PER_CALL {
+                session_ref
+                    .send_event(
+                        turn_ref.as_ref(),
+                        EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+                            call_id: call_id.clone(),
+                            stream: ExecOutputStream::Stdout,
+                            chunk: tail,
+                        }),
+                    )
+                    .await;
             }
         }
         output_drained.notify_one();
@@ -387,6 +415,7 @@ fn split_valid_utf8_prefix_with_max(
     let max_len = buffer.len().min(max_bytes);
     let split = match std::str::from_utf8(&buffer.make_contiguous()[..max_len]) {
         Ok(_) => max_len,
+        Err(error) if error.valid_up_to() == 0 && error.error_len().is_none() => return None,
         Err(error) => error.valid_up_to().max(1),
     };
     Some(buffer.drain(..split).collect())

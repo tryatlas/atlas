@@ -13,26 +13,130 @@ use std::process::ChildStdin;
 use std::process::ChildStdout;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::PoisonError;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 const POWERSHELL_PARSER_SCRIPT: &str = include_str!("powershell_parser.ps1");
 
-/// Cache one long-lived parser process per executable path so repeated safety checks reuse
-/// PowerShell startup work while still consulting the real parser every time.
-///
-/// We keep the cache behind one mutex because each child process speaks a simple
-/// request/response protocol over a single stdin/stdout pair, so callers targeting the same
-/// executable must serialize access anyway.
+/// Cache one worker per executable. Each owns its parser's blocking pipes, so
+/// a stalled executable cannot block another parser or hold the global cache.
+/// Call this synchronous API from a blocking thread.
 pub(super) fn parse_with_powershell_ast(executable: &str, script: &str) -> PowershellParseOutcome {
-    static PARSER_PROCESSES: LazyLock<Mutex<HashMap<String, PowershellParserProcess>>> =
+    static WORKERS: LazyLock<Mutex<HashMap<String, Arc<ParserWorker>>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
+    let worker = {
+        let mut workers = WORKERS.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(worker) = workers.get(executable) {
+            Arc::clone(worker)
+        } else {
+            let Ok(worker) = ParserWorker::spawn(executable.to_string()) else {
+                return PowershellParseOutcome::Failed;
+            };
+            workers.insert(executable.to_string(), Arc::clone(&worker));
+            worker
+        }
+    };
+    worker.parse(script, Duration::from_secs(5))
+}
 
-    let mut parser_processes = PARSER_PROCESSES
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    parse_with_cached_process(&mut parser_processes, executable, script)
+struct ParseRequest {
+    script: String,
+    deadline: Instant,
+    reply: mpsc::SyncSender<PowershellParseOutcome>,
+}
+
+struct ParserWorker {
+    requests: mpsc::SyncSender<ParseRequest>,
+    current_child: Arc<Mutex<Option<Arc<Mutex<Child>>>>>,
+}
+
+impl ParserWorker {
+    fn spawn(executable: String) -> std::io::Result<Arc<Self>> {
+        let (requests, receiver) = mpsc::sync_channel::<ParseRequest>(1);
+        let current_child = Arc::new(Mutex::new(None));
+        let child_for_worker = Arc::clone(&current_child);
+        std::thread::Builder::new()
+            .name("powershell-safety-parser".to_string())
+            .spawn(move || {
+                let mut parser: Option<PowershellParserProcess> = None;
+                for request in receiver {
+                    let mut outcome = PowershellParseOutcome::Failed;
+                    for _ in 0..=1 {
+                        if Instant::now() >= request.deadline {
+                            break;
+                        }
+                        if parser.is_none() {
+                            let Ok(process) = PowershellParserProcess::spawn(&executable) else {
+                                break;
+                            };
+                            *child_for_worker
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner) =
+                                Some(Arc::clone(&process.child));
+                            parser = Some(process);
+                        }
+                        if Instant::now() >= request.deadline {
+                            parser.take();
+                            *child_for_worker
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner) = None;
+                            break;
+                        }
+                        match parser
+                            .as_mut()
+                            .expect("parser was created")
+                            .parse(&request.script)
+                        {
+                            Ok(parsed) => {
+                                outcome = parsed;
+                                break;
+                            }
+                            Err(_) => {
+                                parser.take();
+                                *child_for_worker
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner) = None;
+                            }
+                        }
+                    }
+                    let _ = request.reply.send(outcome);
+                }
+            })?;
+        Ok(Arc::new(Self {
+            requests,
+            current_child,
+        }))
+    }
+
+    fn parse(&self, script: &str, timeout: Duration) -> PowershellParseOutcome {
+        let (reply, response) = mpsc::sync_channel(1);
+        let request = ParseRequest {
+            script: script.to_string(),
+            deadline: Instant::now() + timeout,
+            reply,
+        };
+        if self.requests.try_send(request).is_err() {
+            return PowershellParseOutcome::Failed;
+        }
+        match response.recv_timeout(timeout) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                let child = self
+                    .current_child
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                if let Some(child) = child {
+                    kill_child(&mut child.lock().unwrap_or_else(PoisonError::into_inner));
+                }
+                PowershellParseOutcome::Failed
+            }
+        }
+    }
 }
 
 pub(crate) fn try_parse_powershell_ast_commands(
@@ -52,43 +156,6 @@ pub(super) enum PowershellParseOutcome {
     Failed,
 }
 
-fn parse_with_cached_process(
-    parser_processes: &mut HashMap<String, PowershellParserProcess>,
-    executable: &str,
-    script: &str,
-) -> PowershellParseOutcome {
-    // `powershell.exe` and `pwsh.exe` do not accept the same language surface, so each
-    // executable keeps its own parser process and request stream.
-    let parser_key = executable.to_string();
-    for attempt in 0..=1 {
-        if !parser_processes.contains_key(&parser_key) {
-            match PowershellParserProcess::spawn(executable) {
-                Ok(process) => {
-                    parser_processes.insert(parser_key.clone(), process);
-                }
-                Err(_) => return PowershellParseOutcome::Failed,
-            }
-        }
-
-        let Some(parser_process) = parser_processes.get_mut(&parser_key) else {
-            return PowershellParseOutcome::Failed;
-        };
-        let parse_result = parser_process.parse(script);
-        match parse_result {
-            Ok(outcome) => return outcome,
-            Err(_) if attempt == 0 => {
-                // The common failure mode here is that a previously cached child exited or its
-                // stdio stream became unusable between requests. Drop that process and retry once
-                // with a fresh child before giving up.
-                parser_processes.remove(&parser_key);
-            }
-            Err(_) => return PowershellParseOutcome::Failed,
-        }
-    }
-
-    PowershellParseOutcome::Failed
-}
-
 fn encode_powershell_base64(script: &str) -> String {
     let mut utf16 = Vec::with_capacity(script.len() * 2);
     for unit in script.encode_utf16() {
@@ -104,7 +171,7 @@ fn encoded_parser_script() -> &'static str {
 }
 
 struct PowershellParserProcess {
-    child: Child,
+    child: Arc<Mutex<Child>>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     // Request ids are monotonic within one child process so the caller can detect protocol
@@ -116,6 +183,8 @@ impl PowershellParserProcess {
     fn spawn(executable: &str) -> std::io::Result<Self> {
         let mut command = Command::new(executable);
         command
+            .env_clear()
+            .envs(atlas_engine_protocol::shell_environment::host_environment())
             .args([
                 "-NoLogo",
                 "-NoProfile",
@@ -150,7 +219,7 @@ impl PowershellParserProcess {
             }
         };
         Ok(Self {
-            child,
+            child: Arc::new(Mutex::new(child)),
             stdin,
             stdout,
             next_request_id: 0,
@@ -196,7 +265,7 @@ impl PowershellParserProcess {
 
 impl Drop for PowershellParserProcess {
     fn drop(&mut self) {
-        kill_child(&mut self.child);
+        kill_child(&mut self.child.lock().unwrap_or_else(PoisonError::into_inner));
     }
 }
 
@@ -272,6 +341,35 @@ impl PowershellParserResponse {
 fn kill_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn a_stalled_parser_has_a_deadline_and_does_not_block_another_executable() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::temp_dir().join(format!("atlas-parser-stall-{}.sh", std::process::id()));
+    let mut script = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    script.write_all(b"#!/bin/sh\nexec sleep 60\n").unwrap();
+    script
+        .set_permissions(std::fs::Permissions::from_mode(0o700))
+        .unwrap();
+    drop(script);
+    let worker = ParserWorker::spawn(path.to_str().unwrap().to_string()).unwrap();
+    let started = Instant::now();
+    assert_eq!(
+        worker.parse("Get-Content file", Duration::from_millis(100)),
+        PowershellParseOutcome::Failed
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(
+        parse_with_powershell_ast("/does/not/exist/powershell", "ignored"),
+        PowershellParseOutcome::Failed
+    );
+    std::fs::remove_file(path).unwrap();
 }
 
 #[cfg(all(test, windows))]

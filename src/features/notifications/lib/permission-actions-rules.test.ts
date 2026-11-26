@@ -80,7 +80,7 @@ describe("permissionBannerActions", () => {
 
   it("does not answer plans, questions or outward actions from a banner", () => {
     expect(bannerAnswerable({ kind: "execute", rawInput: { command: "ls" } })).toBe(true);
-    expect(bannerAnswerable({ rawInput: { plan: "1. do it" } })).toBe(false);
+    expect(bannerAnswerable({ kind: "switch_mode", rawInput: { plan: "1. do it" } })).toBe(false);
     expect(bannerAnswerable({ rawInput: { questions: [{ question: "q", options: [] }] } })).toBe(
       false,
     );

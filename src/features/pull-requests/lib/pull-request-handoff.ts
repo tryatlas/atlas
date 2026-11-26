@@ -232,8 +232,15 @@ export function hasFindings(
   if (checks.some((check) => check.status === "failure" || check.status === "cancelled")) {
     return true;
   }
-  return (activity?.reviewThreads ?? []).some(
-    (thread) => !thread.isResolved && thread.comments.some((c) => c.body.trim().length > 0),
+  return (
+    (activity?.comments ?? []).some(
+      (comment) =>
+        (comment.kind === "review" || comment.kind === "review-comment") &&
+        comment.body.trim().length > 0,
+    ) ||
+    (activity?.reviewThreads ?? []).some(
+      (thread) => !thread.isResolved && thread.comments.some((c) => c.body.trim().length > 0),
+    )
   );
 }
 

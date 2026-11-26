@@ -74,17 +74,26 @@ export function useTranscriptJumps({
   //    list, so the projection
   //    we hold is the OLD one and the index is not in it yet. The index is
   //    parked in `pendingJumpRef` and retried when the projection changes.
-  const pendingJumpRef = useRef<number | null>(null);
+  //
+  // A jump may name the row it is for (`rowId`, from a reveal that found it).
+  // It lands there, not on its turn's first row: a pin or a comment on an
+  // answer mid-turn is the answer, and a long turn put it off screen.
+  const pendingJumpRef = useRef<{ messageIndex: number; rowId?: string } | null>(null);
   const [, setJumpTick] = useState(0);
   const projectionRef = useRef(projection);
   projectionRef.current = projection;
 
   const tryJump = useCallback(() => {
-    const messageIndex = pendingJumpRef.current;
-    if (messageIndex === null) return;
+    const pending = pendingJumpRef.current;
+    if (pending === null) return;
     const proj = projectionRef.current;
-    const turn = proj.turns.find((t) => t.messageIndex === messageIndex);
-    const rowId = turn ? proj.rows[turn.rowStart]?.id : undefined;
+    const turn = proj.turns.find((t) => t.messageIndex === pending.messageIndex);
+    const rowId =
+      pending.rowId && proj.rows.some((r) => r.id === pending.rowId)
+        ? pending.rowId
+        : turn
+          ? proj.rows[turn.rowStart]?.id
+          : undefined;
     if (!rowId) return;
     const target = rowsRef.current.findIndex((r) => r.id === rowId);
     if (target < 0) return;
@@ -98,8 +107,8 @@ export function useTranscriptJumps({
   }, [reveal]);
 
   const scrollToMessage = useCallback(
-    (messageIndex: number) => {
-      pendingJumpRef.current = messageIndex;
+    (messageIndex: number, rowId?: string) => {
+      pendingJumpRef.current = { messageIndex, rowId };
       tryJump();
     },
     [tryJump],
@@ -134,7 +143,7 @@ export function useTranscriptJumps({
     }
     pendingRevealRef.current = null;
     pendingHighlightRef.current = step.kind === "shown" ? [step.rowId] : pending.highlight;
-    scrollToMessage(pending.index);
+    scrollToMessage(pending.index, step.kind === "shown" ? step.rowId : undefined);
   }, [scrollToMessage]);
   useEffect(() => {
     if (pendingRevealRef.current) continueReveal();

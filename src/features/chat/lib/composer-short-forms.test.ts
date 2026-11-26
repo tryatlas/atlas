@@ -315,7 +315,7 @@ describe("minted mentions belong to a project", () => {
     ]);
   });
 
-  it("a minted path outside the project is not taken as minted", () => {
+  it("preserves an external file picked for this project across rewrites", () => {
     const outside: MentionData = {
       kind: "file",
       id: "/elsewhere/x.ts",
@@ -324,7 +324,7 @@ describe("minted mentions belong to a project", () => {
     };
     rememberMention(pickedChip(outside), PROJECT);
     const { editor } = composer("@file:/elsewhere/x.ts");
-    expect(raw(editor)).toEqual([outside]);
+    expect(raw(editor)).toEqual([{ ...outside, picked: true }]);
   });
 
   it("a minted path inside the project is", () => {

@@ -1,3 +1,4 @@
+import { isMac } from "@/lib/platform";
 /**
  * The action registry — the single source of truth for every rebindable
  * shortcut: its stable id, title, category, default chord(s) and the focus
@@ -421,7 +422,7 @@ export const ACTIONS = [
     title: "Close terminal tab",
     category: "Terminal",
     when: "terminalFocus",
-    defaults: ["cmd+w"],
+    defaults: isMac ? ["cmd+w"] : ["cmd+shift+w"],
   },
   {
     id: "terminal.splitDown",
@@ -430,14 +431,14 @@ export const ACTIONS = [
     when: "terminalFocus",
     // Terminals split down only; ⌘D, the split key everywhere else, splits
     // down too rather than doing nothing.
-    defaults: ["cmd+d", "cmd+shift+d"],
+    defaults: isMac ? ["cmd+d", "cmd+shift+d"] : ["cmd+shift+d"],
   },
   {
     id: "terminal.closePane",
     title: "Close terminal pane",
     category: "Terminal",
     when: "terminalFocus",
-    defaults: ["cmd+shift+w"],
+    defaults: isMac ? ["cmd+shift+w"] : ["cmd+alt+shift+w"],
   },
   {
     id: "terminal.focusPaneLeft",
@@ -493,7 +494,7 @@ export const ACTIONS = [
     title: "Find in terminal",
     category: "Terminal",
     when: "terminalFocus",
-    defaults: ["cmd+f"],
+    defaults: isMac ? ["cmd+f"] : ["cmd+shift+f"],
   },
   // ── File ──
   {

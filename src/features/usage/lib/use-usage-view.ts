@@ -10,10 +10,11 @@ import type {
   Metric,
   Metrics,
   SessionRow,
+  SessionIdentity,
   TableTab,
   UsageDashboard,
 } from "../types";
-import { previousRange, resolveRange, type ResolvedRange } from "./date-range";
+import { dayKey, previousRange, resolveRange, type ResolvedRange } from "./date-range";
 import {
   allDaily,
   applyFacets,
@@ -61,6 +62,7 @@ export interface UsageView {
   totals: Metrics;
   prevTotals: Metrics | null;
   sessions: SessionRow[];
+  sessionIdentities: SessionIdentity[];
   sessionCount: number;
   /** Distinct sessions in the previous period; `null` when there is none to compare with. */
   prevSessionCount: number | null;
@@ -124,7 +126,8 @@ export function useUsageView(): UsageView {
   const { seriesColor, otherColor } = useSeriesPalette();
   const resolveAgent = useAgentMetaResolver();
 
-  const resolved = useMemo(() => resolveRange(range), [range]);
+  const today = dayKey(new Date());
+  const resolved = useMemo(() => resolveRange(range, today), [range, today]);
   const prev = useMemo(() => previousRange(resolved), [resolved]);
   const all = useMemo(() => (data ? allDaily(data) : EMPTY), [data]);
   const inRange = useMemo(() => rowsInRange(all, resolved), [all, resolved]);
@@ -143,7 +146,9 @@ export function useUsageView(): UsageView {
   const prevSessionCount = useMemo(
     () =>
       data && prev
-        ? distinctSessions(applyFacets(sessionsInRange(data.sessions, prev), facets))
+        ? distinctSessions(
+            applyFacets(sessionsInRange(data.sessionIdentities ?? data.sessions, prev), facets),
+          )
         : null,
     [data, prev, facets],
   );
@@ -151,7 +156,14 @@ export function useUsageView(): UsageView {
     () => filterSessions(facetedSessions, search, data, resolveAgent),
     [facetedSessions, search, data, resolveAgent],
   );
-  const sessionCount = useMemo(() => distinctSessions(facetedSessions), [facetedSessions]);
+  const sessionIdentities = useMemo(
+    () =>
+      data
+        ? applyFacets(sessionsInRange(data.sessionIdentities ?? data.sessions, resolved), facets)
+        : NO_SESSIONS,
+    [data, resolved, facets],
+  );
+  const sessionCount = useMemo(() => distinctSessions(sessionIdentities), [sessionIdentities]);
 
   // Range-filtered but NOT facet-filtered, so picking one value never hides the others.
   const facetOptions = useMemo(
@@ -172,8 +184,8 @@ export function useUsageView(): UsageView {
 
   const days = useMemo(() => dailyMetrics(rows, resolved), [rows, resolved]);
   const sessionDays = useMemo(
-    () => sessionsPerDay(facetedSessions, resolved),
-    [facetedSessions, resolved],
+    () => sessionsPerDay(sessionIdentities, resolved),
+    [sessionIdentities, resolved],
   );
 
   const insightList = useMemo(
@@ -211,6 +223,7 @@ export function useUsageView(): UsageView {
     totals,
     prevTotals,
     sessions,
+    sessionIdentities,
     sessionCount,
     prevSessionCount,
     facetOptions,

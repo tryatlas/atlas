@@ -79,7 +79,43 @@ pub const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 /// experiences as a hang.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
+
+#[derive(Default)]
+struct AccountScope {
+    initialized: bool,
+    account_id: Option<String>,
+    epoch: u64,
+    written: std::collections::HashMap<PathBuf, u64>,
+}
+static ACCOUNT_SCOPE: std::sync::LazyLock<std::sync::Mutex<AccountScope>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(AccountScope::default()));
+
+/// Set the current identity and invalidate entitlements after an auth change.
+/// The first startup notification preserves same-account offline caches; every
+/// later notification fences in-flight fetches and forces an entitlement read.
+pub fn invalidate_catalogue(account_id: Option<String>) {
+    let mut scope = ACCOUNT_SCOPE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if scope.initialized {
+        scope.epoch = scope.epoch.wrapping_add(1);
+    }
+    scope.initialized = true;
+    scope.account_id = account_id;
+    scope.written.clear();
+}
+
+fn account_scope() -> (Option<String>, u64) {
+    let scope = ACCOUNT_SCOPE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    (scope.account_id.clone(), scope.epoch)
+}
+
+fn scope_changed(expected: &(Option<String>, u64)) -> bool {
+    account_scope() != *expected
+}
 
 /// One row of `GET /v1/catalogue`, as the gateway sends it.
 ///
@@ -152,6 +188,8 @@ pub struct GatewayCatalogue {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogueCache {
     pub version: u32,
+    #[serde(default)]
+    pub account_id: Option<String>,
     /// Unix seconds.
     pub fetched_at: u64,
     /// The `Atlas-Org` the rows are entitled for. `None` is personal.
@@ -164,6 +202,7 @@ impl CatalogueCache {
     pub fn new(catalogue: GatewayCatalogue, org: Option<String>, fetched_at: u64) -> Self {
         Self {
             version: CACHE_VERSION,
+            account_id: account_scope().0,
             fetched_at,
             org,
             has_grant: catalogue.has_grant,
@@ -338,13 +377,30 @@ pub async fn load_cache(home: &Path) -> Option<CatalogueCache> {
 /// launch to trip on; `load_cache` would treat it as absent, which is
 /// survivable, but a stale-but-whole cache is strictly better than none.
 pub async fn write_cache(home: &Path, cache: &CatalogueCache) -> Result<()> {
+    write_cache_for_scope(home, cache, account_scope()).await
+}
+
+async fn write_cache_for_scope(
+    home: &Path,
+    cache: &CatalogueCache,
+    expected: (Option<String>, u64),
+) -> Result<()> {
     let path = cache_path(home);
     let body = serde_json::to_vec_pretty(cache).context("serialising the model catalogue cache")?;
-    let target = path.clone();
-    tokio::task::spawn_blocking(move || atlas_fs::replace_file(target, body))
-        .await
-        .context("the model catalogue cache write did not finish")?
-        .with_context(|| format!("writing {}", path.display()))
+    tokio::task::spawn_blocking(move || {
+        let mut scope = ACCOUNT_SCOPE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        anyhow::ensure!(
+            (scope.account_id.clone(), scope.epoch) == expected,
+            "account changed while refreshing models"
+        );
+        atlas_fs::replace_file(&path, body)?;
+        scope.written.insert(path, expected.1);
+        Ok(())
+    })
+    .await
+    .context("the model catalogue cache write did not finish")?
 }
 
 /// A cache is fresh when it is young enough AND was fetched for this org.
@@ -430,8 +486,17 @@ pub async fn resolve(
     clock: &dyn Clock,
     force: bool,
 ) -> std::result::Result<Resolved, CatalogueUnavailable> {
+    let expected = account_scope();
     let org = fetcher.org();
-    let cached = load_cache(home).await;
+    let cached = load_cache(home).await.filter(|cache| {
+        let scope = ACCOUNT_SCOPE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.account_id == expected.0
+            && scope.account_id == expected.0
+            && scope.epoch == expected.1
+            && (scope.epoch == 0 || scope.written.get(&cache_path(home)) == Some(&scope.epoch))
+    });
     if !force {
         if let Some(cache) = cached.as_ref() {
             if is_fresh(cache, org.as_deref(), clock.now_unix()) {
@@ -441,16 +506,33 @@ pub async fn resolve(
     }
     match fetcher.fetch().await {
         Ok(catalogue) => {
+            if scope_changed(&expected) {
+                return Err(CatalogueUnavailable {
+                    error: Some(FetchError::NoToken(
+                        "account changed while refreshing models".into(),
+                    )),
+                });
+            }
             let cache = CatalogueCache::new(catalogue, org, clock.now_unix());
-            if let Err(err) = write_cache(home, &cache).await {
+            if let Err(err) = write_cache_for_scope(home, &cache, expected.clone()).await {
                 // Not fatal: the list is in hand and the next launch will
                 // fetch again. Say so, because a cache that never writes is
                 // a launch that always waits on the network.
                 tracing::warn!(%err, "the model catalogue could not be cached");
             }
+            if scope_changed(&expected) {
+                return Err(CatalogueUnavailable {
+                    error: Some(FetchError::NoToken(
+                        "account changed while refreshing models".into(),
+                    )),
+                });
+            }
             Ok(Resolved::Fetched(cache))
         }
         Err(error) => {
+            if scope_changed(&expected) {
+                return Err(CatalogueUnavailable { error: Some(error) });
+            }
             // Same org only. The previous org's list is not a fallback for
             // this one — it is a list of models this org may not be allowed
             // to run.
@@ -475,11 +557,22 @@ pub async fn refresh_now(
     fetcher: &dyn CatalogueFetcher,
     clock: &dyn Clock,
 ) -> std::result::Result<CatalogueCache, FetchError> {
+    let expected = account_scope();
     let org = fetcher.org();
     let catalogue = fetcher.fetch().await?;
+    if scope_changed(&expected) {
+        return Err(FetchError::NoToken(
+            "account changed while refreshing models".into(),
+        ));
+    }
     let cache = CatalogueCache::new(catalogue, org, clock.now_unix());
-    if let Err(err) = write_cache(home, &cache).await {
+    if let Err(err) = write_cache_for_scope(home, &cache, expected.clone()).await {
         tracing::warn!(%err, "the refreshed model catalogue could not be cached");
+    }
+    if scope_changed(&expected) {
+        return Err(FetchError::NoToken(
+            "account changed while refreshing models".into(),
+        ));
     }
     Ok(cache)
 }
@@ -590,6 +683,9 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    // Serialize access to the process-wide account scope across async tests.
+    static SCOPE_TESTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
     struct FakeClock(u64);
     impl Clock for FakeClock {
         fn now_unix(&self) -> u64 {
@@ -673,6 +769,75 @@ mod tests {
     }
 
     // ── the wire ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn another_accounts_cached_entitlements_are_not_an_offline_fallback() {
+        let _scope = SCOPE_TESTS.acquire().await.unwrap();
+        let home = tempdir();
+        invalidate_catalogue(Some("account-a".to_string()));
+        let cache = cache_with(vec![row("account-a-model", true)], Some("org"), 1_000);
+        write_cache(home.path(), &cache).await.unwrap();
+        invalidate_catalogue(Some("account-b".to_string()));
+        let offline =
+            FakeFetcher::failing(FetchError::Transport("offline".to_string())).for_org("org");
+        assert!(resolve(home.path(), &offline, &FakeClock(1_001), false)
+            .await
+            .is_err());
+        let fresh = FakeFetcher::ok(vec![row("account-b-model", true)]).for_org("org");
+        let resolved = resolve(home.path(), &fresh, &FakeClock(1_001), false)
+            .await
+            .unwrap();
+        assert_eq!(resolved.cache().account_id.as_deref(), Some("account-b"));
+        assert_eq!(resolved.cache().rows[0].id, "account-b-model");
+        invalidate_catalogue(Some("account-b".to_string()));
+        assert!(
+            resolve(home.path(), &offline, &FakeClock(1_002), false)
+                .await
+                .is_err(),
+            "changed entitlements cannot reuse the old account answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_catalogue_cannot_write_after_identity_changes() {
+        let _scope = SCOPE_TESTS.acquire().await.unwrap();
+        struct Delayed {
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        impl CatalogueFetcher for Delayed {
+            fn fetch(&self) -> BoxFuture<'_, std::result::Result<GatewayCatalogue, FetchError>> {
+                async move {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                    Ok(GatewayCatalogue {
+                        has_grant: true,
+                        rows: vec![row("old-model", true)],
+                    })
+                }
+                .boxed()
+            }
+            fn org(&self) -> Option<String> {
+                None
+            }
+        }
+        let home = tempdir();
+        let fetcher = Arc::new(Delayed {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        invalidate_catalogue(Some("old-account".to_string()));
+        let resolving = tokio::spawn({
+            let home = home.path().to_path_buf();
+            let fetcher = fetcher.clone();
+            async move { resolve(&home, fetcher.as_ref(), &FakeClock(1_000), false).await }
+        });
+        fetcher.entered.notified().await;
+        invalidate_catalogue(Some("new-account".to_string()));
+        fetcher.release.notify_one();
+        assert!(resolving.await.unwrap().is_err());
+        assert!(load_cache(home.path()).await.is_none());
+    }
 
     #[test]
     fn the_gateways_answer_parses_with_only_the_fields_it_sends_today() {
@@ -812,6 +977,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_fresh_cache_is_used_without_asking_the_gateway() {
+        let _scope = SCOPE_TESTS.acquire().await.unwrap();
         let home = tempdir();
         let cache = cache_with(vec![row("a", true)], None, 1_000);
         write_cache(home.path(), &cache).await.expect("write");
@@ -827,6 +993,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stale_cache_is_refetched_and_overwritten() {
+        let _scope = SCOPE_TESTS.acquire().await.unwrap();
         let home = tempdir();
         let cache = cache_with(vec![row("a", true)], None, 1_000);
         write_cache(home.path(), &cache).await.expect("write");
@@ -849,6 +1016,7 @@ mod tests {
 
     #[tokio::test]
     async fn force_ignores_freshness_but_keeps_the_stale_fallback() {
+        let _scope = SCOPE_TESTS.acquire().await.unwrap();
         let home = tempdir();
         write_cache(home.path(), &cache_with(vec![row("a", true)], None, 1_000))
             .await
@@ -871,6 +1039,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_fetch_falls_back_to_a_stale_cache_of_any_age() {
+        let _scope = SCOPE_TESTS.acquire().await.unwrap();
         let home = tempdir();
         write_cache(home.path(), &cache_with(vec![row("a", true)], None, 1))
             .await
@@ -888,6 +1057,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_cache_and_no_gateway_is_a_refusal_not_a_list() {
+        let _scope = SCOPE_TESTS.acquire().await.unwrap();
         // Decision 1: nothing authored here stands in. The message is the one
         // the user reads.
         let home = tempdir();
@@ -904,6 +1074,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_credential_failure_reads_as_one_all_the_way_up() {
+        let _scope = SCOPE_TESTS.acquire().await.unwrap();
         // The host classifies on the message text; a 401 must route to
         // sign-in rather than to a generic toast.
         let home = tempdir();
@@ -923,6 +1094,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cache_for_another_org_counts_as_missing() {
+        let _scope = SCOPE_TESTS.acquire().await.unwrap();
         let home = tempdir();
         write_cache(
             home.path(),
@@ -948,6 +1120,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_corrupt_cache_file_is_treated_as_absent() {
+        let _scope = SCOPE_TESTS.acquire().await.unwrap();
         let home = tempdir();
         std::fs::write(home.path().join(CACHE_FILE), b"{not json").expect("write garbage");
         assert!(load_cache(home.path()).await.is_none());
@@ -961,6 +1134,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_cache_is_written_whole_or_not_at_all() {
+        let _scope = SCOPE_TESTS.acquire().await.unwrap();
         let home = tempdir();
         write_cache(home.path(), &cache_with(vec![row("a", true)], None, 5))
             .await
@@ -979,6 +1153,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_now_always_asks_and_rewrites() {
+        let _scope = SCOPE_TESTS.acquire().await.unwrap();
         let home = tempdir();
         write_cache(home.path(), &cache_with(vec![row("a", true)], None, 1_000))
             .await
@@ -1168,6 +1343,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_projection_reloads_as_the_record_the_engine_reads() {
+        let _scope = SCOPE_TESTS.acquire().await.unwrap();
         // Round-trips through disk, which is the path the engine takes.
         let home = tempdir();
         let cache = cache_with(vec![row("a", true)], None, 0);

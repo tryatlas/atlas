@@ -4,6 +4,8 @@ import { KnowledgeTree, type KnowledgeTreeHandle } from "./knowledge-tree";
 import { KnowledgeSidebarView } from "./views/knowledge-sidebar-view";
 import { deleteClonedRepo, listClonedRepos, type KnowledgeClonedRepo } from "../lib/knowledge-api";
 import { onWindowEvent } from "@/lib/window-events";
+import { confirm } from "@/lib/confirm";
+import { toast } from "sonner";
 
 interface KnowledgeSidebarProps {
   projectPath: string;
@@ -87,7 +89,21 @@ export function KnowledgeSidebar({
   }, [loadRepos]);
 
   const handleDeleteRepo = async (name: string) => {
-    await deleteClonedRepo(projectPath, name).catch(() => {});
+    if (
+      !(await confirm({
+        title: "Delete cloned repository?",
+        body: `Permanently delete the local clone “${name}”, including any changes in it?`,
+        confirmLabel: "Delete clone",
+        destructive: true,
+      }))
+    )
+      return;
+    try {
+      await deleteClonedRepo(projectPath, name);
+    } catch (error) {
+      toast.error(`Repository could not be deleted: ${String(error)}`);
+      return;
+    }
     logEvent({
       source: "github",
       kind: "repo-delete",

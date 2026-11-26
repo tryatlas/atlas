@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 //! Cmd+F finder for the Knowledge Base — a simple TITLE-only search across all
 //! entries (lowercased query + lowercased title, plain substring match — no
 //! content scan, which produced noisy/inaccurate hits). A floating bar pinned
@@ -75,7 +76,7 @@ export function KnowledgeFinder({
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       setActive((a) => Math.max(a - 1, 0));
-    } else if (e.key === "Enter") {
+    } else if (e.key === "Enter" && !isComposingKey(e)) {
       e.preventDefault();
       choose(active);
     }

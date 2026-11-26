@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 import { useState, type ReactNode } from "react";
 import {
   ChevronRight,
@@ -138,7 +139,7 @@ export function KnowledgeSidebarView({
             aria-label="New folder name"
             onChange={(e) => folderInput.onChange(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") folderInput.onCommit();
+              if (e.key === "Enter" && !isComposingKey(e)) folderInput.onCommit();
               if (e.key === "Escape") folderInput.onCancel();
             }}
             onBlur={() => {

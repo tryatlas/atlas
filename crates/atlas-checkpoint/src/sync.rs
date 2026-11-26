@@ -262,7 +262,7 @@ pub fn drain(store: &Store, config: &SyncConfig<'_>) -> Result<DrainOutcome> {
                                 "local blob missing; row marked failed"
                             );
                             store.record_attempt(artifact.row_id())?;
-                            store.mark_failed(artifact.row_id())?;
+                            store.mark_artifact_failed(artifact)?;
                             outcome.failed += 1;
                             deferred.insert(artifact.row_id().to_string());
                             break 'blobs;
@@ -276,7 +276,7 @@ pub fn drain(store: &Store, config: &SyncConfig<'_>) -> Result<DrainOutcome> {
                                 "blob rejected as too large; row marked failed"
                             );
                             store.record_attempt(artifact.row_id())?;
-                            store.mark_failed(artifact.row_id())?;
+                            store.mark_artifact_failed(artifact)?;
                             outcome.failed += 1;
                             deferred.insert(artifact.row_id().to_string());
                             break 'blobs;
@@ -340,18 +340,18 @@ pub fn drain(store: &Store, config: &SyncConfig<'_>) -> Result<DrainOutcome> {
                 for artifact in &ready {
                     match results.iter().find(|r| r.row_id == artifact.row_id()) {
                         Some(r) if r.accepted => {
-                            store.mark_sent(artifact.row_id())?;
+                            store.mark_sent(artifact)?;
                             outcome.sent += 1;
                             progressed = true;
                         }
                         Some(_) => {
-                            store.mark_failed(artifact.row_id())?;
+                            store.mark_artifact_failed(artifact)?;
                             outcome.failed += 1;
                             outcome.orphaned_blobs += artifact.blob_refs().len();
                             progressed = true;
                         }
                         None if whole_batch => {
-                            store.mark_sent(artifact.row_id())?;
+                            store.mark_sent(artifact)?;
                             outcome.sent += 1;
                             progressed = true;
                         }

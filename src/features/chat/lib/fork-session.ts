@@ -38,6 +38,9 @@ export function forkSessionToNewTab(tabId: string): void {
           useAppStore.getState().currentProject?.path ||
           "",
         agentType: sess.agentType,
+        // Never the source tab, idle or not: reusing it replaced the
+        // conversation that was branched from.
+        newTab: true,
       });
     } catch (err) {
       toast.error(errInfo(err).message);

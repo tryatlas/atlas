@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 import type { ReactNode } from "react";
 import {
   Check,
@@ -169,7 +170,7 @@ export function OrgMenuPanelView({
                 value={editName}
                 onChange={(e) => onEditNameChange(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter") onSubmitRename();
+                  if (e.key === "Enter" && !isComposingKey(e)) onSubmitRename();
                   if (e.key === "Escape") onCancelRename();
                 }}
                 onBlur={onSubmitRename}

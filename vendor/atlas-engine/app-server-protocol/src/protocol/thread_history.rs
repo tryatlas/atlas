@@ -1333,23 +1333,27 @@ impl ThreadHistoryBuilder {
         self.finish_current_turn();
 
         let n = usize::try_from(payload.num_turns).unwrap_or(usize::MAX);
-        let removed_turn_ids = if n >= self.turns.len() {
-            self.turns.iter().map(|turn| turn.id.clone()).collect()
-        } else if n == 0 {
-            Vec::new()
+        let keep = if n == 0 {
+            self.turns.len()
         } else {
-            self.turns[self.turns.len() - n..]
+            self.turns
                 .iter()
-                .map(|turn| turn.id.clone())
-                .collect()
+                .enumerate()
+                .rev()
+                .filter(|(_, turn)| {
+                    turn.items
+                        .iter()
+                        .any(|item| matches!(item, ThreadItem::UserMessage { .. }))
+                })
+                .nth(n - 1)
+                .map_or(0, |(index, _)| index)
         };
+        let removed_turn_ids = self.turns[keep..]
+            .iter()
+            .map(|turn| turn.id.clone())
+            .collect();
         self.record_removed_turn_ids(removed_turn_ids);
-
-        if n >= self.turns.len() {
-            self.turns.clear();
-        } else {
-            self.turns.truncate(self.turns.len().saturating_sub(n));
-        }
+        self.turns.truncate(keep);
 
         let item_count: usize = self.turns.iter().map(|t| t.items.len()).sum();
         self.next_item_index = i64::try_from(item_count.saturating_add(1)).unwrap_or(i64::MAX);
@@ -2690,6 +2694,53 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn rollback_counts_user_turns_after_a_standalone_compaction() {
+        let mut items = vec![
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "first".into(),
+                ..Default::default()
+            })),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: "answer".into(),
+                phase: None,
+                memory_citation: None,
+            })),
+        ];
+        items.push(RolloutItem::EventMsg(EventMsg::TurnStarted(
+            TurnStartedEvent {
+                turn_id: "compact".into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            },
+        )));
+        items.push(RolloutItem::Compacted(CompactedItem {
+            message: "summary".into(),
+            replacement_history: None,
+            window_number: None,
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        }));
+        items.push(RolloutItem::EventMsg(EventMsg::TurnComplete(
+            TurnCompleteEvent {
+                turn_id: "compact".into(),
+                started_at: None,
+                last_agent_message: None,
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            },
+        )));
+        items.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            ThreadRolledBackEvent { num_turns: 1 },
+        )));
+        assert!(build_turns_from_rollout_items(&items).is_empty());
     }
 
     #[test]

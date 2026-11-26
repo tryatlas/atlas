@@ -19,7 +19,14 @@
 // stack when pushed (`command-palette.tsx` asks `useAddProjectFlow` for the
 // step on screen).
 
-import { isValidElement, useEffect, useState, type ReactElement, type ReactNode } from "react";
+import {
+  isValidElement,
+  useEffect,
+  useRef,
+  useState,
+  type ReactElement,
+  type ReactNode,
+} from "react";
 import { toast } from "sonner";
 import {
   ArrowLeftToLine,
@@ -43,6 +50,7 @@ import { GithubIcon } from "@/components/brand-marks";
 import { cn } from "@/lib/utils";
 import { isMac } from "@/lib/platform";
 import { useProjectStore } from "@/features/projects/stores/project-store";
+import { useCommandPaletteStore } from "../stores/command-palette-store";
 import { pickAndAddProject } from "@/features/projects/lib/pick-project";
 import {
   projectSources,
@@ -140,6 +148,7 @@ function lastSeparator(path: string): number {
  *  typed after it. A bare drive (`F:`) is that drive's root. */
 export function splitBrowseQuery(query: string): { dir: string; filter: string } {
   if (/^[a-zA-Z]:$/.test(query)) return { dir: `${query}\\`, filter: "" };
+  if (query && !/^(?:~(?:[\\/]|$)|[\\/]|[a-zA-Z]:)/.test(query)) query = `~/${query}`;
   const slash = lastSeparator(query);
   if (slash === -1) return { dir: "~/", filter: query };
   return { dir: query.slice(0, slash + 1), filter: query.slice(slash + 1) };
@@ -203,7 +212,14 @@ export function useAddProjectFlow(input: {
   const [checking, setChecking] = useState(false);
   const [githubPrivate, setGithubPrivate] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
-  const [listing, setListing] = useState<BrowseListing | null>(null);
+  const [listed, setListed] = useState<{ dir: string; value: BrowseListing | null } | null>(null);
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
   // `null` until the first answer, so "none found" is not shown as "finding".
   const [locations, setLocations] = useState<BrowseLocation[] | null>(null);
 
@@ -232,13 +248,15 @@ export function useAddProjectFlow(input: {
 
   // The folder browser lists the folder the field names.
   const browseDir = view === BROWSE_VIEW ? splitBrowseQuery(query).dir : null;
+  const listing = listed?.dir === browseDir ? listed.value : null;
   useEffect(() => {
     if (browseDir === null) return;
+    setListed(null);
     let live = true;
     projectSources
       .browse(browseDir)
-      .then((next) => live && setListing(next))
-      .catch(() => live && setListing(null));
+      .then((next) => live && setListed({ dir: browseDir, value: next }))
+      .catch(() => live && setListed({ dir: browseDir, value: null }));
     return () => {
       live = false;
     };
@@ -267,6 +285,8 @@ export function useAddProjectFlow(input: {
     label: string,
     work: () => Promise<string | { path: string; warning: string | null }>,
   ) => {
+    if (busy) return;
+    const palette = useCommandPaletteStore.getState().ui;
     setBusy(label);
     void work()
       .then(async (result) => {
@@ -274,7 +294,7 @@ export function useAddProjectFlow(input: {
           typeof result === "string" ? { path: result, warning: null } : result;
         await useProjectStore.getState().actions.addProject(path);
         if (warning) toast.warning(warning);
-        onClose();
+        if (alive.current && useCommandPaletteStore.getState().ui === palette) onClose();
       })
       .catch((error: unknown) => {
         toast.error(String(error));
@@ -465,7 +485,14 @@ export function useAddProjectFlow(input: {
       placeholder: "~/",
       emptyMessage: listing ? "No folders here." : "That folder cannot be read.",
       footerActionLabel: "Open",
-      endAddon: <StepAction label="Add" keys={`${MOD} Enter`} onRun={add} />,
+      endAddon: (
+        <StepAction
+          label="Add"
+          keys={`${MOD} Enter`}
+          onRun={add}
+          disabled={busy !== null || !listing}
+        />
+      ),
       footerTrailing: openFolderButton,
       onSubmit: ({ mod }) => {
         if (mod) add();

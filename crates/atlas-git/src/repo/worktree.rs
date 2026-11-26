@@ -55,10 +55,44 @@ impl Repository<'_> {
     /// The notifier is told once the index has been touched, before the
     /// files go, whether or not git succeeded.
     pub fn delete_added(&self, files: &[String]) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let root = std::fs::canonicalize(self.path())
+            .map_err(|e| GitErrorPayload::internal(e.to_string()))?;
+        for file in files {
+            let relative = std::path::Path::new(file);
+            if file.is_empty()
+                || relative
+                    .components()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                || relative.components().next()
+                    == Some(std::path::Component::Normal(std::ffi::OsStr::new(".git")))
+            {
+                return Err(GitErrorPayload::internal(
+                    "Only paths inside the working tree can be deleted",
+                ));
+            }
+            // Remove a selected symlink itself, but never follow an intermediate
+            // directory link to delete somebody else's tree.
+            if let Some(parent) = self.path().join(relative).parent() {
+                match std::fs::canonicalize(parent) {
+                    Ok(parent) if !parent.starts_with(&root) => {
+                        return Err(GitErrorPayload::internal(
+                            "Deletion would escape the working tree",
+                        ));
+                    }
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(GitErrorPayload::internal(e.to_string()));
+                    }
+                    _ => {}
+                }
+            }
+        }
         // Remove from the index if it was staged-new; ignore untracked ones.
         if !files.is_empty() {
             let _ = self
-                .git(&["rm", "-f", "--cached", "--ignore-unmatch"])
+                .git(&["rm", "-r", "-f", "--cached", "--ignore-unmatch"])
                 .pathspecs(files)
                 .run();
             self.changed();
@@ -66,9 +100,23 @@ impl Repository<'_> {
         // Delete the working-tree copies.
         for f in files {
             let abs = self.path().join(f);
-            if abs.exists() {
-                std::fs::remove_file(&abs)
+            // Symlink metadata keeps dangling links removable, and prevents
+            // following a directory link outside the selected tree.
+            match std::fs::symlink_metadata(&abs) {
+                Ok(meta) => {
+                    (if meta.is_dir() {
+                        std::fs::remove_dir_all(&abs)
+                    } else {
+                        std::fs::remove_file(&abs)
+                    })
                     .map_err(|e| GitErrorPayload::internal(format!("Failed to delete {f}: {e}")))?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(GitErrorPayload::internal(format!(
+                        "Failed to inspect {f}: {e}"
+                    )))
+                }
             }
         }
         Ok(())

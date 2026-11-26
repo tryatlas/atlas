@@ -199,26 +199,60 @@ enum ShutdownSignal {
     GracefulOnly,
 }
 
-async fn shutdown_signal() -> IoResult<ShutdownSignal> {
+struct ShutdownSignals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::SignalKind;
-        use tokio::signal::unix::signal;
+    term: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    hangup: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    interrupt: tokio::signal::windows::CtrlC,
+}
 
-        let mut term = signal(SignalKind::terminate())?;
-        let mut hangup = signal(SignalKind::hangup())?;
-        tokio::select! {
-            ctrl_c_result = tokio::signal::ctrl_c() => ctrl_c_result.map(|_| ShutdownSignal::Forceable),
-            _ = term.recv() => Ok(ShutdownSignal::Forceable),
-            _ = hangup.recv() => Ok(ShutdownSignal::GracefulOnly),
+impl ShutdownSignals {
+    fn new() -> IoResult<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                term: signal(SignalKind::terminate())?,
+                interrupt: signal(SignalKind::interrupt())?,
+                hangup: signal(SignalKind::hangup())?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                interrupt: tokio::signal::windows::ctrl_c()?,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Ok(Self {})
         }
     }
 
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c()
-            .await
-            .map(|_| ShutdownSignal::Forceable)
+    async fn recv(&mut self) -> IoResult<ShutdownSignal> {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.interrupt.recv() => Ok(ShutdownSignal::Forceable),
+                _ = self.term.recv() => Ok(ShutdownSignal::Forceable),
+                _ = self.hangup.recv() => Ok(ShutdownSignal::GracefulOnly),
+            }
+        }
+        #[cfg(windows)]
+        {
+            self.interrupt.recv().await;
+            Ok(ShutdownSignal::Forceable)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            tokio::signal::ctrl_c()
+                .await
+                .map(|_| ShutdownSignal::Forceable)
+        }
     }
 }
 
@@ -730,6 +764,9 @@ pub async fn run_main_with_transport_options(
     let single_client_mode = matches!(&transport, AppServerTransport::Stdio);
     let graceful_signal_restart_enabled =
         runtime_options.install_shutdown_signal_handler && !single_client_mode;
+    let mut shutdown_signals = graceful_signal_restart_enabled
+        .then(ShutdownSignals::new)
+        .transpose()?;
     let mut app_server_client_name_rx = None;
 
     match &transport {
@@ -956,7 +993,7 @@ pub async fn run_main_with_transport_options(
                 }
 
                 tokio::select! {
-                    shutdown_signal_result = shutdown_signal(), if graceful_signal_restart_enabled && !shutdown_state.forced() => {
+                    shutdown_signal_result = async { shutdown_signals.as_mut().expect("signal handler enabled").recv().await }, if graceful_signal_restart_enabled && !shutdown_state.forced() => {
                         let signal = match shutdown_signal_result {
                             Ok(signal) => signal,
                             Err(err) => {
@@ -1387,6 +1424,51 @@ fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransp
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_signal_is_retained_between_receive_attempts() {
+        const CHILD_MARKER: &str = "ATLAS_SHUTDOWN_SIGNAL_TEST_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let mut signals = super::ShutdownSignals::new().unwrap();
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(1), signals.recv())
+                        .await
+                        .is_err()
+                );
+                let status = std::process::Command::new("/bin/kill")
+                    .args(["-TERM", &std::process::id().to_string()])
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+                // The processor may be handling a transport event with no live recv future.
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                let signal =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), signals.recv())
+                        .await
+                        .expect("the signal must remain queued while another event is handled")
+                        .unwrap();
+                assert!(matches!(signal, super::ShutdownSignal::Forceable));
+            });
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::shutdown_signal_is_retained_between_receive_attempts",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     use super::LogFormat;
     #[cfg(debug_assertions)]
     use super::loader_overrides_with_test_user_config_file;

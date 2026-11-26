@@ -121,7 +121,11 @@ export function SpaceCursors({ actors }: { actors: ReadonlyMap<string, SpaceActo
         <div
           key={a.id}
           ref={(el) => {
-            const g = glides.current.get(a.id);
+            let g = glides.current.get(a.id);
+            if (!g && a.cursor) {
+              g = { el, current: { ...a.cursor }, target: { ...a.cursor } };
+              glides.current.set(a.id, g);
+            }
             if (g) {
               g.el = el;
               // Position before the first paint — a null transform would

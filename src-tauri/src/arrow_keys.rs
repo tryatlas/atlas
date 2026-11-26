@@ -1,6 +1,6 @@
 //! Arrow keys the webview leaves unhandled must not be typed as text (macOS).
 //!
-//! With tauri's `unstable` feature (on for the browser tab's child webview),
+//! With tauri's `unstable` feature (still on; see `src-tauri/Cargo.toml`),
 //! every webview, the main window's included, is built as a *child*: the
 //! WKWebView sits directly in tao's `TaoView`. An arrow key WebKit does not
 //! use (→ at the end of a field, ← at its start) bubbles up the responder

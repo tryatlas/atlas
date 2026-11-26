@@ -46,12 +46,13 @@ describe("MediaLightboxView", () => {
     expect(onIndexChange.mock.calls.map((c) => c[0])).toEqual([2, 2, 3, 0, 0]);
   });
 
-  it("shows the position and a Save link to the current file", () => {
-    show();
+  it("shows the position and saves through the current file's native action", () => {
+    const onSave = vi.fn();
+    show({ onSave });
     expect(screen.getByText("2 / 4")).toBeTruthy();
     const save = screen.getByRole("button", { name: "Save a copy" });
-    expect(save.getAttribute("href")).toBe("blob:b");
-    expect(save.getAttribute("download")).toBe("b.png");
+    fireEvent.click(save);
+    expect(onSave).toHaveBeenCalledOnce();
   });
 
   it("offers no Save while the file resolves, and says so when it fails", () => {

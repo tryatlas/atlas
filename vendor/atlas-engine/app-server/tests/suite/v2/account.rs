@@ -1106,6 +1106,7 @@ async fn login_account_api_key_succeeds_and_notifies() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "Amazon Bedrock is removed in Atlas: atlas-engine-model-provider builds without its aws feature (see model-provider/Cargo.toml)"]
 async fn login_amazon_bedrock_replaces_primary_auth_and_persists_provider() -> Result<()> {
     let atlas_agent_home = TempDir::new()?;
     create_config_toml(atlas_agent_home.path(), CreateConfigTomlParams::default())?;
@@ -1182,6 +1183,7 @@ async fn login_amazon_bedrock_replaces_primary_auth_and_persists_provider() -> R
 }
 
 #[tokio::test]
+#[ignore = "Amazon Bedrock is removed in Atlas: atlas-engine-model-provider builds without its aws feature (see model-provider/Cargo.toml)"]
 async fn login_amazon_bedrock_rejects_non_bedrock_provider_override_without_changes() -> Result<()>
 {
     let atlas_agent_home = TempDir::new()?;
@@ -1241,6 +1243,7 @@ async fn login_amazon_bedrock_rejects_non_bedrock_provider_override_without_chan
 }
 
 #[tokio::test]
+#[ignore = "Amazon Bedrock is removed in Atlas: atlas-engine-model-provider builds without its aws feature (see model-provider/Cargo.toml)"]
 async fn login_amazon_bedrock_allows_bedrock_provider_override() -> Result<()> {
     let atlas_agent_home = TempDir::new()?;
     create_config_toml(atlas_agent_home.path(), CreateConfigTomlParams::default())?;
@@ -1300,6 +1303,7 @@ async fn login_amazon_bedrock_allows_bedrock_provider_override() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "Amazon Bedrock is removed in Atlas: atlas-engine-model-provider builds without its aws feature (see model-provider/Cargo.toml)"]
 async fn logout_managed_bedrock_restores_default_account() -> Result<()> {
     let atlas_agent_home = TempDir::new()?;
     create_config_toml(atlas_agent_home.path(), CreateConfigTomlParams::default())?;
@@ -1501,6 +1505,7 @@ async fn managed_bedrock_login_requires_experimental_api() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "Amazon Bedrock is removed in Atlas: atlas-engine-model-provider builds without its aws feature (see model-provider/Cargo.toml)"]
 async fn login_managed_bedrock_updates_active_bedrock_account() -> Result<()> {
     let atlas_agent_home = TempDir::new()?;
     create_config_toml(atlas_agent_home.path(), CreateConfigTomlParams::default())?;
@@ -2462,6 +2467,7 @@ async fn get_account_when_auth_not_required() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "Amazon Bedrock is removed in Atlas: atlas-engine-model-provider builds without its aws feature (see model-provider/Cargo.toml)"]
 async fn get_account_with_aws_provider() -> Result<()> {
     let atlas_agent_home = TempDir::new()?;
     create_config_toml(
@@ -2504,6 +2510,7 @@ region = "us-west-2"
 }
 
 #[tokio::test]
+#[ignore = "Amazon Bedrock is removed in Atlas: atlas-engine-model-provider builds without its aws feature (see model-provider/Cargo.toml)"]
 async fn get_account_with_user_managed_bedrock_provider() -> Result<()> {
     let atlas_agent_home = TempDir::new()?;
     create_config_toml(
@@ -2542,6 +2549,7 @@ command = "print-token"
 }
 
 #[tokio::test]
+#[ignore = "Amazon Bedrock is removed in Atlas: atlas-engine-model-provider builds without its aws feature (see model-provider/Cargo.toml)"]
 async fn account_reads_use_startup_config_when_config_reload_fails() -> Result<()> {
     let atlas_agent_home = TempDir::new()?;
     create_config_toml(
@@ -2601,6 +2609,7 @@ region = "us-west-2"
 }
 
 #[tokio::test]
+#[ignore = "Amazon Bedrock is removed in Atlas: atlas-engine-model-provider builds without its aws feature (see model-provider/Cargo.toml)"]
 async fn get_account_with_managed_bedrock_provider() -> Result<()> {
     let atlas_agent_home = TempDir::new()?;
     create_config_toml(

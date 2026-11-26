@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1 as acp;
+use atlas_acp_thread::AgentId as ConnectionAgentId;
 use atlas_acp_thread::{
     AcpThread, AcpThreadEvent, AcpThreadHandle, AgentThreadEntry, ElicitationEntryId, EventStream,
     LoadError, TerminalAppend,
@@ -24,6 +25,9 @@ use crate::project;
 /// `ToolCallId`; the host answers with the former and has to reach the latter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionKey {
+    /// The agent the session belongs to: a session id is unique only within
+    /// its agent (#86).
+    pub agent_id: AgentId,
     pub session_id: acp::SessionId,
     pub tool_call_id: acp::ToolCallId,
 }
@@ -35,6 +39,8 @@ pub struct PermissionKey {
 /// host answers with the former.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElicitationKey {
+    /// See [`PermissionKey::agent_id`].
+    pub agent_id: AgentId,
     pub session_id: acp::SessionId,
     pub entry_id: ElicitationEntryId,
 }
@@ -137,19 +143,36 @@ pub trait ThreadObserver: Send + Sync {
     );
 }
 
+/// A session as the projector files it: ACP scopes a session id to the
+/// connection that minted it, so two agents can both answer `"1"` (#86). Every
+/// table here is keyed by the pair, and a lookup by the bare id answers only
+/// when exactly one agent holds it.
+type SessionScope = (AgentId, acp::SessionId);
+
+/// A pre-registered stream's key: the connection's own agent id (not the
+/// host's handle, which the connection does not know) and the session id.
+type PendingKey = (ConnectionAgentId, acp::SessionId);
+
 pub struct DeltaProjector {
     emitter: Emitter,
     /// Set once, before any session exists. Not a list: there is one history
     /// store, and a second observer would be a second thing to keep correct.
     observer: Mutex<Option<Arc<dyn ThreadObserver>>>,
-    sessions: Mutex<HashMap<acp::SessionId, Arc<SessionSlot>>>,
+    /// Serializes replacement and cleanup without holding the session table
+    /// across an emit: pipeline stages can inspect snapshots while emitting.
+    lifecycle: Mutex<()>,
+    sessions: Mutex<HashMap<SessionScope, Arc<SessionSlot>>>,
     /// Event streams for sessions whose thread does not exist yet.
     ///
     /// `ConnectOptions` asks for a session's sink while `session/new` is still
     /// in flight, so the channel has to exist before the thread does. Buffering
     /// here is what stops the updates that replay history during `session/load`
     /// from being dropped — the same pre-registration the transport does.
-    pending: Mutex<HashMap<acp::SessionId, EventStream<AcpThreadEvent>>>,
+    /// Event streams handed out before their session was registered, by the
+    /// connection's agent and the session id: two agents can mint the same id
+    /// (#86), and a stream filed by the bare id would be taken by the wrong
+    /// session's registration.
+    pending: Mutex<HashMap<PendingKey, EventStream<AcpThreadEvent>>>,
     permissions: Mutex<HashMap<Uuid, PermissionKey>>,
     elicitations: Mutex<HashMap<Uuid, ElicitationKey>>,
 }
@@ -159,6 +182,7 @@ impl DeltaProjector {
         Arc::new(Self {
             emitter: Emitter::new(sink),
             observer: Mutex::new(None),
+            lifecycle: Mutex::new(()),
             sessions: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             permissions: Mutex::new(HashMap::new()),
@@ -178,24 +202,26 @@ impl DeltaProjector {
     /// The sink factory to hand to `ConnectOptions`.
     pub fn thread_events(self: &Arc<Self>) -> ThreadEventSink {
         let this = self.clone();
-        Arc::new(move |session_id: &acp::SessionId| {
-            let (tx, rx) = atlas_acp_thread::event_channel();
-            let mut pending = this
-                .pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // A session whose `session/load` or `session/resume` RPC failed
-            // never reaches `register`, so nothing takes its pre-registered
-            // stream back out and the key stays here for the life of the
-            // process (ATL-225). The thread that held the only sender was
-            // dropped along with the failure, so a stream with no senders left
-            // can never carry another event and is safe to forget. Swept here
-            // rather than on a timer because this is the one place that learns
-            // a new session is being opened.
-            pending.retain(|_, stream| stream.sender_strong_count() > 0);
-            pending.insert(session_id.clone(), rx);
-            tx
-        })
+        Arc::new(
+            move |agent: &ConnectionAgentId, session_id: &acp::SessionId| {
+                let (tx, rx) = atlas_acp_thread::event_channel();
+                let mut pending = this
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // A session whose `session/load` or `session/resume` RPC failed
+                // never reaches `register`, so nothing takes its pre-registered
+                // stream back out and the key stays here for the life of the
+                // process (ATL-225). The thread that held the only sender was
+                // dropped along with the failure, so a stream with no senders left
+                // can never carry another event and is safe to forget. Swept here
+                // rather than on a timer because this is the one place that learns
+                // a new session is being opened.
+                pending.retain(|_, stream| stream.sender_strong_count() > 0);
+                pending.insert((agent.clone(), session_id.clone()), rx);
+                tx
+            },
+        )
     }
 
     /// Start projecting `thread`'s events on a task of its own.
@@ -219,10 +245,8 @@ impl DeltaProjector {
     /// round, and because ending a task on a dead channel is right regardless.
     pub fn attach(self: &Arc<Self>, agent_id: AgentId, thread: AcpThreadHandle) {
         let session_id = lock_thread(&thread).session_id().clone();
-        let Some(events) = self.register(agent_id, thread) else {
-            return;
-        };
-        self.drain(session_id, events);
+        let (events, slot) = self.register_slot(agent_id, thread);
+        self.drain((agent_id, session_id), events, &slot);
     }
 
     /// [`Self::attach`], for a thread that already holds a conversation the
@@ -242,11 +266,9 @@ impl DeltaProjector {
     /// For a new session the thread is empty and this is [`Self::attach`].
     pub fn attach_settled(self: &Arc<Self>, agent_id: AgentId, thread: AcpThreadHandle) {
         let session_id = lock_thread(&thread).session_id().clone();
-        let Some(events) = self.register(agent_id, thread) else {
-            return;
-        };
-        self.adopt(&session_id);
-        self.drain(session_id, events);
+        let (events, slot) = self.register_slot(agent_id, thread);
+        self.adopt_slot(&slot);
+        self.drain((agent_id, session_id), events, &slot);
     }
 
     /// Mirror everything the thread holds now without announcing any of it,
@@ -256,7 +278,14 @@ impl DeltaProjector {
         let Some(slot) = self.session(session_id) else {
             return;
         };
+        self.adopt_slot(&slot);
+    }
+
+    fn adopt_slot(&self, slot: &Arc<SessionSlot>) {
         let _emit = lock(&slot.emit);
+        if !slot.active.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let mut projection = lock(&slot.projection);
         drop(projection.catch_up());
         // A replayed elicitation or permission prompt is history too: nothing
@@ -268,15 +297,33 @@ impl DeltaProjector {
 
     fn drain(
         self: &Arc<Self>,
-        session_id: acp::SessionId,
+        scope: SessionScope,
         mut events: EventStream<AcpThreadEvent>,
+        slot: &Arc<SessionSlot>,
     ) {
         let this = self.clone();
+        let slot = Arc::downgrade(slot);
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
-                this.apply(&session_id, event);
+                let Some(slot) = slot.upgrade() else { break };
+                let projector = this.clone();
+                let id = scope.1.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    projector.apply_slot(&id, event, &slot);
+                })
+                .await
+                {
+                    let session_id = &scope.1;
+                    tracing::warn!(%session_id, %error, "session projection task failed");
+                    break;
+                }
             }
-            this.forget_session(&session_id);
+            if let Some(slot) = slot.upgrade() {
+                let _ = tokio::task::spawn_blocking(move || {
+                    this.forget_scope_if(&scope, Some(&slot));
+                })
+                .await;
+            }
         });
     }
 
@@ -290,33 +337,48 @@ impl DeltaProjector {
         agent_id: AgentId,
         thread: AcpThreadHandle,
     ) -> Option<EventStream<AcpThreadEvent>> {
-        let session_id = lock_thread(&thread).session_id().clone();
-        let Some(events) = self
+        Some(self.register_slot(agent_id, thread).0)
+    }
+
+    fn register_slot(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        thread: AcpThreadHandle,
+    ) -> (EventStream<AcpThreadEvent>, Arc<SessionSlot>) {
+        let (session_id, connection_agent) = {
+            let thread = lock_thread(&thread);
+            (thread.session_id().clone(), thread.connection().agent_id())
+        };
+        let _lifecycle = lock(&self.lifecycle);
+        let events = self
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&session_id)
-        else {
-            // No stream was handed out for this session, so nothing will ever
-            // arrive. Attaching anyway would silently project nothing.
-            tracing::warn!(
-                target: "atlas_agent_delta",
-                session = %session_id,
-                "no event stream for this session; was `thread_events` used for this connection?"
-            );
-            return None;
-        };
+            .remove(&(connection_agent, session_id.clone()))
+            .unwrap_or_else(|| {
+                // A closed tab can reopen while its previous turn still owns
+                // this thread. Give that live thread a new event channel.
+                let (tx, rx) = atlas_acp_thread::event_channel();
+                lock_thread(&thread).replace_event_sink(tx);
+                rx
+            });
 
         let slot = Arc::new(SessionSlot {
+            active: std::sync::atomic::AtomicBool::new(true),
             emit: Mutex::new(()),
             projection: Mutex::new(SessionProjection::new(agent_id, session_id.clone(), thread)),
         });
-        self.sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(session_id, slot);
+        // Only this agent's own session by this id is replaced: another
+        // agent's session that happens to share the id is another session.
+        let scope = (agent_id, session_id);
+        if let Some(old) = self.session_in(&scope) {
+            let _emit = lock(&old.emit);
+            old.active
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        lock(&self.sessions).insert(scope, slot.clone());
 
-        Some(events)
+        (events, slot)
     }
 
     /// Forget a session the host has closed.
@@ -331,8 +393,18 @@ impl DeltaProjector {
     ///
     /// Dropping the projection is what releases the thread, and with it the
     /// thread's terminals — whose `Drop` kills any PTY still running.
+    ///
+    /// By the bare id, it closes the session only when one agent alone holds
+    /// that id; [`Self::close_session_of`] names the agent.
     pub fn close_session(&self, session_id: &acp::SessionId) {
-        self.forget_session(session_id);
+        if let Some(scope) = self.scope_of(session_id) {
+            self.forget_scope_if(&scope, None);
+        }
+    }
+
+    /// [`Self::close_session`], for one agent's session.
+    pub fn close_session_of(&self, agent_id: AgentId, session_id: &acp::SessionId) {
+        self.forget_scope_if(&(agent_id, session_id.clone()), None);
     }
 
     /// Drop every session, for the app's way out.
@@ -344,10 +416,13 @@ impl DeltaProjector {
     /// shutdown, after the manager's; nothing is emitted, because there is
     /// no one left to tell.
     pub fn shutdown(&self) {
-        self.sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+        let _lifecycle = lock(&self.lifecycle);
+        let sessions = std::mem::take(&mut *lock(&self.sessions));
+        for slot in sessions.values() {
+            let _emit = lock(&slot.emit);
+            slot.active
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
         self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -368,19 +443,31 @@ impl DeltaProjector {
     /// elicitation tables are keyed by wire request id and had no removal at
     /// all, so on a process-lifetime singleton they retained one entry per
     /// prompt the app had ever shown, for as long as the app ran (ATL-225).
-    fn forget_session(&self, session_id: &acp::SessionId) {
-        self.sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(session_id);
+    fn forget_scope_if(&self, scope: &SessionScope, expected: Option<&Arc<SessionSlot>>) {
+        let _lifecycle = lock(&self.lifecycle);
+        let current = self.session_in(scope);
+        if expected.is_some_and(|old| {
+            current
+                .as_ref()
+                .is_none_or(|current| !Arc::ptr_eq(old, current))
+        }) {
+            return;
+        }
+        if let Some(slot) = current {
+            let _emit = lock(&slot.emit);
+            slot.active
+                .store(false, std::sync::atomic::Ordering::Release);
+            lock(&self.sessions).remove(scope);
+        }
+        let (agent_id, session_id) = scope;
         self.permissions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|_, key| &key.session_id != session_id);
+            .retain(|_, key| !(key.agent_id == *agent_id && key.session_id == *session_id));
         self.elicitations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|_, key| &key.session_id != session_id);
+            .retain(|_, key| !(key.agent_id == *agent_id && key.session_id == *session_id));
     }
 
     /// How many permission and elicitation routes are retained. Test-facing:
@@ -433,11 +520,18 @@ impl DeltaProjector {
 
     /// Stamp this session's deltas with the turn identity the host assigned.
     ///
-    /// Turn identity belongs to the send path, not to the thread: capture reads
-    /// it from the binding it wrote at `note_prompt` time, and the frontend uses
-    /// it to drop a terminal that belongs to a superseded turn.
+    /// Turn identity belongs to the send path: capture reads it from the
+    /// binding it wrote at `note_prompt` time, and the frontend uses it to drop
+    /// a terminal that belongs to a superseded turn. The thread is told too,
+    /// and labels the NEXT turn it opens with it: a turn's end and its status
+    /// are stamped from the thread's own label, captured when the turn opened,
+    /// because the host stamps the next turn while this one may still be
+    /// draining (audit #17).
     pub fn set_turn_seq(&self, session_id: &acp::SessionId, turn_seq: u64) {
-        self.with_session(session_id, |projection| projection.turn_seq = turn_seq);
+        self.with_session(session_id, |projection| {
+            projection.turn_seq = turn_seq;
+            lock_thread(&projection.thread).set_next_turn_seq(turn_seq);
+        });
     }
 
     /// The model this session's assistant messages should be attributed to.
@@ -647,11 +741,12 @@ impl DeltaProjector {
                 (
                     projection.thread.clone(),
                     projection.announced_elicitations.clone(),
+                    (projection.agent_id, projection.session_id.clone()),
                 ),
             )
         };
         snapshot.pending_elicitation =
-            self.pending_elicitation(session_id, &announced.0, &announced.1);
+            self.pending_elicitation(&announced.2, &announced.0, &announced.1);
         for envelope in envelopes {
             self.emitter.emit(envelope);
         }
@@ -676,7 +771,7 @@ impl DeltaProjector {
     /// The newest announced elicitation of this session that is still waiting.
     fn pending_elicitation(
         &self,
-        session_id: &acp::SessionId,
+        scope: &SessionScope,
         thread: &AcpThreadHandle,
         announced: &[ElicitationEntryId],
     ) -> Option<PendingElicitation> {
@@ -685,7 +780,7 @@ impl DeltaProjector {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .filter(|(_, key)| &key.session_id == session_id)
+            .filter(|(_, key)| key.agent_id == scope.0 && key.session_id == scope.1)
             .map(|(request_id, key)| (*request_id, key.entry_id.clone()))
             .collect();
         let thread = lock_thread(thread);
@@ -716,8 +811,20 @@ impl DeltaProjector {
         let Some(slot) = self.session(session_id) else {
             return;
         };
-        self.notify_observer(session_id, &event, &slot);
+        self.apply_slot(session_id, event, &slot);
+    }
+
+    fn apply_slot(
+        &self,
+        session_id: &acp::SessionId,
+        event: AcpThreadEvent,
+        slot: &Arc<SessionSlot>,
+    ) {
         let _emit = lock(&slot.emit);
+        if !slot.active.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        self.notify_observer(session_id, &event, slot);
         let (envelopes, permissions, elicitations) = {
             let mut projection = lock(&slot.projection);
             let deltas = projection.apply(event);
@@ -751,12 +858,39 @@ impl DeltaProjector {
         }
     }
 
+    /// The session by its bare id, when exactly one agent holds that id. Two
+    /// agents' sessions sharing it is no answer rather than a guess: acting on
+    /// the wrong agent's session is the bug this keying exists to stop (#86).
     fn session(&self, session_id: &acp::SessionId) -> Option<Arc<SessionSlot>> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(session_id)
-            .cloned()
+        let scope = self.scope_of(session_id)?;
+        self.session_in(&scope)
+    }
+
+    /// The one scope holding this bare id; `None` when none or several do.
+    fn scope_of(&self, session_id: &acp::SessionId) -> Option<SessionScope> {
+        let sessions = lock(&self.sessions);
+        let mut holders = sessions.keys().filter(|(_, id)| id == session_id);
+        let scope = holders.next()?.clone();
+        if holders.next().is_some() {
+            tracing::warn!(%session_id, "two agents hold this session id; naming the agent is required");
+            return None;
+        }
+        Some(scope)
+    }
+
+    fn session_in(&self, scope: &SessionScope) -> Option<Arc<SessionSlot>> {
+        lock(&self.sessions).get(scope).cloned()
+    }
+
+    /// How many sessions are projected, across every agent. Test-facing.
+    pub fn session_count(&self) -> usize {
+        lock(&self.sessions).len()
+    }
+
+    /// Whether this agent's session by this id is projected and live.
+    pub fn is_projecting(&self, agent_id: AgentId, session_id: &acp::SessionId) -> bool {
+        self.session_in(&(agent_id, session_id.clone()))
+            .is_some_and(|slot| slot.active.load(std::sync::atomic::Ordering::Acquire))
     }
 
     fn with_session<R>(
@@ -778,6 +912,9 @@ impl DeltaProjector {
             return;
         };
         let _emit = lock(&slot.emit);
+        if !slot.active.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let envelopes = {
             let mut projection = lock(&slot.projection);
             let deltas = f(&mut projection);
@@ -791,6 +928,7 @@ impl DeltaProjector {
 
 /// One session's projection and the order its deltas leave in.
 struct SessionSlot {
+    active: std::sync::atomic::AtomicBool,
     /// Held from the moment a batch of deltas is numbered until the last of
     /// them has been handed to the emitter.
     ///
@@ -886,7 +1024,8 @@ struct SessionProjection {
     turn_seq: u64,
     model: Option<String>,
     entries: Vec<Projected>,
-    status: Option<SessionStatus>,
+    /// The status as last announced, with the turn it was announced for.
+    status: Option<(SessionStatus, u64)>,
     /// The plan as last announced, so an unchanged one is not re-sent.
     plan: Option<serde_json::Value>,
     /// The quota as last announced — the engine repeats it every turn.
@@ -1032,7 +1171,8 @@ impl SessionProjection {
                     Projected::Assistant { runs },
                     Some(AgentThreadEntry::AssistantMessage(message)),
                 ) => {
-                    let spans = project::run_spans(&message.chunks);
+                    let chunks = project::prose_chunks(message);
+                    let spans = project::run_spans(chunks);
                     for (run_ix, run) in runs.iter().enumerate() {
                         if run.message_id.is_none() {
                             continue;
@@ -1043,7 +1183,7 @@ impl SessionProjection {
                         if span.is_thought != run.is_thought {
                             continue;
                         }
-                        let Some(full) = project::run_span_tail(&message.chunks, span, 0) else {
+                        let Some(full) = project::run_span_tail(chunks, span, 0) else {
                             continue;
                         };
                         let text = full.get(..run.text_len).unwrap_or(&full).to_string();
@@ -1261,7 +1401,7 @@ impl SessionProjection {
                 // would announce that one's times.
                 let mut deltas = vec![SessionDelta::TurnFinished {
                     stop_reason: project::stop_reason_token(stop_reason),
-                    turn_seq: self.turn_seq,
+                    turn_seq: turn.turn_seq,
                     started_at_ms: turn.started_at.map(|at| at.timestamp_millis()),
                     ended_at_ms: Some(turn.ended_at.timestamp_millis()),
                     worked_ms: turn.worked_ms,
@@ -1407,7 +1547,7 @@ impl SessionProjection {
                 let mut runs = Vec::new();
                 let mut deltas = Vec::new();
                 let at = chrono::Utc::now();
-                for run in project::runs(&message.chunks) {
+                for run in project::runs(project::prose_chunks(message)) {
                     let text_len = run.text.len();
                     // An image- or audio-only chunk flattens to nothing. The
                     // snapshot skips such a run; announcing it here put a blank
@@ -1515,10 +1655,11 @@ impl SessionProjection {
                 // what is new costs the entire message on every token of it
                 // (ATL-223). A run only grows at its end, so a byte length is
                 // enough to locate the new part.
-                let spans = project::run_spans(&message.chunks);
+                let chunks = project::prose_chunks(message);
+                let spans = project::run_spans(chunks);
                 let mut deltas = Vec::new();
                 for (run_ix, span) in spans.iter().enumerate() {
-                    let len = project::run_span_len(&message.chunks, span);
+                    let len = project::run_span_len(chunks, span);
                     match runs.get_mut(run_ix) {
                         Some(projected) if projected.is_thought == span.is_thought => {
                             match projected.message_id.clone() {
@@ -1529,11 +1670,9 @@ impl SessionProjection {
                                     if len <= projected.text_len {
                                         continue;
                                     }
-                                    let Some(delta) = project::run_span_tail(
-                                        &message.chunks,
-                                        span,
-                                        projected.text_len,
-                                    ) else {
+                                    let Some(delta) =
+                                        project::run_span_tail(chunks, span, projected.text_len)
+                                    else {
                                         continue;
                                     };
                                     if delta.is_empty() {
@@ -1554,9 +1693,7 @@ impl SessionProjection {
                                     if len == 0 {
                                         continue;
                                     }
-                                    let Some(text) =
-                                        project::run_span_tail(&message.chunks, span, 0)
-                                    else {
+                                    let Some(text) = project::run_span_tail(chunks, span, 0) else {
                                         continue;
                                     };
                                     let message_id = new_message_id();
@@ -1577,8 +1714,7 @@ impl SessionProjection {
                             }
                         }
                         _ => {
-                            let Some(text) = project::run_span_tail(&message.chunks, span, 0)
-                            else {
+                            let Some(text) = project::run_span_tail(chunks, span, 0) else {
                                 continue;
                             };
                             let announced = if text.is_empty() {
@@ -1741,6 +1877,7 @@ impl SessionProjection {
         self.new_permissions.push((
             request_id,
             PermissionKey {
+                agent_id: self.agent_id,
                 session_id: self.session_id.clone(),
                 tool_call_id,
             },
@@ -1766,6 +1903,7 @@ impl SessionProjection {
         self.new_elicitations.push((
             request_id,
             ElicitationKey {
+                agent_id: self.agent_id,
                 session_id: self.session_id.clone(),
                 entry_id: id.clone(),
             },
@@ -1829,6 +1967,7 @@ impl SessionProjection {
     fn usage_deltas(&self) -> Vec<SessionDelta> {
         let thread = lock_thread(&self.thread);
         let usage = thread.token_usage().cloned();
+        let reported_cost = thread.cost().is_some();
         let (cost, currency) = thread
             .cost()
             .map(|cost| (cost.amount, Some(cost.currency.to_string())))
@@ -1861,8 +2000,12 @@ impl SessionProjection {
                 },
             });
         }
-        // The context gauge, from an agent that reports a window size.
-        if usage.max_tokens > 0 {
+        // The context gauge, from an agent that reports a window size — and
+        // the session's cost, which rides on the same delta. An agent that
+        // reports a cost with `size: 0` (no window known) still has a cost to
+        // show; dropping the whole update lost it (audit, lower list). The
+        // client already treats a zero size as "no gauge".
+        if usage.max_tokens > 0 || (reported_cost && !has_split) {
             deltas.push(SessionDelta::ContextUsage {
                 used: usage.used_tokens,
                 size: usage.max_tokens,
@@ -1877,20 +2020,21 @@ impl SessionProjection {
     ///
     /// Deduplicated because a repeated identical status carries no information,
     /// and every entry update flips the thread's status event.
+    ///
+    /// Stamped with the thread's label for the turn it is on, read under the
+    /// same lock as the status, so the pair describes one moment. The host's
+    /// `turn_seq` moves on before the next turn opens, and pairing it with a
+    /// status read later put the next turn's number on this one's idle.
     fn status_deltas(&mut self) -> Vec<SessionDelta> {
-        let status = self.current_status();
-        if self.status == Some(status) {
+        let (status, turn_seq) = {
+            let thread = lock_thread(&self.thread);
+            (project::session_status(&thread), thread.turn_seq())
+        };
+        if self.status == Some((status, turn_seq)) {
             return Vec::new();
         }
-        self.status = Some(status);
-        vec![SessionDelta::Status {
-            status,
-            turn_seq: self.turn_seq,
-        }]
-    }
-
-    fn current_status(&self) -> SessionStatus {
-        project::session_status(&lock_thread(&self.thread))
+        self.status = Some((status, turn_seq));
+        vec![SessionDelta::Status { status, turn_seq }]
     }
 }
 

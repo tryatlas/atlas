@@ -152,9 +152,6 @@ function generate(): ThreadRow[] {
     at(i).snoozedAt = iso(now - HOUR);
     at(i).snoozedUntil = iso(now + ms);
   }
-  // Running in another process (a terminal): the list shows it working.
-  at(4).liveElsewhere = true;
-  at(14).liveElsewhere = true;
   // Linked pull requests: three on the top row (opened from it, found on
   // its branch, linked by hand), one merged and one draft further down.
   at(0).pullRequests = [

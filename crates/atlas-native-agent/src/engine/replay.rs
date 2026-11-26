@@ -59,8 +59,26 @@ pub const FAILED_NOTICE_FALLBACK: &str = "the turn failed";
 /// Runs before the thread handle is returned to the host, so the entries are
 /// simply *there* when the first snapshot is taken — no streaming, no events
 /// that could race a not-yet-bound tab.
-pub fn replay_turns(thread: &mut AcpThread, turns: &[v2::Turn]) {
+pub(crate) fn replay_turns(
+    thread: &mut AcpThread,
+    turns: &[v2::Turn],
+) -> Vec<crate::engine::sink::EngineTurnBoundary> {
+    let mut boundaries = Vec::new();
     for turn in turns {
+        let start = thread.entries().len();
+        let prompt = turn
+            .items
+            .iter()
+            .find_map(|item| match item {
+                v2::ThreadItem::UserMessage { content, .. } => Some(user_text(content)),
+                _ => None,
+            })
+            .unwrap_or_default();
+        boundaries.push(crate::engine::sink::EngineTurnBoundary {
+            id: turn.id.clone(),
+            entry: start,
+            prompt,
+        });
         for item in &turn.items {
             match item {
                 v2::ThreadItem::UserMessage { id, content, .. } => {
@@ -139,6 +157,38 @@ pub fn replay_turns(thread: &mut AcpThread, turns: &[v2::Turn]) {
         }
         replay_outcome(thread, turn);
     }
+    boundaries
+}
+
+/// The parent's rollout records starts; the child's rollout owns its end.
+/// A persisted unfinished turn is interrupted unless the engine says that
+/// child is actively loaded. A missing history is reported explicitly rather
+/// than invented as either success or a perpetually running child.
+pub(crate) fn replay_child_turn(
+    thread: &mut AcpThread,
+    child_id: &str,
+    path: &str,
+    active: bool,
+    last: Option<&v2::Turn>,
+) {
+    if active {
+        return;
+    }
+    let call = match last {
+        Some(turn) => {
+            let mut turn = turn.clone();
+            if turn.status == v2::TurnStatus::InProgress { turn.status = v2::TurnStatus::Interrupted; }
+            crate::engine::sink::subagent_end_of(child_id, path, &turn)
+        }
+        None => Some(acp::ToolCall::new(format!("subagent-unavailable-{child_id}"), "Subagent history unavailable")
+            .kind(acp::ToolKind::Other)
+            .status(acp::ToolCallStatus::Failed)
+            .raw_input(serde_json::json!({ "agentThreadId": child_id, "agentPath": path, "activityKind": "completed" }))
+            .content(vec![acp::ToolCallContent::Content(acp::Content::new(acp::ContentBlock::Text(acp::TextContent::new("The child's saved history could not be read, so its final outcome is unavailable."))))])),
+    };
+    if let Some(call) = call {
+        let _ = thread.upsert_tool_call(call);
+    }
 }
 
 /// Say how a turn ended, when how it ended is not self-evident.
@@ -168,7 +218,7 @@ fn replay_outcome(thread: &mut AcpThread, turn: &v2::Turn) {
 /// Injected context blocks are machinery, not what the user said; the engine
 /// recorded the wire prompt, so they have to come back off here — the same
 /// stripping every other replay path applies.
-fn user_text(content: &[v2::UserInput]) -> String {
+pub(crate) fn user_text(content: &[v2::UserInput]) -> String {
     let mut out = String::new();
     for input in content {
         if let v2::UserInput::Text { text, .. } = input {

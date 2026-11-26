@@ -15,6 +15,7 @@ const invoke = vi.hoisted(() =>
 );
 vi.mock("@tauri-apps/api/core", () => ({
   invoke,
+  isTauri: () => false,
   convertFileSrc: (p: string) => `asset://localhost${p}`,
 }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
@@ -79,7 +80,7 @@ function paste(dom: HTMLElement, flavours: Record<string, string>) {
   });
 }
 
-const allowCalls = () => invoke.mock.calls.filter(([cmd]) => cmd === "asset_allow_dir");
+const allowCalls = () => invoke.mock.calls.filter(([cmd]) => cmd === "asset_allow_file");
 
 describe("media preview provenance", () => {
   it("a chip rebuilt from typed text previews nothing and allow-lists nothing", async () => {
@@ -95,7 +96,7 @@ describe("media preview provenance", () => {
     act(() => ref.current!.insertMention(CLIP));
     expect(ref.current!.getMentions()).toEqual([CLIP]);
     await hoverChip(container);
-    expect(allowCalls()).toEqual([["asset_allow_dir", { path: "/abs/media" }]]);
+    expect(allowCalls()).toEqual([["asset_allow_file", { path: CLIP.absPath }]]);
   });
 
   it("a picked chip restored from its text is still picked", async () => {

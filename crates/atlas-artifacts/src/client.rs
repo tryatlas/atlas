@@ -129,6 +129,7 @@ pub struct ArtifactsClient {
     /// either and its turn died on "Missing bearer token". Dropped on any
     /// `401`, so a rejected token is never offered twice.
     cached: std::sync::Mutex<Option<(String, std::time::Instant)>>,
+    token_epoch: std::sync::atomic::AtomicU64,
 }
 
 /// How long a minted token is reused. Access JWTs live about ten minutes;
@@ -147,6 +148,7 @@ impl ArtifactsClient {
             base: ingest_base(),
             tokens,
             cached: std::sync::Mutex::new(None),
+            token_epoch: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -158,6 +160,7 @@ impl ArtifactsClient {
             base: base.trim_end_matches('/').to_string(),
             tokens,
             cached: std::sync::Mutex::new(None),
+            token_epoch: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -656,6 +659,7 @@ impl ArtifactsClient {
     }
 
     async fn token(&self) -> Result<String> {
+        let epoch = self.token_epoch.load(std::sync::atomic::Ordering::SeqCst);
         {
             let cached = self
                 .cached
@@ -668,19 +672,29 @@ impl ArtifactsClient {
             }
         }
         let token = self.tokens.mint().await?;
-        *self
+        let mut cached = self
             .cached
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some((token.clone(), std::time::Instant::now()));
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.token_epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch {
+            return Err(Error::from_status(
+                401,
+                "account changed while minting credential",
+            ));
+        }
+        *cached = Some((token.clone(), std::time::Instant::now()));
         Ok(token)
     }
 
-    fn forget_token(&self) {
-        *self
+    /// Invalidate on sign-in, sign-out and changed organisation membership.
+    pub fn invalidate_token(&self) {
+        let mut cached = self
             .cached
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.token_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *cached = None;
     }
 
     /// Send and classify the status, discarding the body.
@@ -695,8 +709,11 @@ impl ArtifactsClient {
             .map_err(|e| Error::Transport(format!("{what}: {e}")))?;
 
         let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            self.forget_token();
+        if matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            self.invalidate_token();
         }
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(Error::RateLimited {
@@ -725,8 +742,11 @@ impl ArtifactsClient {
             .map_err(|e| Error::Transport(format!("{what}: {e}")))?;
 
         let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            self.forget_token();
+        if matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            self.invalidate_token();
         }
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(Error::RateLimited {
@@ -784,6 +804,100 @@ mod tests {
         fn mint(&self) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> {
             Box::pin(async { Ok("tok".to_string()) })
         }
+    }
+
+    struct ChangingToken {
+        account: std::sync::atomic::AtomicUsize,
+        pause_first: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl TokenSource for ChangingToken {
+        fn mint(&self) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> {
+            Box::pin(async move {
+                let account = self.account.load(std::sync::atomic::Ordering::SeqCst);
+                if self
+                    .pause_first
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                Ok(format!("account-{account}"))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_account_change_cannot_repopulate_the_old_credential() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let source = Arc::new(ChangingToken {
+            account: AtomicUsize::new(1),
+            pause_first: AtomicBool::new(true),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let client = Arc::new(ArtifactsClient::at("http://unused", source.clone()));
+        let first = tokio::spawn({
+            let client = client.clone();
+            async move { client.token().await }
+        });
+        source.entered.notified().await;
+        source.account.store(2, Ordering::SeqCst);
+        client.invalidate_token();
+        source.release.notify_one();
+        assert!(first.await.unwrap().is_err());
+        assert_eq!(client.token().await.unwrap(), "account-2");
+        source.account.store(3, Ordering::SeqCst);
+        assert_eq!(client.token().await.unwrap(), "account-2");
+        client.invalidate_token();
+        assert_eq!(client.token().await.unwrap(), "account-3");
+    }
+
+    #[tokio::test]
+    async fn a_membership_denial_refreshes_credentials_for_the_next_request() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let source = Arc::new(ChangingToken {
+            account: AtomicUsize::new(1),
+            pause_first: AtomicBool::new(false),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let serving = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut chunk = [0; 1024];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0, "request ended before its headers");
+                    head.extend_from_slice(&chunk[..read]);
+                    assert!(head.len() <= 8192, "request headers are bounded");
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = ArtifactsClient::at(&base, source.clone());
+        assert_eq!(client.token().await.unwrap(), "account-1");
+        source.account.store(2, Ordering::SeqCst);
+        let result: Result<serde_json::Value> = client.send(client.http.get(&base), "read").await;
+        assert!(result.is_err());
+        assert_eq!(client.token().await.unwrap(), "account-2");
+        source.account.store(3, Ordering::SeqCst);
+        assert!(client
+            .send_discarding_body(client.http.post(&base), "write")
+            .await
+            .is_err());
+        assert_eq!(client.token().await.unwrap(), "account-3");
+        serving.await.unwrap();
     }
 
     /// Answers every request with `body` and keeps each request's head (the

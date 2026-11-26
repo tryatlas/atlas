@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 // The Summary's reviewer and label pickers: a search box over the
 // repository's candidates, each row toggling one person or label. The
 // candidates are read only while a picker is open, and a picker the viewer
@@ -105,7 +106,12 @@ function CandidatePicker<T>({
             } else if (event.key === "ArrowUp") {
               event.preventDefault();
               setActive(Math.max(highlighted - 1, 0));
-            } else if (event.key === "Enter" && candidates[highlighted] && !disabled) {
+            } else if (
+              event.key === "Enter" &&
+              !isComposingKey(event) &&
+              candidates[highlighted] &&
+              !disabled
+            ) {
               event.preventDefault();
               onSelect(candidates[highlighted]);
             }

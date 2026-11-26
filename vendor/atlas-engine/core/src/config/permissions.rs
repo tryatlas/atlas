@@ -537,6 +537,17 @@ fn compile_filesystem_permission(
         }
         FilesystemPermissionToml::Scoped(scoped_entries) => {
             for (subpath, access) in scoped_entries {
+                if matches!(
+                    parse_special_path(path),
+                    Some(FileSystemSpecialPath::Unknown { .. })
+                ) {
+                    entries.push(FileSystemSandboxEntry {
+                        path: compile_scoped_filesystem_path(path, subpath, startup_warnings)?,
+                        access: *access,
+                        missing_path_behavior: None,
+                    });
+                    continue;
+                }
                 let has_glob = contains_glob_chars(subpath);
                 let can_compile_as_pattern = match parse_special_path(path) {
                     Some(FileSystemSpecialPath::ProjectRoots { .. }) | None => true,

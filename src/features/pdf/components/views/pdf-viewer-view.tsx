@@ -4,7 +4,7 @@ import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
 // Vite `?url` import — resolves to the bundled worker asset. Must match the
 // pdfjs-dist version react-pdf re-exports (pinned in package.json).
-import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import pdfWorker from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 import { FileWarning } from "lucide-react";
 import { EmptyState, Spinner } from "@tryatlas/design";
 import { useElementSize } from "../../hooks/use-element-size";

@@ -1,3 +1,4 @@
+// Modified by Atlas from upstream OpenAI Codex (Apache-2.0). See CONTEXT.md.
 //! Watches subscribed files or directories and routes coarse-grained change
 //! notifications to the subscribers that own matching watched paths.
 
@@ -657,7 +658,18 @@ impl FileWatcher {
                                 continue;
                             }
                             let inner = inner.as_ref().and_then(std::sync::Weak::upgrade);
-                            Self::notify_subscribers(&state, inner.as_ref(), &event.paths).await;
+                            let invalidates_watch = matches!(
+                                event.kind,
+                                EventKind::Remove(_)
+                                    | EventKind::Modify(notify::event::ModifyKind::Name(_))
+                            );
+                            Self::notify_subscribers(
+                                &state,
+                                inner.as_ref(),
+                                &event.paths,
+                                invalidates_watch,
+                            )
+                            .await;
                         }
                         Some(Err(err)) => {
                             warn!("file watcher error: {err}");
@@ -675,12 +687,14 @@ impl FileWatcher {
         state: &RwLock<WatchState>,
         inner: Option<&Arc<Mutex<FileWatcherInner>>>,
         event_paths: &[PathBuf],
+        invalidates_watch: bool,
     ) {
         let subscribers_to_notify: Vec<(WatchSender, Vec<PathBuf>)> = {
             let mut state = state
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut actual_watch_moves = Vec::new();
+            let mut watches_to_rearm = BTreeSet::new();
             let mut subscribers_to_notify = Vec::new();
 
             for subscriber in state.subscribers.values_mut() {
@@ -704,6 +718,14 @@ impl FileWatcher {
                             let count = subscriber_watch_state.count;
                             subscriber_watch_state.actual = new_actual.clone();
                             actual_watch_moves.push((old_actual, new_actual, count));
+                        } else if invalidates_watch
+                            && (new_actual.path.starts_with(event_path)
+                                || subscriber_watch.matched.path.starts_with(event_path))
+                        {
+                            // A deleted or renamed watch root may already exist again
+                            // by the time this event is handled. The path is unchanged,
+                            // but the OS watch still refers to the old filesystem object.
+                            watches_to_rearm.insert(new_actual.path);
                         }
                     }
                 }
@@ -723,6 +745,14 @@ impl FileWatcher {
                     &mut inner_guard,
                 );
             }
+            for path in watches_to_rearm {
+                let mode = state
+                    .path_ref_counts
+                    .get(&path)
+                    .and_then(|counts| counts.effective_mode());
+                Self::reconfigure_watch_inner(inner, &path, None, &mut inner_guard);
+                Self::reconfigure_watch_inner(inner, &path, mode, &mut inner_guard);
+            }
 
             subscribers_to_notify
         };
@@ -734,7 +764,7 @@ impl FileWatcher {
 
     #[cfg(test)]
     pub(crate) async fn send_paths_for_test(&self, paths: Vec<PathBuf>) {
-        Self::notify_subscribers(&self.state, self.inner.as_ref(), &paths).await;
+        Self::notify_subscribers(&self.state, self.inner.as_ref(), &paths, false).await;
     }
 
     #[cfg(test)]

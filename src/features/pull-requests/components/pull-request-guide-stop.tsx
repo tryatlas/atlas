@@ -1,3 +1,5 @@
+import { shortcutLabel } from "@/features/keybindings/lib/combo";
+import { isComposingKey } from "@/lib/keyboard-event";
 // One stop of the review guide, and the rail that lists them: the stop's
 // title and summary, the call it asks the reader to make, its excerpts cut
 // from the pull request's diff, its lettered notes, the other files it owns,
@@ -266,8 +268,9 @@ function GuideLineDraft({
             onCancel();
           } else if (
             event.key === "Enter" &&
+            !isComposingKey(event) &&
             (event.metaKey || event.ctrlKey) &&
-            !event.nativeEvent.isComposing &&
+            !isComposingKey(event) &&
             body &&
             !event.repeat
           ) {
@@ -278,7 +281,9 @@ function GuideLineDraft({
       />
       <div className="mt-1.5 flex items-center gap-1">
         <span className="mr-auto text-2xs text-muted-foreground">
-          {canComment ? "⌘↵ adds to your review" : "⌘↵ asks"}
+          {canComment
+            ? `${shortcutLabel("cmd+enter")} adds to your review`
+            : `${shortcutLabel("cmd+enter")} asks`}
         </span>
         <Button size="xs" variant="ghost" onClick={onCancel}>
           Cancel

@@ -1,3 +1,4 @@
+// Modified by Atlas from upstream OpenAI Codex (Apache-2.0). See CONTEXT.md.
 use chrono::SecondsFormat;
 use chrono::Utc;
 
@@ -5,7 +6,7 @@ macro_rules! log_event {
     ($self:expr, $($fields:tt)*) => {{
         tracing::event!(
             target: $crate::targets::OTEL_LOG_ONLY_TARGET,
-            tracing::Level::INFO,
+            tracing::Level::DEBUG,
             $($fields)*
             event.timestamp = %$crate::events::shared::timestamp(),
             conversation.id = %$self.metadata.conversation_id,
@@ -25,7 +26,7 @@ macro_rules! trace_event {
     ($self:expr, $($fields:tt)*) => {{
         tracing::event!(
             target: $crate::targets::OTEL_TRACE_SAFE_TARGET,
-            tracing::Level::INFO,
+            tracing::Level::TRACE,
             $($fields)*
             event.timestamp = %$crate::events::shared::timestamp(),
             conversation.id = %$self.metadata.conversation_id,

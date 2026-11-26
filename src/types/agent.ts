@@ -218,6 +218,13 @@ export interface ChatSession {
    *  backend running past its tab: closing the tab neither asks nor cancels.
    *  Mirrors the `hold_changed` delta / the snapshot's `held`. */
   held?: boolean;
+  /** The last turn failed (an error, a refusal, a token or request cap) with
+   *  prompts queued behind it, so Rust's turn controller halted the queue
+   *  instead of draining it (ACP audit finding 77). The composer offers
+   *  "Queue paused — Resume" while this holds and the queue is non-empty
+   *  (`queuePausedByFailure`). Cleared by the next turn starting, a turn that
+   *  ends well, the queue emptying, or a resume. */
+  queueHalted?: boolean;
   /** The agent process backing this session died (agent_disconnected). The
    *  binding fields are kept for resume — the next send (or the Restart
    *  affordance) respawns the agent and load_session-resumes where the
@@ -267,8 +274,9 @@ export interface ChatSession {
   /** The current turn's live plan (ACP `plan` / TodoWrite), mirrored here from
    *  the trailing assistant message so the docked plan panel above the composer
    *  can select it with one narrow read instead of scanning `messages` every
-   *  streaming frame. Set on `plan_updated`, reset at each turn start. The dock
-   *  hides itself when this is empty or fully completed while idle. */
+   *  streaming frame. Set on `plan_updated` and kept until the agent replaces
+   *  or clears it (a turn start does not); reset on a rebind. The pill hides
+   *  itself when this is empty, or fully completed while idle. */
   livePlan?: PlanStep[];
   /** Children this session delegated to, keyed by the id of the tool call that
    *  launched each one (`Subagent.toolCallId`), which is a child's identity
@@ -360,6 +368,9 @@ export interface ChatSession {
     requestedSchema?: unknown;
     url?: string | null;
   };
+  /** Elicitations asked while `pendingElicitation` was still open, oldest
+   *  first. Each is shown in turn as the one before it is answered. */
+  queuedElicitations?: Array<NonNullable<ChatSession["pendingElicitation"]>>;
   /** Models the ACP agent advertised (Claude Code / Codex) — drives the
    *  composer's model picker. Seeded from the snapshot's `available_models`;
    *  empty for agents (or the native one) that don't expose ACP model lists. */
@@ -622,6 +633,9 @@ export interface PlanStep {
   id: string;
   description: string;
   status: "pending" | "in_progress" | "completed";
+  /** The agent's own priority for the step (ACP `high` / `medium` / `low`),
+   *  absent when it gave none. */
+  priority?: string;
 }
 
 export interface AgentTask {

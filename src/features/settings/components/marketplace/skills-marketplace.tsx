@@ -119,7 +119,14 @@ export function SkillsMarketplace({
   const refreshInstalled = useCallback(async () => {
     try {
       const metas = await skillsApi.list(scope, effectiveProject);
-      setInstalledSkills(new Set(metas.map((m) => m.name)));
+      setInstalledSkills(
+        new Set(
+          metas.flatMap((m) => {
+            const parts = m.path.replace(/\\/g, "/").split("/");
+            return [m.name, parts[parts.length - 2]].filter((name): name is string => !!name);
+          }),
+        ),
+      );
     } catch {
       /* installed badges just won't show */
     }
@@ -164,6 +171,7 @@ export function SkillsMarketplace({
   const debRef = useRef<number | null>(null);
   useEffect(() => {
     const q = query.trim();
+    let live = true;
     if (!q) {
       setResults([]);
       setLoading(false);
@@ -174,11 +182,18 @@ export function SkillsMarketplace({
     debRef.current = window.setTimeout(() => {
       void packsApi
         .search(q)
-        .then((r) => setResults(r.sort((a, b) => b.installs - a.installs)))
-        .catch((e) => toast.error(String(e)))
-        .finally(() => setLoading(false));
+        .then((r) => {
+          if (live) setResults(r.sort((a, b) => b.installs - a.installs));
+        })
+        .catch((e) => {
+          if (live) toast.error(String(e));
+        })
+        .finally(() => {
+          if (live) setLoading(false);
+        });
     }, 220);
     return () => {
+      live = false;
       if (debRef.current) window.clearTimeout(debRef.current);
     };
   }, [query]);

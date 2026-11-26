@@ -186,9 +186,7 @@ pub async fn recent_files_push(
 
     // Ignore pushes from outside the current project. Frontend tab
     // listeners can fire just after a project switch.
-    if !abs_path.starts_with(&format!("{}/", root.to_string_lossy()))
-        && abs_path != root.to_string_lossy()
-    {
+    if !Path::new(&abs_path).starts_with(&root) {
         return Ok(items_lock.read().clone());
     }
 
@@ -231,8 +229,15 @@ pub async fn recent_files_rename(
         return Ok(Vec::new());
     };
 
-    let root_prefix = format!("{}/", root.to_string_lossy());
-    let rel_of = |abs: &str| abs.strip_prefix(&root_prefix).unwrap_or(abs).to_string();
+    let rel_of = |abs: &str| {
+        Path::new(abs)
+            .strip_prefix(&root)
+            .unwrap_or_else(|_| Path::new(abs))
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    };
     let old_prefix = format!("{old_path}/");
     let new_prefix = format!("{new_path}/");
 

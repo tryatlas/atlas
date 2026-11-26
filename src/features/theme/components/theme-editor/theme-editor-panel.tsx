@@ -17,7 +17,7 @@ import { ChevronDown, ChevronUp, Moon, Paintbrush, Sun, X } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { useSettingsStore } from "@/features/settings/stores/settings-store";
-import { applyTheme } from "../../apply-theme";
+import { beginThemePreview } from "../../apply-theme";
 import { saveTheme } from "../../lib/theme-api";
 import { themeIdSlug } from "../../lib/theme-import-api";
 import {
@@ -68,8 +68,12 @@ function initialDraft(session: ThemeEditorSession, source: Theme): Draft {
   // The other two keep every value the source writes, in both variants.
   if (session.kind !== "create") {
     return {
-      light: source.light ? slotsOf(source.light) : null,
-      dark: source.dark ? slotsOf(source.dark) : null,
+      light: source.light
+        ? slotsOf({ ...source.light, base: { ...source.base, ...source.light.base } })
+        : null,
+      dark: source.dark
+        ? slotsOf({ ...source.dark, base: { ...source.base, ...source.dark.base } })
+        : null,
     };
   }
   // `create` keeps only the seeds of the variant on screen, so the new theme
@@ -175,7 +179,7 @@ export function ThemeEditorPanel({
   // The whole app is the preview. Not cached for the next launch, and the
   // configured theme is painted back when the editor closes, however it does.
   useEffect(() => {
-    applyTheme(draftTheme, appearance, {}, { preview: true });
+    return beginThemePreview(draftTheme, appearance);
   }, [draftTheme, appearance]);
   useEffect(() => () => repaintTheme(), []);
 
@@ -251,7 +255,6 @@ export function ThemeEditorPanel({
       name: trimmed,
       author: author.trim(),
       license: license.trim(),
-      ...(session.kind !== "create" && source.base ? { base: source.base } : {}),
       ...(light ? { light } : {}),
       ...(dark ? { dark } : {}),
     };

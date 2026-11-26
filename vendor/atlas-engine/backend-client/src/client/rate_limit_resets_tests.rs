@@ -10,17 +10,17 @@ use pretty_assertions::assert_eq;
 fn rate_limit_reset_contract_uses_expected_paths_and_payloads() {
     assert_eq!(
         test_client("https://example.test", PathStyle::AtlasEngineApi).rate_limit_status_url(),
-        "https://example.test/api/codex/usage"
+        "https://example.test/api/atlas-agent/usage"
     );
     assert_eq!(
         test_client("https://example.test", PathStyle::AtlasEngineApi)
             .rate_limit_reset_credits_url(),
-        "https://example.test/api/codex/rate-limit-reset-credits"
+        "https://example.test/api/atlas-agent/rate-limit-reset-credits"
     );
     assert_eq!(
         test_client("https://example.test", PathStyle::AtlasEngineApi)
             .consume_rate_limit_reset_credit_url(),
-        "https://example.test/api/codex/rate-limit-reset-credits/consume"
+        "https://example.test/api/atlas-agent/rate-limit-reset-credits/consume"
     );
     assert_eq!(
         test_client("https://chatgpt.com/backend-api", PathStyle::ChatGptApi)

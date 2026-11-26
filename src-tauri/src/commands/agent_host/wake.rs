@@ -61,6 +61,7 @@ impl WakeSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingWake {
     pub source: WakeSource,
+    pub restart_continuations: u32,
     /// The session, by its history row.
     pub thread_id: ThreadId,
     /// What the agent is told.
@@ -79,7 +80,16 @@ impl PendingWake {
         let thread_id = wakes[0].thread_id;
         // Several held for one turn are pull request updates in practice; a
         // continuation goes out at launch, before any of those.
-        let source = wakes[0].source;
+        let restart_continuations = wakes
+            .iter()
+            .map(|w| w.restart_continuations)
+            .max()
+            .unwrap_or(0);
+        let source = if restart_continuations > 0 {
+            WakeSource::Restart
+        } else {
+            wakes[0].source
+        };
         let text = wakes
             .iter()
             .map(|w| w.text.as_str())
@@ -92,6 +102,7 @@ impl PendingWake {
             .join("; ");
         Some(PendingWake {
             source,
+            restart_continuations,
             thread_id,
             text,
             summary,
@@ -246,6 +257,7 @@ mod tests {
     fn wake(text: &str) -> PendingWake {
         PendingWake {
             source: WakeSource::PullRequestWatch,
+            restart_continuations: 0,
             thread_id: ThreadId::from_uuid(uuid::Uuid::nil()),
             text: text.into(),
             summary: format!("#1: {text}"),

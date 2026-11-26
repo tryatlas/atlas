@@ -1,7 +1,8 @@
 import { create } from "zustand";
 import { immer } from "zustand/middleware/immer";
 import { invoke } from "@tauri-apps/api/core";
-import { useAppStore } from "@/features/app/stores/app-store";
+import { registerFlush } from "@/features/projects/lib/flush-registry";
+import { toast } from "sonner";
 import { PDF_COLORS, type PdfAnnotation, type PdfTool } from "../lib/pdf-annotations";
 
 interface PdfAnnotationState {
@@ -15,28 +16,37 @@ interface PdfAnnotationState {
   dirty: Record<string, boolean>;
   /** Currently-selected annotation id (for the note editor), or null. */
   selectedId: string | null;
+  loaded: Record<string, boolean>;
   actions: {
     setTool: (tool: PdfTool) => void;
     setColor: (color: string) => void;
     select: (id: string | null) => void;
-    add: (pdfPath: string, ann: PdfAnnotation) => void;
-    updateNoteText: (pdfPath: string, id: string, text: string) => void;
-    remove: (pdfPath: string, id: string) => void;
+    add: (pdfPath: string, ann: PdfAnnotation, projectPath: string) => void;
+    updateNoteText: (pdfPath: string, id: string, text: string, projectPath: string) => void;
+    remove: (pdfPath: string, id: string, projectPath: string) => void;
     /** Load persisted annotations for a PDF into the store. */
-    load: (pdfPath: string) => Promise<void>;
+    load: (pdfPath: string, projectPath: string) => Promise<void>;
     /** Persist a PDF's annotations now (also called debounced after edits).
      *  Resolves once written so Cmd+S can await + toast. */
-    save: (pdfPath: string) => Promise<void>;
+    save: (pdfPath: string, projectPath: string) => Promise<void>;
   };
 }
 
 // Debounced per-path autosave so edits aren't lost on tab close / crash.
 const saveTimers: Record<string, ReturnType<typeof setTimeout>> = {};
-function scheduleSave(pdfPath: string): void {
-  if (saveTimers[pdfPath]) clearTimeout(saveTimers[pdfPath]);
-  saveTimers[pdfPath] = setTimeout(() => {
-    delete saveTimers[pdfPath];
-    void usePdfAnnotationStore.getState().actions.save(pdfPath);
+export const pdfDocumentKey = (projectPath: string, pdfPath: string) =>
+  JSON.stringify([projectPath, pdfPath]);
+const writes = new Map<string, Promise<void>>();
+
+function scheduleSave(pdfPath: string, projectPath: string): void {
+  const key = pdfDocumentKey(projectPath, pdfPath);
+  if (saveTimers[key]) clearTimeout(saveTimers[key]);
+  saveTimers[key] = setTimeout(() => {
+    delete saveTimers[key];
+    void usePdfAnnotationStore
+      .getState()
+      .actions.save(pdfPath, projectPath)
+      .catch((error) => toast.error(`Annotations could not be saved: ${String(error)}`));
   }, 600);
 }
 
@@ -47,6 +57,7 @@ export const usePdfAnnotationStore = create<PdfAnnotationState>()(
     byPath: {},
     dirty: {},
     selectedId: null,
+    loaded: {},
     actions: {
       setTool: (tool) =>
         set((s) => {
@@ -61,63 +72,100 @@ export const usePdfAnnotationStore = create<PdfAnnotationState>()(
         set((s) => {
           s.selectedId = id;
         }),
-      add: (pdfPath, ann) => {
+      add: (pdfPath, ann, projectPath) => {
+        const key = pdfDocumentKey(projectPath, pdfPath);
+        if (!get().loaded[key]) return;
         set((s) => {
-          const list = s.byPath[pdfPath] ?? [];
+          const list = s.byPath[key] ?? [];
           list.push(ann);
-          s.byPath[pdfPath] = list;
-          s.dirty[pdfPath] = true;
+          s.byPath[key] = list;
+          s.dirty[key] = true;
           if (ann.kind === "note") s.selectedId = ann.id;
         });
-        scheduleSave(pdfPath);
+        scheduleSave(pdfPath, projectPath);
       },
-      updateNoteText: (pdfPath, id, text) => {
+      updateNoteText: (pdfPath, id, text, projectPath) => {
+        const key = pdfDocumentKey(projectPath, pdfPath);
+        if (!get().loaded[key]) return;
         set((s) => {
-          const ann = s.byPath[pdfPath]?.find((a) => a.id === id);
+          const ann = s.byPath[key]?.find((a) => a.id === id);
           if (ann && ann.kind === "note") {
             ann.text = text;
-            s.dirty[pdfPath] = true;
+            s.dirty[key] = true;
           }
         });
-        scheduleSave(pdfPath);
+        scheduleSave(pdfPath, projectPath);
       },
-      remove: (pdfPath, id) => {
+      remove: (pdfPath, id, projectPath) => {
+        const key = pdfDocumentKey(projectPath, pdfPath);
+        if (!get().loaded[key]) return;
         set((s) => {
-          s.byPath[pdfPath] = (s.byPath[pdfPath] ?? []).filter((a) => a.id !== id);
-          s.dirty[pdfPath] = true;
+          s.byPath[key] = (s.byPath[key] ?? []).filter((a) => a.id !== id);
+          s.dirty[key] = true;
           if (s.selectedId === id) s.selectedId = null;
         });
-        scheduleSave(pdfPath);
+        scheduleSave(pdfPath, projectPath);
       },
-      load: async (pdfPath) => {
-        const projectPath = useAppStore.getState().currentProject?.path;
-        if (!projectPath) return;
-        try {
-          const anns = await invoke<PdfAnnotation[]>("pdf_annotations_load", {
-            projectPath,
-            pdfPath,
-          });
-          set((s) => {
-            s.byPath[pdfPath] = anns ?? [];
-            s.dirty[pdfPath] = false;
-          });
-        } catch {
-          /* no annotations yet */
+      load: async (pdfPath, projectPath) => {
+        if (!projectPath) throw new Error("No project owns these annotations.");
+        const key = pdfDocumentKey(projectPath, pdfPath);
+        if (get().loaded[key]) return;
+        const annotations = await invoke<PdfAnnotation[]>("pdf_annotations_load", {
+          projectPath,
+          pdfPath,
+        });
+        set((state) => {
+          if (state.dirty[key]) return;
+          state.byPath[key] = annotations ?? [];
+          state.loaded[key] = true;
+          state.dirty[key] = false;
+        });
+      },
+      save: async (pdfPath, projectPath) => {
+        const key = pdfDocumentKey(projectPath, pdfPath);
+        if (!get().loaded[key]) throw new Error("Annotations have not loaded successfully.");
+        if (saveTimers[key]) {
+          clearTimeout(saveTimers[key]);
+          delete saveTimers[key];
         }
-      },
-      save: async (pdfPath) => {
-        const projectPath = useAppStore.getState().currentProject?.path;
-        if (!projectPath) return;
-        const annotations = get().byPath[pdfPath] ?? [];
-        try {
-          await invoke("pdf_annotations_save", { projectPath, pdfPath, annotations });
-          set((s) => {
-            s.dirty[pdfPath] = false;
+        const annotations = get().byPath[key] ?? [];
+        const write = (writes.get(projectPath) ?? Promise.resolve())
+          .catch(() => {})
+          .then(async () => {
+            await invoke("pdf_annotations_save", { projectPath, pdfPath, annotations });
+            if (get().byPath[key] === annotations)
+              set((state) => {
+                state.dirty[key] = false;
+              });
           });
-        } catch {
-          /* keep dirty so a later save retries */
+        writes.set(projectPath, write);
+        try {
+          await write;
+        } finally {
+          if (writes.get(projectPath) === write) writes.delete(projectPath);
         }
       },
     },
   })),
+);
+
+registerFlush(
+  "pdf-annotations",
+  async ({ path }) => {
+    const state = usePdfAnnotationStore.getState();
+    const pending = Object.keys(state.dirty)
+      .filter((key) => state.dirty[key])
+      .map((key) => {
+        const [projectPath, pdfPath] = JSON.parse(key) as [string, string];
+        return !path || path === projectPath
+          ? state.actions.save(pdfPath, projectPath)
+          : Promise.resolve();
+      });
+    const results = await Promise.allSettled(pending);
+    const failures = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    if (failures.length) throw new AggregateError(failures, "Annotations could not be saved.");
+  },
+  { required: true },
 );

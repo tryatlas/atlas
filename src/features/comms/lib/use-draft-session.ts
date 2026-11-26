@@ -3,7 +3,6 @@ import * as Y from "yjs";
 import { comms } from "./comms-api";
 import { subscribeDraftBus } from "./draft-bus";
 import {
-  applyContent,
   AWARENESS_HEARTBEAT_MS,
   AWARENESS_INTERVAL_MS,
   AWARENESS_TTL_MS,
@@ -15,6 +14,8 @@ import {
   UPDATE_DEBOUNCE_MS,
 } from "./draft-sync";
 import { useCommsStore } from "../stores/comms-store";
+import { useAuthStore } from "@/features/auth/stores/auth-store";
+import { authoritativePage, spaceOutbox, updateBatches } from "@/features/spaces/lib/space-outbox";
 import type { PromptDraft } from "../types";
 
 export interface DraftPeer {
@@ -23,143 +24,229 @@ export interface DraftPeer {
   at: number;
 }
 
-/**
- * One live editing session for one draft: the Y.Doc, the relay to and from
- * the socket, and the peers map.
- *
- * The reliability model is web parity, verbatim: local updates are batched
- * at 100ms and MERGED; a batch that cannot send (no socket) stays merged in
- * `unsent` and re-flushes after the next `draft.opened` — which a reconnect
- * always produces, because this hook re-opens on every disconnected→open
- * edge (the subscription is per-socket). Losing an awareness frame is
- * meaningless; the heartbeat restates it.
- */
+/** A draft view owns its editor; the scoped native journal owns unsent work. */
 export function useDraftSession(draft: PromptDraft) {
   const draftId = draft.id;
-  const me = useCommsStore((s) => s.me);
-
-  const doc = useMemo(() => new Y.Doc(), []);
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
+  const accountId = useAuthStore((s) =>
+    s.snapshot.status === "signed-in" ? (s.snapshot.user?.id ?? null) : null,
+  );
+  const orgId = useAuthStore((s) =>
+    s.snapshot.status === "signed-in" ? s.snapshot.commsOrgId : null,
+  );
+  const identity = useMemo(
+    () => (accountId && orgId ? { accountId, orgId } : null),
+    [accountId, orgId],
+  );
+  const doc = useMemo(() => new Y.Doc({ gc: false }), [draftId, identity]);
   const ytext = useMemo(() => doc.getText(PROMPT_TEXT_KEY), [doc]);
-
+  const journal = useMemo(
+    () =>
+      identity
+        ? spaceOutbox({ ...identity, convId: draft.conv_id, pageId: `draft:${draftId}` })
+        : null,
+    [identity, draft.conv_id, draftId],
+  );
   const [ready, setReady] = useState(false);
   const [meta, setMeta] = useState<PromptDraft>(draft);
   const [peers, setPeers] = useState<Record<string, DraftPeer>>({});
-
-  const pending = useRef<Uint8Array[]>([]);
-  const unsent = useRef<Uint8Array[]>([]);
-  const flushTimer = useRef<number | undefined>(undefined);
+  const [syncError, setSyncError] = useState<string | null>(null);
+  const [pending, setPending] = useState(false);
+  const retryRef = useRef<() => void>(() => {});
   const lastAwareness = useRef(0);
 
-  // ---- outbound: local edits → merged base64 batches ----------------------
   useEffect(() => {
-    const flush = () => {
-      flushTimer.current = undefined;
-      const batch = [...unsent.current, ...pending.current];
-      pending.current = [];
-      if (batch.length === 0) return;
-      const merged = Y.mergeUpdates(batch);
-      // The invoke itself always resolves (Rust drops silently with no
-      // socket), so retention is keyed on CONNECTION state, the same signal
-      // the web client keys on.
-      const open = useCommsStore.getState().connection.state === "open";
-      if (open) {
-        void comms.draftUpdate(draftId, toBase64(merged)).catch(() => {
-          unsent.current = [merged];
-        });
-        unsent.current = [];
-      } else {
-        // Keep it MERGED — a long disconnect stays one catch-up update.
-        unsent.current = [merged];
+    setReady(false);
+    setMeta(draftRef.current);
+    setPeers({});
+    setSyncError(null);
+    if (!identity || !journal) {
+      setSyncError("Sign in to recover this draft's saved edits.");
+      return () => doc.destroy();
+    }
+    let alive = true;
+    let opened = false;
+    let sent = draftRef.current.sent_at !== null;
+    let sending = false;
+    let connectionGeneration = 0;
+    let sentIds = new Set<number>();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let proofTimer: ReturnType<typeof setTimeout> | undefined;
+    const current = () => {
+      const auth = useAuthStore.getState().snapshot;
+      const connection = useCommsStore.getState().connection;
+      return (
+        alive &&
+        auth.status === "signed-in" &&
+        auth.user?.id === identity.accountId &&
+        auth.commsOrgId === identity.orgId &&
+        connection.orgId === identity.orgId &&
+        connection.state === "open"
+      );
+    };
+    const fail = (error: unknown) => {
+      if (alive) setSyncError(String(error).replace(/Space/g, "Draft"));
+    };
+    const announce = () => {
+      if (!alive) return;
+      setPending(journal.pending);
+      if (journal.error) fail(journal.error);
+    };
+    const open = async () => {
+      if (current()) await comms.draftOpen(draftId, identity);
+    };
+    const transmit = async () => {
+      if (sending) return;
+      sending = true;
+      const generation = connectionGeneration;
+      try {
+        await journal.flush();
+        if (!current() || !opened || sent || generation !== connectionGeneration) return;
+        const records = journal.records.filter((record) => !sentIds.has(record.id));
+        for (const batch of updateBatches(records.map((record) => record.data))) {
+          if (!current() || generation !== connectionGeneration || sent) return;
+          await comms.draftUpdate(draftId, toBase64(batch), identity);
+        }
+        if (!current() || generation !== connectionGeneration) return;
+        for (const record of records) sentIds.add(record.id);
+        if (records.length && proofTimer === undefined)
+          proofTimer = setTimeout(() => {
+            proofTimer = undefined;
+            void open().catch(fail);
+          }, 750);
+      } catch (error) {
+        fail(error);
+      } finally {
+        sending = false;
+        announce();
       }
     };
-
     const relay = (update: Uint8Array, origin: unknown) => {
       if (origin === REMOTE) return;
-      pending.current.push(update);
-      if (flushTimer.current === undefined) {
-        flushTimer.current = window.setTimeout(flush, UPDATE_DEBOUNCE_MS);
-      }
+      journal.record(update, () => Y.encodeStateAsUpdate(doc));
+      if (timer !== undefined) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = undefined;
+        void transmit();
+      }, UPDATE_DEBOUNCE_MS);
     };
     doc.on("update", relay);
-    return () => {
-      doc.off("update", relay);
-      if (flushTimer.current !== undefined) window.clearTimeout(flushTimer.current);
-      // A mid-word edit must not die with the unmount.
-      flush();
-    };
-  }, [doc, draftId]);
-
-  // ---- inbound: bus → doc / peers ----------------------------------------
-  useEffect(() => {
-    const off = subscribeDraftBus((ev) => {
-      if (ev.draft_id !== draftId) return;
-      if (ev.kind === "opened") {
-        applyContent(doc, ev.snapshot, ev.updates);
-        setMeta(ev.draft);
-        setReady(true);
-        // The reconnect catch-up: anything held while offline goes now.
-        if (unsent.current.length > 0) {
-          const merged = Y.mergeUpdates(unsent.current);
-          unsent.current = [];
-          void comms.draftUpdate(draftId, toBase64(merged)).catch(() => {
-            unsent.current = [merged];
-          });
-        }
-      } else if (ev.kind === "update") {
-        const bytes = ev.update;
+    const loaded = journal.hydrate().then(() => {
+      if (!alive) return;
+      if (journal.savedSnapshot) Y.applyUpdate(doc, journal.savedSnapshot, REMOTE);
+      for (const update of journal.data) Y.applyUpdate(doc, update, REMOTE);
+      if (journal.savedSnapshot || journal.pending) setReady(true);
+      announce();
+    });
+    void loaded.catch(fail);
+    const offJournal = journal.subscribe(announce);
+    const offBus = subscribeDraftBus((event) => {
+      if (event.draft_id !== draftId || !current()) return;
+      if (event.kind === "opened") {
+        const generation = connectionGeneration;
+        void loaded
+          .then(async () => {
+            if (!current() || generation !== connectionGeneration) return;
+            const authoritative = authoritativePage(event);
+            try {
+              Y.applyUpdate(doc, Y.encodeStateAsUpdate(authoritative), REMOTE);
+              await journal.flush();
+              if (!current() || generation !== connectionGeneration) return;
+              await journal.acknowledge(authoritative);
+              sent = event.draft.sent_at !== null;
+              opened = true;
+              setMeta(event.draft);
+              setReady(true);
+              setSyncError(
+                sent && journal.pending
+                  ? "This draft was sent before your local changes synced. Your edits remain saved here; copy them to recover."
+                  : null,
+              );
+              journal.captureSnapshot(() => Y.encodeStateAsUpdate(doc));
+              void transmit();
+            } finally {
+              authoritative.destroy();
+            }
+          })
+          .catch(fail);
+      } else if (event.kind === "update") {
         try {
-          const decoded = Uint8Array.from(atob(bytes), (c) => c.charCodeAt(0));
-          Y.applyUpdate(doc, decoded, REMOTE);
-        } catch (e) {
-          console.warn("comms: malformed draft update dropped:", e);
+          Y.applyUpdate(
+            doc,
+            Uint8Array.from(atob(event.update), (c) => c.charCodeAt(0)),
+            REMOTE,
+          );
+          journal.captureSnapshot(() => Y.encodeStateAsUpdate(doc));
+        } catch (error) {
+          fail(error);
         }
-      } else {
-        if (ev.user_id === me) return;
-        const state = decodeAwareness(ev.state);
-        if (state) {
-          setPeers((current) => ({
-            ...current,
-            [ev.user_id]: { userId: ev.user_id, cursor: state.cursor, at: Date.now() },
+      } else if (event.user_id !== useCommsStore.getState().me) {
+        const state = decodeAwareness(event.state);
+        if (state)
+          setPeers((currentPeers) => ({
+            ...currentPeers,
+            [event.user_id]: { userId: event.user_id, cursor: state.cursor, at: Date.now() },
           }));
-        }
       }
     });
-    return off;
-  }, [doc, draftId, me]);
-
-  // ---- open + reopen on reconnect ----------------------------------------
-  useEffect(() => {
-    // Surfaced, not void-dropped: on a stale binary this invoke REJECTS
-    // (command not registered), and an unhandled rejection here looked like
-    // "clicked and nothing happened".
-    comms.draftOpen(draftId).catch((e) => {
-      console.error("comms: draft open failed:", draftId, e);
+    let connection = useCommsStore.getState().connection;
+    void loaded.then(open).catch(fail);
+    const offConnection = useCommsStore.subscribe((state) => {
+      if (
+        connection.state === state.connection.state &&
+        connection.epoch === state.connection.epoch &&
+        connection.orgId === state.connection.orgId
+      )
+        return;
+      connection = state.connection;
+      connectionGeneration += 1;
+      opened = false;
+      sentIds = new Set();
+      if (proofTimer !== undefined) clearTimeout(proofTimer);
+      proofTimer = undefined;
+      void loaded.then(open).catch(fail);
     });
-    let wasOpen = useCommsStore.getState().connection.state === "open";
-    const unsub = useCommsStore.subscribe((s) => {
-      const open = s.connection.state === "open";
-      if (open && !wasOpen) {
-        comms.draftOpen(draftId).catch((e) => {
-          console.error("comms: draft re-open failed:", draftId, e);
-        });
-      }
-      wasOpen = open;
-    });
-    return unsub;
-  }, [draftId]);
+    retryRef.current = () => {
+      sentIds.clear();
+      setSyncError(null);
+      void journal
+        .hydrate()
+        .then(() => {
+          void transmit();
+          return open();
+        })
+        .catch(fail);
+    };
+    return () => {
+      alive = false;
+      if (timer !== undefined) clearTimeout(timer);
+      if (proofTimer !== undefined) clearTimeout(proofTimer);
+      offConnection();
+      offBus();
+      offJournal();
+      doc.off("update", relay);
+      // flush synchronously materializes the full snapshot before destruction.
+      journal.captureSnapshot(() => Y.encodeStateAsUpdate(doc));
+      void journal.flush().catch(() => {});
+      doc.destroy();
+    };
+  }, [doc, draftId, identity, journal]);
 
   // ---- awareness out: throttled publisher + heartbeat ---------------------
   const cursorRef = useRef(0);
   const publishCursor = useMemo(() => {
     return (offset: number, force = false) => {
       cursorRef.current = offset;
-      if (meta.sent_at !== null) return;
+      if (meta.sent_at !== null || !identity) return;
       const now = Date.now();
       if (!force && now - lastAwareness.current < AWARENESS_INTERVAL_MS) return;
       lastAwareness.current = now;
-      void comms.draftAwareness(draftId, encodeAwareness({ cursor: offset })).catch(() => {});
+      void comms
+        .draftAwareness(draftId, encodeAwareness({ cursor: offset }), identity)
+        .catch(() => {});
     };
-  }, [draftId, meta.sent_at]);
+  }, [draftId, meta.sent_at, identity]);
 
   useEffect(() => {
     const beat = window.setInterval(() => {
@@ -181,7 +268,15 @@ export function useDraftSession(draft: PromptDraft) {
     return () => window.clearInterval(sweep);
   }, []);
 
-  useEffect(() => () => doc.destroy(), [doc]);
-
-  return { doc, ytext, ready, meta, peers, publishCursor };
+  return {
+    doc,
+    ytext,
+    ready,
+    meta,
+    peers,
+    publishCursor,
+    syncError,
+    pending,
+    retrySync: () => retryRef.current(),
+  };
 }

@@ -1,6 +1,13 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { toast } from "sonner";
+import {
+  captureDocumentEdit,
+  deleteDocument,
+  documentKey,
+  saveDocument,
+} from "@/features/editor-notion/lib/document-saves";
 
 export interface PageMeta {
   icon?: string | null;
@@ -56,11 +63,14 @@ interface KnowledgeMetaState {
   projectPath: string | null;
   pages: Record<string, PageMeta>;
   loading: boolean;
+  error: string | null;
+  writable: boolean;
   actions: {
     /** Hydrate from disk + start listening. Idempotent per project path. */
     bind: (projectPath: string) => Promise<void>;
     unbind: () => void;
-    /** Merge a patch into the active page and persist (debounced in Rust). */
+    retry: () => Promise<void>;
+    /** Merge a patch into the active page and persist durably in Rust. */
     patch: (entryId: string, patch: PageMetaPatch) => Promise<void>;
     /** Drop a page's metadata entirely (e.g. after `delete_knowledge_note`). */
     drop: (entryId: string) => Promise<void>;
@@ -68,6 +78,17 @@ interface KnowledgeMetaState {
 }
 
 let unlisten: UnlistenFn | null = null;
+let bindingGeneration = 0;
+let loadGeneration = 0;
+const drafts = new Map<string, { path: string; entryId: string; patch: PageMetaPatch }>();
+
+function applyDrafts(path: string, pages: Record<string, PageMeta>): Record<string, PageMeta> {
+  const next = { ...pages };
+  for (const draft of drafts.values()) {
+    if (draft.path === path) next[draft.entryId] = { ...next[draft.entryId], ...draft.patch };
+  }
+  return next;
+}
 
 // Re-push knowledge titles + icons into the Rust mention cache so the
 // @-/~ picker shows real titles + emoji instead of note ids. Must run
@@ -79,113 +100,155 @@ function republishMentionCache() {
   void import("@/features/chat/lib/mentions").then((m) => m.publishKnowledgeToMentionCache());
 }
 
-const store = create<KnowledgeMetaState>()((set, get) => ({
-  projectPath: null,
-  pages: {},
-  loading: false,
-  actions: {
-    bind: async (projectPath) => {
-      // Already bound to this project — re-hydrate silently in case the
-      // metadata file changed under us, but don't toggle loading.
-      if (get().projectPath === projectPath && unlisten) {
-        try {
-          const file = await invoke<MetaFile>("knowledge_meta_load", { projectPath });
-          set({ pages: mapPages(file.pages) });
-          republishMentionCache();
-        } catch {
-          // ignore
-        }
+const store = create<KnowledgeMetaState>()((set, get) => {
+  const refresh = async (path: string, binding: number) => {
+    const generation = ++loadGeneration;
+    try {
+      const file = await invoke<MetaFile>("knowledge_meta_load", { projectPath: path });
+      if (
+        binding !== bindingGeneration ||
+        generation !== loadGeneration ||
+        get().projectPath !== path
+      )
         return;
-      }
-      get().actions.unbind();
-      set({ projectPath, loading: true, pages: {} });
-      try {
-        const file = await invoke<MetaFile>("knowledge_meta_load", { projectPath });
-        set({ pages: mapPages(file.pages), loading: false });
-        republishMentionCache();
-      } catch {
-        set({ loading: false });
-      }
-      // Re-load when Rust emits a meta-changed event for this project.
-      // Other open projects share the same global event channel, so we
-      // filter by payload.projectPath defensively.
-      unlisten = await listen<{ projectPath: string }>(
-        "atlas:knowledge:meta-changed",
-        async (event) => {
-          const current = get().projectPath;
-          if (!current || event.payload?.projectPath !== current) return;
-          try {
-            const fresh = await invoke<MetaFile>("knowledge_meta_load", {
-              projectPath: current,
-            });
-            set({ pages: mapPages(fresh.pages) });
-            republishMentionCache();
-          } catch {
-            // ignore
-          }
-        },
-      );
-    },
-    unbind: () => {
-      if (unlisten) {
-        unlisten();
-        unlisten = null;
-      }
-      set({ projectPath: null, pages: {} });
-    },
-    patch: async (entryId, patch) => {
-      const { projectPath, pages } = get();
-      if (!projectPath) return;
-
-      // Optimistic in-memory merge so the UI updates immediately; the
-      // event listener reconciles when Rust persists.
-      const existing = pages[entryId] ?? {};
-      const optimistic: PageMeta = {
-        ...existing,
-        ...(patch.icon !== undefined ? { icon: patch.icon } : {}),
-        ...(patch.cover !== undefined ? { cover: patch.cover } : {}),
-        ...(patch.title !== undefined ? { title: patch.title } : {}),
-        ...(patch.status !== undefined ? { status: patch.status } : {}),
-        ...(patch.tags !== undefined ? { tags: patch.tags } : {}),
-        ...(patch.owner !== undefined ? { owner: patch.owner } : {}),
-        updatedAt: new Date().toISOString(),
-      };
-      set({ pages: { ...pages, [entryId]: optimistic } });
-
-      try {
-        // Rust expects `Option<Option<T>>` shape: explicit `null` clears,
-        // missing field leaves unchanged. JSON `null` ⇒ Some(None).
-        await invoke("knowledge_meta_patch", {
-          projectPath,
-          entryId,
-          patch: toRustPatch(patch),
-        });
-        // If this patch touched the page-header title or icon, republish
-        // the mention cache so @-/~ picker results immediately reflect
-        // the new label/emoji.
-        if (patch.title !== undefined || patch.icon !== undefined) {
-          republishMentionCache();
+      set({
+        pages: applyDrafts(path, mapPages(file.pages)),
+        loading: false,
+        writable: file.version === 1,
+        error:
+          file.version === 1
+            ? null
+            : "This metadata version is newer than Atlas. Open it in a newer version before editing.",
+      });
+      republishMentionCache();
+    } catch (error) {
+      if (
+        binding !== bindingGeneration ||
+        generation !== loadGeneration ||
+        get().projectPath !== path
+      )
+        return;
+      set({ loading: false, writable: false, error: String(error) });
+    }
+  };
+  return {
+    projectPath: null,
+    pages: {},
+    loading: false,
+    error: null,
+    writable: false,
+    actions: {
+      bind: async (projectPath) => {
+        if (get().projectPath === projectPath && unlisten) {
+          await refresh(projectPath, bindingGeneration);
+          return;
         }
-      } catch {
-        // On error, restore the prior state.
-        set({ pages });
-      }
+        get().actions.unbind();
+        const binding = bindingGeneration;
+        set({ projectPath, loading: true, pages: {}, error: null, writable: false });
+        // Subscribe before reading so a write between load and listen is observed.
+        const off = await listen<{ projectPath: string }>(
+          "atlas:knowledge:meta-changed",
+          (event) => {
+            if (event.payload.projectPath === projectPath && binding === bindingGeneration)
+              void refresh(projectPath, binding);
+          },
+        ).catch((error) => {
+          if (binding === bindingGeneration) set({ error: String(error), loading: false });
+          return null;
+        });
+        if (binding !== bindingGeneration) {
+          off?.();
+          return;
+        }
+        unlisten = off;
+        await refresh(projectPath, binding);
+      },
+      unbind: () => {
+        bindingGeneration += 1;
+        unlisten?.();
+        unlisten = null;
+        set({ projectPath: null, pages: {}, loading: false, writable: false, error: null });
+      },
+      retry: async () => {
+        const path = get().projectPath;
+        if (!path) return;
+        await get().actions.bind(path);
+        if (!get().writable || get().projectPath !== path) return;
+        await Promise.all(
+          [...drafts].filter(([, draft]) => draft.path === path).map(([key]) => saveDocument(key)),
+        );
+      },
+      patch: async (entryId, patch) => {
+        const { projectPath, writable } = get();
+        if (!projectPath || !writable) {
+          const error = new Error(
+            "Page properties are read-only until their file is repaired and reloaded.",
+          );
+          toast.error(error.message);
+          throw error;
+        }
+        const key = documentKey(projectPath, "knowledge-meta", entryId);
+        const draft = {
+          path: projectPath,
+          entryId,
+          patch: { ...drafts.get(key)?.patch, ...patch },
+        };
+        drafts.set(key, draft);
+        set((state) => ({
+          pages: { ...state.pages, [entryId]: { ...state.pages[entryId], ...patch } },
+        }));
+        captureDocumentEdit(key, {
+          projectPath,
+          serialize: () => JSON.stringify(toRustPatch(draft.patch)),
+          persist: async (raw) => {
+            try {
+              await invoke("knowledge_meta_patch", {
+                projectPath,
+                entryId,
+                patch: JSON.parse(raw),
+              });
+              if (drafts.get(key) === draft) drafts.delete(key);
+              if (get().projectPath === projectPath) {
+                set({ error: null });
+                republishMentionCache();
+              }
+            } catch (error) {
+              if (get().projectPath === projectPath) set({ error: String(error) });
+              throw error;
+            }
+          },
+        });
+        try {
+          await saveDocument(key);
+        } catch (error) {
+          toast.error(`Page properties could not be saved: ${String(error)}`);
+          throw error;
+        }
+      },
+      drop: async (entryId) => {
+        const projectPath = get().projectPath;
+        if (!projectPath) return;
+        const key = documentKey(projectPath, "knowledge-meta", entryId);
+        try {
+          await deleteDocument(key, async () => {
+            await invoke("knowledge_meta_delete", { projectPath, entryId });
+            drafts.delete(key);
+            if (get().projectPath === projectPath)
+              set((state) => {
+                const pages = { ...state.pages };
+                delete pages[entryId];
+                return { pages };
+              });
+          });
+        } catch (error) {
+          if (get().projectPath === projectPath) set({ error: String(error) });
+          throw error;
+        }
+      },
     },
-    drop: async (entryId) => {
-      const { projectPath, pages } = get();
-      if (!projectPath) return;
-      if (!(entryId in pages)) return;
-      const next = { ...pages };
-      delete next[entryId];
-      set({ pages: next });
-      try {
-        await invoke("knowledge_meta_delete", { projectPath, entryId });
-      } catch {
-        // ignore — re-hydrate via event will reconcile if needed
-      }
-    },
-  },
-}));
+  };
+});
 
 function mapPages(raw: Record<string, RustPageMeta>): Record<string, PageMeta> {
   const out: Record<string, PageMeta> = {};

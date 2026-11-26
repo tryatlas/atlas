@@ -10,9 +10,9 @@
 //! Model listing stays a plain `/models` fetch (`modelchat_models`).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 
 use futures::StreamExt;
 use parking_lot::Mutex;
@@ -77,7 +77,7 @@ pub(super) fn provider_endpoint(provider: &str) -> Option<(ApiKind, &'static str
 
 #[derive(Default)]
 pub struct ModelChatState {
-    cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    cancels: Mutex<HashMap<String, Arc<watch::Sender<bool>>>>,
 }
 
 impl ModelChatState {
@@ -263,16 +263,34 @@ pub(super) fn start_stream(
 
 // ── Stream drain (shared across providers) ──────────────────────────────────
 
+/// Longest wait for the next piece of a streamed reply (or for the first,
+/// which includes the connection and the model's time to first token).
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+fn idle_error() -> String {
+    format!(
+        "the provider sent nothing for {}s",
+        STREAM_IDLE_TIMEOUT.as_secs()
+    )
+}
+
 /// Iterate a Rig completion stream, forwarding text deltas to the UI, then read
 /// token usage from the folded response once the stream is exhausted.
 async fn drain(
     mut stream: Streamed<Completion>,
     app: &AppHandle,
     stream_id: &str,
-    cancel: &Arc<AtomicBool>,
+    cancel: &Arc<watch::Sender<bool>>,
 ) -> Result<(u64, u64), String> {
-    while let Some(item) = stream.next().await {
-        if cancel.load(Ordering::Relaxed) {
+    // A provider that accepts the request and then goes silent (or a dial
+    // that never completes: Rig's client connects on the first poll) must not
+    // hold the chat open forever. The bound is per item, not on the whole
+    // reply, so a long answer that keeps streaming is never cut off.
+    while let Some(item) = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next())
+        .await
+        .map_err(|_| idle_error())?
+    {
+        if *cancel.borrow() {
             return Ok((0, 0));
         }
         if let Item::Event(StreamEvent::Text { text, .. }) = item.map_err(|e| e.to_string())? {
@@ -285,7 +303,10 @@ async fn drain(
     // the provider never ended (connection cut before the terminal record)
     // fails here as `Truncated` rather than as a stream item, so it must surface
     // as an error, not as `Done` after partial text.
-    let response = stream.finish().await.map_err(|e| e.to_string())?;
+    let response = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.finish())
+        .await
+        .map_err(|_| idle_error())?
+        .map_err(|e| e.to_string())?;
     Ok((
         response.usage.input_tokens.unwrap_or(0),
         response.usage.output_tokens.unwrap_or(0),
@@ -303,13 +324,18 @@ pub async fn modelchat_stream(
     model: String,
     messages: Vec<ChatMsg>,
 ) -> Result<(), String> {
-    let cancel = Arc::new(AtomicBool::new(false));
+    let (cancel, mut cancelled) = watch::channel(false);
+    let cancel = Arc::new(cancel);
     state
         .cancels
         .lock()
         .insert(stream_id.clone(), cancel.clone());
 
-    let result = run_stream(&app, &stream_id, &provider, &model, messages, &cancel).await;
+    let result = tokio::select! {
+        biased;
+        _ = cancelled.wait_for(|cancelled| *cancelled) => Ok((0, 0)),
+        result = run_stream(&app, &stream_id, &provider, &model, messages, &cancel) => result,
+    };
 
     state.cancels.lock().remove(&stream_id);
 
@@ -343,7 +369,7 @@ pub async fn modelchat_stream(
             Ok(())
         }
         Err(e) => {
-            if cancel.load(Ordering::Relaxed) {
+            if *cancel.borrow() {
                 emit(&app, &stream_id, ModelChatEvent::Done);
                 Ok(())
             } else {
@@ -364,7 +390,7 @@ async fn run_stream(
     provider: &str,
     model: &str,
     messages: Vec<ChatMsg>,
-    cancel: &Arc<AtomicBool>,
+    cancel: &Arc<watch::Sender<bool>>,
 ) -> Result<(u64, u64), String> {
     let (api, base) =
         provider_endpoint(provider).ok_or_else(|| format!("{provider} does not support chat"))?;
@@ -380,7 +406,7 @@ async fn run_stream(
 #[tauri::command]
 pub fn modelchat_cancel(state: State<'_, ModelChatState>, stream_id: String) {
     if let Some(flag) = state.cancels.lock().get(&stream_id) {
-        flag.store(true, Ordering::Relaxed);
+        flag.send_replace(true);
     }
 }
 
@@ -447,6 +473,8 @@ fn http() -> reqwest::Client {
             env!("CARGO_PKG_VERSION"),
             " (model-chat)"
         ))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(60))
         .build()
         .unwrap_or_default()
 }

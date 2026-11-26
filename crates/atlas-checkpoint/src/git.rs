@@ -73,6 +73,8 @@ pub struct CommitInfo {
     /// is what makes the bounded recovery re-scan safe: historical commits that
     /// predate every Session can neither link nor consume its touches.
     pub commit_time: i64,
+    /// Original authorship time survives amend/rebase and bounds attribution.
+    pub author_time: i64,
     pub subject: String,
 }
 
@@ -630,7 +632,7 @@ pub fn commit_info(repo: &Path, sha: &str) -> Result<CommitInfo> {
         &[
             "show",
             "--no-patch",
-            "--format=%H%x1f%an%x1f%ae%x1f%P%x1f%ct%x1f%s",
+            "--format=%H%x1f%an%x1f%ae%x1f%P%x1f%ct%x1f%at%x1f%s",
             sha,
         ],
     )?;
@@ -652,6 +654,10 @@ pub fn commit_info(repo: &Path, sha: &str) -> Result<CommitInfo> {
         // linking it to all of them — a missing link is recoverable, a wrong
         // one corrupts a shared timeline.
         commit_time: fields
+            .next()
+            .and_then(|f| f.trim().parse().ok())
+            .unwrap_or(0),
+        author_time: fields
             .next()
             .and_then(|f| f.trim().parse().ok())
             .unwrap_or(0),

@@ -17,12 +17,12 @@ use anyhow::{anyhow, Context as _, Result};
 use atlas_acp_thread::{
     build_terminal_auth_command, AcpThread, AcpThreadEvent, AcpThreadHandle, AgentConnection,
     AgentId, AgentModelId, AgentModelInfo, AgentModelList, AgentModelSelector,
-    AgentSessionConfigOptions, AgentSessionModes, AuthRequired, ElicitationStore,
+    AgentSessionConfigOptions, AgentSessionFork, AgentSessionModes, AuthRequired, ElicitationStore,
     ElicitationStoreEvent, ElicitationStoreHandle, EventSink, LoadError, TerminalAuthCommand,
 };
 use futures::future::BoxFuture;
-use futures::{AsyncBufReadExt, FutureExt, StreamExt};
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use futures::{FutureExt, StreamExt};
+use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 use crate::debug_log::{AcpDebugLog, AcpDebugMessage, AcpDebugMessageDirection};
 use crate::handlers::{self, ClientContext};
@@ -34,6 +34,29 @@ use crate::session_mcp::{self, SessionMcpRequest, SessionMcpServers};
 
 /// Anything below v1 is rejected outright rather than degraded to.
 const MINIMUM_SUPPORTED_VERSION: ProtocolVersion = ProtocolVersion::V1;
+
+/// The newest protocol Atlas speaks. An agent that answers `initialize` with
+/// a later one is refused (#14): ACP's negotiation has the agent answer with
+/// the version it chose, and one Atlas never offered is a wire Atlas cannot
+/// read.
+const MAXIMUM_SUPPORTED_VERSION: ProtocolVersion = ProtocolVersion::V1;
+
+/// Longest stdout line read as a message (#92). A JSON-RPC frame is one line,
+/// and the largest Atlas expects is a whole file in `fs/write_text_file`;
+/// a longer run without a newline is discarded rather than buffered for ever.
+const MAX_STDOUT_LINE_BYTES: usize = 64 * 1024 * 1024;
+
+/// How long a closed stdout waits for the process's own exit status before
+/// the agent is declared gone without one (#87). An agent that exits closes
+/// its pipes a moment before its status is reaped; its status (and the stderr
+/// that explains it) is the better report when it is about to land.
+const TRANSPORT_EXIT_GRACE: Duration = Duration::from_secs(1);
+
+/// How long an agent has between SIGTERM and SIGKILL when its connection
+/// goes (#91): long enough to flush a session to disk, short enough that a
+/// wedged one does not outlive the tab by more than a moment.
+#[cfg(unix)]
+const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// How long to wait for the child's exit status after `initialize` fails.
 ///
@@ -52,6 +75,131 @@ const INITIALIZE_EXIT_GRACE: Duration = Duration::from_millis(250);
 /// report. Generous: a cold `node` start on a slow disk is seconds, not a
 /// minute, so expiry means the agent is not going to answer.
 pub const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Longest stderr line handed on whole; a longer run without a newline is
+/// split here, so a child that never prints one cannot grow the buffer forever.
+const MAX_STDERR_LINE_BYTES: usize = 64 * 1024;
+
+/// Read an agent's stderr to EOF, one line at a time, decoding each lossily.
+///
+/// `lines()` stopped at the first line that was not UTF-8 and dropped the
+/// reader, closing the pipe: the agent's next write to stderr then failed
+/// (EPIPE, or SIGPIPE for one that does not ignore it). Bytes are read here and
+/// decoded with replacement characters, so the pipe is drained until the agent
+/// closes it.
+async fn drain_stderr_lines<R>(mut reader: R, mut on_line: impl FnMut(&str))
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt as _;
+    let mut emit = |line: &mut Vec<u8>| {
+        let text = String::from_utf8_lossy(line);
+        on_line(text.trim_end_matches(['\n', '\r']));
+        line.clear();
+    };
+    let mut line = Vec::new();
+    loop {
+        let buf = match reader.fill_buf().await {
+            Ok(buf) => buf,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        if buf.is_empty() {
+            break;
+        }
+        let room = MAX_STDERR_LINE_BYTES - line.len();
+        let (take, ended) = match buf.iter().take(room).position(|b| *b == b'\n') {
+            Some(at) => (at + 1, true),
+            None => (buf.len().min(room), false),
+        };
+        line.extend_from_slice(&buf[..take]);
+        reader.consume(take);
+        if ended || line.len() >= MAX_STDERR_LINE_BYTES {
+            emit(&mut line);
+        }
+    }
+    if !line.is_empty() {
+        emit(&mut line);
+    }
+}
+
+/// An agent's stdout as lines, each decoded lossily (#71, #87).
+///
+/// `lines()` ended the stream at the first line that was not UTF-8, and the
+/// connection with it: every later request failed or hung while the process
+/// lived on. A bad byte now costs at most the characters it spoils. A line
+/// longer than [`MAX_STDOUT_LINE_BYTES`] is skipped to its newline instead of
+/// grown without bound (#92). A read error ends the stream, which ends the
+/// connection; the wait task reports the agent gone.
+fn lossy_lines<R>(
+    reader: R,
+    max_line_bytes: usize,
+) -> impl futures::Stream<Item = std::io::Result<String>> + Send
+where
+    R: tokio::io::AsyncBufRead + Unpin + Send,
+{
+    struct State<R> {
+        reader: R,
+        line: Vec<u8>,
+        /// Inside a line already over the cap: dropping bytes to its end.
+        skipping: bool,
+    }
+    let state = State {
+        reader,
+        line: Vec::new(),
+        skipping: false,
+    };
+    futures::stream::unfold(state, move |mut state| async move {
+        use tokio::io::AsyncBufReadExt as _;
+        loop {
+            let buf = match state.reader.fill_buf().await {
+                Ok(buf) => buf,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => {
+                    tracing::warn!("ACP transport read error: {err}");
+                    return None;
+                }
+            };
+            if buf.is_empty() {
+                // EOF: a last line without its newline still counts.
+                if state.line.is_empty() || state.skipping {
+                    return None;
+                }
+                let text = String::from_utf8_lossy(&state.line).into_owned();
+                state.line.clear();
+                return Some((Ok(text), state));
+            }
+            let (take, ended) = match buf.iter().position(|byte| *byte == b'\n') {
+                Some(at) => (at, true),
+                None => (buf.len(), false),
+            };
+            if !state.skipping {
+                if state.line.len() + take > max_line_bytes {
+                    tracing::warn!(
+                        "skipping an agent stdout line longer than {max_line_bytes} bytes"
+                    );
+                    state.skipping = true;
+                    state.line = Vec::new();
+                } else {
+                    state.line.extend_from_slice(&buf[..take]);
+                }
+            }
+            state.reader.consume(if ended { take + 1 } else { take });
+            if !ended {
+                continue;
+            }
+            if std::mem::take(&mut state.skipping) {
+                continue;
+            }
+            if state.line.last() == Some(&b'\r') {
+                state.line.pop();
+            }
+            let text = String::from_utf8_lossy(&state.line).into_owned();
+            state.line.clear();
+            return Some((Ok(text), state));
+        }
+    })
+}
 
 /// Maximum time the exit path waits for the stderr reader to reach EOF before
 /// it builds the `Exited` error out of what was recorded. The reader normally
@@ -104,8 +252,12 @@ impl Default for ConnectionDeadlines {
 /// What a session's `AcpThread` events are sent to.
 ///
 /// The host supplies a sink per session, so routing deltas onto the outbound
-/// pipeline stays the host's business and this crate stays leaf-level.
-pub type ThreadEventSink = Arc<dyn Fn(&acp::SessionId) -> EventSink<AcpThreadEvent> + Send + Sync>;
+/// pipeline stays the host's business and this crate stays leaf-level. The
+/// sink is told which agent's session it is: ACP scopes a session id to its
+/// connection, so two agents can both mint `"1"` (#86), and a host that files
+/// the stream by the bare id would hand one agent's events to the other.
+pub type ThreadEventSink =
+    Arc<dyn Fn(&AgentId, &acp::SessionId) -> EventSink<AcpThreadEvent> + Send + Sync>;
 
 /// Where a connection's request-scoped elicitations are announced, supplied by
 /// the host the same way [`ThreadEventSink`] is. See `ConnectOptions`.
@@ -145,12 +297,17 @@ pub struct AcpConnection {
     /// Decides the MCP servers each session request carries. `None` sends
     /// every session an empty list.
     session_mcp: Option<Arc<dyn SessionMcpServers>>,
-    /// `true` once the child has exited; see [`AgentConnection::exited`].
+    /// `true` once the child has exited, or its transport has died; see
+    /// [`AgentConnection::exited`].
     exited: tokio::sync::watch::Receiver<bool>,
     /// The inbound dispatch queue, held weakly so the connection does not
     /// keep the drain alive: a `session/load` replay ends on it, behind the
-    /// replay's own frames (`handlers::enqueue_barrier`).
-    dispatch_tx: tokio::sync::mpsc::WeakUnboundedSender<handlers::DispatchWork>,
+    /// replay's own frames, and a turn ends behind its own updates
+    /// (`handlers::enqueue_barrier`).
+    dispatch_tx: tokio::sync::mpsc::WeakSender<handlers::DispatchWork>,
+    /// Bumped by [`AgentConnection::cancel_authentication`]; a running
+    /// `authenticate` ends when it moves (#67).
+    auth_cancel: tokio::sync::watch::Sender<u64>,
     _io_task: tokio::task::JoinHandle<()>,
     _stderr_task: tokio::task::JoinHandle<()>,
     _wait_task: tokio::task::JoinHandle<()>,
@@ -192,7 +349,12 @@ impl AcpConnection {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // The agent is not attached to a tty and must never try to prompt.
-            .kill_on_drop(true);
+            //
+            // Not on Unix: there `AgentChild` owns the kill, SIGTERM first
+            // and SIGKILL after a grace (#91), and tokio's SIGKILL on drop
+            // would take the direct child before it heard the first. Tokio
+            // still reaps it.
+            .kill_on_drop(cfg!(not(unix)));
         if let Some(env) = &command.env {
             child_command.envs(env);
         }
@@ -216,15 +378,25 @@ impl AcpConnection {
 
         // Both directions are tee'd into the debug log before they reach the
         // codec, so the log shows the bytes as they went over the wire.
-        let incoming = futures::io::BufReader::new(stdout.compat())
-            .lines()
+        // Told when the transport ends, whatever ended it: the wait task
+        // treats a dead transport as a dead agent (#87). Stdout reaching EOF
+        // is the end; the SDK's connection future does not finish on it.
+        let transport_closed = Arc::new(tokio::sync::Notify::new());
+        let incoming = lossy_lines(tokio::io::BufReader::new(stdout), MAX_STDOUT_LINE_BYTES)
             .inspect({
                 let debug_log = debug_log.clone();
                 move |result| match result {
                     Ok(line) => debug_log.record_line(AcpDebugMessageDirection::Incoming, line),
                     Err(err) => tracing::warn!("ACP transport read error: {err}"),
                 }
-            });
+            })
+            .chain(futures::stream::poll_fn({
+                let transport_closed = transport_closed.clone();
+                move |_| {
+                    transport_closed.notify_one();
+                    std::task::Poll::Ready(None)
+                }
+            }));
         let outgoing = futures::sink::unfold(
             (Box::pin(stdin.compat_write()), debug_log.clone()),
             async move |(mut writer, debug_log), line: String| {
@@ -242,13 +414,14 @@ impl AcpConnection {
         let stderr_task = tokio::spawn({
             let debug_log = debug_log.clone();
             async move {
-                use tokio::io::AsyncBufReadExt as _;
-                let mut lines = tokio::io::BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let trimmed = line.trim_end_matches(['\n', '\r']);
-                    tracing::warn!("agent stderr: {trimmed}");
-                    debug_log.record_line(AcpDebugMessageDirection::Stderr, trimmed);
-                }
+                // Debug, not warn: an agent's stderr is its own chatter (it was
+                // most of the app's WARN lines). It still reaches the debug
+                // log, which is what an error report quotes.
+                drain_stderr_lines(tokio::io::BufReader::new(stderr), |line| {
+                    tracing::debug!("agent stderr: {line}");
+                    debug_log.record_line(AcpDebugMessageDirection::Stderr, line);
+                })
+                .await;
                 let _ = stderr_drained_tx.send(());
             }
         });
@@ -262,9 +435,13 @@ impl AcpConnection {
         let weak_dispatch_tx = dispatch_tx.downgrade();
         let connection_future =
             connect_client_future(client_name, transport, dispatch_tx, connection_tx);
-        let io_task = tokio::spawn(async move {
-            if let Err(err) = connection_future.await {
-                tracing::error!("ACP connection error: {err}");
+        let io_task = tokio::spawn({
+            let transport_closed = transport_closed.clone();
+            async move {
+                if let Err(err) = connection_future.await {
+                    tracing::error!("ACP connection error: {err}");
+                }
+                transport_closed.notify_one();
             }
         });
 
@@ -354,6 +531,13 @@ impl AcpConnection {
                 message: "This agent speaks an ACP version Atlas no longer supports.".into(),
             }));
         }
+        if response.protocol_version > MAXIMUM_SUPPORTED_VERSION {
+            return Err(anyhow!(LoadError::Unsupported {
+                message: "This agent speaks a newer ACP version than this Atlas does. \
+                          Updating Atlas should let it connect."
+                    .into(),
+            }));
+        }
 
         // From here on the child's death is a live-session event, not a
         // connect failure: every thread is told, so an agent that dies
@@ -362,7 +546,25 @@ impl AcpConnection {
         let wait_task = tokio::spawn({
             let sessions = sessions.clone();
             async move {
-                let (load_error, _child) = status_fut.await;
+                let mut status_fut = status_fut;
+                // A transport that dies while the process lives on is as dead
+                // as an exit: nothing can reach the agent any more. Without
+                // this the UI kept saying "Connected" to a process that could
+                // no longer hear it (#87). The process gets a moment to exit
+                // on its own, since its status says more; then it is killed
+                // (dropping `status_fut` drops the child).
+                let load_error = tokio::select! {
+                    (load_error, _child) = &mut status_fut => load_error,
+                    () = transport_closed.notified() => {
+                        match tokio::time::timeout(TRANSPORT_EXIT_GRACE, &mut status_fut).await {
+                            Ok((load_error, _child)) => load_error,
+                            Err(_) => LoadError::Other(
+                                "Atlas lost its connection to the agent.".into(),
+                            ),
+                        }
+                    }
+                };
+                drop(status_fut);
                 for thread in sessions.all_threads() {
                     thread
                         .lock()
@@ -412,6 +614,7 @@ impl AcpConnection {
             session_mcp: None,
             exited,
             dispatch_tx: weak_dispatch_tx,
+            auth_cancel: tokio::sync::watch::channel(0).0,
             _io_task: io_task,
             _stderr_task: stderr_task,
             _wait_task: wait_task,
@@ -513,7 +716,7 @@ impl AcpConnection {
         work_dirs: Vec<PathBuf>,
         title: Option<Arc<str>>,
     ) -> AcpThreadHandle {
-        let events = (self.thread_events)(&session_id);
+        let events = (self.thread_events)(&self.id, &session_id);
         let mut thread = AcpThread::new(
             session_id,
             self.clone() as Arc<dyn AgentConnection>,
@@ -525,17 +728,50 @@ impl AcpConnection {
         Arc::new(Mutex::new(thread))
     }
 
+    /// Runs `then` on the dispatch drain once every inbound message queued
+    /// before this call has been applied, and waits for it. `then` is handed
+    /// the drain's context, or `None` when the queue is gone and it runs here.
+    ///
+    /// Every frame the agent wrote before an answer was parsed, and so
+    /// queued, before that answer resolved its request: work queued after the
+    /// answer runs after all of them. That is how a load ends behind its
+    /// replay (#10) and a turn behind its last word (#16).
+    async fn behind_the_queue<T: Send + 'static>(
+        &self,
+        then: impl FnOnce(Option<&ClientContext>) -> T + Send + 'static,
+    ) -> Option<T> {
+        let Some(dispatch_tx) = self.dispatch_tx.upgrade() else {
+            return Some(then(None));
+        };
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        handlers::enqueue_on_drain(&dispatch_tx, move |ctx| {
+            let _ = done_tx.send(then(ctx));
+        })
+        .await;
+        // Not held across the wait: the connection must never be what keeps
+        // the drain alive.
+        drop(dispatch_tx);
+        // `None` only if the drain died with the work still queued.
+        done_rx.await.ok()
+    }
+
     /// The load/resume path.
     ///
-    /// Two things here are load-bearing:
+    /// Three things here are load-bearing:
     ///
     /// 1. **The session is registered before the RPC resolves.** `session/load`
     ///    replays history as `session/update` notifications *while the call is
     ///    still in flight*; a session registered only on success drops every one
     ///    of them, and the thread comes back empty.
     /// 2. **Concurrent opens share one load.** A second caller joins the
-    ///    in-flight attempt and bumps the pending ref count, so ref-counting
-    ///    happens in one place and both callers see a fully loaded session.
+    ///    in-flight attempt, bumps the pending ref count and waits for its
+    ///    outcome, so ref-counting happens in one place and both callers get
+    ///    the same, fully loaded session (#9). Refusing it as "already in
+    ///    flight" failed a second tab opening the same chat.
+    /// 3. **An abandoned load leaves nothing behind.** The deadline (or a
+    ///    caller giving up) drops this future mid-RPC; a guard then removes
+    ///    the pending entry and the pre-registered row, which otherwise said
+    ///    "already in flight" to every later open until restart (#8, #59).
     async fn open_or_create_session(
         self: Arc<Self>,
         session_id: acp::SessionId,
@@ -553,10 +789,8 @@ impl AcpConnection {
             Option<acp::Meta>,
         ) -> BoxFuture<'static, Result<SessionConfigResponse>>,
     ) -> Result<AcpThreadHandle> {
-        if self.sessions.pending_acquire(&session_id) {
-            return Err(anyhow!(
-                "a load for session {session_id} is already in flight"
-            ));
+        if let Some(outcome) = self.sessions.pending_join(&session_id) {
+            return self.join_load(session_id, outcome).await;
         }
         if let Some(thread) = self.sessions.acquire(&session_id) {
             return Ok(thread);
@@ -575,7 +809,8 @@ impl AcpConnection {
         // The replay ends once the load has answered AND the frames the agent
         // sent before that answer have been applied: they can still be queued
         // on the dispatch task when the answer resolves, so the end is queued
-        // behind them (below). A prompt or a new turn also ends it.
+        // behind them, and awaited (below). A prompt or a new turn also ends
+        // it.
         if replays_history {
             thread
                 .lock()
@@ -590,10 +825,16 @@ impl AcpConnection {
                 thread: Arc::downgrade(&thread),
                 cancel_signal: CancelSignal::new(),
                 session_modes: None,
+                modes_from_config: None,
                 config_options: None,
                 ref_count: 1,
             },
         );
+        let mut guard = LoadGuard {
+            connection: self.clone(),
+            session_id: session_id.clone(),
+            stage: LoadStage::Loading,
+        };
 
         let response = match rpc_call(
             self.connection.clone(),
@@ -606,50 +847,185 @@ impl AcpConnection {
         {
             Ok(response) => response,
             Err(err) => {
-                self.sessions.remove(&session_id);
-                self.sessions.pending_take(&session_id);
+                guard.fail(&err);
                 return Err(err);
             }
         };
 
-        let ref_count = self.sessions.pending_take(&session_id).unwrap_or(1);
+        // `None` when `close_session` released every handle while the RPC was
+        // in flight; it took the sessions row with it, caught just below.
+        let (ref_count, announcer) = match self.sessions.pending_finish(&session_id) {
+            Some((count, announcer)) => (count, Some(announcer)),
+            None => (1, None),
+        };
 
         // `close_session` may have run to completion while the RPC was in
         // flight, taking the sessions entry with it. Handing back a thread with
         // no live session would produce one that silently receives nothing.
         let attached = self.sessions.with_session(&session_id, |session| {
-            let modes = session_modes_of(response.modes, response.config_options.as_deref());
+            let (modes, from_config) =
+                session_modes_of(response.modes, response.config_options.as_deref());
             session.session_modes = modes.map(|modes| Arc::new(Mutex::new(modes)));
+            session.modes_from_config = from_config;
+            // `None` when the agent sent none; a later announcement creates
+            // the store (`handle_session_notification`, #37).
             session.config_options = response
                 .config_options
                 .map(|options| ConfigOptions::new(Arc::new(Mutex::new(options))));
-            session.ref_count = ref_count;
+            // Added, not assigned: the row counted the leader's own handle,
+            // and an open that found the row after `pending_finish` has
+            // already counted itself on it.
+            session.ref_count += ref_count.saturating_sub(1);
         });
         if attached.is_none() {
-            return Err(anyhow!("session was closed before load completed"));
+            let err = anyhow!("session was closed before load completed");
+            if let Some(announcer) = announcer {
+                announcer.announce(Err(Arc::from(err.to_string())));
+            }
+            guard.stage = LoadStage::Done;
+            return Err(err);
         }
         mcp_offer.bind(&session_id);
+        guard.stage = LoadStage::Attached {
+            thread: thread.clone(),
+            announcer,
+        };
 
         if replays_history {
-            // Every frame the agent sent before its answer was parsed, and so
-            // queued, before the answer resolved: a barrier queued now runs
-            // after the last of them.
             let weak = Arc::downgrade(&thread);
-            let end = move || {
+            self.behind_the_queue(move |_ctx| {
                 if let Some(thread) = weak.upgrade() {
                     thread
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .end_replay();
                 }
-            };
-            match self.dispatch_tx.upgrade() {
-                Some(dispatch_tx) => handlers::enqueue_barrier(&dispatch_tx, end),
-                None => end(),
-            }
+            })
+            .await;
         }
 
+        guard.complete();
         Ok(thread)
+    }
+
+    /// An open that found a load already in flight: wait for it, and hand
+    /// back what it produced. The handle this open added is the load's to
+    /// count until it ends; if this open is abandoned first, it gives it back.
+    async fn join_load(
+        self: Arc<Self>,
+        session_id: acp::SessionId,
+        mut outcome: tokio::sync::watch::Receiver<Option<crate::session::LoadOutcome>>,
+    ) -> Result<AcpThreadHandle> {
+        let mut guard = JoinGuard {
+            connection: Some(self.clone()),
+            session_id: session_id.clone(),
+        };
+        let result = outcome
+            .wait_for(Option::is_some)
+            .await
+            .map(|outcome| outcome.clone());
+        // Settled either way: a failed or abandoned load took this open's
+        // handle with it, and a loaded one carries it.
+        guard.connection = None;
+        match result {
+            Ok(Some(Ok(thread))) => Ok(thread),
+            Ok(Some(Err(reason))) => Err(anyhow!("{reason}")),
+            _ => Err(anyhow!(
+                "the load of session {session_id} this open was waiting on was abandoned"
+            )),
+        }
+    }
+}
+
+/// Where a load is, for [`LoadGuard`].
+enum LoadStage {
+    /// The RPC is in flight: the pending entry and the pre-registered row
+    /// are this load's alone.
+    Loading,
+    /// The session is attached and its handles counted on the row; only the
+    /// replay's end is outstanding.
+    Attached {
+        thread: AcpThreadHandle,
+        announcer: Option<crate::session::LoadAnnouncer>,
+    },
+    Done,
+}
+
+/// Cleans up after a load whose future is dropped part-way — its deadline
+/// expired, or its caller went away (#8, #59).
+struct LoadGuard {
+    connection: Arc<AcpConnection>,
+    session_id: acp::SessionId,
+    stage: LoadStage,
+}
+
+impl LoadGuard {
+    /// The RPC failed: the joiners hear why, and nothing stays registered.
+    fn fail(&mut self, err: &anyhow::Error) {
+        self.connection.sessions.remove(&self.session_id);
+        if let Some((_, announcer)) = self.connection.sessions.pending_finish(&self.session_id) {
+            announcer.announce(Err(Arc::from(err.to_string())));
+        }
+        self.stage = LoadStage::Done;
+    }
+
+    /// The load finished: the joiners get the thread.
+    fn complete(&mut self) {
+        if let LoadStage::Attached {
+            thread,
+            announcer: Some(announcer),
+        } = std::mem::replace(&mut self.stage, LoadStage::Done)
+        {
+            announcer.announce(Ok(thread));
+        }
+    }
+}
+
+impl Drop for LoadGuard {
+    fn drop(&mut self) {
+        match std::mem::replace(&mut self.stage, LoadStage::Done) {
+            LoadStage::Loading => {
+                // Abandoned mid-RPC. The joiners' handles go with the pending
+                // entry; dropping its announcer tells them.
+                self.connection.sessions.remove(&self.session_id);
+                drop(self.connection.sessions.pending_finish(&self.session_id));
+            }
+            LoadStage::Attached { thread, announcer } => {
+                // The session is loaded: the joiners get it. This caller never
+                // will, so its own handle is given back.
+                if let Some(announcer) = announcer {
+                    announcer.announce(Ok(thread));
+                }
+                release_in_background(self.connection.clone(), self.session_id.clone());
+            }
+            LoadStage::Done => {}
+        }
+    }
+}
+
+/// Gives back the handle a joined open added, if that open is dropped before
+/// the load it joined ends.
+struct JoinGuard {
+    connection: Option<Arc<AcpConnection>>,
+    session_id: acp::SessionId,
+}
+
+impl Drop for JoinGuard {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            release_in_background(connection, self.session_id.clone());
+        }
+    }
+}
+
+/// `release_session` from a `Drop`, which cannot await it.
+fn release_in_background(connection: Arc<AcpConnection>, session_id: acp::SessionId) {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(async move {
+            if let Err(err) = connection.release_session(session_id).await {
+                tracing::debug!("releasing an abandoned open failed: {err:#}");
+            }
+        });
     }
 }
 
@@ -676,24 +1052,63 @@ struct AgentChild {
     /// thing, and the kill is `start_kill` on the direct child alone.
     #[cfg(unix)]
     pgid: Option<i32>,
+    #[cfg(windows)]
+    job: crate::windows_job::AgentJob,
 }
 
 impl AgentChild {
     fn spawn(command: &mut tokio::process::Command) -> std::io::Result<Self> {
         #[cfg(unix)]
         {
-            // SAFETY: `setsid` is async-signal-safe and touches nothing the
-            // parent shares with the child; it either succeeds or, if the
-            // child somehow already leads a group, fails harmlessly.
+            #[cfg(target_os = "linux")]
+            let parent = libc::pid_t::try_from(std::process::id()).unwrap_or(0);
+            // SAFETY: `setsid`, `prctl` and `getppid` are async-signal-safe
+            // and touch nothing the parent shares with the child. `setsid`
+            // either succeeds or, if the child somehow already leads a group,
+            // fails harmlessly.
             unsafe {
-                command.pre_exec(|| {
+                command.pre_exec(move || {
                     libc::setsid();
+                    // Linux: the agent dies with Atlas even when Atlas cannot
+                    // kill it — a crash, a SIGKILL — instead of living on
+                    // holding its model subscription (#91). Only the direct
+                    // child: its descendants are in its group, and a
+                    // restarted Atlas cannot find them, so this is a backstop
+                    // rather than the kill. The signal fires when the THREAD
+                    // that spawned the child exits; the spawn runs on a tokio
+                    // worker, which lives as long as the runtime.
+                    #[cfg(target_os = "linux")]
+                    {
+                        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);
+                        // Atlas already gone between fork and prctl: nobody
+                        // is left to send the signal.
+                        if libc::getppid() != parent {
+                            libc::_exit(1);
+                        }
+                    }
                     Ok(())
                 });
             }
         }
-        let inner = command.spawn()?;
+        #[cfg(windows)]
+        let job = crate::windows_job::AgentJob::new()?;
+        #[cfg(windows)]
+        command.creation_flags(
+            windows_sys::Win32::System::Threading::CREATE_SUSPENDED
+                | windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
+        );
+        #[allow(unused_mut)]
+        let mut inner = command.spawn()?;
+        #[cfg(windows)]
+        if let Err(error) = job.assign_and_resume(&inner) {
+            // A failed assignment must never leave the suspended process
+            // behind, nor run an agent without process-tree containment.
+            let _ = inner.start_kill();
+            return Err(error);
+        }
         Ok(Self {
+            #[cfg(windows)]
+            job,
             #[cfg(unix)]
             pgid: inner.id().map(|pid| pid as i32),
             inner,
@@ -703,16 +1118,37 @@ impl AgentChild {
     /// Kill the child and everything it spawned. Idempotent; safe after the
     /// direct child has been reaped, because its grandchildren keep the group
     /// alive and `killpg` on an empty group is `ESRCH`, not a fault.
+    ///
+    /// Unix: SIGTERM first, SIGKILL after [`KILL_GRACE`] (#91). A straight
+    /// SIGKILL gave an agent no chance to write out the session it was in
+    /// the middle of saving. The escalation runs on a thread of its own, so
+    /// it happens whether or not a runtime is still there to run it.
     fn kill_tree(&mut self) {
         #[cfg(unix)]
-        if let Some(pgid) = self.pgid {
+        if let Some(pgid) = self.pgid.take() {
             // SAFETY: plain syscall on a pgid we created; no memory involved.
             unsafe {
-                libc::killpg(pgid, libc::SIGKILL);
+                libc::killpg(pgid, libc::SIGTERM);
             }
+            let _ = std::thread::Builder::new()
+                .name("agent-kill-grace".into())
+                .spawn(move || {
+                    std::thread::sleep(KILL_GRACE);
+                    // SAFETY: as above. While any member lives the group
+                    // keeps its id; only a group already empty could have
+                    // had it reused, which takes a pid wraparound inside
+                    // the grace.
+                    unsafe {
+                        libc::killpg(pgid, libc::SIGKILL);
+                    }
+                });
         }
-        // The backstop, and the whole of the non-unix path.
-        let _ = self.inner.start_kill();
+        #[cfg(windows)]
+        {
+            self.job.terminate();
+            // Direct-child backstop; the job also owns descendants.
+            let _ = self.inner.start_kill();
+        }
     }
 
     async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
@@ -822,7 +1258,7 @@ fn connect_client_future(
         ($handler:path) => {{
             let dispatch_tx = dispatch_tx.clone();
             async move |req, responder, _connection| {
-                handlers::enqueue_request(&dispatch_tx, req, responder, $handler);
+                handlers::enqueue_request(&dispatch_tx, req, responder, $handler).await;
                 Ok(())
             }
         }};
@@ -831,7 +1267,7 @@ fn connect_client_future(
         ($handler:path) => {{
             let dispatch_tx = dispatch_tx.clone();
             async move |notif, _connection| {
-                handlers::enqueue_notification(&dispatch_tx, notif, $handler);
+                handlers::enqueue_notification(&dispatch_tx, notif, $handler).await;
                 Ok(())
             }
         }};
@@ -1054,6 +1490,10 @@ impl AgentConnection for AcpConnection {
             // Built here: the offer holds a non-`Sync` settle callback, so the
             // request future must not borrow it across the await.
             let request = directories.into_new_session_request(mcp_servers, mcp_offer.ask_first());
+            // While this is in flight an update for a session nobody knows is
+            // parked, not dropped: it may name the session about to be
+            // answered with (#12).
+            let in_flight = self.sessions.new_session_in_flight();
             let response = self
                 .request_deadline("session/new", async {
                     self.connection
@@ -1067,20 +1507,58 @@ impl AgentConnection for AcpConnection {
             let session_id = response.session_id.clone();
             mcp_offer.bind(&session_id);
             let thread = self.new_thread(session_id.clone(), work_dirs, None);
-            let modes = session_modes_of(response.modes, response.config_options.as_deref());
+            let (modes, modes_from_config) =
+                session_modes_of(response.modes, response.config_options.as_deref());
+            let session = AcpSession {
+                thread: Arc::downgrade(&thread),
+                cancel_signal: CancelSignal::new(),
+                session_modes: modes.map(|modes| Arc::new(Mutex::new(modes))),
+                modes_from_config,
+                config_options: response
+                    .config_options
+                    .map(|options| ConfigOptions::new(Arc::new(Mutex::new(options)))),
+                ref_count: 1,
+            };
 
-            self.sessions.insert(
-                session_id.clone(),
-                AcpSession {
-                    thread: Arc::downgrade(&thread),
-                    cancel_signal: CancelSignal::new(),
-                    session_modes: modes.map(|modes| Arc::new(Mutex::new(modes))),
-                    config_options: response
-                        .config_options
-                        .map(|options| ConfigOptions::new(Arc::new(Mutex::new(options)))),
-                    ref_count: 1,
-                },
-            );
+            // Registered on the drain, behind every frame the agent wrote
+            // before its answer, and handed the updates parked for it in wire
+            // order — so an update sent before the answer, or after it but
+            // ahead of this, is applied rather than dropped as "unknown
+            // session" (#12).
+            let slot = Arc::new(Mutex::new(Some(session)));
+            let registered = self
+                .behind_the_queue({
+                    let sessions = self.sessions.clone();
+                    let session_id = session_id.clone();
+                    let slot = slot.clone();
+                    move |ctx| {
+                        let session = slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take();
+                        if let Some(session) = session {
+                            sessions.insert(session_id.clone(), session);
+                        }
+                        let parked = sessions.take_parked(&session_id);
+                        if let Some(ctx) = ctx {
+                            for update in parked {
+                                handlers::handle_session_notification(update, ctx);
+                            }
+                        }
+                        drop(in_flight);
+                    }
+                })
+                .await;
+            if registered.is_none() {
+                // The drain died holding the work: register it here.
+                let session = slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(session) = session {
+                    self.sessions.insert(session_id.clone(), session);
+                }
+            }
 
             self.apply_default_mode(&session_id).await;
 
@@ -1208,13 +1686,21 @@ impl AgentConnection for AcpConnection {
         self: Arc<Self>,
         session_id: acp::SessionId,
     ) -> BoxFuture<'static, Result<()>> {
-        async move {
-            if !self.supports_close_session() {
-                return Err(anyhow!(LoadError::Other(
+        if !self.supports_close_session() {
+            return Box::pin(async {
+                Err(anyhow!(LoadError::Other(
                     "Closing sessions is not supported by this agent.".into()
-                )));
-            }
+                )))
+            });
+        }
+        self.release_session(session_id)
+    }
 
+    fn release_session(
+        self: Arc<Self>,
+        session_id: acp::SessionId,
+    ) -> BoxFuture<'static, Result<()>> {
+        async move {
             match self.sessions.pending_release(&session_id) {
                 Some(0) => {
                     self.sessions.remove(&session_id);
@@ -1228,10 +1714,19 @@ impl AgentConnection for AcpConnection {
                 },
             }
 
-            self.connection
-                .send_request(acp::CloseSessionRequest::new(session_id))
-                .block_task()
+            if self.supports_close_session() {
+                // Bounded like the rest of the session housekeeping: an agent
+                // that never answers must not park whoever closed the tab
+                // (#13).
+                self.request_deadline("session/close", async {
+                    self.connection
+                        .send_request(acp::CloseSessionRequest::new(session_id))
+                        .block_task()
+                        .await
+                        .map_err(map_acp_error)
+                })
                 .await?;
+            }
             Ok(())
         }
         .boxed()
@@ -1263,10 +1758,18 @@ impl AgentConnection for AcpConnection {
         Some(async move { Ok(command) }.boxed())
     }
 
+    /// No fixed deadline (#67): an `agent` method is the user signing in —
+    /// a browser tab, a device code — and that takes as long as they take.
+    /// It ends when the agent answers, when the user dismisses the sign-in
+    /// ([`AgentConnection::cancel_authentication`]), or when the caller drops
+    /// the future; the last two drop the request, which tells the agent with
+    /// `$/cancel_request`.
     fn authenticate(&self, method: acp::AuthMethodId) -> BoxFuture<'static, Result<()>> {
         let conn = self.connection.clone();
-        let agent_id = self.id.clone();
-        let debug_log = self.debug_log.clone();
+        // Taken now, so a dismissal that lands while the request is still
+        // being sent is seen.
+        let mut cancelled = self.auth_cancel.subscribe();
+        cancelled.mark_unchanged();
         // Both terminal shapes (typed and `_meta`) count — see
         // `terminal_auth_command_for`.
         let method_is_terminal = self
@@ -1278,19 +1781,22 @@ impl AgentConnection for AcpConnection {
                     || meta_terminal_auth_command(&self.id, &method, m).is_some()
             });
         async move {
-            with_request_deadline(&agent_id, "authenticate", &debug_log, async {
-                match conn
-                    .send_request(acp::AuthenticateRequest::new(method))
-                    .block_task()
-                    .await
-                {
+            let request = conn
+                .send_request(acp::AuthenticateRequest::new(method))
+                .block_task();
+            tokio::select! {
+                answer = request => match answer {
                     Ok(_) => Ok(()),
                     Err(err) => authenticate_outcome(err, method_is_terminal),
-                }
-            })
-            .await
+                },
+                _ = cancelled.changed() => Err(anyhow!("the sign-in was cancelled")),
+            }
         }
         .boxed()
+    }
+
+    fn cancel_authentication(&self) {
+        self.auth_cancel.send_modify(|generation| *generation += 1);
     }
 
     fn supports_logout(&self) -> bool {
@@ -1299,10 +1805,18 @@ impl AgentConnection for AcpConnection {
 
     fn logout(&self) -> BoxFuture<'static, Result<()>> {
         let conn = self.connection.clone();
+        let agent_id = self.id.clone();
+        let debug_log = self.debug_log.clone();
         async move {
-            conn.send_request(acp::LogoutRequest::new())
-                .block_task()
-                .await?;
+            // Bounded (#13): signing out is housekeeping, not a wait on the
+            // user.
+            with_request_deadline(&agent_id, "logout", &debug_log, async {
+                conn.send_request(acp::LogoutRequest::new())
+                    .block_task()
+                    .await
+                    .map_err(map_acp_error)
+            })
+            .await?;
             Ok(())
         }
         .boxed()
@@ -1313,6 +1827,7 @@ impl AgentConnection for AcpConnection {
         params: acp::PromptRequest,
     ) -> BoxFuture<'static, Result<acp::PromptResponse>> {
         let conn = self.connection.clone();
+        let dispatch_tx = self.dispatch_tx.clone();
         let sessions = self.sessions.clone();
         let session_id = params.session_id.clone();
         // Taken before the request goes out, so a cancel that lands while we
@@ -1323,11 +1838,25 @@ impl AgentConnection for AcpConnection {
             sessions.with_session(&session_id, |session| session.cancel_signal.waiter());
         let cancel_probe = cancel_waiter.as_ref().map(CancelWaiter::probe);
         let cancel_grace = self.deadlines().cancel_grace;
+        let mut exited = self.exited.clone();
 
         async move {
+            // A turn ends when its agent is gone, too: the SDK does not fail a
+            // request whose transport died with the process still alive, and
+            // the turn waited for an answer that could no longer arrive (#87).
+            let send = |params| {
+                let request = conn.send_request(params).block_task();
+                async move {
+                    tokio::select! {
+                        result = request => result,
+                        _ = exited.wait_for(|gone| *gone) => Err(acp::Error::internal_error()
+                            .data("Atlas lost its connection to the agent.")),
+                    }
+                }
+            };
             let result = match cancel_waiter {
                 Some(waiter) => {
-                    let request = conn.send_request(params).block_task();
+                    let request = send(params);
                     futures::pin_mut!(request);
                     let deadline = async move {
                         waiter.cancelled().await;
@@ -1360,8 +1889,24 @@ impl AgentConnection for AcpConnection {
                 }
                 // No session to hang a clock on. The request is still the right
                 // thing to await; an unknown session id fails on its own.
-                None => conn.send_request(params).block_task().await,
+                None => send(params).await,
             };
+
+            // The answer can be read out of the pipe while the turn's last
+            // updates are still queued for the thread: the agent wrote them
+            // first, but the drain applies them on its own task. Ending the
+            // turn now showed "(no response)" and then the reply (#16). Every
+            // one of them was queued before this answer resolved, so a
+            // barrier queued now runs after the last.
+            if let Some(dispatch_tx) = dispatch_tx.upgrade() {
+                let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                handlers::enqueue_barrier(&dispatch_tx, move || {
+                    let _ = done_tx.send(());
+                })
+                .await;
+                drop(dispatch_tx);
+                let _ = done_rx.await;
+            }
 
             // Read, not consumed: this turn's own answer, so it cannot be
             // spent by a sibling turn or inherited by a later one.
@@ -1422,13 +1967,18 @@ impl AgentConnection for AcpConnection {
     }
 
     fn session_modes(&self, session_id: &acp::SessionId) -> Option<Arc<dyn AgentSessionModes>> {
-        let modes = self
-            .sessions
-            .with_session(session_id, |session| session.session_modes.clone())??;
+        let (modes, via_config) = self.sessions.with_session(session_id, |session| {
+            let via_config = session
+                .modes_from_config
+                .clone()
+                .zip(session.config_options.clone());
+            (session.session_modes.clone(), via_config)
+        })?;
         Some(Arc::new(AcpSessionModes {
             connection: self.connection.clone(),
             session_id: session_id.clone(),
-            modes,
+            modes: modes?,
+            via_config,
         }))
     }
 
@@ -1466,6 +2016,67 @@ impl AgentConnection for AcpConnection {
             options,
         }))
     }
+
+    /// Advertised `sessionCapabilities.fork` (#15; unstable in the schema,
+    /// so only ever on the agent's word) — and a way to open the branch,
+    /// since the caller opens it through the ordinary reopen path.
+    fn supports_fork(&self) -> bool {
+        self.agent_capabilities.session_capabilities.fork.is_some()
+            && (self.supports_load_session() || self.supports_resume_session())
+    }
+
+    fn fork(&self, session_id: &acp::SessionId) -> Option<Arc<dyn AgentSessionFork>> {
+        if !self.supports_fork() {
+            return None;
+        }
+        let thread = self.sessions.thread(session_id).ok()?;
+        let work_dirs = thread
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .work_dirs()
+            .to_vec();
+        let directories = self.directories(&work_dirs).ok()?;
+        // No MCP servers on the fork itself: the branch is opened through
+        // the reopen path, whose `session/load` carries the servers (and the
+        // token) bound to it.
+        let request = acp::ForkSessionRequest::new(session_id.clone(), directories.cwd)
+            .additional_directories(directories.additional_directories);
+        Some(Arc::new(AcpSessionFork {
+            connection: self.connection.clone(),
+            agent: self.id.clone(),
+            debug_log: self.debug_log.clone(),
+            request,
+        }))
+    }
+}
+
+/// `session/fork` on one session: see [`AgentConnection::fork`].
+struct AcpSessionFork {
+    connection: ConnectionTo<Agent>,
+    agent: AgentId,
+    debug_log: AcpDebugLog,
+    request: acp::ForkSessionRequest,
+}
+
+impl AgentSessionFork for AcpSessionFork {
+    fn run(&self) -> BoxFuture<'static, Result<acp::SessionId>> {
+        let connection = self.connection.clone();
+        let agent = self.agent.clone();
+        let debug_log = self.debug_log.clone();
+        let request = self.request.clone();
+        async move {
+            let response = with_request_deadline(&agent, "session/fork", &debug_log, async {
+                connection
+                    .send_request(request)
+                    .block_task()
+                    .await
+                    .map_err(map_acp_error)
+            })
+            .await?;
+            Ok(response.session_id)
+        }
+        .boxed()
+    }
 }
 
 impl AcpConnection {
@@ -1475,10 +2086,13 @@ impl AcpConnection {
         let Some(default_mode) = self.defaults.mode.clone() else {
             return;
         };
-        let Some(Some(modes)) = self
-            .sessions
-            .with_session(session_id, |session| session.session_modes.clone())
-        else {
+        let Some((Some(modes), via_config)) = self.sessions.with_session(session_id, |session| {
+            let via_config = session
+                .modes_from_config
+                .clone()
+                .zip(session.config_options.clone());
+            (session.session_modes.clone(), via_config)
+        }) else {
             return;
         };
 
@@ -1501,18 +2115,14 @@ impl AcpConnection {
         // On the `session/new` path, so it gets the same deadline: a wedged
         // agent that answered `session/new` and then went quiet must not park
         // the bind here instead. Expiry is just "the mode did not take".
-        let set_mode = self
-            .connection
-            .send_request(acp::SetSessionModeRequest::new(
-                session_id.clone(),
-                default_mode,
-            ));
-        if self
-            .request_deadline("session/set_mode", async {
-                set_mode.block_task().await.map_err(map_acp_error)
-            })
-            .await
-            .is_err()
+        if send_mode(
+            &self.connection,
+            session_id.clone(),
+            default_mode,
+            via_config.as_ref(),
+        )
+        .await
+        .is_err()
         {
             modes
                 .lock()
@@ -1526,6 +2136,57 @@ struct AcpSessionModes {
     connection: ConnectionTo<Agent>,
     session_id: acp::SessionId,
     modes: Arc<Mutex<acp::SessionModeState>>,
+    /// The config option the modes came from, and the session's option
+    /// store, when the agent expressed its modes that way (#35).
+    via_config: Option<(acp::SessionConfigId, ConfigOptions)>,
+}
+
+/// Applies a mode the way the agent said modes are set (#35): through
+/// `session/set_config_option` on the option they came from, keeping the
+/// stored options in step with the agent's answer — or, for an agent with a
+/// `modes` field, `session/set_mode`. An agent whose modes are a config
+/// option never offered `session/set_mode`, and refuses it.
+async fn send_mode(
+    connection: &ConnectionTo<Agent>,
+    session_id: acp::SessionId,
+    mode: acp::SessionModeId,
+    via_config: Option<&(acp::SessionConfigId, ConfigOptions)>,
+) -> Result<()> {
+    match via_config {
+        Some((config_id, options)) => {
+            let response = bounded(
+                "session/set_config_option (mode)",
+                connection
+                    .send_request(acp::SetSessionConfigOptionRequest::new(
+                        session_id,
+                        config_id.clone(),
+                        acp::SessionConfigOptionValue::ValueId {
+                            value: acp::SessionConfigValueId::new(mode.0.as_ref()),
+                        },
+                    ))
+                    .block_task(),
+            )
+            .await?
+            .map_err(map_acp_error)?;
+            *options
+                .config_options
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = response.config_options;
+            options.notify();
+            Ok(())
+        }
+        None => {
+            bounded(
+                "session/set_mode",
+                connection
+                    .send_request(acp::SetSessionModeRequest::new(session_id, mode))
+                    .block_task(),
+            )
+            .await?
+            .map_err(map_acp_error)?;
+            Ok(())
+        }
+    }
 }
 
 impl AgentSessionModes for AcpSessionModes {
@@ -1549,6 +2210,7 @@ impl AgentSessionModes for AcpSessionModes {
         let conn = self.connection.clone();
         let session_id = self.session_id.clone();
         let modes = self.modes.clone();
+        let via_config = self.via_config.clone();
         let previous = self.current_mode();
         modes
             .lock()
@@ -1556,15 +2218,9 @@ impl AgentSessionModes for AcpSessionModes {
             .current_mode_id = mode.clone();
 
         async move {
-            // Flattened: a refusal from the agent and an expiry both roll the
-            // local mode back.
-            let result = bounded(
-                "session/set_mode",
-                conn.send_request(acp::SetSessionModeRequest::new(session_id, mode))
-                    .block_task(),
-            )
-            .await
-            .and_then(|answer| answer.map_err(|err| anyhow!(err)));
+            // A refusal from the agent and an expiry both roll the local mode
+            // back.
+            let result = send_mode(&conn, session_id, mode, via_config.as_ref()).await;
             match result {
                 Ok(_) => Ok(()),
                 Err(err) => {
@@ -1594,11 +2250,20 @@ impl AgentSessionModes for AcpSessionModes {
 /// The `modes` field wins when present. The select is consulted only in its
 /// absence, so an agent that sends both keeps its `modes` state untouched and
 /// nothing but the `mode` category is ever lifted into the pill.
+///
+/// The second half is the select's option id when the modes came from it:
+/// how a pick is then sent (#35).
 fn session_modes_of(
     modes: Option<acp::SessionModeState>,
     config_options: Option<&[acp::SessionConfigOption]>,
-) -> Option<acp::SessionModeState> {
-    modes.or_else(|| config_options.and_then(mode_select_of))
+) -> (Option<acp::SessionModeState>, Option<acp::SessionConfigId>) {
+    match modes {
+        Some(modes) => (Some(modes), None),
+        None => match config_options.and_then(mode_select_with_id) {
+            Some((config_id, modes)) => (Some(modes), Some(config_id)),
+            None => (None, None),
+        },
+    }
 }
 
 /// The `category: "mode"` select of a config-option list as a
@@ -1608,44 +2273,70 @@ fn session_modes_of(
 pub(crate) fn mode_select_of(
     options: &[acp::SessionConfigOption],
 ) -> Option<acp::SessionModeState> {
-    options.iter().find_map(|option| {
-        if !matches!(
-            option.category,
-            Some(acp::SessionConfigOptionCategory::Mode)
-        ) {
-            return None;
-        }
-        let acp::SessionConfigKind::Select(select) = &option.kind else {
-            return None;
-        };
-        let choices: Vec<&acp::SessionConfigSelectOption> = match &select.options {
-            acp::SessionConfigSelectOptions::Ungrouped(choices) => choices.iter().collect(),
-            acp::SessionConfigSelectOptions::Grouped(groups) => groups
-                .iter()
-                .flat_map(|group| group.options.iter())
-                .collect(),
-            _ => return None,
-        };
-        if choices.is_empty() {
-            return None;
-        }
-        let available_modes = choices
-            .into_iter()
-            .map(|choice| {
-                let name = if choice.name.is_empty() {
-                    choice.value.0.as_ref().to_string()
-                } else {
-                    choice.name.clone()
-                };
-                acp::SessionMode::new(acp::SessionModeId::new(choice.value.0.clone()), name)
-                    .description(choice.description.clone())
-            })
-            .collect();
-        Some(acp::SessionModeState::new(
-            acp::SessionModeId::new(select.current_value.0.clone()),
-            available_modes,
-        ))
-    })
+    mode_select_with_id(options).map(|(_, modes)| modes)
+}
+
+/// [`mode_select_of`], with the id of the option it came from.
+pub(crate) fn mode_select_with_id(
+    options: &[acp::SessionConfigOption],
+) -> Option<(acp::SessionConfigId, acp::SessionModeState)> {
+    options
+        .iter()
+        .find_map(|option| mode_state_of(option).map(|modes| (option.id.clone(), modes)))
+}
+
+/// The mode state of the `category: "mode"` select with this id — the option
+/// a session's modes came from — as the agent now describes it, so a change
+/// to its list reaches the session, not just a change to its value (#43).
+pub(crate) fn mode_select_by_id(
+    options: &[acp::SessionConfigOption],
+    config_id: &acp::SessionConfigId,
+) -> Option<acp::SessionModeState> {
+    options
+        .iter()
+        .find(|option| option.id == *config_id)
+        .and_then(mode_state_of)
+}
+
+/// One option as a [`acp::SessionModeState`], when it is a `category: "mode"`
+/// select with something to pick.
+fn mode_state_of(option: &acp::SessionConfigOption) -> Option<acp::SessionModeState> {
+    if !matches!(
+        option.category,
+        Some(acp::SessionConfigOptionCategory::Mode)
+    ) {
+        return None;
+    }
+    let acp::SessionConfigKind::Select(select) = &option.kind else {
+        return None;
+    };
+    let choices: Vec<&acp::SessionConfigSelectOption> = match &select.options {
+        acp::SessionConfigSelectOptions::Ungrouped(choices) => choices.iter().collect(),
+        acp::SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| group.options.iter())
+            .collect(),
+        _ => return None,
+    };
+    if choices.is_empty() {
+        return None;
+    }
+    let available_modes = choices
+        .into_iter()
+        .map(|choice| {
+            let name = if choice.name.is_empty() {
+                choice.value.0.as_ref().to_string()
+            } else {
+                choice.name.clone()
+            };
+            acp::SessionMode::new(acp::SessionModeId::new(choice.value.0.clone()), name)
+                .description(choice.description.clone())
+        })
+        .collect();
+    Some(acp::SessionModeState::new(
+        acp::SessionModeId::new(select.current_value.0.clone()),
+        available_modes,
+    ))
 }
 
 /// The model picker an agent advertises, projected out of its config options.
@@ -1869,10 +2560,11 @@ impl AgentSessionConfigOptions for AcpSessionConfigOptions {
 /// ARGUMENTS that sign this agent in, because the program is the agent's own.
 /// Atlas re-runs the binary it already spawned — same path, launch args then
 /// auth args, and the SAME ENVIRONMENT with the method's own vars layered on
-/// top. That env matters: it carries the proxy configuration and the spawn
-/// quirks (`env_quirks`, which deliberately blanks `ANTHROPIC_API_KEY`), so a
-/// login subprocess started without it reaches the network differently from
-/// the agent it is signing in.
+/// top. That env matters: it carries the proxy configuration and the entry's
+/// Variables, including the launch defaults seeded into them at install
+/// (`atlas_agent_store::launch_defaults` — a blank `ANTHROPIC_API_KEY`, for
+/// one), so a login subprocess started without it reaches the network
+/// differently from the agent it is signing in.
 ///
 /// `_meta["terminal-auth"]` is the fallback — the pre-stabilization shape. It
 /// names a whole command, which need not be the binary Atlas launched, so it
@@ -2080,8 +2772,9 @@ mod terminal_auth_tests {
 
     /// The login subprocess inherits the agent's OWN environment, with the
     /// method's vars on top. Without it the login runs with no proxy config
-    /// and with the API key `env_quirks` exists to blank — reaching the network
-    /// differently from the agent it is signing in.
+    /// and without the entry's Variables — the launch defaults among them,
+    /// such as the API key one blanks — reaching the network differently from
+    /// the agent it is signing in.
     #[test]
     fn a_typed_terminal_method_inherits_the_agents_environment() {
         let m: acp::AuthMethod = serde_json::from_value(serde_json::json!({
@@ -2444,6 +3137,47 @@ mod deadline_tests {
         assert_eq!(value, 7);
     }
 
+    /// N4: a line that is not UTF-8 used to end the reader and close the pipe.
+    /// It is decoded lossily, and every line after it still arrives.
+    #[tokio::test]
+    async fn stderr_drain_survives_non_utf8_and_keeps_reading() {
+        let input: &[u8] = b"first\n\xff\xfe bad bytes\nafter\r\nno newline at end";
+        let mut lines = Vec::new();
+        drain_stderr_lines(input, |line| lines.push(line.to_string())).await;
+        assert_eq!(
+            lines,
+            vec![
+                "first".to_string(),
+                "\u{fffd}\u{fffd} bad bytes".to_string(),
+                "after".to_string(),
+                "no newline at end".to_string(),
+            ]
+        );
+    }
+
+    /// #71, #87, #92: stdout is read lossily — a bad byte spoils a
+    /// character, not the connection — and a line over the cap is skipped to
+    /// its newline while the lines around it arrive.
+    #[tokio::test]
+    async fn stdout_lines_are_lossy_and_capped() {
+        let mut input = b"{\"a\":\"caf\xe9\"}\r\n".to_vec();
+        input.extend(std::iter::repeat_n(b'x', 40));
+        input.extend_from_slice(b"\nafter\nlast");
+        let lines: Vec<String> = lossy_lines(input.as_slice(), 32)
+            .map(|line| line.expect("a line"))
+            .collect()
+            .await;
+        assert_eq!(lines, ["{\"a\":\"caf\u{fffd}\"}", "after", "last"]);
+    }
+
+    #[tokio::test]
+    async fn stderr_drain_splits_an_endless_line() {
+        let input = vec![b'x'; MAX_STDERR_LINE_BYTES * 2 + 5];
+        let mut sizes = Vec::new();
+        drain_stderr_lines(input.as_slice(), |line| sizes.push(line.len())).await;
+        assert_eq!(sizes, vec![MAX_STDERR_LINE_BYTES, MAX_STDERR_LINE_BYTES, 5]);
+    }
+
     /// Without stderr the message stops at the deadline; no dangling colon.
     #[test]
     fn a_timed_out_error_without_stderr_has_no_trailing_reason() {
@@ -2484,7 +3218,9 @@ mod mode_select_tests {
             { "id": "effort", "name": "Effort", "category": "thought_level", "type": "select",
               "currentValue": "high", "options": [ { "value": "high", "name": "High" } ] }
         ]));
-        let modes = session_modes_of(None, Some(&opts)).expect("modes from the select");
+        let modes = session_modes_of(None, Some(&opts))
+            .0
+            .expect("modes from the select");
         assert_eq!(modes.current_mode_id.0.as_ref(), "plan");
         let ids: Vec<&str> = modes
             .available_modes
@@ -2512,7 +3248,9 @@ mod mode_select_tests {
             "default",
             vec![acp::SessionMode::new("default", "Default")],
         );
-        let modes = session_modes_of(Some(own), Some(&opts)).expect("the agent's own modes");
+        let (modes, from_config) = session_modes_of(Some(own), Some(&opts));
+        assert!(from_config.is_none());
+        let modes = modes.expect("the agent's own modes");
         assert_eq!(modes.current_mode_id.0.as_ref(), "default");
     }
 
@@ -2527,8 +3265,8 @@ mod mode_select_tests {
               "currentValue": "high", "options": [ { "value": "high", "name": "High" } ] },
             { "id": "yolo", "name": "Yolo", "category": "mode", "type": "boolean", "currentValue": true }
         ]));
-        assert!(session_modes_of(None, Some(&opts)).is_none());
-        assert!(session_modes_of(None, None).is_none());
+        assert!(session_modes_of(None, Some(&opts)).0.is_none());
+        assert!(session_modes_of(None, None).0.is_none());
     }
 
     /// A select with no choices is a dead control, not a mode list.

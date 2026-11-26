@@ -7,11 +7,6 @@
 // unanswered command there is indistinguishable from a broken screen. The
 // grouping is "everything the wave-2 domain files did not claim", which is why
 // the sections below jump between subsystems.
-//
-// The native Browser tab is here too, as deliberate no-ops: it is a real
-// `WebviewWindow` that a plain browser cannot host (see `README.md`), and the
-// point of answering its commands is only to keep the unmocked badge honest
-// about what is *missing* rather than about what is *native*.
 
 import { emit } from "@tauri-apps/api/event";
 import type { ComposedPrompt } from "@/features/chat/lib/mentions";
@@ -85,9 +80,7 @@ const THREADS: ThreadRow[] = [
     ...RESTING_LIFECYCLE,
     projectName: MOCK_PROJECT.name,
     folderPaths: [MOCK_PROJECT.path],
-    // Another process is writing this one: the live dot, and the composer's
-    // "Send anyway" hold when it is opened.
-    liveElsewhere: true,
+    liveElsewhere: false,
     // A sibling project attached read-only: the composer chip's access toggle
     // and the row's attached-projects data both have something to show.
     attachedProjects: [
@@ -592,7 +585,7 @@ export const miscHandlers: MockHandlers = {
   },
 
   // ── chat history ────────────────────────────────────────────────────────
-  // As in Rust: every row (the composer's live-elsewhere feed relies on that).
+  // As in Rust: every row (the composer's session-projects feed relies on that).
   threads_history: (): ThreadRow[] => threads,
   threads_sync_project: () => 0,
   threads_projects: ({ cwd }): ThreadProject[] =>
@@ -863,6 +856,9 @@ export const miscHandlers: MockHandlers = {
   // it needs to update the transcript, not just resolve.
   agents_logout: nothing,
   agents_authenticate: nothing,
+  // Ends a sign-in in flight; nothing is ever in flight here (the
+  // `agent-signin` scenario has one that hangs, and ends it).
+  agents_cancel_authentication: nothing,
   agents_run_auth_method: (): string => "mock-auth-run",
   agents_start_diagnostics: (): string => "mock-diagnostics-run",
   // agents_list_running lives in `fake-agent.ts`: only it knows which sessions
@@ -962,6 +958,7 @@ export const miscHandlers: MockHandlers = {
   scratch_write_bytes: (): string => abs(".atlas/scratch/pasted.png"),
   window_zoom: nothing,
   clipboard_write_text: nothing,
+  clipboard_read_text: () => navigator.clipboard.readText(),
   // A paste carrying file paths is a Finder-only gesture (see `README.md`),
   // so the browser answer is always "no files came with it".
   clipboard_file_paths: (): string[] => [],
@@ -971,24 +968,6 @@ export const miscHandlers: MockHandlers = {
   usage_write_file: nothing,
   usage_export_markdown: nothing,
 
-  // ── native Browser tab — answered, never faked ──────────────────────────
-  // These drive a real child `WebviewWindow`. There is nothing to stand in for
-  // it in a plain browser, so the panel draws its chrome around an empty area;
-  // that is the known limitation, not a missing fake.
-  browser_embed_create: nothing,
-  browser_embed_destroy: nothing,
-  browser_embed_navigate: nothing,
-  browser_embed_back: nothing,
-  browser_embed_forward: nothing,
-  browser_embed_reload: nothing,
-  browser_embed_set_bounds: nothing,
-  browser_embed_set_visible: nothing,
-  browser_open_window: nothing,
-  fetch_readable: ({ url }) => ({
-    title: "Reader mode is served by Rust, not the webview",
-    url: String(url ?? "https://example.invalid"),
-    html: "<h1>Readable</h1><p>The reader pane is ordinary HTML, so it themes and renders here even though the Browser tab itself cannot.</p>",
-  }),
   // A plain browser has no CSP refusing remote images, so the URL itself is
   // the answer. Relative paths would need the real disk; they show alt text.
   markdown_preview_image: ({ src }) => {

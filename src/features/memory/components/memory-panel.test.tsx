@@ -515,6 +515,7 @@ describe("importing Claude's auto-memory", () => {
     expect(invoke).toHaveBeenCalledWith("memory_claude_import_confirm", {
       projectPath: "/repo",
       ids: ["d1"],
+      offeredIds: ["d1", "f1", "f2"],
     });
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(

@@ -122,7 +122,6 @@ tightest and `||` loosest. Empty means always.
 | `knowledgeFocus`                | … is Knowledge                                        |
 | `pdfFocus`                      | … is a PDF                                            |
 | `canvasFocus`                   | … is a canvas or a space                              |
-| `browserFocus`                  | … is the browser                                      |
 | `diffFocus`                     | … is the review diff                                  |
 | `pullRequestFocus`              | … is a pull request                                   |
 | `inputFocus`                    | a text field, text area or rich-text editor has focus |
@@ -229,8 +228,8 @@ window focus or hiding the document also resets the hold.
 The navigation-hints unit and component suites cover platform conventions,
 modifier lifetime, profile changes, scoped dispatch and split-local target
 mapping using the real layout store and hotkey handlers. Browser checks can
-verify layout and dispatch, but do not establish how native macOS menus or
-an embedded browser webview intercept keys; those still need native-window QA.
+verify layout and dispatch, but do not establish how native macOS menus
+intercept keys; that still needs native-window QA.
 
 ## Sharing a profile
 
@@ -262,8 +261,8 @@ shortcut turned off, it works.
 ## The native Close Tab item
 
 On macOS, Window ▸ Close Tab carries the first chord bound to `tabs.close`.
-That menu item is what closes a tab while the embedded browser has focus, so
-it follows a rebind. A chord it can't express (punctuation) leaves the item
+A Cmd+W that reaches the menu closes a tab rather than the window, so the item
+follows a rebind. A chord it can't express (punctuation) leaves the item
 without one.
 
 ## Validation

@@ -1,4 +1,4 @@
-import type { CloudOrg, RunAction } from "../lib/capture-flow";
+import type { CloudOrg } from "../lib/capture-flow";
 import type { Binding, ConnectPick } from "../types";
 import { ConnectTab } from "./connect-tab";
 
@@ -14,7 +14,6 @@ export function SwitchForm({
   cloudOrgs,
   cloudReason,
   busy,
-  run,
   onCancel,
   onContinue,
 }: {
@@ -23,7 +22,6 @@ export function SwitchForm({
   cloudOrgs: CloudOrg[];
   cloudReason: string | null;
   busy: boolean;
-  run: RunAction;
   onCancel: () => void;
   onContinue: (pick: ConnectPick) => void;
 }) {
@@ -40,7 +38,6 @@ export function SwitchForm({
         cloudOrgs={cloudOrgs}
         cloudReason={cloudReason}
         busy={busy}
-        run={run}
         onCancel={onCancel}
         onContinue={onContinue}
         excludeId={binding.remoteWorkspaceId}

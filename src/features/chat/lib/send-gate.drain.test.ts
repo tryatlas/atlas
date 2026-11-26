@@ -14,8 +14,6 @@ function drainEdge(i: {
   curAcp: string | undefined;
   prevResuming: boolean;
   curResuming: boolean;
-  prevHeldElsewhere?: boolean;
-  curHeldElsewhere?: boolean;
   prevGrantHold: boolean;
   curGrantHold: boolean;
 }) {
@@ -23,7 +21,6 @@ function drainEdge(i: {
     status: string | null,
     acp: string | undefined,
     resuming: boolean,
-    heldElsewhere: boolean | undefined,
     grantHold: boolean,
   ) =>
     sendStateOf(
@@ -33,15 +30,12 @@ function drainEdge(i: {
         acpSessionId: acp,
         resumePending: resuming,
       },
-      { heldElsewhere: !!heldElsewhere, grantHold },
+      { grantHold },
     );
-  const decision = decide(
-    snapshot(i.curStatus, i.curAcp, i.curResuming, i.curHeldElsewhere, i.curGrantHold),
-    {
-      kind: "drain",
-      prev: snapshot(i.prevStatus, i.prevAcp, i.prevResuming, i.prevHeldElsewhere, i.prevGrantHold),
-    },
-  );
+  const decision = decide(snapshot(i.curStatus, i.curAcp, i.curResuming, i.curGrantHold), {
+    kind: "drain",
+    prev: snapshot(i.prevStatus, i.prevAcp, i.prevResuming, i.prevGrantHold),
+  });
   if (decision.do !== "drain") throw new Error("a drain intent decides a drain");
   return { ...decision.edges, drainQueue: decision.queue };
 }
@@ -115,34 +109,6 @@ describe("drainEdge", () => {
     expect(drainEdge({ ...held, prevAcp: undefined }).justBound).toBe(false);
     expect(drainEdge(held).turnFinished).toBe(false);
     expect(drainEdge({ ...base, prevStatus: "idle", prevResuming: true }).justResumed).toBe(true);
-  });
-
-  it("holds the queue while the session is live elsewhere, and drains when the hold lifts", () => {
-    // A turn ending on a session another process is writing must not shift
-    // the next queued message out — that send would fork the transcript.
-    const held = drainEdge({ ...base, prevHeldElsewhere: true, curHeldElsewhere: true });
-    expect(held.turnFinished).toBe(false);
-    expect(held.drainQueue).toBe(false);
-    // "Send anyway" (or the other process going quiet) is the release.
-    const lifted = drainEdge({
-      ...base,
-      prevStatus: "idle",
-      prevHeldElsewhere: true,
-      curHeldElsewhere: false,
-    });
-    expect(lifted.justResumed).toBe(true);
-    expect(lifted.drainQueue).toBe(true);
-    // A resume that lands on a live session stays closed.
-    expect(
-      drainEdge({
-        ...base,
-        prevStatus: "idle",
-        prevResuming: true,
-        curResuming: false,
-        curHeldElsewhere: true,
-        prevHeldElsewhere: true,
-      }).drainQueue,
-    ).toBe(false);
   });
 
   describe("the no-AI-grant hold", () => {

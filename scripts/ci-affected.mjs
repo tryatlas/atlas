@@ -146,7 +146,7 @@ export const EXTRA_INPUTS = [
   {
     path: "crates/atlas-kb-server/",
     packages: ["atlas"],
-    why: "commands/knowledge_export.rs locates and compiles it at runtime",
+    why: "commands/knowledge_export.rs embeds this source and lockfile for standalone exports",
   },
   {
     path: "src/dev/mock-backend/fixtures/",

@@ -9,6 +9,64 @@
 //! requires a live user activation, which a copy that happens *after* an
 //! `await` no longer has. See [`clipboard_write_text`].
 
+/// Read plain text through the native pasteboard. GTK delivers the selection
+/// asynchronously, keeping both the UI and the IPC runtime responsive.
+#[tauri::command]
+pub async fn clipboard_read_text(app: tauri::AppHandle) -> Result<String, String> {
+    let (send, receive) = tokio::sync::oneshot::channel();
+    app.run_on_main_thread(move || {
+        #[cfg(target_os = "linux")]
+        {
+            let clipboard = gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD);
+            clipboard.request_text(move |_, text| {
+                let _ = send.send(Ok(text.map(str::to_owned).unwrap_or_default()));
+            });
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = send.send(macos_read_text());
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = send.send(Err("native clipboard read unavailable".into()));
+        }
+    })
+    .map_err(|e| e.to_string())?;
+    tokio::time::timeout(std::time::Duration::from_secs(3), receive)
+        .await
+        .map_err(|_| "clipboard did not respond".to_string())?
+        .map_err(|_| "clipboard request closed".to_string())?
+}
+
+#[cfg(target_os = "macos")]
+fn macos_read_text() -> Result<String, String> {
+    use objc2::{
+        msg_send,
+        rc::autoreleasepool,
+        runtime::{AnyClass, AnyObject},
+    };
+    use std::ffi::CStr;
+    autoreleasepool(|_| unsafe {
+        let pb_class = AnyClass::get(c"NSPasteboard").ok_or("NSPasteboard unavailable")?;
+        let str_class = AnyClass::get(c"NSString").ok_or("NSString unavailable")?;
+        let board: *mut AnyObject = msg_send![pb_class, generalPasteboard];
+        if board.is_null() {
+            return Err("no general pasteboard".into());
+        }
+        let kind: *mut AnyObject =
+            msg_send![str_class, stringWithUTF8String: c"public.utf8-plain-text".as_ptr()];
+        let value: *mut AnyObject = msg_send![board, stringForType: kind];
+        if value.is_null() {
+            return Ok(String::new());
+        }
+        let text: *const std::ffi::c_char = msg_send![value, UTF8String];
+        if text.is_null() {
+            return Err("clipboard text is not UTF-8".into());
+        }
+        Ok(CStr::from_ptr(text).to_string_lossy().into_owned())
+    })
+}
+
 /// Put `text` on the system clipboard, bypassing the web clipboard API.
 ///
 /// `navigator.clipboard.writeText` works only while a user activation is in
@@ -19,19 +77,34 @@
 ///
 /// Callers should still try the web API first (it is cross-platform and needs
 /// no IPC) and fall back here; `src/lib/clipboard.ts` does exactly that.
+///
+/// Async, so it never runs on the main thread: on Linux the write spawns
+/// `wl-copy`/`xclip` and waits on it (100 ms and more under X11), which as a
+/// sync command froze the UI for that long. macOS keeps its pasteboard write
+/// on the main thread, where it always ran, by hopping there explicitly.
 #[tauri::command]
-pub fn clipboard_write_text(text: String) -> Result<(), String> {
+pub async fn clipboard_write_text(app: tauri::AppHandle, text: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        macos_write_text(&text)
+        let (send, receive) = tokio::sync::oneshot::channel();
+        app.run_on_main_thread(move || {
+            let _ = send.send(macos_write_text(&text));
+        })
+        .map_err(|e| e.to_string())?;
+        receive
+            .await
+            .map_err(|_| "clipboard request closed".to_string())?
     }
     #[cfg(target_os = "linux")]
     {
-        linux_write_text(&text)
+        let _ = app;
+        tokio::task::spawn_blocking(move || linux_write_text(&text))
+            .await
+            .map_err(|e| e.to_string())?
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = text;
+        let _ = (app, text);
         Err("clipboard writes are only implemented on macOS and Linux".to_string())
     }
 }
@@ -214,14 +287,64 @@ fn macos_write_text(text: &str) -> Result<(), String> {
 /// order. Empty when the clipboard holds no file references — e.g. plain text,
 /// or a raw screenshot bitmap that has no backing file on disk.
 #[tauri::command]
-pub fn clipboard_file_paths() -> Vec<String> {
+pub async fn clipboard_file_paths() -> Result<Vec<String>, String> {
     #[cfg(target_os = "macos")]
     {
-        macos_file_paths()
+        tokio::task::spawn_blocking(macos_file_paths)
+            .await
+            .map_err(|error| error.to_string())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        Vec::new()
+        tokio::task::spawn_blocking(windows_file_paths)
+            .await
+            .map_err(|error| error.to_string())?
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_file_paths() -> Result<Vec<String>, String> {
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    };
+    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+    // CF_HDROP is the predefined Shell format for existing file paths.
+    const FILE_DROP: u32 = 15;
+    struct ClipboardGuard;
+    impl Drop for ClipboardGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseClipboard() };
+        }
+    }
+    unsafe {
+        OpenClipboard(None).map_err(|error| error.to_string())?;
+        let _guard = ClipboardGuard;
+        if IsClipboardFormatAvailable(FILE_DROP).is_err() {
+            return Ok(Vec::new());
+        }
+        let handle = GetClipboardData(FILE_DROP).map_err(|error| error.to_string())?;
+        let drop = HDROP(handle.0);
+        let count = DragQueryFileW(drop, u32::MAX, None);
+        if count > 10_000 {
+            return Err("The clipboard contains too many files.".into());
+        }
+        let mut paths = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let length = DragQueryFileW(drop, index, None);
+            if length == 0 || length > 32_767 {
+                return Err("Invalid clipboard file path.".into());
+            }
+            let mut path = vec![0u16; length as usize + 1];
+            if DragQueryFileW(drop, index, Some(&mut path)) != length {
+                return Err("Could not read the clipboard file path.".into());
+            }
+            paths.push(String::from_utf16_lossy(&path[..length as usize]));
+        }
+        Ok(paths)
     }
 }
 
@@ -244,9 +367,11 @@ pub async fn clipboard_paste_paths(app: tauri::AppHandle) -> Result<Vec<String>,
     {
         match linux::with_clipboard(&app, linux::pasted).await? {
             linux::Pasted::Files(paths) => Ok(paths),
-            linux::Pasted::Image { ext, bytes } => {
+            linux::Pasted::Image { ext, bytes } => tokio::task::spawn_blocking(move || {
                 spool_scratch(&app, &format!("pasted.{ext}"), &bytes).map(|path| vec![path])
-            }
+            })
+            .await
+            .map_err(|e| e.to_string())?,
             linux::Pasted::Nothing => Ok(Vec::new()),
         }
     }
@@ -331,8 +456,11 @@ const SCRATCH_TTL_SECS: u64 = 24 * 60 * 60;
 /// not round-trip through base64 JSON. The filename rides in `x-filename`;
 /// only its basename and extension are trusted, and the extension is what the
 /// downstream content-type guess keys on.
+///
+/// Async, with the write on a blocking worker: up to 64 MB of disk I/O plus a
+/// directory sweep used to run on the main thread as a sync command.
 #[tauri::command]
-pub fn scratch_write_bytes(
+pub async fn scratch_write_bytes(
     app: tauri::AppHandle,
     request: tauri::ipc::Request<'_>,
 ) -> Result<String, String> {
@@ -355,7 +483,10 @@ pub fn scratch_write_bytes(
         .filter(|s| !s.is_empty())
         .map(percent_decode)
         .unwrap_or_else(|| "pasted.png".to_string());
-    spool_scratch(&app, &requested, bytes)
+    let bytes = bytes.to_vec();
+    tokio::task::spawn_blocking(move || spool_scratch(&app, &requested, &bytes))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Write `bytes` to `<app_cache_dir>/pasted/<stem>-<uuid>.<ext>`, the stem

@@ -190,62 +190,97 @@ pub fn line_selection_patch(
     hunk_index: usize,
     selected: Option<&[usize]>,
 ) -> Option<String> {
+    line_selection_patch_impl(diff, hunk_index, selected, false)
+}
+
+/// Select changes against the new side, for `git apply --reverse`.
+/// Unselected additions remain context; unselected deletions stay absent.
+pub fn reverse_line_selection_patch(
+    diff: &FilePatch,
+    hunk_index: usize,
+    selected: Option<&[usize]>,
+) -> Option<String> {
+    line_selection_patch_impl(diff, hunk_index, selected, true)
+}
+
+fn line_selection_patch_impl(
+    diff: &FilePatch,
+    hunk_index: usize,
+    selected: Option<&[usize]>,
+    reverse: bool,
+) -> Option<String> {
     let hunk = diff.hunks.get(hunk_index)?;
-    let is_selected = |visible_idx: usize| -> bool {
-        match selected {
-            None => true,
-            Some(s) => s.contains(&visible_idx),
-        }
-    };
-
-    let mut body = String::new();
-    let mut old_count: u32 = 0;
-    let mut new_count: u32 = 0;
+    let is_selected = |idx: usize| selected.is_none_or(|s| s.contains(&idx));
+    let mut lines: Vec<(char, &str, bool)> = Vec::new();
+    let mut visible_idx = 0;
+    let mut previous: Option<usize> = None;
     let mut any_change = false;
-    let mut visible_idx = 0usize;
-    // Whether the previous emitted line was kept (for no-newline markers:
-    // they only make sense right after their line survived).
-    let mut prev_kept = false;
-
     for line in &hunk.lines {
-        match line {
-            PatchLine::Context(c) => {
-                push_line(&mut body, ' ', c);
-                old_count += 1;
-                new_count += 1;
-                prev_kept = true;
-                visible_idx += 1;
+        if matches!(line, PatchLine::NoNewline) {
+            if let Some(idx) = previous {
+                lines[idx].2 = true;
             }
-            PatchLine::Del(c) => {
+            continue;
+        }
+        let (marker, text) = match line {
+            PatchLine::Context(c) => (Some(' '), c.as_str()),
+            PatchLine::Del(c) => (
                 if is_selected(visible_idx) {
-                    push_line(&mut body, '-', c);
-                    old_count += 1;
                     any_change = true;
+                    Some('-')
+                } else if reverse {
+                    None
                 } else {
-                    // Not chosen: the old line stays — context.
-                    push_line(&mut body, ' ', c);
-                    old_count += 1;
-                    new_count += 1;
-                }
-                prev_kept = true;
-                visible_idx += 1;
-            }
-            PatchLine::Add(c) => {
+                    Some(' ')
+                },
+                c.as_str(),
+            ),
+            PatchLine::Add(c) => (
                 if is_selected(visible_idx) {
-                    push_line(&mut body, '+', c);
-                    new_count += 1;
                     any_change = true;
-                    prev_kept = true;
+                    Some('+')
+                } else if reverse {
+                    Some(' ')
                 } else {
-                    prev_kept = false;
-                }
-                visible_idx += 1;
+                    None
+                },
+                c.as_str(),
+            ),
+            PatchLine::NoNewline => unreachable!(),
+        };
+        visible_idx += 1;
+        previous = marker.map(|marker| {
+            let idx = lines.len();
+            lines.push((marker, text, false));
+            idx
+        });
+    }
+    let old_count = lines.iter().filter(|(m, _, _)| *m != '+').count() as u32;
+    let new_count = lines.iter().filter(|(m, _, _)| *m != '-').count() as u32;
+    let (mut old_left, mut new_left) = (old_count, new_count);
+    let mut body = String::new();
+    for (marker, text, no_newline) in lines {
+        old_left -= u32::from(marker != '+');
+        new_left -= u32::from(marker != '-');
+        let emit = |body: &mut String, marker, no_newline| {
+            push_line(body, marker, text);
+            if no_newline {
+                body.push_str("\\ No newline at end of file\n");
             }
-            PatchLine::NoNewline => {
-                if prev_kept {
-                    body.push_str("\\ No newline at end of file\n");
-                }
-            }
+        };
+        // A formerly-final line becomes nonfinal when a partial selection
+        // appends content. Represent its newline change explicitly; a context
+        // no-newline marker would otherwise glue the new line onto it.
+        if marker == ' ' && no_newline && (old_left > 0 || new_left > 0) {
+            emit(&mut body, '-', old_left == 0);
+            emit(&mut body, '+', new_left == 0);
+        } else {
+            let final_line = match marker {
+                '-' => old_left == 0,
+                '+' => new_left == 0,
+                _ => old_left == 0 && new_left == 0,
+            };
+            emit(&mut body, marker, no_newline && final_line);
         }
     }
 

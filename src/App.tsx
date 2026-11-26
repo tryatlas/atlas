@@ -35,7 +35,6 @@ import { cycleChatAgent } from "@/features/chat/lib/switch-agent";
 import { readChatTabSession } from "@/features/chat/lib/chat-tab-session";
 import { HintOverlay } from "@/features/hint-nav/components/hint-overlay";
 import { NavigationHints } from "@/features/keybindings/components/navigation-hints";
-import { BrowserOverlayWatcher } from "@/features/browser/components/browser-overlay-watcher";
 import {
   fileIndex,
   openFileIndex,
@@ -581,6 +580,10 @@ export function App() {
     () => tabs.map((t) => `${t.id} ${readChatTabSession(t.data) ?? ""}`).join("\n"),
     [tabs],
   );
+  // And on the terminal tabs' pane trees: a split, a closed pane or a dragged
+  // divider changes nothing above, but is part of the same file. The write is
+  // skipped when the payload is byte-identical (`writeEditorState`).
+  const terminalTrees = useTerminalStore((s) => s.tabs);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   useEffect(() => {
     if (!currentProject) return;
@@ -589,7 +592,7 @@ export function App() {
       useLayoutStore.getState().actions.saveEditorState(currentProject.path);
     }, 1000);
     return () => clearTimeout(saveTimerRef.current);
-  }, [tabOrder, activeTabId, groupOrder, focusedGroupId, currentProject]);
+  }, [tabOrder, activeTabId, groupOrder, focusedGroupId, currentProject, terminalTrees]);
 
   // Maintain the chat-mention picker's "recent files" queue. Push whenever
   // an editor/media/unsupported tab appears whose data.filePath we haven't
@@ -703,10 +706,8 @@ export function App() {
     ensureRecentFilesListener();
   }, []);
 
-  // Quit durability: per-switch flushes are fire-and-forget, so on window
-  // close flush the ACTIVE project's pending writes (background projects
-  // were already flushed when we left them). beforeunload can't await, but it
-  // cancels the debounce and kicks the write immediately.
+  // Fallback for webview reloads. Native quit is held by useQuitGuard until
+  // the same flush barrier finishes, including pending background documents.
   useEffect(() => {
     const onBeforeUnload = () => {
       const wsId = useProjectStore.getState().activeProjectId;
@@ -714,7 +715,9 @@ export function App() {
       // Capture first so the flush dedup compares against the CURRENT state
       // (not a stale capture from the last switch-away).
       if (wsId) captureSnapshot(wsId);
-      void flushAll({ projectId: wsId, path });
+      void flushAll({ projectId: wsId, path, reason: "quit" }).catch((error) =>
+        console.error("Reload save failed", error),
+      );
     };
     window.addEventListener("beforeunload", onBeforeUnload);
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
@@ -764,7 +767,12 @@ export function App() {
       ]),
     ),
     "tabs.close": () => {
-      const current = useLayoutStore.getState().activeTabId;
+      const layout = useLayoutStore.getState();
+      if (layout.destinationShown) {
+        layout.actions.hideDestination();
+        return;
+      }
+      const current = layout.activeTabId;
       if (current) requestCloseTab(current);
     },
     "tabs.prev": () => cycleTab(-1, !useAppStore.getState().currentProject),
@@ -775,7 +783,7 @@ export function App() {
     "split.focusRight": () => focusAdjacentGroup(1),
     // Close the focused split column (tabs move to the left neighbour).
     "split.close": () => closeGroup(useLayoutStore.getState().focusedGroupId),
-    // Zen mode: Session │ Knowledge │ Browser, side panels hidden. Again restores.
+    // Zen mode: the session alone, side panels hidden. Again restores.
     "panels.zen": () => {
       if (currentProject) toggleZenMode();
     },
@@ -905,7 +913,6 @@ export function App() {
       <LinkPullRequestDialogHost />
       <SessionDetailsDialogs />
       <RemoveAgentDialog />
-      <BrowserOverlayWatcher />
       <ThemeEditorHost />
       {/* Renders nothing at all until a glyph-based icon theme is in use, and
           so costs an SVG theme (including the bundled default) nothing. */}

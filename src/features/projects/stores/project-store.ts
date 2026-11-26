@@ -29,6 +29,12 @@ import {
 } from "../lib/stop-agents-confirm";
 import { markFileIndexClosedFor } from "@/features/file-picker/lib/file-picker-api";
 import { instructionSync } from "../lib/instruction-sync-api";
+import {
+  confirmCloseFileTabs,
+  dirtyFileTabs,
+  filePathOf,
+  releaseOrphanedFileBuffers,
+} from "@/features/editor/lib/dirty-close";
 import type { Project as ProjectWire } from "@/bindings/app-state/Project";
 import type { NullsDropped } from "@/lib/drop-nulls";
 
@@ -173,6 +179,12 @@ function teardownHot(id: string): void {
   if (drawerTabs.length) useTerminalStore.getState().actions.removeTabs(drawerTabs);
   evictSnapshot(id);
   useLayoutStore.getState().actions.removeProjectView(id);
+  // Its file buffers go with it (unless another project still shows the
+  // file): every caller has saved or been told "Don't save" first.
+  const filePaths = view
+    ? view.tabs.flatMap((t) => (t.type === "editor" ? (filePathOf(t) ?? []) : []))
+    : [];
+  if (filePaths.length) releaseOrphanedFileBuffers(filePaths);
   // The picker's no-IPC fast path must stop vouching for an index that is
   // about to be torn down.
   const path = useProjectStore.getState().projects.find((w) => w.id === id)?.path;
@@ -295,6 +307,9 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
         const w = byId(wid);
         if (!w) return true;
         if (isProjectRunning(w.path)) return false;
+        // Unsaved file edits live in its mounted editors: discarding the
+        // project would drop them without asking. It stays over the cap.
+        if (dirtyFileTabs(wid).length > 0) return false;
         return true;
       };
       // Evict the least-recently-active evictable projects until under cap.
@@ -304,7 +319,7 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
         const candidates = mounted
           .filter(evictable)
           .sort((a, b) => (byId(a)?.lastActiveAt ?? "").localeCompare(byId(b)?.lastActiveAt ?? ""));
-        if (candidates.length === 0) break; // all running — exceed cap
+        if (candidates.length === 0) break; // all running or unsaved — exceed cap
         const lru = candidates[0];
         teardownHot(lru);
         mounted = mounted.filter((x) => x !== lru);
@@ -432,6 +447,10 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
       const isActive = id === activeProjectId;
       const closingPath = closing.path;
 
+      // Unsaved file edits first: answering this has no side effects, so
+      // Cancel leaves everything (agents included) exactly as it was.
+      if (!(await confirmCloseFileTabs(dirtyFileTabs(id), "Closing this project"))) return;
+
       // Closing kills this project's running agents — confirm, then cancel
       // their turns so the adapters actually stop (drop alone leaves them
       // editing files headless).
@@ -454,13 +473,13 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
       // Free RAM + unmount its subtree (closes PTYs) + stop Rust watchers,
       // then drop it from the hot set AND the registry.
       teardownHot(id);
-      const remaining = projects.filter((w) => w.id !== id);
+      const remaining = get().projects.filter((w) => w.id !== id);
       set((s) => ({
         projects: remaining,
         mountedProjectIds: s.mountedProjectIds.filter((x) => x !== id),
       }));
 
-      if (isActive) {
+      if (get().activeProjectId === id) {
         // Switch to the most-recently-active remaining project IN THIS ORG,
         // or clear. Unscoped, closing an org's last project opened another
         // org's — invisible in this org's switcher, so it could not be

@@ -1150,3 +1150,52 @@ async fn turn_metadata_state_git_enrichment_cancellation_is_retryable_and_errors
     .expect("failed git enrichment should complete");
     assert!(invalid_state.current_workspaces().is_empty());
 }
+
+/// Atlas: a credential embedded in a git remote never reaches turn metadata.
+#[test]
+fn remote_urls_lose_their_credentials() {
+    assert_eq!(
+        remote_without_credentials("https://user:ghp_secret@github.com/acme/repo.git"),
+        "https://github.com/acme/repo.git"
+    );
+    assert_eq!(
+        remote_without_credentials("https://x-access-token@github.com/acme/repo.git"),
+        "https://github.com/acme/repo.git"
+    );
+    assert_eq!(
+        remote_without_credentials("ssh://git@github.com/acme/repo.git"),
+        "ssh://github.com/acme/repo.git"
+    );
+    // scp-style and credential-free remotes are left alone.
+    assert_eq!(
+        remote_without_credentials("git@github.com:acme/repo.git"),
+        "git@github.com:acme/repo.git"
+    );
+    assert_eq!(
+        remote_without_credentials("https://github.com/acme/repo.git"),
+        "https://github.com/acme/repo.git"
+    );
+}
+
+/// Atlas: only a server on this machine counts as local.
+#[test]
+fn only_loopback_and_stdio_mcp_origins_are_local() {
+    for origin in [
+        "stdio",
+        "http://127.0.0.1:9",
+        "http://127.8.0.1:9",
+        "http://localhost:9",
+        "http://[::1]:9",
+    ] {
+        assert!(mcp_server_origin_is_local(Some(origin)), "{origin}");
+    }
+    for origin in [
+        "https://mcp.example.com",
+        "http://192.168.1.2:9",
+        "http://localhost.example.com",
+        "garbage",
+    ] {
+        assert!(!mcp_server_origin_is_local(Some(origin)), "{origin}");
+    }
+    assert!(!mcp_server_origin_is_local(None));
+}

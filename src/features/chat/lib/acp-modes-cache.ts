@@ -55,3 +55,14 @@ export function saveCachedAcpModes(agentType: string, modes: CachedAcpModes): vo
     // storage full / unavailable — caching is best-effort
   }
 }
+
+/** Forget an agent's cached modes: a live session answered that it has none,
+ *  and a cached list would otherwise seed the picker with ghosts forever
+ *  (saving an empty list is a no-op, so it has to be removed). */
+export function clearCachedAcpModes(agentType: string): void {
+  try {
+    localStorage.removeItem(key(agentType));
+  } catch {
+    // storage unavailable — caching is best-effort
+  }
+}

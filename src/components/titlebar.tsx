@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useNavigationHint } from "@/features/keybindings/lib/use-navigation-hint";
 import { useActionShortcut } from "@/features/keybindings/lib/use-action-shortcut";
 import { Popover } from "@base-ui/react/popover";
@@ -10,11 +10,8 @@ import { useAppProfile } from "@/lib/app-profile";
 import { TitlebarDock, type DockItem } from "./titlebar-dock";
 import { isTauri } from "@tauri-apps/api/core";
 import { zoomWindow } from "@/features/app/lib/app-lifecycle-api";
-import {
-  captureBinding,
-  captureHealth,
-  onCaptureChanged,
-} from "@/features/capture/lib/capture-api";
+import { onCaptureChanged } from "@/features/capture/lib/capture-api";
+import { useProjectCaptureState } from "@/features/capture/hooks/use-project-capture-state";
 import { toast } from "sonner";
 import type { Window as TauriWindow } from "@tauri-apps/api/window";
 import { useUpdaterStore } from "@/features/updater/stores/updater-store";
@@ -22,8 +19,6 @@ import { updater } from "@/features/updater/lib/updater-api";
 import { useOrgStore } from "@/features/organisations/stores/org-store";
 import { CapturePopover } from "@/features/capture/components/capture-popover";
 import { StatusDot } from "@/features/capture/components/capture-status";
-import type { Binding, CaptureHealth } from "@/features/capture/types";
-import { activeProjectId } from "@/features/projects/lib/active-project";
 import { useFullscreen } from "@/hooks/use-fullscreen";
 import { isDev } from "@/lib/env";
 import { isLinux, isMac, isWindows } from "@/lib/platform";
@@ -348,22 +343,35 @@ export function WindowControls() {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
+    let alive = true;
 
     (async () => {
       try {
         const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        if (!alive) return;
         const win = getCurrentWindow();
         windowRef.current = win;
-        setIsMaximized(await win.isMaximized());
-        unlisten = await win.onResized(async () => {
-          setIsMaximized(await win.isMaximized());
+        const refresh = async () => {
+          const maximized = await win.isMaximized();
+          if (alive) setIsMaximized(maximized);
+        };
+        await refresh();
+        if (!alive) return;
+        const stop = await win.onResized(() => {
+          void refresh().catch(() => {});
         });
+        if (alive) unlisten = stop;
+        else stop();
       } catch {
         // not in Tauri context
       }
     })();
 
-    return () => unlisten?.();
+    return () => {
+      alive = false;
+      windowRef.current = null;
+      unlisten?.();
+    };
   }, []);
 
   const button =
@@ -445,25 +453,9 @@ function ProjectLabel({
   path?: string;
 }) {
   const [captureOpen, setCaptureOpen] = useState(false);
-  const [binding, setBinding] = useState<Binding | null>(null);
-  const [health, setHealth] = useState<CaptureHealth | null>(null);
-
   // Capture state for the dot, re-read when the popover changes something.
-  const readCapture = useCallback(() => {
-    if (!path) {
-      setBinding(null);
-      setHealth(null);
-      return;
-    }
-    void captureBinding(path)
-      .then(setBinding)
-      .catch(() => setBinding(null));
-    void captureHealth(path, activeProjectId())
-      .then(setHealth)
-      .catch(() => setHealth(null));
-  }, [path]);
-
-  useEffect(() => readCapture(), [readCapture]);
+  // Tagged by project, so a switch never shows the previous project's dot.
+  const { binding, health, reload: readCapture } = useProjectCaptureState(path);
 
   // Fresh numbers whenever the popover is looked at. Health was otherwise read
   // on project switch and after a popover action only — so right after Promote

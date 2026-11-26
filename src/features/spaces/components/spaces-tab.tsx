@@ -6,6 +6,7 @@ import { useSpacesStore } from "../stores/spaces-store";
 import { readDock, writeDock, type SpaceDock } from "../lib/dock";
 import { SpaceCanvas } from "./space-canvas";
 import { SpacePages } from "./space-pages";
+import { SpaceRecovery } from "./space-recovery";
 import { EmptyState, Hint, IconButton } from "@tryatlas/design";
 
 /**
@@ -18,12 +19,15 @@ export function SpacesTab({ convId }: { convId: string }) {
   const conv = useCommsStore((s) => s.conversations.find((c) => c.id === convId));
   if (!conv) {
     return (
-      <EmptyState
-        className="h-full"
-        icon={Frame}
-        title="This Space is no longer available."
-        description="The conversation was removed, or you left it."
-      />
+      <div className="flex h-full flex-col">
+        <SpaceRecovery convId={convId} />
+        <EmptyState
+          className="flex-1"
+          icon={Frame}
+          title="This Space is no longer available."
+          description="The conversation was removed, or you left it."
+        />
+      </div>
     );
   }
   return <SpaceHost convId={convId} />;
@@ -39,17 +43,36 @@ function SpaceHost({ convId }: { convId: string }) {
     writeDock(next);
   };
 
-  if (meta?.error) {
-    return <EmptyState className="h-full" icon={AlertTriangle} title={meta.error} />;
+  if (meta?.error && !session.ready) {
+    return (
+      <div className="flex h-full flex-col">
+        <SpaceRecovery convId={convId} />
+        <EmptyState className="flex-1" icon={AlertTriangle} title={meta.error} />
+      </div>
+    );
   }
 
   const connection = meta?.connection ?? "disconnected";
   const archived = meta?.archived ?? false;
   const stale = meta?.stale ?? false;
-  const treeEditable = connection === "open" && !archived && !stale;
+  const treeEditable = connection === "open" && !archived && !stale && session.readOnly === null;
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-background">
+      <SpaceRecovery convId={convId} />
+      {session.syncError && (
+        <div role="alert" className="flex items-center gap-2 border-b border-error p-3 text-sm">
+          <p className="flex-1">{session.syncError}</p>
+          <button type="button" onClick={session.retrySync}>
+            Retry sync
+          </button>
+        </div>
+      )}
+      {meta?.error && (
+        <p role="status" className="border-b border-border p-3 text-sm">
+          Showing your saved copy. {meta.error}
+        </p>
+      )}
       {archived && (
         <div className="flex shrink-0 items-center gap-2 border-b border-border-subtle bg-element-hover px-3 py-1 text-2xs text-muted-foreground">
           This conversation is archived — the canvas is read-only. Cursors still show who is
@@ -95,7 +118,7 @@ function SpaceHost({ convId }: { convId: string }) {
           <SpaceCanvas
             convId={convId}
             session={session}
-            forceReadOnly={stale}
+            forceReadOnly={stale || connection === "unavailable"}
             pagesOpen={pagesOpen}
             onTogglePages={() => setPagesOpen((o) => !o)}
             dock={dock}

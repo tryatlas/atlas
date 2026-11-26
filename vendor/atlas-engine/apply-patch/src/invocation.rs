@@ -268,13 +268,19 @@ async fn try_verify_apply_patch_args(
                     sandbox,
                 )
                 .await?;
+                let move_path = crate::resolve_move_destination(
+                    &path,
+                    move_path.as_ref(),
+                    &effective_cwd,
+                    fs,
+                    sandbox,
+                )
+                .await?;
                 changes.insert(
                     path,
                     ApplyPatchFileChange::Update {
                         unified_diff,
-                        move_path: move_path
-                            .map(|path| effective_cwd.join(&path.to_string_lossy()))
-                            .transpose()?,
+                        move_path,
                         new_content: contents,
                     },
                 );

@@ -1,3 +1,4 @@
+// Modified by Atlas from upstream OpenAI Codex (Apache-2.0). See CONTEXT.md.
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,6 +57,11 @@ impl Stopwatch {
         let notify = Arc::clone(&self.notify);
         tokio::spawn(async move {
             loop {
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                // Register before inspecting state so a pause/resume between
+                // the inspection and await cannot lose its wakeup.
+                notified.as_mut().enable();
                 let (remaining, running) = {
                     let guard = inner.lock().await;
                     let elapsed = guard.elapsed
@@ -70,19 +76,16 @@ impl Stopwatch {
                 };
 
                 if !running {
-                    notify.notified().await;
+                    notified.await;
                     continue;
                 }
 
                 let sleep = tokio::time::sleep(remaining);
                 tokio::pin!(sleep);
                 tokio::select! {
-                    _ = &mut sleep => {
-                        break;
-                    }
-                    _ = notify.notified() => {
-                        continue;
-                    }
+                    // Recheck elapsed under the lock: a pause can race the timer.
+                    _ = &mut sleep => {}
+                    _ = &mut notified => {}
                 }
             }
             cancel.cancel();

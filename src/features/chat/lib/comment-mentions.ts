@@ -53,7 +53,13 @@ export function commentExcerpt(
     (_, id: string) => `@${directory?.byId.get(id)?.name ?? id}`,
   );
   const flat = named.replace(/\s+/g, " ").replace(/"/g, "'").trim();
-  return flat.length > max ? `${flat.slice(0, max - 1).trimEnd()}…` : flat;
+  const points = Array.from(flat);
+  return points.length > max
+    ? `${points
+        .slice(0, Math.max(0, max - 1))
+        .join("")
+        .trimEnd()}…`
+    : flat;
 }
 
 /** What a comment hangs off, as a phrase: "the session", "a prompt", "a Bash call". */

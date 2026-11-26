@@ -336,3 +336,31 @@ fn removes_an_existing_unscoped_target_when_cwd_is_unavailable() {
     );
     assert!(!target_root.exists());
 }
+
+#[test]
+fn rejects_path_traversal_project_keys_without_removing_files() {
+    let root = TempDir::new().expect("tempdir");
+    let home = root.path().join("home");
+    let outside = root.path().join("outside");
+    fs::create_dir_all(&outside).expect("outside dir");
+    fs::write(outside.join("keep"), "untouched").expect("sentinel");
+    let absolute = outside.to_str().expect("UTF-8 path");
+    for key in [
+        absolute,
+        "..",
+        "../outside",
+        ".",
+        "a/b",
+        r"a\b",
+        "C:outside",
+        "",
+    ] {
+        let result = copy_resources(&home, &[], &BTreeSet::from([key])).expect("result");
+        assert_eq!(result.failures.len(), 1, "{key}");
+        assert!(result.synchronized_projects.is_empty());
+        assert_eq!(
+            fs::read_to_string(outside.join("keep")).expect("sentinel survives"),
+            "untouched"
+        );
+    }
+}

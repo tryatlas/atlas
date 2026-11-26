@@ -181,7 +181,14 @@ export function ElicitationDialogView({
                     type={f.kind === "number" ? "number" : "text"}
                     value={String(values[f.name] ?? "")}
                     onChange={(e) =>
-                      set(f.name, f.kind === "number" ? Number(e.target.value) : e.target.value)
+                      set(
+                        f.name,
+                        f.kind === "number"
+                          ? e.target.value.trim() === ""
+                            ? undefined
+                            : Number(e.target.value)
+                          : e.target.value,
+                      )
                     }
                     spellCheck={false}
                     autoComplete="off"

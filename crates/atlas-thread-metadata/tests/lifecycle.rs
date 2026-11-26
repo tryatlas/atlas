@@ -281,6 +281,7 @@ fn snapshot() -> ThreadSnapshot {
         is_draft: false,
         title: Some(Arc::from("Work")),
         work_dirs: vec![PathBuf::from("/tmp/atlas")],
+        replayed: false,
     }
 }
 
@@ -293,6 +294,7 @@ fn stopped(at: DateTime<Utc>) -> AcpThreadEvent {
             stop_reason: acp::StopReason::EndTurn,
             entries: 0..0,
             worked_ms: Some(30_000),
+            turn_seq: 0,
         },
     )
 }
@@ -336,7 +338,7 @@ fn a_failed_send_is_a_raised_hand() {
     let (recorder, session, id) = live(&store);
     store.snooze(id, soon());
 
-    recorder.note_failure(&session, Utc::now());
+    recorder.note_failure(&"some-agent".into(), &session, Utc::now());
 
     assert!(!row(&store, id).is_snoozed());
 }
@@ -417,10 +419,14 @@ fn viewing_through_the_live_feed_marks_the_bound_row() {
     let (recorder, session, id) = live(&store);
     store.note_turn_completed(id, Utc::now() - Duration::seconds(5));
 
-    assert!(recorder.note_viewed(&session, Utc::now()));
+    assert!(recorder.note_viewed(Some(&"some-agent".into()), &session, Utc::now()));
+    assert!(
+        recorder.note_viewed(None, &session, Utc::now()),
+        "an id only one agent holds needs no agent"
+    );
     assert!(!row(&store, id).is_unread());
     assert!(
-        !recorder.note_viewed(&acp::SessionId::new("unknown"), Utc::now()),
+        !recorder.note_viewed(None, &acp::SessionId::new("unknown"), Utc::now()),
         "a session with no row has nothing to mark"
     );
 }

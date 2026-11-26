@@ -1,3 +1,4 @@
+import { isComposingKey } from "@/lib/keyboard-event";
 import { useEffect, useRef, useState } from "react";
 import { Check, Hash, Plus } from "lucide-react";
 import {
@@ -74,7 +75,7 @@ export function CreateChannelMenuView({
             maxLength={CHANNEL_NAME_MAX}
             onChange={(e) => setName(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") {
+              if (e.key === "Enter" && !isComposingKey(e)) {
                 e.preventDefault();
                 submit();
               }

@@ -32,6 +32,12 @@ use crate::elicitation::{ElicitationEntryId, ElicitationStore};
 use crate::terminal::{AcpTerminal, TerminalAppend, TerminalProviderEvent, TerminalRegistry};
 use crate::EventSink;
 
+/// What an image contributes to a message's text: it has none of its own,
+/// and rendering nothing made an image-only reply look like no reply at all.
+pub const IMAGE_PLACEHOLDER: &str = "[image]";
+/// The same for audio.
+pub const AUDIO_PLACEHOLDER: &str = "[audio]";
+
 /// One piece of renderable content.
 ///
 /// Text is carried as a plain `String` because the frontend already renders
@@ -108,17 +114,27 @@ impl ContentBlock {
                 *self = ContentBlock::Text(combined);
             }
             (ContentBlock::Image { .. }, _) => {
-                let combined = format!("`Image`\n{}", Self::block_string_contents(&block));
+                let combined = format!(
+                    "{IMAGE_PLACEHOLDER}\n{}",
+                    Self::block_string_contents(&block)
+                );
                 *self = ContentBlock::Text(combined);
             }
         }
     }
 
+    /// The text a block contributes to a merged message.
+    ///
+    /// Content with no text of its own (an image, audio, a binary resource)
+    /// contributes a labelled placeholder rather than nothing: an agent reply
+    /// that was only a picture otherwise rendered as an empty bubble, or
+    /// vanished, and the reader could not tell anything had been said.
     fn block_string_contents(block: &acp::ContentBlock) -> String {
         match block {
             acp::ContentBlock::Text(text) => text.text.clone(),
             acp::ContentBlock::ResourceLink(link) => Self::resource_link_string(&link.uri),
-            acp::ContentBlock::Image(_) => "`Image`".into(),
+            acp::ContentBlock::Image(_) => IMAGE_PLACEHOLDER.into(),
+            acp::ContentBlock::Audio(_) => AUDIO_PLACEHOLDER.into(),
             acp::ContentBlock::Resource(resource) => {
                 Self::embedded_resource_string_contents(resource)
             }
@@ -135,6 +151,9 @@ impl ContentBlock {
     fn embedded_resource_string_contents(resource: &acp::EmbeddedResource) -> String {
         match &resource.resource {
             acp::EmbeddedResourceResource::TextResourceContents(text) => text.text.clone(),
+            acp::EmbeddedResourceResource::BlobResourceContents(blob) => {
+                format!("[resource: {}]", blob.uri)
+            }
             _ => String::new(),
         }
     }
@@ -145,7 +164,7 @@ impl ContentBlock {
             ContentBlock::Text(text) => text,
             ContentBlock::EmbeddedResource { text, .. } => text,
             ContentBlock::ResourceLink { resource_link } => &resource_link.uri,
-            ContentBlock::Image { .. } => "`Image`",
+            ContentBlock::Image { .. } => IMAGE_PLACEHOLDER,
         }
     }
 
@@ -184,6 +203,11 @@ pub struct AssistantMessage {
     pub chunks: Vec<AssistantMessageChunk>,
     pub indented: bool,
     pub is_subagent_output: bool,
+    /// The subagent launch this narration belongs to, from the chunk's
+    /// `_meta` ([`crate::subagent::parent_tool_call_id`]). Atlas declares the
+    /// `subagent-transcript` capability, so an adapter forwards a child's own
+    /// text on the parent session; without this it read as the parent's prose.
+    pub parent_tool_call_id: Option<Arc<str>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -309,10 +333,13 @@ impl ToolCallContent {
 
     pub fn update_from_acp(&mut self, new: acp::ToolCallContent) -> Result<bool> {
         let needs_update = match (&self, &new) {
-            (Self::Diff(old_diff), acp::ToolCallContent::Diff(new_diff)) => old_diff.needs_update(
-                new_diff.old_text.as_deref().unwrap_or(""),
-                &new_diff.new_text,
-            ),
+            (Self::Diff(old_diff), acp::ToolCallContent::Diff(new_diff)) => {
+                old_diff.path != new_diff.path
+                    || old_diff.needs_update(
+                        new_diff.old_text.as_deref().unwrap_or(""),
+                        &new_diff.new_text,
+                    )
+            }
             _ => true,
         };
 
@@ -775,10 +802,7 @@ impl ToolCall {
 pub const TOOL_NAME_META_KEY: &str = "tool_name";
 
 pub fn tool_name_from_meta(meta: &Option<acp::Meta>) -> Option<Arc<str>> {
-    meta.as_ref()
-        .and_then(|m| m.get(TOOL_NAME_META_KEY))
-        .and_then(|v| v.as_str())
-        .map(Arc::from)
+    crate::subagent::meta_tool_name(meta.as_ref()).map(Arc::from)
 }
 
 #[derive(Debug, Default)]
@@ -1037,6 +1061,26 @@ pub struct TurnRecord {
     /// already left out and must not be subtracted again. `None` with
     /// `started_at`.
     pub worked_ms: Option<u64>,
+    /// The host's label for the turn ([`AcpThread::set_next_turn_seq`]),
+    /// captured when the turn opened. Carried on the record so a consumer
+    /// draining events behind the thread stamps a stop with THIS turn's
+    /// label, not whatever the host has moved on to (audit #17).
+    pub turn_seq: u64,
+}
+
+/// Where the thread's turn stands, published on every change so an async
+/// caller can wait for a stop to settle without polling the lock.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnState {
+    /// The running turn's id, if one is open (stopping included).
+    pub running: Option<u32>,
+    /// The running turn was asked to stop and the agent has not answered yet.
+    pub stopping: bool,
+    /// The newest turn whose stop was given up on after the grace period
+    /// ([`AcpThread::expire_stop`]); 0 for none.
+    pub expired: u32,
+    /// Bumped by every user Stop ([`AcpThread::request_stop`]).
+    pub stop_epoch: u64,
 }
 
 /// The open turn: when it began, on both clocks, and how many entries there
@@ -1054,6 +1098,10 @@ struct OpenTurn {
 #[derive(Debug)]
 struct RunningTurn {
     id: u32,
+    /// `session/cancel` went out and the agent has not answered the prompt
+    /// yet. Stop is a state, not an instant (audit #75): the turn stays open
+    /// until the agent says it ended, or the host gives up after a grace.
+    stopping: bool,
 }
 
 /// The marker line opening the next-steps directive Atlas appends to every wire
@@ -1164,6 +1212,14 @@ pub struct AcpThread {
     plan: Plan,
     turn_id: u32,
     running_turn: Option<RunningTurn>,
+    /// The host's label for the next turn to open (its `turn_seq`).
+    next_turn_seq: u64,
+    /// The label of the turn opened last: the one running, or the one that
+    /// ended most recently.
+    turn_seq: u64,
+    stop_epoch: u64,
+    expired_turn: u32,
+    turn_state: tokio::sync::watch::Sender<TurnState>,
     /// Why the last turn ended, once one has. What a child launched to run on
     /// its own ended as: the agent holds a turn open until such children
     /// settle, so the turn's end is theirs too — a Stop stopped them.
@@ -1212,6 +1268,11 @@ impl AcpThread {
             plan: Plan::default(),
             turn_id: 0,
             running_turn: None,
+            next_turn_seq: 0,
+            turn_seq: 0,
+            stop_epoch: 0,
+            expired_turn: 0,
+            turn_state: tokio::sync::watch::Sender::new(TurnState::default()),
             last_stop_reason: None,
             turn_opened: None,
             turns: Vec::new(),
@@ -1422,6 +1483,15 @@ impl AcpThread {
         self.had_error
     }
 
+    pub fn active_turn(&self) -> Option<u32> {
+        self.running_turn.as_ref().map(|turn| turn.id)
+    }
+
+    /// Reattach a projection when a still-running thread is reopened.
+    pub fn replace_event_sink(&mut self, events: EventSink<AcpThreadEvent>) {
+        self.events = events;
+    }
+
     pub fn is_generating(&self) -> bool {
         self.running_turn.is_some()
     }
@@ -1438,7 +1508,56 @@ impl AcpThread {
     }
 
     fn emit(&self, event: AcpThreadEvent) {
+        if matches!(event, AcpThreadEvent::StatusChanged) {
+            self.publish_turn_state();
+        }
         let _ = self.events.send(event);
+    }
+
+    fn publish_turn_state(&self) {
+        let state = TurnState {
+            running: self.running_turn.as_ref().map(|turn| turn.id),
+            stopping: self.running_turn.as_ref().is_some_and(|turn| turn.stopping),
+            expired: self.expired_turn,
+            stop_epoch: self.stop_epoch,
+        };
+        self.turn_state.send_if_modified(|current| {
+            let changed = *current != state;
+            *current = state;
+            changed
+        });
+    }
+
+    /// Follow the turn's state: what a caller waits on for a stop to settle.
+    pub fn watch_turn(&self) -> tokio::sync::watch::Receiver<TurnState> {
+        self.turn_state.subscribe()
+    }
+
+    /// Label the next turn to open with the host's `turn_seq`. The label is
+    /// captured when the turn opens, so setting it while an earlier turn is
+    /// still draining does not relabel that turn.
+    pub fn set_next_turn_seq(&mut self, turn_seq: u64) {
+        self.next_turn_seq = turn_seq;
+    }
+
+    /// The label [`Self::begin_turn`] would open the next turn with.
+    pub fn next_turn_seq(&self) -> u64 {
+        self.next_turn_seq
+    }
+
+    /// The label of the turn opened last — running, or most recently ended.
+    pub fn turn_seq(&self) -> u64 {
+        self.turn_seq
+    }
+
+    /// Whether the running turn was asked to stop and has not ended yet.
+    pub fn is_stopping(&self) -> bool {
+        self.running_turn.as_ref().is_some_and(|turn| turn.stopping)
+    }
+
+    /// How many user Stops this thread has seen.
+    pub fn stop_epoch(&self) -> u64 {
+        self.stop_epoch
     }
 
     /// Announce that the entry at `ix` changed.
@@ -1548,16 +1667,20 @@ impl AcpThread {
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk {
                 content,
                 message_id,
+                meta,
                 ..
             }) => {
-                self.push_assistant_content_block_with_message_id(message_id, content, false, false)
+                let parent = crate::subagent::parent_tool_call_id(meta.as_ref());
+                self.push_assistant_chunk(message_id, content, false, parent)
             }
             acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk {
                 content,
                 message_id,
+                meta,
                 ..
             }) => {
-                self.push_assistant_content_block_with_message_id(message_id, content, true, false)
+                let parent = crate::subagent::parent_tool_call_id(meta.as_ref());
+                self.push_assistant_chunk(message_id, content, true, parent)
             }
             acp::SessionUpdate::ToolCall(tool_call) => {
                 self.upsert_tool_call(tool_call)?;
@@ -1571,19 +1694,29 @@ impl AcpThread {
                 // There are no provisional titles (shown while the agent has
                 // not yet named the session), so an unchanged title needs no
                 // re-emit.
-                if let MaybeUndefined::Value(title) = info_update.title {
-                    let title: Arc<str> = title.into();
-                    // Dropped, not stored-then-hidden: every consumer of
-                    // `title()` is in another crate, and the one that keeps a
-                    // title the user never sees is the one that shows it.
-                    if is_host_machinery_title(&title) {
-                        tracing::debug!(%title, "ignoring agent title naming Atlas's own prompt machinery");
-                        return Ok(());
+                match info_update.title {
+                    MaybeUndefined::Value(title) => {
+                        let title: Arc<str> = title.into();
+                        // Dropped, not stored-then-hidden: every consumer of
+                        // `title()` is in another crate, and the one that keeps a
+                        // title the user never sees is the one that shows it.
+                        if is_host_machinery_title(&title) {
+                            tracing::debug!(%title, "ignoring agent title naming Atlas's own prompt machinery");
+                            return Ok(());
+                        }
+                        if self.title.as_ref() != Some(&title) {
+                            self.title = Some(title);
+                            self.emit(AcpThreadEvent::TitleUpdated);
+                        }
                     }
-                    if self.title.as_ref() != Some(&title) {
-                        self.title = Some(title);
-                        self.emit(AcpThreadEvent::TitleUpdated);
+                    // An explicit `null` is the agent clearing its title, which
+                    // the schema distinguishes from leaving it alone (absent).
+                    MaybeUndefined::Null => {
+                        if self.title.take().is_some() {
+                            self.emit(AcpThreadEvent::TitleUpdated);
+                        }
                     }
+                    MaybeUndefined::Undefined => {}
                 }
             }
             acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate {
@@ -1737,25 +1870,31 @@ impl AcpThread {
     }
 
     pub fn push_assistant_content_block(&mut self, chunk: acp::ContentBlock, is_thought: bool) {
-        self.push_assistant_content_block_with_message_id(None, chunk, is_thought, false)
+        self.push_assistant_chunk(None, chunk, is_thought, None)
     }
 
-    fn push_assistant_content_block_with_message_id(
+    /// Append an assistant chunk, merging into the last entry when it is the
+    /// same speaker: the parent agent, or the same subagent. A child's
+    /// narration is an entry of its own, never glued onto the parent's prose
+    /// (nor the parent's next words onto it).
+    fn push_assistant_chunk(
         &mut self,
         message_id: Option<acp::MessageId>,
         chunk: acp::ContentBlock,
         is_thought: bool,
-        indented: bool,
+        parent: Option<Arc<str>>,
     ) {
         let entries_len = self.entries.len();
+        let indented = parent.is_some();
 
         if let Some(AgentThreadEntry::AssistantMessage(AssistantMessage {
             chunks,
             indented: existing_indented,
+            parent_tool_call_id: existing_parent,
             ..
         })) = self.entries.last_mut()
         {
-            if *existing_indented == indented {
+            if *existing_indented == indented && *existing_parent == parent {
                 let idx = entries_len - 1;
                 match (chunks.last_mut(), is_thought) {
                     (
@@ -1812,7 +1951,8 @@ impl AcpThread {
         self.push_entry(AgentThreadEntry::AssistantMessage(AssistantMessage {
             chunks: vec![chunk],
             indented,
-            is_subagent_output: false,
+            is_subagent_output: parent.is_some(),
+            parent_tool_call_id: parent,
         }));
     }
 
@@ -1830,6 +1970,7 @@ impl AcpThread {
             chunks: vec![AssistantMessageChunk::Message { id: None, block }],
             indented: false,
             is_subagent_output: false,
+            parent_tool_call_id: None,
         }));
     }
 
@@ -1905,36 +2046,22 @@ impl AcpThread {
         Ok(())
     }
 
-    /// An update for an id that was never announced becomes a *failed* entry
-    /// rather than being dropped: the agent believes it ran a tool, and silently
-    /// discarding that leaves the transcript claiming it never happened.
+    /// An update for an id that was never announced builds the call from the
+    /// update itself, the way `TryFrom<ToolCallUpdate>` does for a full one:
+    /// some adapters only ever send updates, and the agent believes it ran a
+    /// tool, so dropping it (or showing a red "not found") misreports what
+    /// happened (audit #22). Whatever the update omits starts at the
+    /// protocol's defaults: a pending call titled "Tool call".
     pub fn update_tool_call(&mut self, update: impl Into<ToolCallUpdate>) -> Result<()> {
         let update = update.into();
 
         let ix = match self.index_for_tool_call(update.id()) {
             Some(ix) => ix,
             None => {
-                let failed_tool_call = ToolCall {
-                    parent_tool_call_id: None,
-                    launched_subagent: None,
-                    launched_async: false,
-                    id: update.id().clone(),
-                    label: "Tool call not found".into(),
-                    kind: acp::ToolKind::Fetch,
-                    content: vec![ToolCallContent::ContentBlock(ContentBlock::Text(
-                        "Tool call not found".into(),
-                    ))],
-                    status: ToolCallStatus::Failed,
-                    locations: Vec::new(),
-                    raw_input: None,
-                    raw_output: None,
-                    tool_name: None,
-                    started_at: chrono::Utc::now(),
-                    started_clock: Instant::now(),
-                    ended_at: None,
-                };
-                self.push_entry(AgentThreadEntry::ToolCall(failed_tool_call));
-                return Ok(());
+                let skeleton = acp::ToolCall::new(update.id().clone(), "Tool call");
+                let call = ToolCall::from_acp(skeleton, ToolCallStatus::Pending)?;
+                self.push_entry(AgentThreadEntry::ToolCall(call));
+                self.entries.len() - 1
             }
         };
 
@@ -1998,9 +2125,8 @@ impl AcpThread {
         // some adapters ask without a prior `tool_call` notification. Refusing
         // it over a missing display string strands the agent on an error and
         // the user never sees a prompt, so synthesize the title the schema
-        // made optional. Only here: an ordinary update for an unknown id still
-        // becomes a failed entry (see `update_tool_call`), because there the
-        // agent believes the tool RAN — nobody is waiting on an answer.
+        // made optional. An ordinary update for an unknown id gets the same
+        // default title (see `update_tool_call`).
         let mut tool_call = tool_call;
         if self.index_for_tool_call(&tool_call_id).is_none() && tool_call.fields.title.is_none() {
             tool_call.fields.title = Some("Tool call".to_string());
@@ -2095,12 +2221,8 @@ impl AcpThread {
                     _ => ToolCallStatus::status_after_permission_grant(*current_status),
                 }
             }
-            _ => match outcome.option_kind {
-                acp::PermissionOptionKind::RejectOnce | acp::PermissionOptionKind::RejectAlways => {
-                    ToolCallStatus::Rejected
-                }
-                _ => ToolCallStatus::InProgress,
-            },
+            // An answer for a prompt that already settled is stale.
+            _ => return,
         };
 
         let curr_status = mem::replace(&mut call.status, new_status);
@@ -2316,11 +2438,38 @@ impl AcpThread {
     /// permission answer, which is a different thing from the user pressing
     /// stop.
     pub fn begin_turn(&mut self) -> u32 {
+        self.begin_turn_as(self.next_turn_seq)
+    }
+
+    /// [`Self::begin_turn`], labelled with a `turn_seq` the caller captured
+    /// earlier — a send that waited for a stop to settle keeps the label it
+    /// was dispatched with, whatever the host stamped in the meantime.
+    pub fn begin_turn_as(&mut self, turn_seq: u64) -> u32 {
         self.had_error = false;
         self.replaying = false;
         self.cancel_inner(RequestPermissionOutcome::InterruptedByFollowUp);
+        self.open_turn(turn_seq)
+    }
+
+    /// The connection reports a turn it started itself (for example a goal
+    /// continuation). Supersede the local command without cancelling that
+    /// already-started remote work; its late prompt result is guarded by id.
+    pub fn begin_external_turn(&mut self) -> u32 {
+        if self.running_turn.is_some() {
+            self.end_turn(acp::StopReason::EndTurn);
+        }
+        self.had_error = false;
+        self.replaying = false;
+        self.open_turn(self.next_turn_seq)
+    }
+
+    fn open_turn(&mut self, turn_seq: u64) -> u32 {
         self.turn_id += 1;
-        self.running_turn = Some(RunningTurn { id: self.turn_id });
+        self.turn_seq = turn_seq;
+        self.running_turn = Some(RunningTurn {
+            id: self.turn_id,
+            stopping: false,
+        });
         self.turn_opened = Some(OpenTurn {
             at: chrono::Utc::now(),
             clock: Instant::now(),
@@ -2351,8 +2500,13 @@ impl AcpThread {
         let opened = self.turn_opened.take();
         if opened.is_none() && !self.turns.is_empty() {
             self.running_turn = None;
+            self.publish_turn_state();
             return;
         }
+        // The turn is over, so nothing in it is still running: a call the
+        // agent never settled would otherwise read as live forever (audit
+        // #107). Before `Stopped`, so the wire says so ahead of the turn end.
+        self.settle_unfinished_tool_calls();
         self.running_turn = None;
         self.last_stop_reason = Some(stop_reason);
         let start = opened.map_or(0, |turn| turn.entries);
@@ -2363,6 +2517,7 @@ impl AcpThread {
             entries: start.min(self.entries.len())..self.entries.len(),
             worked_ms: opened
                 .map(|turn| u64::try_from(turn.clock.elapsed().as_millis()).unwrap_or(u64::MAX)),
+            turn_seq: self.turn_seq,
         };
         self.turns.push(record.clone());
         self.emit(AcpThreadEvent::Stopped(stop_reason, record));
@@ -2388,9 +2543,10 @@ impl AcpThread {
     /// while the live turn was still streaming (ATL-229).
     ///
     /// The guard is "no OTHER turn is running", not "this turn is running", and
-    /// the difference is the whole of the cancel path. `cancel()` clears
-    /// `running_turn` before the agent has answered, so by the time the prompt
-    /// returns `StopReason::Cancelled` there is no running turn at all — and a
+    /// the difference is the whole of the cancel path. `cancel()` (and a
+    /// stop given up on, [`Self::expire_stop`]) clears `running_turn` before
+    /// the agent has answered, so by the time the prompt returns
+    /// `StopReason::Cancelled` there may be no running turn at all — and a
     /// guard that demanded one would swallow the only `Stopped` a cancelled
     /// turn ever emits. Nothing downstream would then flush: no
     /// `TurnFinished` on the wire, no analytics, no transcript write, and the
@@ -2444,6 +2600,60 @@ impl AcpThread {
         self.cancel_inner(RequestPermissionOutcome::Cancelled)
     }
 
+    /// The user pressed Stop. Unlike [`Self::cancel`], the turn stays open,
+    /// marked stopping, until the agent answers the prompt (the caller then
+    /// closes it as usual) or the host gives up ([`Self::expire_stop`]):
+    /// reporting idle at once re-enabled Send while the agent was still
+    /// working, and put a second prompt on the wire beside the first (audit
+    /// #75). What is ours resolves at once, as in `cancel`: open permission
+    /// prompts and elicitations, and calls still running.
+    ///
+    /// Answers the stopping turn's id, if one is open.
+    pub fn request_stop(&mut self) -> Option<u32> {
+        self.stop_epoch += 1;
+        let turn = self.stop_running_turn(RequestPermissionOutcome::Cancelled);
+        self.publish_turn_state();
+        turn
+    }
+
+    /// Stop the running turn because a new prompt is about to replace it.
+    /// The same as [`Self::request_stop`], except that it is not a user Stop:
+    /// a permission still open resolves as interrupted by a follow-up, and a
+    /// send waiting on this does not take it as "abort me" (audit #76).
+    pub fn stop_for_follow_up(&mut self) -> Option<u32> {
+        self.stop_running_turn(RequestPermissionOutcome::InterruptedByFollowUp)
+    }
+
+    fn stop_running_turn(&mut self, permission_outcome: RequestPermissionOutcome) -> Option<u32> {
+        self.cancel_outstanding_elicitations();
+        self.mark_pending_entries_as_canceled(permission_outcome);
+        let turn = self.running_turn.as_mut()?;
+        let id = turn.id;
+        if !turn.stopping {
+            turn.stopping = true;
+            self.connection.cancel(&self.session_id);
+            self.emit(AcpThreadEvent::StatusChanged);
+        }
+        Some(id)
+    }
+
+    /// Give up waiting for the agent to answer a stop: close `turn` as
+    /// cancelled if it is still the one stopping. A wedged agent must not
+    /// hold the session in "stopping" forever; the host calls this after its
+    /// grace period. A no-op once the agent has answered.
+    pub fn expire_stop(&mut self, turn: u32) -> bool {
+        let stopping = self
+            .running_turn
+            .as_ref()
+            .is_some_and(|running| running.id == turn && running.stopping);
+        if !stopping {
+            return false;
+        }
+        self.expired_turn = self.expired_turn.max(turn);
+        self.end_turn(acp::StopReason::Cancelled);
+        true
+    }
+
     /// Resolving the thread's own state is unconditional; telling the AGENT is
     /// what needs a running turn.
     ///
@@ -2472,6 +2682,52 @@ impl AcpThread {
         }
         self.connection.cancel(&self.session_id);
         self.emit(AcpThreadEvent::StatusChanged);
+    }
+
+    /// At a turn's end, every tool call still pending or running becomes
+    /// `Canceled`, and a permission prompt still open is answered `Cancelled`.
+    ///
+    /// Except the work of a child launched to run on its own
+    /// ([`ToolCall::launched_async`]): its calls keep arriving after the
+    /// turn that launched it ended, and they settle themselves.
+    fn settle_unfinished_tool_calls(&mut self) {
+        let detached: Vec<String> = self
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                AgentThreadEntry::ToolCall(call) if call.launched_async => {
+                    Some(call.id.to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut updated = Vec::new();
+        for (ix, entry) in self.entries.iter_mut().enumerate() {
+            let AgentThreadEntry::ToolCall(call) = entry else {
+                continue;
+            };
+            let unfinished = matches!(
+                call.status,
+                ToolCallStatus::Pending
+                    | ToolCallStatus::WaitingForConfirmation { .. }
+                    | ToolCallStatus::InProgress
+            );
+            let belongs_to_detached_child = call
+                .parent_tool_call_id
+                .as_deref()
+                .is_some_and(|parent| detached.iter().any(|id| id == parent));
+            if !unfinished || belongs_to_detached_child {
+                continue;
+            }
+            let previous = mem::replace(&mut call.status, ToolCallStatus::Canceled);
+            if let ToolCallStatus::WaitingForConfirmation { respond_tx, .. } = previous {
+                let _ = respond_tx.send(RequestPermissionOutcome::Cancelled);
+            }
+            updated.push(ix);
+        }
+        for ix in updated {
+            self.entry_updated(ix);
+        }
     }
 
     /// Every tool call that had not reached a terminal state becomes `Canceled`,

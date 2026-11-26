@@ -39,11 +39,11 @@ impl StyleSheet {
 
 pub fn parse(css: &str) -> StyleSheet {
     let mut sheet = StyleSheet::default();
-    collect(&strip_comments(css), &mut sheet, 0);
+    collect(&strip_comments(css), &mut sheet, 0, false);
     sheet
 }
 
-fn collect(css: &str, sheet: &mut StyleSheet, depth: usize) {
+fn collect(css: &str, sheet: &mut StyleSheet, depth: usize, dark: bool) {
     // `@layer base { @layer x { … } }` is legal but nobody writes it deep;
     // the cap is only here so a pathological paste cannot recurse forever.
     if depth > 4 {
@@ -53,7 +53,10 @@ fn collect(css: &str, sheet: &mut StyleSheet, depth: usize) {
         let head = selector.trim();
         if head.starts_with("@layer") || head.starts_with("@media") || head.starts_with("@supports")
         {
-            collect(&body, sheet, depth + 1);
+            let media = head.split_whitespace().collect::<String>();
+            let dark = dark
+                || (head.starts_with("@media") && media.contains("(prefers-color-scheme:dark)"));
+            collect(&body, sheet, depth + 1, dark);
             continue;
         }
         let target = if head.starts_with("@theme") {
@@ -61,7 +64,11 @@ fn collect(css: &str, sheet: &mut StyleSheet, depth: usize) {
         } else if is_dark_selector(head) {
             Some(&mut sheet.dark)
         } else if is_root_selector(head) {
-            Some(&mut sheet.root)
+            Some(if dark {
+                &mut sheet.dark
+            } else {
+                &mut sheet.root
+            })
         } else {
             None
         };
@@ -122,7 +129,7 @@ fn blocks(css: &str) -> Vec<(String, String)> {
                 ));
                 selector_start = index;
             }
-            ';' if out.is_empty() || selector_start == index => {
+            ';' => {
                 // A stray top-level statement (`@import …;`). Skip it.
                 index += 1;
                 selector_start = index;
@@ -247,6 +254,23 @@ mod tests {
         }
         .prose h1 { color: red; }
     "#;
+
+    #[test]
+    fn system_dark_blocks_and_statements_preserve_variant_boundaries() {
+        let sheet = parse(":root { --background: white; } @import url('extra.css'); @media (prefers-color-scheme: dark) { :root { --background: black; } } :root { --foreground: navy; }");
+        assert_eq!(
+            sheet.root.get("background").map(String::as_str),
+            Some("white")
+        );
+        assert_eq!(
+            sheet.dark.get("background").map(String::as_str),
+            Some("black")
+        );
+        assert_eq!(
+            sheet.root.get("foreground").map(String::as_str),
+            Some("navy")
+        );
+    }
 
     #[test]
     fn reads_the_shadcn_globals_shape() {

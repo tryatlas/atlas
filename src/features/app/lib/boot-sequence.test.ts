@@ -10,7 +10,6 @@ import { tauri } from "@/test/tauri-fake";
 
 vi.mock("@/features/log/lib/log", () => ({ logEvent: () => {} }));
 vi.mock("@/features/projects/lib/flush-registry", () => ({ registerFlush: () => {} }));
-vi.mock("@/features/projects/lib/project-snapshot", () => ({ persistHashOf: () => "" }));
 vi.mock("@/features/layout/stores/layout-store", () => ({
   useLayoutStore: { getState: () => ({ actions: {} }) },
 }));

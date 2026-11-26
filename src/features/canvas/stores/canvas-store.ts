@@ -2,6 +2,14 @@ import { create } from "zustand";
 import { immer } from "zustand/middleware/immer";
 import { logEvent } from "@/features/log/lib/log";
 import { loadCanvas, saveCanvas } from "../lib/canvas-api";
+import {
+  captureDocumentEdit,
+  documentKey,
+  isDocumentDirty,
+  saveDocument,
+  saveProjectDocuments,
+} from "@/features/editor-notion/lib/document-saves";
+import { toast } from "sonner";
 
 /** What a canvas node is. `note` = rich card (title/body/icon), `text` = chrome-
  *  less free text, `media` = image, `shape` = geometric flowchart shape with a
@@ -85,6 +93,8 @@ export interface CanvasFile {
 interface CanvasState {
   projectPath: string | null;
   loaded: boolean;
+  error: string | null;
+  saveError: string | null;
   // The top-level nodes/edges/viewport are the ACTIVE page's live working
   // copy — every action + selector reads/writes these. Inactive pages live in
   // `pages`; `syncActiveIntoPages` folds the working copy back before save/switch.
@@ -115,6 +125,13 @@ type NodePatch = Partial<
 interface CanvasActions {
   actions: {
     loadProject: (path: string) => Promise<void>;
+    flush: (path?: string) => Promise<void>;
+    saveNoteBody: (
+      projectPath: string,
+      pageId: string,
+      noteId: string,
+      body: string,
+    ) => Promise<void>;
     addNote: (at?: { x: number; y: number }) => string;
     addText: (at?: { x: number; y: number }) => string;
     addMedia: (
@@ -191,32 +208,55 @@ function activePageSnapshot(s: CanvasState): CanvasPage | null {
   };
 }
 
-// Debounce save per project; cleared whenever we load a different project.
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
-const SAVE_DEBOUNCE_MS = 400;
+// The immutable snapshot and its writer stay bound to their project, even
+// after React tears down the board or starts loading another project.
+const snapshots = new Map<string, CanvasFile>();
+const saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+let loadGeneration = 0;
 
-function scheduleSave() {
-  if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(async () => {
-    saveTimer = null;
-    const s = useCanvasStore.getState();
-    if (!s.projectPath || !s.loaded || !s.activePageId) return;
-    // Fold the live active page into the pages map for a complete snapshot.
-    const active = activePageSnapshot(s);
-    const pages = Object.values({ ...s.pages, ...(active ? { [active.id]: active } : {}) });
-    const payload: CanvasFile = {
-      version: 4,
-      pages,
-      tree: s.tree,
-      activePageId: s.activePageId,
-    };
-    try {
-      await saveCanvas(s.projectPath, JSON.stringify(payload));
-    } catch (err) {
-      // Silent — UI continues to function from in-memory state.
-      console.error("save canvas failed", err);
-    }
-  }, SAVE_DEBOUNCE_MS);
+function canvasKey(path: string): string {
+  return documentKey(path, "canvas");
+}
+
+function snapshot(s: CanvasState): CanvasFile {
+  const active = activePageSnapshot(s);
+  if (!active) throw new Error("No canvas page is loaded.");
+  return {
+    version: 4,
+    pages: Object.values({ ...s.pages, [active.id]: active }),
+    tree: s.tree,
+    activePageId: active.id,
+  };
+}
+
+function retainSnapshot(path: string, file: CanvasFile): void {
+  snapshots.set(path, file);
+  captureDocumentEdit(canvasKey(path), {
+    projectPath: path,
+    serialize: () => JSON.stringify(file),
+    persist: async (payload) => {
+      try {
+        await saveCanvas(path, payload);
+        if (useCanvasStore.getState().projectPath === path)
+          useCanvasStore.setState({ saveError: null });
+      } catch (error) {
+        if (useCanvasStore.getState().projectPath === path)
+          useCanvasStore.setState({ saveError: String(error) });
+        throw error;
+      }
+    },
+  });
+  const timer = saveTimers.get(path);
+  if (timer) clearTimeout(timer);
+  saveTimers.set(
+    path,
+    setTimeout(() => {
+      saveTimers.delete(path);
+      void saveDocument(canvasKey(path)).catch((error) =>
+        toast.error(`Board could not be saved: ${String(error)}`),
+      );
+    }, 400),
+  );
 }
 
 // ── Undo/redo snapshot stacks ────────────────────────────────────────────────
@@ -258,44 +298,94 @@ function freshFile(): CanvasFile {
   };
 }
 
-function parseFile(raw: string): CanvasFile {
-  try {
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
+function record(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
 
-    // v4: already multi-page. Sanitize + guarantee at least one page.
-    if (parsed.version === 4 && Array.isArray(parsed.pages)) {
-      const pages = (parsed.pages as CanvasPage[]).map((p) => ({
-        id: p.id,
-        viewport: p.viewport ?? { ...emptyViewport },
-        nodes: normalizeNodes(p.nodes),
-        edges: Array.isArray(p.edges) ? p.edges : [],
-      }));
-      if (pages.length === 0) return freshFile();
-      const tree = Array.isArray(parsed.tree) ? (parsed.tree as PageTreeEntry[]) : [];
-      const activePageId =
-        typeof parsed.activePageId === "string" && pages.some((p) => p.id === parsed.activePageId)
-          ? (parsed.activePageId as string)
-          : pages[0].id;
-      return { version: 4, pages, tree, activePageId };
-    }
+function validViewport(value: unknown): boolean {
+  return (
+    value === undefined ||
+    (record(value) &&
+      [value.x, value.y, value.zoom].every((n) => typeof n === "number" && Number.isFinite(n)) &&
+      Number(value.zoom) > 0)
+  );
+}
 
-    // v1/v2/v3 → v4: wrap the single board as "Page 1".
-    const id = genId("p");
-    const page: CanvasPage = {
-      id,
-      viewport: (parsed.viewport as CanvasViewport) ?? { ...emptyViewport },
-      nodes: normalizeNodes(parsed.nodes),
-      edges: Array.isArray(parsed.edges) ? (parsed.edges as CanvasEdge[]) : [],
-    };
+function validBoard(value: unknown): value is Record<string, unknown> {
+  return (
+    record(value) &&
+    Array.isArray(value.nodes) &&
+    value.nodes.every((node) => record(node) && typeof node.id === "string") &&
+    (value.edges === undefined ||
+      (Array.isArray(value.edges) &&
+        value.edges.every(
+          (edge) =>
+            record(edge) &&
+            typeof edge.id === "string" &&
+            typeof edge.source === "string" &&
+            typeof edge.target === "string",
+        ))) &&
+    validViewport(value.viewport)
+  );
+}
+
+export function parseCanvasFile(raw: string): CanvasFile {
+  const parsed: unknown = JSON.parse(raw);
+  const invalid = () =>
+    new Error("canvas.json has an invalid or unsupported format. Repair the file, then Retry.");
+  if (!record(parsed)) throw invalid();
+  if (parsed.version === 4) {
+    if (
+      !Array.isArray(parsed.pages) ||
+      !parsed.pages.every(
+        (page) => validBoard(page) && typeof page.id === "string" && page.id.length > 0,
+      ) ||
+      !Array.isArray(parsed.tree) ||
+      !parsed.tree.every(
+        (entry) =>
+          record(entry) &&
+          typeof entry.id === "string" &&
+          (entry.kind === "page" || entry.kind === "folder") &&
+          typeof entry.name === "string" &&
+          (entry.parentId === null || typeof entry.parentId === "string") &&
+          typeof entry.order === "number",
+      )
+    )
+      throw invalid();
+    const pages = parsed.pages as unknown as CanvasPage[];
+    const tree = parsed.tree as PageTreeEntry[];
+    if (
+      !pages.length ||
+      new Set(pages.map((page) => page.id)).size !== pages.length ||
+      new Set(tree.map((entry) => entry.id)).size !== tree.length ||
+      typeof parsed.activePageId !== "string" ||
+      !pages.some((page) => page.id === parsed.activePageId) ||
+      pages.some((page) => !tree.some((entry) => entry.id === page.id && entry.kind === "page")) ||
+      tree.some((entry) => entry.kind === "page" && !pages.some((page) => page.id === entry.id))
+    )
+      throw invalid();
     return {
       version: 4,
-      pages: [page],
-      tree: [{ id, kind: "page", parentId: null, name: "Page 1", order: 0 }],
-      activePageId: id,
+      pages: pages.map((page) => ({
+        ...page,
+        nodes: normalizeNodes(page.nodes),
+        edges: page.edges ?? [],
+        viewport: page.viewport ?? { ...emptyViewport },
+      })),
+      tree,
+      activePageId: parsed.activePageId,
     };
-  } catch {
-    return freshFile();
   }
+  if (![undefined, 1, 2, 3].includes(parsed.version as number | undefined) || !validBoard(parsed))
+    throw invalid();
+  const file = freshFile();
+  file.pages[0] = {
+    ...file.pages[0],
+    viewport: (parsed.viewport as CanvasViewport | undefined) ?? { ...emptyViewport },
+    nodes: normalizeNodes(parsed.nodes),
+    edges: (parsed.edges as CanvasEdge[] | undefined) ?? [],
+  };
+  return file;
 }
 
 export const useCanvasStore = create<CanvasState & CanvasActions>()(
@@ -303,7 +393,9 @@ export const useCanvasStore = create<CanvasState & CanvasActions>()(
     // Capture the pre-mutation nodes/edges as one undo step. `get()` inside a
     // producer returns committed (pre-`set`) state, and immer never mutates a
     // previously-produced object, so storing the references is a safe snapshot.
+    const writable = () => get().loaded && !get().error && !!get().activePageId;
     const takeSnapshot = () => {
+      if (!writable()) return;
       past.push({ nodes: get().nodes, edges: get().edges });
       if (past.length > HISTORY_CAP) past.shift();
       future = [];
@@ -315,6 +407,8 @@ export const useCanvasStore = create<CanvasState & CanvasActions>()(
     return {
       projectPath: null,
       loaded: false,
+      error: null,
+      saveError: null,
       nodes: [],
       edges: [],
       viewport: emptyViewport,
@@ -328,13 +422,15 @@ export const useCanvasStore = create<CanvasState & CanvasActions>()(
       canRedo: false,
       actions: {
         loadProject: async (path) => {
-          if (saveTimer) {
-            clearTimeout(saveTimer);
-            saveTimer = null;
-          }
+          const generation = ++loadGeneration;
+          const previous = get().projectPath;
+          if (previous && previous !== path) await saveProjectDocuments(previous);
+          if (generation !== loadGeneration) return;
           set((s) => {
             s.projectPath = path;
             s.loaded = false;
+            s.error = null;
+            s.saveError = null;
             s.nodes = [];
             s.edges = [];
             s.pages = {};
@@ -344,33 +440,71 @@ export const useCanvasStore = create<CanvasState & CanvasActions>()(
             s.viewport = emptyViewport;
           });
           try {
-            const raw = await loadCanvas(path);
-            const parsed = parseFile(raw);
+            const retained = isDocumentDirty(canvasKey(path)) ? snapshots.get(path) : undefined;
+            const parsed = retained ?? parseCanvasFile(await loadCanvas(path));
+            if (generation !== loadGeneration || get().projectPath !== path) return;
+            snapshots.set(path, parsed);
             resetHistory();
             set((s) => {
-              if (s.projectPath !== path) return; // user switched projects mid-load
               const pagesMap: Record<string, CanvasPage> = {};
               for (const p of parsed.pages) pagesMap[p.id] = p;
               s.pages = pagesMap;
               s.tree = parsed.tree;
               s.activePageId = parsed.activePageId;
-              // Mirror the active page into the working fields.
               const active = pagesMap[parsed.activePageId];
-              s.nodes = active?.nodes ?? [];
-              s.edges = active?.edges ?? [];
-              s.viewport = active?.viewport ?? { ...emptyViewport };
+              s.nodes = active.nodes;
+              s.edges = active.edges;
+              s.viewport = active.viewport;
               s.loaded = true;
               s.canUndo = false;
               s.canRedo = false;
             });
-          } catch {
-            set((s) => {
-              if (s.projectPath !== path) return;
-              s.loaded = true;
-            });
+          } catch (error) {
+            if (generation === loadGeneration && get().projectPath === path)
+              set({ loaded: false, error: String(error) });
           }
         },
+        flush: async (path) => {
+          const target = path ?? get().projectPath;
+          if (!target) return;
+          const timer = saveTimers.get(target);
+          if (timer) clearTimeout(timer);
+          saveTimers.delete(target);
+          await saveProjectDocuments(target);
+        },
+        saveNoteBody: async (path, pageId, noteId, body) => {
+          let file = snapshots.get(path);
+          if (!file) file = parseCanvasFile(await loadCanvas(path));
+          const page = file.pages.find((p) => p.id === pageId);
+          if (!page?.nodes.some((n) => n.id === noteId)) return; // intentionally deleted
+          if (get().projectPath === path && get().loaded) {
+            set((s) => {
+              const target = s.activePageId === pageId ? s.nodes : s.pages[pageId]?.nodes;
+              const note = target?.find((n) => n.id === noteId);
+              if (note) {
+                note.body = body;
+                note.updatedAt = nowIso();
+              }
+            });
+          } else {
+            retainSnapshot(path, {
+              ...file,
+              pages: file.pages.map((p) =>
+                p.id === pageId
+                  ? {
+                      ...p,
+                      nodes: p.nodes.map((n) =>
+                        n.id === noteId ? { ...n, body, updatedAt: nowIso() } : n,
+                      ),
+                    }
+                  : p,
+              ),
+            });
+          }
+          await saveDocument(canvasKey(path));
+        },
         addNote: (at) => {
+          if (!writable()) return "";
           takeSnapshot();
           const id = genId("n");
           const stamp = nowIso();
@@ -390,11 +524,11 @@ export const useCanvasStore = create<CanvasState & CanvasActions>()(
             });
             s.selectedIds = [id];
           });
-          scheduleSave();
           logEvent({ source: "canvas", kind: "note-add", summary: "New note", payload: { id } });
           return id;
         },
         addText: (at) => {
+          if (!writable()) return "";
           takeSnapshot();
           const id = genId("n");
           const stamp = nowIso();
@@ -413,11 +547,11 @@ export const useCanvasStore = create<CanvasState & CanvasActions>()(
             });
             s.selectedIds = [id];
           });
-          scheduleSave();
           logEvent({ source: "canvas", kind: "text-add", summary: "New text", payload: { id } });
           return id;
         },
         addShape: (shapeType, at, size) => {
+          if (!writable()) return "";
           takeSnapshot();
           const id = genId("n");
           const stamp = nowIso();
@@ -443,11 +577,11 @@ export const useCanvasStore = create<CanvasState & CanvasActions>()(
             });
             s.selectedIds = [id];
           });
-          scheduleSave();
           logEvent({ source: "canvas", kind: "shape-add", summary: shapeType, payload: { id } });
           return id;
         },
         addMedia: ({ src, mediaKind, width, height }, at) => {
+          if (!writable()) return "";
           takeSnapshot();
           const id = genId("n");
           const stamp = nowIso();
@@ -468,12 +602,12 @@ export const useCanvasStore = create<CanvasState & CanvasActions>()(
             });
             s.selectedIds = [id];
           });
-          scheduleSave();
           logEvent({ source: "canvas", kind: "media-add", summary: mediaKind, payload: { id } });
           return id;
         },
         updateNote: (id, patch) =>
           set((s) => {
+            if (!writable()) return;
             const n = s.nodes.find((n) => n.id === id);
             if (!n) return;
             if (patch.title !== undefined) n.title = patch.title;
@@ -485,16 +619,15 @@ export const useCanvasStore = create<CanvasState & CanvasActions>()(
             if (patch.src !== undefined) n.src = patch.src;
             if (patch.mediaKind !== undefined) n.mediaKind = patch.mediaKind;
             n.updatedAt = nowIso();
-            scheduleSave();
           }),
         deleteNote: (id) => {
+          if (!writable()) return;
           takeSnapshot();
           const removed = get().nodes.find((n) => n.id === id);
           set((s) => {
             s.nodes = s.nodes.filter((n) => n.id !== id);
             s.edges = s.edges.filter((e) => e.source !== id && e.target !== id);
             s.selectedIds = s.selectedIds.filter((x) => x !== id);
-            scheduleSave();
           });
           if (removed) {
             logEvent({
@@ -507,13 +640,14 @@ export const useCanvasStore = create<CanvasState & CanvasActions>()(
         },
         moveNote: (id, x, y) =>
           set((s) => {
+            if (!writable()) return;
             const n = s.nodes.find((n) => n.id === id);
             if (!n) return;
             n.x = x;
             n.y = y;
-            scheduleSave();
           }),
         addEdge: (source, target, sourceHandle, targetHandle) => {
+          if (!writable()) return;
           if (source === target) return;
           const exists = get().edges.some(
             (e) =>
@@ -524,7 +658,6 @@ export const useCanvasStore = create<CanvasState & CanvasActions>()(
           takeSnapshot();
           set((s) => {
             s.edges.push({ id: genId("e"), source, target, sourceHandle, targetHandle });
-            scheduleSave();
           });
           logEvent({
             source: "canvas",
@@ -534,10 +667,10 @@ export const useCanvasStore = create<CanvasState & CanvasActions>()(
           });
         },
         deleteEdge: (id) => {
+          if (!writable()) return;
           takeSnapshot();
           set((s) => {
             s.edges = s.edges.filter((e) => e.id !== id);
-            scheduleSave();
           });
           logEvent({
             source: "canvas",
@@ -556,8 +689,8 @@ export const useCanvasStore = create<CanvasState & CanvasActions>()(
           }),
         setViewport: (vp) =>
           set((s) => {
+            if (!writable()) return;
             s.viewport = vp;
-            scheduleSave();
           }),
         setFullscreen: (open) =>
           set((s) => {
@@ -573,6 +706,7 @@ export const useCanvasStore = create<CanvasState & CanvasActions>()(
           }),
         beginInteraction: () => takeSnapshot(),
         undo: () => {
+          if (!writable()) return;
           if (past.length === 0) return;
           future.push({ nodes: get().nodes, edges: get().edges });
           const prev = past.pop()!;
@@ -582,9 +716,9 @@ export const useCanvasStore = create<CanvasState & CanvasActions>()(
             s.canUndo = past.length > 0;
             s.canRedo = true;
           });
-          scheduleSave();
         },
         redo: () => {
+          if (!writable()) return;
           if (future.length === 0) return;
           past.push({ nodes: get().nodes, edges: get().edges });
           const next = future.pop()!;
@@ -594,11 +728,11 @@ export const useCanvasStore = create<CanvasState & CanvasActions>()(
             s.canUndo = true;
             s.canRedo = future.length > 0;
           });
-          scheduleSave();
         },
 
         // ── Pages ──────────────────────────────────────────────────────────
         createPage: (parentId = null) => {
+          if (!writable()) return "";
           const id = genId("p");
           set((s) => {
             s.pages[id] = emptyPage(id);
@@ -618,22 +752,22 @@ export const useCanvasStore = create<CanvasState & CanvasActions>()(
             s.canUndo = false;
             s.canRedo = false;
           });
-          scheduleSave();
           logEvent({ source: "canvas", kind: "page-add", summary: "New page", payload: { id } });
           return id;
         },
 
         createPageFolder: (parentId = null) => {
+          if (!writable()) return "";
           const id = genId("f");
           set((s) => {
             const order = s.tree.filter((e) => e.parentId === parentId).length;
             s.tree.push({ id, kind: "folder", parentId, name: "New folder", order });
           });
-          scheduleSave();
           return id;
         },
 
         setActivePage: (id) => {
+          if (!writable()) return;
           if (get().activePageId === id) return;
           set((s) => {
             const target = s.pages[id];
@@ -652,26 +786,26 @@ export const useCanvasStore = create<CanvasState & CanvasActions>()(
             s.canUndo = false;
             s.canRedo = false;
           });
-          scheduleSave();
         },
 
         renameTreeEntry: (id, name) =>
           set((s) => {
+            if (!writable()) return;
             const e = s.tree.find((t) => t.id === id);
             if (!e) return;
             e.name = name;
-            scheduleSave();
           }),
 
         setTreeEntryIcon: (id, icon) =>
           set((s) => {
+            if (!writable()) return;
             const e = s.tree.find((t) => t.id === id);
             if (!e) return;
             e.icon = icon ?? undefined;
-            scheduleSave();
           }),
 
         deleteTreeEntry: (id) => {
+          if (!writable()) return;
           set((s) => {
             // Collect the entry + all descendants (folders cascade).
             const toRemove = new Set<string>([id]);
@@ -704,11 +838,36 @@ export const useCanvasStore = create<CanvasState & CanvasActions>()(
               s.edges = target?.edges ?? [];
               s.viewport = target?.viewport ?? { ...emptyViewport };
               s.selectedIds = [];
+              resetHistory();
+              s.canUndo = false;
+              s.canRedo = false;
             }
-            scheduleSave();
           });
         },
       },
     };
   }),
 );
+
+// Subscribe after each committed mutation; actions inside Immer producers must
+// never snapshot the previous state or read a future project's global state.
+useCanvasStore.subscribe((state, previous) => {
+  if (
+    !state.loaded ||
+    !previous.loaded ||
+    !state.projectPath ||
+    state.projectPath !== previous.projectPath ||
+    state.error
+  )
+    return;
+  if (
+    state.nodes === previous.nodes &&
+    state.edges === previous.edges &&
+    state.viewport === previous.viewport &&
+    state.pages === previous.pages &&
+    state.tree === previous.tree &&
+    state.activePageId === previous.activePageId
+  )
+    return;
+  retainSnapshot(state.projectPath, snapshot(state));
+});

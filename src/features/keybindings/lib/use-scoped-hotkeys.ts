@@ -52,7 +52,9 @@ const scopedSources = new Set<{ current: ScopedHotkeysOptions }>();
 const scopeListeners = new Set<() => void>();
 
 function scopeIsActive({ rootRef, requireFocusWithin, tabId }: ScopedHotkeysOptions): boolean {
-  if (tabId !== undefined && useLayoutStore.getState().activeTabId !== tabId) return false;
+  const layout = useLayoutStore.getState();
+  const shown = layout.destinationShown ? layout.destination?.id : layout.activeTabId;
+  if (tabId !== undefined && shown !== tabId) return false;
   if (requireFocusWithin) {
     const root = rootRef?.current;
     if (!root || root.offsetParent == null || !root.contains(document.activeElement)) return false;

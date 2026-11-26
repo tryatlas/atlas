@@ -42,7 +42,7 @@
 //! in-process; every other agent exists only because the installed map says so.
 //! [`AgentHost::agent_for`] is the whole of that policy, and it is four lines.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -413,7 +413,9 @@ const ATLAS_WRITE_SLACK: chrono::Duration = chrono::Duration::seconds(5);
 pub trait SessionLifecycle: Send + Sync {
     /// `agent` is the durable plugin id (`atlas-agent` for the native agent).
     fn session_started(&self, session_id: &str, agent: &str, cwd: &str);
-    fn session_ended(&self, session_id: &str);
+    /// `agent` as in `session_started`: two agents can end a session by the
+    /// same id (#86), and only that agent's is over.
+    fn session_ended(&self, session_id: &str, agent: &str);
 }
 
 /// The MCP servers every agent connection offers its sessions, installed after
@@ -481,8 +483,8 @@ pub struct AgentHost {
     history: Option<ThreadRecorder>,
     /// What Atlas itself has been doing in each session, by session id: turns
     /// in flight and when the last one ended. This, not membership of
-    /// the session registry, is what "Atlas is hosting it" means for the
-    /// live-elsewhere rule (Rule 7). A session is bound the moment a sidebar
+    /// the session registry, is what "Atlas is hosting it" means to the
+    /// session watcher. A session is bound the moment a sidebar
     /// row is opened, while a terminal may well still be writing it; only
     /// Atlas's own turns explain Atlas's own writes. Entries outlive the
     /// binding — a tab closed right after its turn still owns that turn's
@@ -504,6 +506,11 @@ pub struct AgentHost {
     /// and a confirmed alias moves to the history store, which persists it.
     /// Nothing provisional is ever written to disk.
     aliases: Mutex<HashMap<String, ProvisionalAlias>>,
+    /// Sessions this run opened with `session/new`. The store records every
+    /// session Atlas opens, across runs (`record_session_opened`); this tells
+    /// the project sync's cleanup which of them are this run's, and so may
+    /// still be starting or open in a tab (see `delete_unused_listed`).
+    opened_this_run: Mutex<HashSet<String>>,
     /// When each project directory was last synced, for the debounce in
     /// [`AgentHost::sync_project`]. In memory only: a restart syncing once more
     /// is the right behaviour.
@@ -704,6 +711,7 @@ impl AgentHost {
             history,
             activity: Mutex::new(HashMap::new()),
             aliases: Mutex::new(HashMap::new()),
+            opened_this_run: Mutex::new(HashSet::new()),
             last_project_sync: Mutex::new(HashMap::new()),
             sync_backoff: Mutex::new(HashMap::new()),
             history_error,
@@ -753,13 +761,14 @@ impl AgentHost {
         lock(&self.session_end_observers).push(observer);
     }
 
-    /// Record the end of every session in `ended`.
-    fn end_sessions(&self, ended: impl IntoIterator<Item = String>) {
+    /// Record the end of every session in `ended`, each as `(plugin id,
+    /// session id)`: two agents can share a session id (#86).
+    fn end_sessions(&self, ended: impl IntoIterator<Item = (String, String)>) {
         let lifecycle = self.lifecycle();
         let observers = lock(&self.session_end_observers).clone();
-        for session_id in ended {
+        for (agent, session_id) in ended {
             if let Some(lifecycle) = &lifecycle {
-                lifecycle.session_ended(&session_id);
+                lifecycle.session_ended(&session_id, &agent);
             }
             for observer in &observers {
                 observer(&session_id);
@@ -776,11 +785,15 @@ impl AgentHost {
     /// Answers the connection to send `session/close` on, when the end calls
     /// for one: the only step that waits, so it is the caller's to await.
     fn finish_end(&self, ended: &Ended) -> Option<Arc<dyn AgentConnection>> {
-        self.follow_up(&ended.session_id, &ended.follow_ups)
+        self.follow_up(&ended.agent, &ended.session_id, &ended.follow_ups)
     }
 
+    /// The steps for `agent`'s session `session_id`. By agent as well as id:
+    /// two agents can mint the same id (#86), and closing the projection of
+    /// the wrong one would end a session nobody closed.
     fn follow_up(
         &self,
+        agent: &Agent,
         session_id: &str,
         follow_ups: &[FollowUp],
     ) -> Option<Arc<dyn AgentConnection>> {
@@ -792,12 +805,14 @@ impl AgentHost {
                     self.projector
                         .note_agent_disconnected(&acp_id, reason.as_str());
                 }
-                FollowUp::AnnounceEnded => self.end_sessions([session_id.to_owned()]),
+                FollowUp::AnnounceEnded => {
+                    self.end_sessions([(Self::plugin_id_of(agent), session_id.to_owned())]);
+                }
                 // Only the live binding goes. The history row is the record
                 // of the conversation and outlives the tab that showed it.
                 FollowUp::ForgetHistoryBinding => {
                     if let Some(history) = self.history() {
-                        history.forget(&acp_id);
+                        history.forget(&Self::plugin_id_of(agent).as_str().into(), &acp_id);
                     }
                 }
                 // The projector holds the session's only strong thread
@@ -806,7 +821,9 @@ impl AgentHost {
                 // request id with no other removal path (ATL-225). The
                 // thread holds the connection: left in place, the agent's
                 // process outlives whatever ended the session.
-                FollowUp::CloseProjection => self.projector.close_session(&acp_id),
+                FollowUp::CloseProjection => self
+                    .projector
+                    .close_session_of(self.handle_for(agent), &acp_id),
                 FollowUp::CloseOnAgent { connection } => close_on = Some(connection.clone()),
             }
         }
@@ -817,8 +834,16 @@ impl AgentHost {
     fn end_agent(&self, plugin_id: &str, agent: &Agent, how: AgentEnd) {
         // A dialog whose agent has died can no longer be answered.
         self.forget_request_elicitations(&ThreadAgentId::new(plugin_id));
+        // Cancel first (audit #85): the registry's end forgets the manager's
+        // handle, and with it the only way left to tell the agent to stop.
+        // A turn left running keeps the process working headless, and a
+        // permission it asks for later has nobody to answer it.
+        for session_id in self.sessions.sessions_of(agent) {
+            self.manager
+                .cancel_of(agent, &acp::SessionId::new(session_id));
+        }
         for ended in self.sessions.end_agent(agent, how) {
-            self.follow_up(&ended.session_id, &ended.follow_ups);
+            self.follow_up(&ended.agent, &ended.session_id, &ended.follow_ups);
         }
     }
 
@@ -888,6 +913,12 @@ impl AgentHost {
         // First: the sweep below fails every running turn's send, and those
         // turns must stay recorded as cut short, not ended.
         self.open_turns.freeze();
+        // Every running turn is cancelled before its session goes (audit
+        // #85): resolves the permission prompts it waits on, and tells an
+        // agent that outlives the sweep to stop.
+        for session_id in self.manager.sessions() {
+            self.manager.cancel(&session_id);
+        }
         // Quitting ends every agent process, and with it every session. The
         // registry shuts the manager down as part of that, which sweeps its
         // own maps rather than being driven through `connections()`: that
@@ -1381,6 +1412,14 @@ impl AgentHost {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "session/new opened"
         );
+        // Atlas's from here on, before anything is sent to it and so before
+        // it has a row: no project sync imports it as a session started
+        // elsewhere, in this run or a later one.
+        let session_id = lock_thread(&thread).session_id().clone();
+        lock(&self.opened_this_run).insert(session_id.to_string());
+        if let Some(history) = self.history() {
+            history.store().record_session_opened(&session_id);
+        }
         self.bind(ticket, agent_id, &record, cwd, thread).await
     }
 
@@ -1474,9 +1513,10 @@ impl AgentHost {
         );
         if let Err(refused) = bound {
             tracing::info!(session = %session_id, "{refused}; the session it opened is discarded");
-            let close_on = self.follow_up(session_id.0.as_ref(), &refused.follow_ups);
+            let close_on =
+                self.follow_up(&record.agent, session_id.0.as_ref(), &refused.follow_ups);
             if let Some(connection) = close_on {
-                if let Err(e) = connection.close_session(session_id.clone()).await {
+                if let Err(e) = connection.release_session(session_id.clone()).await {
                     tracing::debug!(session = %session_id, "closing a discarded session: {e:#}");
                 }
             }
@@ -1490,17 +1530,18 @@ impl AgentHost {
         // `NewEntry` that lands first would be followed by this draft write and
         // pushed back to "nothing sent yet".
         let history = self.history();
-        let had_row = history.is_some_and(|history| history.thread_for(&session_id).is_some());
+        let history_agent: atlas_acp_thread::AgentId = record.plugin_id.as_str().into();
+        let had_row = history.is_some_and(|history| {
+            history
+                .thread_for_agent(&history_agent, &session_id)
+                .is_some()
+        });
         if let Some(history) = history {
-            history.record_connected(
-                &record.plugin_id.as_str().into(),
-                &session_id,
-                snapshot_of(&thread),
-            );
+            history.record_connected(&history_agent, &session_id, snapshot_of(&thread));
         }
         // After `record_connected`, which is what binds the session to its
         // row: the branch has somewhere to land by the time git answers.
-        self.refresh_branch(&session_id, &cwd.to_string_lossy());
+        self.refresh_branch(&history_agent, &session_id, &cwd.to_string_lossy());
         // Settled: whatever the thread holds by now is the history a
         // `session/load` replayed, which every reader takes from a snapshot.
         // Announced entry by entry as well, it reached the window twice (a
@@ -1515,11 +1556,15 @@ impl AgentHost {
         // agent's process. Undo it, as that end would have. The history row
         // goes only if this bind made it and nobody sent to it; one that was
         // there before is the end's to decide, and it has.
-        if !self.sessions.contains(session_id.0.as_ref()) {
+        if self
+            .sessions
+            .info_of(&record.agent, session_id.0.as_ref())
+            .is_none()
+        {
             tracing::info!(session = %session_id, "the session ended as it was bound; it is discarded");
-            self.projector.close_session(&session_id);
+            self.projector.close_session_of(agent_id, &session_id);
             if let (Some(history), false) = (history, had_row) {
-                history.forget(&session_id);
+                history.forget(&history_agent, &session_id);
             }
             return Err(HostError::new(
                 "the session ended while it was opening",
@@ -1571,6 +1616,12 @@ impl AgentHost {
         )
     }
 
+    /// [`Self::drop_session_in`] by the bare id.
+    #[cfg(test)]
+    pub async fn drop_session(self: &Arc<Self>, session_id: &str) -> Result<()> {
+        self.drop_session_in(None, session_id).await
+    }
+
     /// The window lets a session go: its tab closed, or its project left the
     /// hot set. Idempotent — a tab can close twice.
     ///
@@ -1578,10 +1629,53 @@ impl AgentHost {
     /// remembered, and the last hold's release finishes it. Every frontend
     /// path that lets a session go ends here, so the hold is honoured by all
     /// of them without the window having to know.
-    pub async fn drop_session(self: &Arc<Self>, session_id: &str) -> Result<()> {
-        match self.sessions.close(session_id) {
+    ///
+    /// `agent_id` names the session's agent when the caller knows it: two
+    /// agents can share a session id (#86), and by the bare id such a session
+    /// is not dropped at all. An agent this process no longer knows falls back
+    /// to the bare id.
+    pub async fn drop_session_in(
+        self: &Arc<Self>,
+        agent_id: Option<AgentId>,
+        session_id: &str,
+    ) -> Result<()> {
+        let agent = agent_id.and_then(|id| self.record_for(id).ok());
+        // Taken before the close: once the registry ends the session the
+        // manager no longer knows it, and a running turn could not be
+        // cancelled by its id (audit #85).
+        let thread = match (&agent, agent_id) {
+            (Some(_), Some(id)) => self.thread_in(id, &acp::SessionId::new(session_id)).ok(),
+            _ => self.thread(session_id).ok(),
+        };
+        let closed = match &agent {
+            Some(record) => self.sessions.close_of(&record.agent, session_id),
+            None => self.sessions.close(session_id),
+        };
+        // Whether anything was ever sent to it, read off the handle taken
+        // above.
+        let acp_id = acp::SessionId::new(session_id);
+        let unused = self.is_unused_atlas_session(&acp_id)
+            && thread
+                .as_ref()
+                .is_some_and(|thread| lock_thread(thread).entries().is_empty());
+        match closed {
             Closed::Unknown => Ok(()),
-            Closed::Ended(ended) => self.finish_close(ended).await,
+            Closed::Ended(ended) => {
+                if let Some(thread) = &thread {
+                    lock_thread(thread).cancel();
+                }
+                let agent = ended.agent.clone();
+                let closed = self.finish_close(ended).await;
+                // Nothing was ever sent to it: nothing in it is anybody's, and
+                // left on the agent it is one more empty session in the
+                // agent's own list.
+                if unused {
+                    if let Some(connection) = self.connected(&agent) {
+                        delete_on_agent(&connection, &acp_id).await;
+                    }
+                }
+                closed
+            }
             Closed::Held => {
                 tracing::info!(session = session_id, "held session outlives its tab");
                 // The window's send gate went with the tab: a queue it had
@@ -1600,18 +1694,87 @@ impl AgentHost {
         self.sessions.reclaim_for_window(session_id)
     }
 
-    /// Finish a close the registry made: the host's follow-ups, then the
-    /// agent's own `session/close` when it advertised one. Last, so the
-    /// thread and its terminals are dropped whether or not that RPC
-    /// succeeds.
+    /// Finish a close the registry made: the host's follow-ups, then release
+    /// the connection's local handle. That release sends `session/close`
+    /// only when advertised. Last, so the thread and its terminals are
+    /// dropped whether or not that RPC succeeds.
     async fn finish_close(&self, ended: Ended) -> Result<()> {
         let Some(connection) = self.finish_end(&ended) else {
             return Ok(());
         };
         connection
-            .close_session(acp::SessionId::new(ended.session_id.as_str()))
+            .release_session(acp::SessionId::new(ended.session_id.as_str()))
             .await
             .map_err(HostError::from)
+    }
+
+    /// A session Atlas opened itself that nothing was ever sent to, as the
+    /// store recorded it (`is_opened_unused`). Only such a session is ever
+    /// deleted on its agent.
+    fn is_unused_atlas_session(&self, session_id: &acp::SessionId) -> bool {
+        self.history()
+            .is_some_and(|history| history.store().is_opened_unused(session_id))
+    }
+
+    /// Delete, on the agent, the sessions it listed that an earlier run of
+    /// Atlas opened and never sent to: Atlas quit or crashed with one still
+    /// open, so nothing let it go. Never one opened in this run, which may
+    /// still be starting or open in a tab; those are deleted when they are
+    /// let go (`drop_session`).
+    ///
+    /// Atlas sending nothing does not mean nobody did: the session is in the
+    /// agent's own list, and can be carried on from the agent's terminal. So
+    /// each is checked against the agent's own "last updated", given with the
+    /// listing: one touched after [`UNUSED_SESSION_GRACE`] from its opening
+    /// was used somewhere, is not deleted, and stops being Atlas's (the
+    /// import that follows lists it like any outside session). One the agent
+    /// gives no time for is left alone.
+    pub(crate) async fn delete_unused_listed(
+        &self,
+        plugin_id: &str,
+        listed: &[(acp::SessionId, Option<DateTime<Utc>>)],
+    ) {
+        let Some(history) = self.history() else {
+            return;
+        };
+        let store = history.store();
+        let leftovers: Vec<&acp::SessionId> = {
+            let this_run = lock(&self.opened_this_run);
+            listed
+                .iter()
+                .filter(|(id, _)| !this_run.contains(id.0.as_ref()))
+                .filter_map(|(id, updated_at)| {
+                    let opened_at = store.opened_unused_since(id)?;
+                    let updated_at = (*updated_at)?;
+                    if updated_at > opened_at + UNUSED_SESSION_GRACE {
+                        tracing::info!(session = %id, "a session Atlas opened was used elsewhere");
+                        store.forget_session_opened(id);
+                        return None;
+                    }
+                    Some(id)
+                })
+                .collect()
+        };
+        tracing::debug!(
+            plugin_id,
+            listed = listed.len(),
+            leftovers = leftovers.len(),
+            "unused-session cleanup"
+        );
+        if leftovers.is_empty() {
+            return;
+        }
+        let Ok(agent) = self.agent_for(plugin_id) else {
+            tracing::debug!(plugin_id, "unused-session cleanup: agent not runnable");
+            return;
+        };
+        let Some(connection) = self.connected(&agent) else {
+            tracing::debug!(plugin_id, "unused-session cleanup: agent not connected");
+            return;
+        };
+        for id in leftovers {
+            delete_on_agent(&connection, id).await;
+        }
     }
 
     // ---- session reads ---------------------------------------------------
@@ -1628,6 +1791,16 @@ impl AgentHost {
     fn thread(&self, session_id: &str) -> Result<AcpThreadHandle> {
         self.manager
             .session(&acp::SessionId::new(session_id))
+            .map(|handle| handle.thread)
+            .ok_or_else(HostError::unknown_session)
+    }
+
+    /// [`Self::thread`], for one agent's session: what a caller that knows
+    /// the agent uses, since an id alone can name two sessions (#86).
+    fn thread_in(&self, agent_id: AgentId, session_id: &acp::SessionId) -> Result<AcpThreadHandle> {
+        let agent = self.record_for(agent_id)?.agent;
+        self.manager
+            .session_of(&agent, session_id)
             .map(|handle| handle.thread)
             .ok_or_else(HostError::unknown_session)
     }
@@ -1850,12 +2023,6 @@ impl AgentHost {
         self.open_turns.take_left_open()
     }
 
-    /// The next turn in `thread` continues one cut short by a restart, the
-    /// `count`th in a row.
-    pub fn expect_continuation(&self, thread: ThreadId, count: u32) {
-        self.open_turns.expect_continuation(thread, count);
-    }
-
     fn begin_atlas_turn(&self, session_id: &str) {
         let mut activity = lock(&self.activity);
         let entry = activity.entry(session_id.to_owned()).or_default();
@@ -1870,8 +2037,25 @@ impl AgentHost {
         entry.last_turn_end = Some(Utc::now());
     }
 
+    /// Transcript files proven or provisionally attributed to Atlas already
+    /// have a live capture owner and must not be imported a second time.
+    pub(crate) fn transcript_alias_ids(&self) -> std::collections::HashSet<String> {
+        let mut aliases: std::collections::HashSet<_> =
+            lock(&self.aliases).keys().cloned().collect();
+        if let Some(history) = self.history() {
+            aliases.extend(
+                history
+                    .store()
+                    .session_aliases()
+                    .into_keys()
+                    .map(|id| id.to_string()),
+            );
+        }
+        aliases
+    }
+
     /// What Atlas has been doing in each session it has prompted — the input
-    /// the live-elsewhere rule and the session watcher read to tell Atlas's own
+    /// the session watcher reads to tell Atlas's own
     /// transcript writes from another process's. An alias, provisional or
     /// confirmed, carries its owner's activity: its writes are the owner's
     /// turn.
@@ -1987,7 +2171,12 @@ impl AgentHost {
     /// "no branch" writes nothing — the row keeps the last branch Atlas
     /// actually saw (or stays unknown). The store skips the write, and the
     /// sidebar event, when the branch has not changed.
-    fn refresh_branch(&self, session_id: &acp::SessionId, cwd: &str) {
+    fn refresh_branch(
+        &self,
+        agent: &atlas_acp_thread::AgentId,
+        session_id: &acp::SessionId,
+        cwd: &str,
+    ) {
         if cwd.is_empty() {
             return;
         }
@@ -1999,6 +2188,7 @@ impl AgentHost {
             return;
         };
         let session_id = session_id.clone();
+        let agent = agent.clone();
         let cwd = PathBuf::from(cwd);
         let probes = Arc::clone(&self.branch_probes);
         let probe = lock(&probes).start(&session_id);
@@ -2014,7 +2204,7 @@ impl AgentHost {
                 return;
             }
             if let Some(branch) = branch {
-                history.note_branch(&session_id, Arc::from(branch));
+                history.note_branch(&agent, &session_id, Arc::from(branch));
             }
         });
     }
@@ -2026,7 +2216,7 @@ impl AgentHost {
     /// and may do work, and neither a send nor a model pick may wait on it.
     /// An agent with no model selection, or one that answers nothing, writes
     /// nothing — the row keeps the last model Atlas saw.
-    fn refresh_model(&self, session_id: &acp::SessionId) {
+    fn refresh_model(&self, agent: &atlas_acp_thread::AgentId, session_id: &acp::SessionId) {
         let Some(history) = self.history().cloned() else {
             return;
         };
@@ -2041,6 +2231,7 @@ impl AgentHost {
             return;
         };
         let session_id = session_id.clone();
+        let agent = agent.clone();
         runtime.spawn(async move {
             let Ok(model) = selector.selected_model().await else {
                 return;
@@ -2055,7 +2246,7 @@ impl AgentHost {
             } else {
                 model.name.clone()
             };
-            history.note_model(&session_id, label);
+            history.note_model(&agent, &session_id, label);
         });
     }
 
@@ -2321,7 +2512,7 @@ impl AgentHost {
                     .await
                     .map_err(HostError::from)?;
                 let session_id = lock_thread(&opened).session_id().clone();
-                history.adopt(session_id, thread_id);
+                history.adopt(&thread.agent_id, session_id, thread_id);
                 (opened, false)
             }
             Some(session_id) => {
@@ -2344,7 +2535,7 @@ impl AgentHost {
                 // clicked is orphaned on the dead id (#56).
                 let opened_session_id = lock_thread(&resumed.thread).session_id().clone();
                 if opened_session_id != session_id {
-                    history.adopt(opened_session_id, thread_id);
+                    history.adopt(&thread.agent_id, opened_session_id, thread_id);
                 }
                 (resumed.thread, resumed.mode == ResumeMode::WithoutHistory)
             }
@@ -2380,38 +2571,14 @@ impl AgentHost {
     /// behaviour: history records conversations, and this one has not
     /// finished. Settle is the action for "out of my way but keep it".
     ///
-    /// Deleting a session that is **live elsewhere** (Rule 7 — another
-    /// process, typically `claude` in a terminal, is writing it now) is
-    /// refused outright. The agent-side delete would remove the transcript out
-    /// from under that process. `modified` is the session watcher's file times,
-    /// the same input the sidebar's dot is computed from, so the refusal and
-    /// the dot agree.
-    ///
     /// The delete is durable against re-import: the store records the session
     /// as deleted, and no sync, backfill or manual import brings it back even
     /// when the agent could not forget it.
-    pub async fn delete_thread(
-        &self,
-        thread_id: ThreadId,
-        modified: &HashMap<String, DateTime<Utc>>,
-    ) -> Result<()> {
+    pub async fn delete_thread(&self, thread_id: ThreadId) -> Result<()> {
         let history = self.history_or_err()?;
         let Some(thread) = history.store().thread(thread_id) else {
             return Ok(());
         };
-        if let Some(session_id) = thread.session_id.as_ref() {
-            let id = session_id.0.as_ref();
-            if live_elsewhere(
-                modified.get(id).copied(),
-                self.atlas_activity().get(id),
-                Utc::now(),
-            ) {
-                return Err(HostError::new(
-                    "This session is still active in another process; close it there first.",
-                    ErrorClass::Fatal,
-                ));
-            }
-        }
         history.store().delete(thread_id);
 
         let Some(session_id) = thread.session_id else {
@@ -2446,13 +2613,9 @@ impl AgentHost {
     /// this side has it. The UI comparing its own raw path string silently
     /// matched nothing whenever the two spellings differed (symlink,
     /// `/private` prefix, trailing slash).
-    pub fn thread_projects(
-        &self,
-        cwd: Option<&str>,
-        modified: &HashMap<String, DateTime<Utc>>,
-    ) -> Result<Vec<ThreadProjectWire>> {
+    pub fn thread_projects(&self, cwd: Option<&str>) -> Result<Vec<ThreadProjectWire>> {
         let projects = self.history_or_err()?.store().projects();
-        let live = self.live_context(modified);
+        let live = self.live_context();
 
         // Basenames collide: two checkouts both called `web` are one label. Any
         // name shared by more than one project gets qualified with its parent
@@ -2507,11 +2670,8 @@ impl AgentHost {
     }
 
     /// Every thread, newest-started first — the history view.
-    pub fn thread_history(
-        &self,
-        modified: &HashMap<String, DateTime<Utc>>,
-    ) -> Result<Vec<ThreadRow>> {
-        let live = self.live_context(modified);
+    pub fn thread_history(&self) -> Result<Vec<ThreadRow>> {
+        let live = self.live_context();
         Ok(self
             .history_or_err()?
             .store()
@@ -2521,15 +2681,10 @@ impl AgentHost {
             .collect())
     }
 
-    /// Snapshot what `thread_row` needs to decide `live_elsewhere`: the
-    /// watcher's file times, what Atlas's own turns have been doing, and the
-    /// clock. The watcher is passed in rather than held, since it already
-    /// holds the host.
-    fn live_context<'a>(&self, modified: &'a HashMap<String, DateTime<Utc>>) -> LiveContext<'a> {
+    /// Snapshot what `thread_row` reads besides the row itself: the fork
+    /// lineage and the sessions a hold keeps working.
+    fn live_context(&self) -> LiveContext {
         LiveContext {
-            modified,
-            activity: self.atlas_activity(),
-            now: Utc::now(),
             forks: self
                 .history()
                 .map(|history| {
@@ -2547,24 +2702,17 @@ impl AgentHost {
 
     /// Move a session to the sidebar's Settled shelf.
     ///
-    /// Refused while a turn is running there — in Atlas, or in another
-    /// process — or the agent is waiting on the user: a session that is
+    /// Refused while a turn is running there or the agent is waiting on the
+    /// user — ACP state only, as Atlas hosts it: a session that is
     /// mid-work is not done, and settling it would hide the very thing about
     /// to need attention. Also refused just after a user send: the send
     /// records the interaction before the turn is counted in, and the store
     /// re-checks that under its lock, so a settle racing a send cannot slip
     /// through the gap.
     ///
-    /// `activity_in` answers, for one of the row's folders, the file times
-    /// that are evidence of another process ([`ActivityIn`]). It is asked for
-    /// this row's own folders, not whichever project the sidebar has open:
-    /// a row from another project is live or not by its own transcripts. A
-    /// folder with no answer is no evidence either way; by hand, the user's
-    /// word stands.
-    ///
     /// Answers whether the session moved; `false` when it was already settled
     /// or no longer exists.
-    pub fn settle_thread(&self, thread_id: ThreadId, activity_in: ActivityIn<'_>) -> Result<bool> {
+    pub fn settle_thread(&self, thread_id: ThreadId) -> Result<bool> {
         let history = self.history_or_err()?;
         let Some(thread) = history.store().thread(thread_id) else {
             return Ok(false);
@@ -2572,17 +2720,7 @@ impl AgentHost {
         if let Some(session_id) = thread.session_id.as_ref() {
             let id = session_id.0.as_ref();
             let activity = self.atlas_activity();
-            let modified = thread
-                .folder_paths()
-                .paths()
-                .iter()
-                .filter_map(|folder| activity_in(folder))
-                .filter_map(|times| times.get(id).copied())
-                .max();
-            if history.store().sent_to_recently(thread_id)
-                || self.session_is_busy(id, &activity)
-                || live_elsewhere(modified, activity.get(id), Utc::now())
-            {
+            if history.store().sent_to_recently(thread_id) || self.session_is_busy(id, &activity) {
                 return Err(HostError::new(
                     "This session is still running; settle it once the turn ends.",
                     ErrorClass::Fatal,
@@ -2673,10 +2811,18 @@ impl AgentHost {
 
     /// The user opened or focused the session the tab `session_id` runs.
     /// Answers whether a row was marked (a draft has none).
-    pub fn mark_session_viewed(&self, session_id: &str) -> Result<bool> {
-        Ok(self
-            .history_or_err()?
-            .note_viewed(&acp::SessionId::new(session_id), Utc::now()))
+    ///
+    /// With `agent_id`, that agent's session: two agents can share a session
+    /// id (#86), and by the bare id such a session marks nothing.
+    pub fn mark_session_viewed(&self, session_id: &str, agent_id: Option<AgentId>) -> Result<bool> {
+        let plugin_id: Option<atlas_acp_thread::AgentId> = agent_id
+            .and_then(|id| self.plugin_id_for_agent(id))
+            .map(|plugin_id| plugin_id.as_str().into());
+        Ok(self.history_or_err()?.note_viewed(
+            plugin_id.as_ref(),
+            &acp::SessionId::new(session_id),
+            Utc::now(),
+        ))
     }
 
     /// Make a session read as unread again. Refused for one with no
@@ -3055,24 +3201,13 @@ impl AgentHost {
 
     /// Settle every session idle for longer than `idle`, skipping any that is
     /// busy in Atlas ([`Self::session_is_busy`]: a running turn or a pending
-    /// request) or live in another process. The store applies the rest of
-    /// the rule (already settled, pinned, snoozed, un-settled since its last
-    /// activity) under its own lock. Answers how many were settled.
-    ///
-    /// Liveness elsewhere is judged per candidate from its own folders'
-    /// transcripts ([`ActivityIn`]), asked once per folder. The sweep covers
-    /// every project, while the session watcher only watches the open one;
-    /// reading only the watcher's times would take "nothing recorded" for
-    /// "quiet" and settle a session a terminal is using in another project.
-    /// A candidate any of whose folders cannot be answered for is skipped:
-    /// the sweep never settles a session it could not check.
+    /// request). The store applies the rest of the rule (already settled,
+    /// pinned, snoozed, un-settled since its last activity) under its own
+    /// lock. Answers how many were settled. A row with no folder is left
+    /// alone, as it always was.
     #[cfg(test)]
-    pub fn auto_settle_idle(
-        &self,
-        idle: chrono::Duration,
-        activity_in: ActivityIn<'_>,
-    ) -> Result<usize> {
-        self.auto_settle_idle_keeping(idle, activity_in, false)
+    pub fn auto_settle_idle(&self, idle: chrono::Duration) -> Result<usize> {
+        self.auto_settle_idle_keeping(idle, false)
     }
 
     /// [`Self::auto_settle_idle`], leaving every session with a linked pull
@@ -3081,7 +3216,6 @@ impl AgentHost {
     pub fn auto_settle_idle_keeping(
         &self,
         idle: chrono::Duration,
-        activity_in: ActivityIn<'_>,
         keep_pull_requests: bool,
     ) -> Result<usize> {
         let history = self.history_or_err()?;
@@ -3096,26 +3230,10 @@ impl AgentHost {
             return Ok(0);
         }
         let activity = self.atlas_activity();
-        let mut by_folder: HashMap<PathBuf, Option<HashMap<String, DateTime<Utc>>>> =
-            HashMap::new();
         let busy: std::collections::HashSet<acp::SessionId> = idle_sessions
             .into_iter()
             .filter(|(session_id, folders)| {
-                let id = session_id.0.as_ref();
-                if folders.paths().is_empty() || self.session_is_busy(id, &activity) {
-                    return true;
-                }
-                let mut modified = None;
-                for folder in folders.paths() {
-                    let times = by_folder
-                        .entry(folder.clone())
-                        .or_insert_with(|| activity_in(folder));
-                    let Some(times) = times else {
-                        return true; // no coverage: not settled
-                    };
-                    modified = modified.max(times.get(id).copied());
-                }
-                live_elsewhere(modified, activity.get(id), now)
+                folders.paths().is_empty() || self.session_is_busy(session_id.0.as_ref(), &activity)
             })
             .map(|(session_id, _)| session_id)
             .collect();
@@ -3405,6 +3523,11 @@ impl AgentHost {
             let sessions = match listed {
                 Ok(Ok(Some(sessions))) => {
                     self.note_sync_answered(&plugin_id);
+                    let listed: Vec<(acp::SessionId, Option<DateTime<Utc>>)> = sessions
+                        .iter()
+                        .map(|s| (s.session_id.clone(), s.updated_at))
+                        .collect();
+                    self.delete_unused_listed(&plugin_id, &listed).await;
                     sessions
                 }
                 Ok(Ok(None)) => {
@@ -3449,11 +3572,12 @@ impl AgentHost {
         Ok(added)
     }
 
-    /// What an import must skip: every session the store knows (rows, and
-    /// those the user deleted), plus every on-disk session id attributed to
-    /// one of Atlas's own sessions ([`AgentHost::claim_for_atlas_turn`]). The
-    /// last is what keeps an adapter's internal continuation of a session
-    /// Atlas is running from being listed back in as somebody else's.
+    /// What an import must skip: every session the store knows (rows, those
+    /// the user deleted, and those Atlas opened itself, sent to or not), plus
+    /// every on-disk session id attributed to one of Atlas's own sessions
+    /// ([`AgentHost::claim_for_atlas_turn`]). The last is what keeps an
+    /// adapter's internal continuation of a session Atlas is running from
+    /// being listed back in as somebody else's.
     fn known_or_atlas_owned(
         &self,
         history: &ThreadRecorder,
@@ -3487,6 +3611,16 @@ impl AgentHost {
         let Some(connection) = self.connected(&record.agent) else {
             return Ok(Vec::new());
         };
+        // The Variables the user set for this agent in Settings → Agents —
+        // what its process runs with (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`). A
+        // login typed into a terminal without them signs in to the default
+        // home, not the one the agent reads (audit #66).
+        let configured = self
+            .store
+            .settings()
+            .0
+            .get(&record.plugin_id)
+            .map(|entry| (entry.launch_env(), entry.secret_env().to_vec()));
         let mut out = Vec::new();
         for method in connection.auth_methods() {
             let Some(wire) = AuthMethodWire::from_acp(method) else {
@@ -3513,7 +3647,11 @@ impl AgentHost {
                 },
                 None => None,
             };
-            out.push(wire.with_runnable(resolved.as_ref()));
+            let mut wire = wire.with_runnable(resolved.as_ref());
+            if let Some((env, secret)) = &configured {
+                wire = wire.with_configured_env(env, secret);
+            }
+            out.push(wire);
         }
         Ok(out)
     }
@@ -3546,6 +3684,19 @@ impl AgentHost {
             .authenticate(acp::AuthMethodId::new(method_id))
             .await
             .map_err(HostError::from)
+    }
+
+    /// The user dismissed the sign-in: end the agent's `authenticate` in
+    /// flight, which has no deadline of its own (#67). Without this a
+    /// dismissed browser sign-in kept its request open, and the next attempt
+    /// started a second flow beside it. A no-op when the agent is not
+    /// connected or nothing is in flight.
+    pub fn cancel_authentication(&self, agent_id: AgentId) -> Result<()> {
+        let record = self.record_for(agent_id)?;
+        if let Some(connection) = self.connected(&record.agent) {
+            connection.cancel_authentication();
+        }
+        Ok(())
     }
 
     pub async fn logout(&self, agent_id: AgentId) -> Result<()> {
@@ -3585,6 +3736,12 @@ fn snapshot_of(thread: &AcpThreadHandle) -> ThreadSnapshot {
         // with as a working directory is not the session's project, and
         // recording it would move the row to another group.
         work_dirs: thread.own_work_dirs(),
+        // Its newest entry came from a `session/load` replay, not from now.
+        replayed: thread
+            .entries()
+            .len()
+            .checked_sub(1)
+            .is_some_and(|ix| thread.entry_time_approximate(ix)),
     }
 }
 
@@ -3622,7 +3779,9 @@ impl ThreadObserver for HostObserver {
             event,
             atlas_acp_thread::AcpThreadEvent::LoadError(atlas_acp_thread::LoadError::Exited { .. })
         ) {
-            host.end_sessions([session_id.to_string()]);
+            if let Some(plugin_id) = host.plugin_id_for_agent(agent_id) {
+                host.end_sessions([(plugin_id, session_id.to_string())]);
+            }
         }
         let Some(history) = host.history() else {
             return;
@@ -3696,8 +3855,11 @@ pub struct ThreadRow {
     /// The model the latest turn ran on, by its display name. `None` when
     /// Atlas never saw one (an import, a row older than the column).
     pub model: Option<String>,
-    /// Another process (typically `claude` in a terminal) wrote this session
-    /// within the liveness window and Atlas is not hosting it (Rule 7).
+    /// Deprecated: always `false`. It meant "another process wrote this
+    /// session's transcript recently", read from one agent's private files;
+    /// liveness is ACP state only now (decided 2026-11-25), so nothing sets
+    /// it and nothing should read it. Kept on the wire because removing a
+    /// field is a breaking change (`wire-shape-contract.test.ts`).
     pub live_elsewhere: bool,
     /// The projects attached to the session besides its own folder, in the
     /// order they were attached. Everything a surface needs to show them, to
@@ -3854,11 +4016,8 @@ fn access_card_body(request: &ProjectAccessRequest) -> String {
     body
 }
 
-/// What `thread_row` needs to decide [`ThreadRow::live_elsewhere`].
-struct LiveContext<'a> {
-    modified: &'a HashMap<String, DateTime<Utc>>,
-    activity: HashMap<String, AtlasActivity>,
-    now: DateTime<Utc>,
+/// What `thread_row` reads besides the row itself.
+struct LiveContext {
     /// Branched sessions, child -> parent session id (`session_forks`), for
     /// [`ThreadRow::forked_from_session_id`].
     forks: HashMap<String, String>,
@@ -3965,25 +4124,6 @@ pub(crate) fn alias_owner(
         .min()
 }
 
-/// The liveness rule (ADR-0001 amendment, Rule 7): the transcript was written
-/// within the live window, and not by Atlas. Being *bound* in Atlas — the row
-/// was opened — says nothing either way; a terminal can be writing a session
-/// Atlas has open, and that is exactly the fork this guards against.
-/// For one folder, the session file times that are evidence of another
-/// process (`SessionWatcher::activity_in`); `None` when the folder cannot be
-/// checked. Settling reads it per row, so a row is judged by its own project.
-pub type ActivityIn<'a> = &'a dyn Fn(&Path) -> Option<HashMap<String, DateTime<Utc>>>;
-
-pub(crate) fn live_elsewhere(
-    modified: Option<DateTime<Utc>>,
-    activity: Option<&AtlasActivity>,
-    now: DateTime<Utc>,
-) -> bool {
-    modified.is_some_and(|at| {
-        atlas_agent_transcript::discovery::is_live(at, now) && !explained_by_atlas(at, activity)
-    })
-}
-
 /// One project's threads, as the sidebar groups them.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -3996,7 +4136,7 @@ pub struct ThreadProjectWire {
     pub threads: Vec<ThreadRow>,
 }
 
-fn thread_row(thread: &ThreadMetadata, live: &LiveContext<'_>) -> ThreadRow {
+fn thread_row(thread: &ThreadMetadata, live: &LiveContext) -> ThreadRow {
     let session_id = thread
         .session_id
         .as_ref()
@@ -4004,13 +4144,6 @@ fn thread_row(thread: &ThreadMetadata, live: &LiveContext<'_>) -> ThreadRow {
     let held_working = session_id
         .as_deref()
         .is_some_and(|id| live.held_working.contains(id));
-    let live_elsewhere = session_id.as_deref().is_some_and(|id| {
-        live_elsewhere(
-            live.modified.get(id).copied(),
-            live.activity.get(id),
-            live.now,
-        )
-    });
     let forked_from_session_id = session_id
         .as_deref()
         .and_then(|id| live.forks.get(id).cloned());
@@ -4033,7 +4166,7 @@ fn thread_row(thread: &ThreadMetadata, live: &LiveContext<'_>) -> ThreadRow {
         woke: thread.is_woke(),
         project_name: project_name(thread.main_worktree_paths()),
         folder_paths: paths_of(thread.folder_paths()),
-        live_elsewhere,
+        live_elsewhere: false,
         held_working,
         branch: thread.branch.as_deref().map(str::to_string),
         model: thread.model.as_deref().map(str::to_string),
@@ -4325,6 +4458,29 @@ impl AuthMethodWire {
         }
         self
     }
+
+    /// Put the agent's configured Variables under the login's own
+    /// environment, for a method with a command to run. What the agent
+    /// declared for the login wins a name both set, as it does in the spawn
+    /// environment. A Variable kept in the keychain stays out: this field is
+    /// displayed, copied and typed into a shell that keeps history.
+    fn with_configured_env(
+        mut self,
+        configured: &HashMap<String, String>,
+        secret: &[String],
+    ) -> Self {
+        if self.terminal_command.is_none() {
+            return self;
+        }
+        let mut env: std::collections::BTreeMap<String, String> = configured
+            .iter()
+            .filter(|(name, _)| !secret.contains(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        env.extend(self.terminal_env.drain(..));
+        self.terminal_env = env.into_iter().collect();
+        self
+    }
 }
 
 /// One `vars[]` entry. Skips a malformed item rather than failing the method —
@@ -4414,20 +4570,24 @@ pub fn installed_map_path(data_dir: &std::path::Path) -> PathBuf {
     atlas_agent_store::external_agents_dir(data_dir).join("installed.json")
 }
 
-/// Read the installed map. A missing or unreadable file is an empty map — a
-/// fresh install has no external agents, which is the whole point.
-pub fn load_installed(data_dir: &std::path::Path) -> atlas_agent_store::AllAgentServersSettings {
+/// Only a missing file is an empty installation. Mutations must use this
+/// reader so a damaged map cannot be replaced with a partial fresh map.
+pub(crate) fn read_installed(
+    data_dir: &std::path::Path,
+) -> std::io::Result<atlas_agent_store::AllAgentServersSettings> {
     let path = installed_map_path(data_dir);
     match std::fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
-            tracing::warn!(
-                target: "atlas::agents",
-                path = %path.display(),
-                "installed map is unreadable ({e}); treating it as empty"
-            );
-            Default::default()
+        Ok(raw) => serde_json::from_str(&raw).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "repair {} before changing installed agents: {e}",
+                    path.display()
+                ),
+            )
         }),
-        Err(_) => Default::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(e) => Err(e),
     }
 }
 
@@ -4436,6 +4596,7 @@ pub fn save_installed(
     data_dir: &std::path::Path,
     settings: &atlas_agent_store::AllAgentServersSettings,
 ) -> std::io::Result<()> {
+    read_installed(data_dir)?;
     let path = installed_map_path(data_dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -4572,6 +4733,57 @@ mod auth_method_wire_tests {
             "the spawn environment must not reach a field that is displayed, \
              copied to the clipboard and typed into a shell that keeps history"
         );
+    }
+
+    /// A terminal login runs with the agent's configured Variables, under
+    /// what the agent declared for it — a login without `CLAUDE_CONFIG_DIR`
+    /// signs in to a home the agent never reads (audit #66). A keychain
+    /// Variable is never put on the wire.
+    #[test]
+    fn a_terminal_login_carries_the_agents_configured_variables() {
+        let resolved = atlas_acp_thread::build_terminal_auth_command(
+            "run-1".to_string(),
+            "Log in".to_string(),
+            "/usr/local/bin/claude".to_string(),
+            vec!["/login".to_string()],
+            Vec::new(),
+            vec![("HTTPS_PROXY".to_string(), "http://declared".to_string())],
+        );
+        let configured: HashMap<String, String> = [
+            ("CLAUDE_CONFIG_DIR", "/home/u/.claude-work"),
+            ("HTTPS_PROXY", "http://configured"),
+            ("API_TOKEN", "kept-in-keychain"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let login = AuthMethodWire::from_acp(&method(serde_json::json!({
+            "id": "login",
+            "name": "Log in",
+            "type": "terminal",
+        })))
+        .expect("a wire method")
+        .with_runnable(Some(&resolved))
+        .with_configured_env(&configured, &["API_TOKEN".to_string()]);
+        assert_eq!(
+            login.terminal_env,
+            vec![
+                (
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    "/home/u/.claude-work".to_string()
+                ),
+                ("HTTPS_PROXY".to_string(), "http://declared".to_string()),
+            ]
+        );
+
+        let nothing_to_run = AuthMethodWire::from_acp(&method(serde_json::json!({
+            "id": "agent",
+            "name": "Agent",
+        })))
+        .expect("a wire method")
+        .with_runnable(None)
+        .with_configured_env(&configured, &[]);
+        assert!(nothing_to_run.terminal_env.is_empty());
     }
 
     /// An agent that named no login at all still reports none. Guessing is what
@@ -4893,7 +5105,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The host half of the live-elsewhere fix: binding a session records no
+    /// The host half of telling Atlas's writes from another process's: binding a session records no
     /// Atlas activity (opening a row must not hide a terminal's writes), and a
     /// sent turn is counted in and out, leaving the time it ended behind.
     #[tokio::test]
@@ -4911,11 +5123,9 @@ mod tests {
             !host.atlas_activity().contains_key(&id),
             "bound is not active"
         );
-        let opened = Utc::now();
-        assert!(live_elsewhere(
-            Some(opened),
-            host.atlas_activity().get(&id),
-            opened
+        assert!(!explained_by_atlas(
+            Utc::now(),
+            host.atlas_activity().get(&id)
         ));
 
         host.submit(
@@ -4935,9 +5145,40 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         };
         let activity = host.atlas_activity();
-        assert!(!live_elsewhere(Some(ended), activity.get(&id), ended));
+        assert!(explained_by_atlas(ended, activity.get(&id)));
         let later = ended + chrono::Duration::seconds(30);
-        assert!(live_elsewhere(Some(later), activity.get(&id), later));
+        assert!(!explained_by_atlas(later, activity.get(&id)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #67: `authenticate` has no deadline, so a dismissed sign-in has to end
+    /// it. Cancelling settles the call in flight with an error; before, it
+    /// stayed open until the agent answered, and a retry ran a second flow.
+    #[tokio::test]
+    async fn cancelling_a_sign_in_ends_the_authenticate_in_flight() {
+        let native = ScriptedServer::detached(
+            FakeConnection::builder()
+                .agent(ATLAS_AGENT_ID)
+                .hold_authenticate()
+                .handle(),
+        );
+        let (host, dir) = fresh_host_with_native(native);
+        let agent_id = host.spawn(ATLAS_AGENT_ID).await.expect("spawn").agent_id;
+
+        let pending = tokio::spawn({
+            let host = host.clone();
+            async move { host.authenticate(agent_id, "browser".into()).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!pending.is_finished(), "a sign-in waits for the user");
+
+        host.cancel_authentication(agent_id).expect("cancel");
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .expect("cancelling ends the authenticate")
+            .expect("task");
+        assert!(answer.is_err(), "a cancelled sign-in is not a success");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5073,6 +5314,99 @@ mod tests {
             .await
             .expect("spawn")
             .agent_id
+    }
+
+    /// #86: ACP scopes a session id to its connection, so two agents can both
+    /// answer the same id. Atlas keeps them apart from bind to end: the
+    /// second bind replaces neither the first's record nor its projection,
+    /// and ending one agent leaves the other's session bound and projected.
+    #[tokio::test]
+    async fn two_agents_answering_the_same_session_id_stay_separate() {
+        let (host, dir) = fresh_host();
+        // Both installed at once: `connect_external` writes a one-agent map.
+        let mut settings = atlas_agent_store::AllAgentServersSettings::default();
+        let mut handles = Vec::new();
+        for plugin in ["agent-a", "agent-b"] {
+            settings.0.insert(
+                plugin.to_string(),
+                atlas_agent_store::AgentServerSettings::custom("/bin/echo", vec!["acp".into()]),
+            );
+        }
+        host.store().set_settings(settings).await;
+        for plugin in ["agent-a", "agent-b"] {
+            let server = ScriptedServer::new(agent_script(plugin, "s-same").handle());
+            let key = Agent::Custom {
+                id: atlas_acp_thread::AgentId::new(plugin),
+            };
+            let entry = host.manager().request_connection(key, server);
+            let connecting = lock(&entry).wait_for_connection();
+            connecting.await.expect("the scripted agent connects");
+            handles.push(host.spawn(plugin).await.expect("spawn").agent_id);
+        }
+        let (a, b) = (handles[0], handles[1]);
+        let id = acp::SessionId::new("s-same");
+        let opened_a = host
+            .new_session(a, PathBuf::from("/tmp/atlas"), Vec::new())
+            .await
+            .expect("A opens");
+        let opened_b = host
+            .new_session(b, PathBuf::from("/tmp/atlas"), Vec::new())
+            .await
+            .expect("B opens under the same id");
+        assert_eq!(opened_a.key.session_id, opened_b.key.session_id);
+        assert_ne!(opened_a.key.agent_id, opened_b.key.agent_id);
+
+        let agent_a = host.record_for(a).unwrap().agent;
+        let agent_b = host.record_for(b).unwrap().agent;
+        assert_eq!(host.sessions.holders("s-same"), 2, "two sessions, not one");
+        assert!(host.sessions.info_of(&agent_a, "s-same").is_some());
+        assert!(
+            host.projector.is_projecting(a, &id),
+            "B's bind left A's projection"
+        );
+        assert!(host.projector.is_projecting(b, &id));
+        assert!(host.thread_in(a, &id).is_ok() && host.thread_in(b, &id).is_ok());
+        assert!(
+            !Arc::ptr_eq(
+                &host.thread_in(a, &id).unwrap(),
+                &host.thread_in(b, &id).unwrap()
+            ),
+            "each agent's own thread"
+        );
+
+        // Each agent's session writes its own history row.
+        let history = host.history().expect("history is on");
+        let row_a = history.thread_for_agent(&"agent-a".into(), &id);
+        let row_b = history.thread_for_agent(&"agent-b".into(), &id);
+        assert!(row_a.is_some() && row_b.is_some(), "one row per agent");
+        assert_ne!(row_a, row_b);
+        assert!(
+            !host.mark_session_viewed("s-same", None).unwrap(),
+            "the bare id names two rows and marks neither"
+        );
+        assert!(host.mark_session_viewed("s-same", Some(a)).unwrap());
+
+        // A hold by the bare id cannot pick one; naming the agent can.
+        assert!(host.hold_session("s-same", "dev").is_err());
+        host.hold_session_in(Some(a), "s-same", "dev")
+            .expect("A's session is held");
+        assert!(host.sessions.info_of(&agent_a, "s-same").unwrap().held);
+        assert!(!host.sessions.info_of(&agent_b, "s-same").unwrap().held);
+        host.release_session_in(Some(a), "s-same", "dev")
+            .await
+            .expect("released");
+
+        host.end_agent("agent-b", &agent_b, AgentEnd::stopping());
+        assert!(host.sessions.info_of(&agent_b, "s-same").is_none());
+        assert!(!host.projector.is_projecting(b, &id));
+        assert!(
+            host.sessions.info_of(&agent_a, "s-same").is_some(),
+            "ending B leaves A bound"
+        );
+        assert!(host.projector.is_projecting(a, &id), "and projected");
+        assert!(host.thread_in(a, &id).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ADR-0002, at the three places the host used to ask "is this the native
@@ -5387,6 +5721,7 @@ mod tests {
                 is_draft: false,
                 title: None,
                 work_dirs: vec![PathBuf::from("/tmp/atlas")],
+                replayed: false,
             },
         );
         let rows = history.store().threads();
@@ -5489,7 +5824,7 @@ mod tests {
         let thread_id = thread.thread_id;
         history.store().save_all(vec![thread]);
 
-        host.delete_thread(thread_id, &HashMap::new())
+        host.delete_thread(thread_id)
             .await
             .expect("delete is local");
 
@@ -5497,52 +5832,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The review finding: deleting a row whose session a terminal is still
-    /// writing asked the agent to delete the transcript under it. Refused,
-    /// with the row left as it was; once the terminal is quiet, it goes.
-    #[tokio::test]
-    async fn a_session_live_elsewhere_cannot_be_deleted() {
-        let (host, dir) = fresh_host();
-        let history = host.history().expect("a fresh host has history");
-        let thread = atlas_thread_metadata::ThreadMetadata {
-            session_id: Some(acp::SessionId::new("ses-live")),
-            ..atlas_thread_metadata::ThreadMetadata::new(
-                atlas_thread_metadata::ThreadId::new(),
-                "an-uninstalled-agent".into(),
-                atlas_thread_metadata::PathList::new(&[PathBuf::from("/tmp/atlas")]),
-            )
-        };
-        let thread_id = thread.thread_id;
-        history.store().save_all(vec![thread]);
-
-        let written_just_now = HashMap::from([("ses-live".to_owned(), Utc::now())]);
-        let err = host
-            .delete_thread(thread_id, &written_just_now)
-            .await
-            .expect_err("a session another process is writing is not deleted");
-        assert!(err.message.contains("still active in another process"));
-        assert!(history.store().thread(thread_id).is_some(), "row untouched");
-
-        let quiet = HashMap::from([(
-            "ses-live".to_owned(),
-            Utc::now() - chrono::Duration::minutes(10),
-        )]);
-        host.delete_thread(thread_id, &quiet)
-            .await
-            .expect("a quiet session deletes");
-        assert!(history.store().thread(thread_id).is_none());
-        assert!(
-            history
-                .store()
-                .is_session_deleted(&acp::SessionId::new("ses-live")),
-            "and stays deleted against the next sync"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// Settling refuses a session with a turn in flight, and the idle sweep
-    /// passes over it and over one live in another process; once quiet, both
-    /// settle it and the row says so on the wire.
+    /// passes over it; once quiet, both settle it and the row says so on the
+    /// wire. A transcript written on disk is no evidence of anything: the
+    /// other session settles at once (liveness is ACP state only).
     #[tokio::test]
     async fn a_running_session_is_not_settled_by_hand_or_by_the_sweep() {
         let (host, dir) = fresh_host();
@@ -5564,39 +5857,34 @@ mod tests {
         let (running_id, elsewhere_id) = (running.thread_id, elsewhere.thread_id);
         history.store().save_all(vec![running, elsewhere]);
 
-        let quiet = |_: &Path| Some(HashMap::new());
-        let written_just_now =
-            |_: &Path| Some(HashMap::from([("ses-elsewhere".to_owned(), Utc::now())]));
-
         host.begin_atlas_turn("ses-running");
         let err = host
-            .settle_thread(running_id, &quiet)
+            .settle_thread(running_id)
             .expect_err("a session mid-turn is not settled");
         assert!(err.message.contains("still running"));
 
-        host.settle_thread(elsewhere_id, &written_just_now)
-            .expect_err("nor is one running in another process");
-        let settled = host
-            .auto_settle_idle(chrono::Duration::days(3), &written_just_now)
-            .unwrap();
-        assert_eq!(settled, 0, "busy here, live elsewhere: neither is settled");
+        let settled = host.auto_settle_idle(chrono::Duration::days(3)).unwrap();
+        assert_eq!(settled, 1, "only the idle one is swept; the busy one stays");
+        assert!(
+            history
+                .store()
+                .thread(elsewhere_id)
+                .is_some_and(|t| t.settled_at.is_some()),
+            "no transcript liveness keeps it out"
+        );
 
         host.end_atlas_turn("ses-running");
         assert!(
-            host.settle_thread(running_id, &quiet)
+            host.settle_thread(running_id)
                 .expect("a quiet session settles"),
             "and says it moved"
         );
         assert!(
-            !host.settle_thread(running_id, &quiet).unwrap(),
+            !host.settle_thread(running_id).unwrap(),
             "settling it again changes nothing, and says so"
         );
-        let settled = host
-            .auto_settle_idle(chrono::Duration::days(3), &quiet)
-            .unwrap();
-        assert_eq!(settled, 1, "the sweep settles the other once it is quiet");
 
-        let rows = host.thread_history(&HashMap::new()).unwrap();
+        let rows = host.thread_history().unwrap();
         for id in [running_id, elsewhere_id] {
             let row = rows
                 .iter()
@@ -5604,57 +5892,6 @@ mod tests {
                 .unwrap();
             assert!(row.settled_at.is_some(), "settledAt on the wire");
         }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The review finding: the sweep covers every project, the session watcher
-    /// only the open one. A session in another project is judged by its own
-    /// folder's transcripts — and when they cannot be read, it is not settled.
-    #[tokio::test]
-    async fn the_sweep_judges_each_session_by_its_own_project() {
-        let (host, dir) = fresh_host();
-        let history = host.history().expect("a fresh host has history");
-        let mut thread = atlas_thread_metadata::ThreadMetadata::new(
-            atlas_thread_metadata::ThreadId::new(),
-            "an-uninstalled-agent".into(),
-            atlas_thread_metadata::PathList::new(&[PathBuf::from("/tmp/another-project")]),
-        );
-        thread.session_id = Some(acp::SessionId::new("ses-other"));
-        thread.updated_at = Utc::now() - chrono::Duration::days(5);
-        thread.interacted_at = Some(thread.updated_at);
-        let id = thread.thread_id;
-        history.store().save_all(vec![thread]);
-
-        // What the sidebar's open project knows: nothing about this one.
-        let open_project = PathBuf::from("/tmp/atlas");
-        let asked = std::sync::Mutex::new(Vec::<PathBuf>::new());
-        let terminal_in_other = |folder: &Path| {
-            asked.lock().unwrap().push(folder.to_path_buf());
-            if folder == open_project {
-                Some(HashMap::new())
-            } else {
-                Some(HashMap::from([("ses-other".to_owned(), Utc::now())]))
-            }
-        };
-        let idle = chrono::Duration::days(3);
-        assert_eq!(host.auto_settle_idle(idle, &terminal_in_other).unwrap(), 0);
-        assert_eq!(
-            *asked.lock().unwrap(),
-            [PathBuf::from("/tmp/another-project")],
-            "asked about the session's own folder"
-        );
-        host.settle_thread(id, &terminal_in_other)
-            .expect_err("by hand too, the row's own project decides");
-
-        let unreadable = |_: &Path| None;
-        assert_eq!(
-            host.auto_settle_idle(idle, &unreadable).unwrap(),
-            0,
-            "no coverage, no settle"
-        );
-
-        let quiet = |_: &Path| Some(HashMap::new());
-        assert_eq!(host.auto_settle_idle(idle, &quiet).unwrap(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5682,7 +5919,7 @@ mod tests {
         let until = Utc::now() + chrono::Duration::hours(1);
         assert!(host.snooze_thread(id, until).unwrap());
         let row_of = |host: &AgentHost| {
-            host.thread_history(&HashMap::new())
+            host.thread_history()
                 .unwrap()
                 .into_iter()
                 .find(|r| r.thread_id == id.to_key_string())
@@ -5696,7 +5933,7 @@ mod tests {
         let row = row_of(&host);
         assert!(row.snoozed_until.is_none() && row.woke);
 
-        assert!(host.mark_session_viewed("ses-snooze").unwrap());
+        assert!(host.mark_session_viewed("ses-snooze", None).unwrap());
         assert!(!row_of(&host).woke, "viewing clears it");
         assert!(
             host.mark_thread_unread(id).is_err(),
@@ -5722,7 +5959,7 @@ mod tests {
         history.store().update_interacted_at(id, Utc::now());
 
         let err = host
-            .settle_thread(id, &|_: &Path| Some(HashMap::new()))
+            .settle_thread(id)
             .expect_err("the turn has not been counted in yet");
         assert!(err.message.contains("still running"));
         assert!(!history.store().settle(id), "the store refuses it too");
@@ -5803,7 +6040,7 @@ mod tests {
     #[test]
     fn an_absent_installed_map_reads_as_empty() {
         let dir = std::env::temp_dir().join(format!("atlas-installed-{}", Uuid::new_v4()));
-        assert!(load_installed(&dir).0.is_empty());
+        assert!(read_installed(&dir).unwrap().0.is_empty());
     }
 
     #[test]
@@ -5815,12 +6052,20 @@ mod tests {
             atlas_agent_store::AgentServerSettings::registry(),
         );
         save_installed(&dir, &settings).expect("the map is written");
-        assert_eq!(load_installed(&dir), settings);
+        assert_eq!(read_installed(&dir).unwrap(), settings);
 
-        // A corrupt file is an empty map, not a panic: a half-written install
-        // must not make the app unable to list agents.
+        // A corrupt map is repairable input, never an empty installation that
+        // a subsequent write can silently replace.
         std::fs::write(installed_map_path(&dir), "{ not json").unwrap();
-        assert!(load_installed(&dir).0.is_empty());
+        assert!(read_installed(&dir).is_err());
+        assert!(save_installed(&dir, &settings).is_err());
+        assert_eq!(
+            std::fs::read_to_string(installed_map_path(&dir)).unwrap(),
+            "{ not json"
+        );
+        std::fs::write(installed_map_path(&dir), "{}").unwrap();
+        save_installed(&dir, &settings).unwrap();
+        assert_eq!(read_installed(&dir).unwrap(), settings);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5865,13 +6110,8 @@ mod tests {
     }
 
     /// A liveness snapshot in which nothing is live.
-    fn no_live() -> LiveContext<'static> {
-        static EMPTY: std::sync::LazyLock<HashMap<String, DateTime<Utc>>> =
-            std::sync::LazyLock::new(HashMap::new);
+    fn no_live() -> LiveContext {
         LiveContext {
-            modified: &EMPTY,
-            activity: HashMap::new(),
-            now: Utc::now(),
             forks: HashMap::new(),
             held_working: std::collections::HashSet::new(),
         }
@@ -6049,10 +6289,9 @@ mod tests {
         let on_disk: std::collections::HashSet<String> =
             ["hosted".to_owned(), "fresh".to_owned()].into();
         assert!(host.claim_for_atlas_turn("fresh", &on_disk));
-        let now = Utc::now();
         assert!(
-            !live_elsewhere(Some(now), host.atlas_activity().get("fresh"), now),
-            "Atlas's own continuation is not live elsewhere"
+            explained_by_atlas(Utc::now(), host.atlas_activity().get("fresh")),
+            "a write to Atlas's own continuation is Atlas's"
         );
         // And an import skips it.
         let history = host.history().expect("history");
@@ -6062,28 +6301,221 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn live_elsewhere_needs_a_recent_write() {
-        let now = Utc::now();
-        let recent = Some(now - chrono::Duration::seconds(5));
-        let old = Some(now - chrono::Duration::seconds(600));
-        assert!(live_elsewhere(recent, None, now));
-        assert!(!live_elsewhere(old, None, now));
-        assert!(!live_elsewhere(None, None, now));
+    /// A host whose native slot is a scripted agent that can list and delete
+    /// its sessions, and that agent's live id and script handle.
+    async fn host_with_deleting_agent(
+        session_id: &str,
+    ) -> (
+        Arc<AgentHost>,
+        PathBuf,
+        AgentId,
+        atlas_acp_thread::test_support::FakeHandle,
+    ) {
+        let fake = agent_script(ATLAS_AGENT_ID, session_id)
+            .supports_session_list()
+            .supports_session_delete()
+            .handle();
+        let (host, dir) = fresh_host_with_native(ScriptedServer::new(fake.clone()));
+        let agent_id = host.spawn(ATLAS_AGENT_ID).await.expect("spawn").agent_id;
+        (host, dir, agent_id, fake)
+    }
+
+    fn deletes(fake: &atlas_acp_thread::test_support::FakeHandle) -> Vec<String> {
+        fake.calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                atlas_acp_thread::test_support::FakeCall::DeleteSession(id) => Some(id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A session Atlas opened is Atlas's from the moment it opens, not from
+    /// its first prompt, and the store keeps that across restarts. An agent
+    /// that lists a session as soon as it exists (opencode) used to have the
+    /// project sync import Atlas's own empty session, on the next launch, as
+    /// one the user started elsewhere: an untitled "New session" row.
+    #[tokio::test]
+    async fn a_session_atlas_opened_is_never_imported_back() {
+        let native = ScriptedServer::new(agent_script(ATLAS_AGENT_ID, "s-opened").handle());
+        let (host, dir) = fresh_host_with_native(native);
+        let agent_id = host.spawn(ATLAS_AGENT_ID).await.expect("spawn").agent_id;
+        let init = host
+            .new_session(agent_id, PathBuf::from("/tmp/atlas"), Vec::new())
+            .await
+            .expect("a session opens");
+        let id = acp::SessionId::new(init.key.session_id.as_str());
+
+        let store = host.history().expect("history").store();
+        assert!(
+            store.thread_for_session(&id).is_none(),
+            "never sent to, so no row"
+        );
+        assert!(
+            store.is_opened_unused(&id),
+            "recorded in the store, not in memory"
+        );
+        assert!(store.known_session_ids().contains(&id));
+        assert!(host
+            .known_or_atlas_owned(host.history().unwrap())
+            .contains(&id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Let go before anything was sent (the tab closed, "New session", an
+    /// agent switch): nothing in it is anybody's, so it is deleted on the
+    /// agent too, and does not sit in the agent's own session list.
+    #[tokio::test]
+    async fn a_session_let_go_before_anything_was_sent_is_deleted_on_its_agent() {
+        let (host, dir, agent_id, fake) = host_with_deleting_agent("s-unused").await;
+        let init = host
+            .new_session(agent_id, PathBuf::from("/tmp/atlas"), Vec::new())
+            .await
+            .expect("a session opens");
+        host.drop_session(&init.key.session_id)
+            .await
+            .expect("drops");
+        assert_eq!(deletes(&fake), std::slice::from_ref(&init.key.session_id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A conversation is never deleted: one with a row (something was sent)
+    /// is only closed, as before.
+    #[tokio::test]
+    async fn a_session_that_was_sent_to_is_never_deleted() {
+        let (host, dir, agent_id, fake) = host_with_deleting_agent("s-used").await;
+        let init = host
+            .new_session(agent_id, PathBuf::from("/tmp/atlas"), Vec::new())
+            .await
+            .expect("a session opens");
+        let id = acp::SessionId::new(init.key.session_id.as_str());
+        // What the first message writes: the conversation's row.
+        let history = host.history().unwrap();
+        let thread_id = history.thread_for(&id).expect("bound to its draft row");
+        history
+            .store()
+            .record_live_update(atlas_thread_metadata::LiveThreadUpdate {
+                thread_id,
+                is_draft: false,
+                session_id: Some(id.clone()),
+                agent_id: ATLAS_AGENT_ID.into(),
+                title: None,
+                worktree_paths: Default::default(),
+                remote_connection: None,
+                activity: true,
+            });
+
+        host.drop_session(&init.key.session_id)
+            .await
+            .expect("drops");
+        assert!(deletes(&fake).is_empty());
+
+        // Nor as a leftover in a later run, when its agent lists it.
+        lock(&host.opened_this_run).clear();
+        host.delete_unused_listed(ATLAS_AGENT_ID, &[(id, Some(Utc::now()))])
+            .await;
+        assert!(deletes(&fake).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An agent that did not advertise `session/delete` is never sent one.
+    #[tokio::test]
+    async fn an_agent_that_cannot_delete_is_not_asked_to() {
+        let fake = agent_script(ATLAS_AGENT_ID, "s-kept")
+            .supports_session_list()
+            .handle();
+        let (host, dir) = fresh_host_with_native(ScriptedServer::new(fake.clone()));
+        let agent_id = host.spawn(ATLAS_AGENT_ID).await.expect("spawn").agent_id;
+        let init = host
+            .new_session(agent_id, PathBuf::from("/tmp/atlas"), Vec::new())
+            .await
+            .expect("a session opens");
+        host.drop_session(&init.key.session_id)
+            .await
+            .expect("drops");
+        assert!(deletes(&fake).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What an earlier run left behind (Atlas quit or crashed with a session
+    /// nobody sent to) is deleted when its agent next lists it. Never one
+    /// opened in this run, which may still be starting, and never a session
+    /// Atlas did not open.
+    #[tokio::test]
+    async fn leftovers_from_an_earlier_run_are_deleted_when_their_agent_lists_them() {
+        let (host, dir, agent_id, fake) = host_with_deleting_agent("s-this-run").await;
+        let this_run = host
+            .new_session(agent_id, PathBuf::from("/tmp/atlas"), Vec::new())
+            .await
+            .expect("a session opens");
+        let store = host.history().unwrap().store();
+        let leftover = acp::SessionId::new("s-earlier-run");
+        store.record_session_opened(&leftover);
+        let untouched = Some(Utc::now());
+
+        host.delete_unused_listed(
+            ATLAS_AGENT_ID,
+            &[
+                (leftover.clone(), untouched),
+                (
+                    acp::SessionId::new(this_run.key.session_id.as_str()),
+                    untouched,
+                ),
+                (acp::SessionId::new("s-from-a-terminal"), untouched),
+            ],
+        )
+        .await;
+        assert_eq!(deletes(&fake), [leftover.to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Atlas sent nothing to it, but somebody did: a session Atlas opened is
+    /// in the agent's own list, and can be carried on from the agent's
+    /// terminal. The agent says it was written to well after Atlas opened
+    /// it, so it is not deleted, and it stops being Atlas's unused session:
+    /// the import lists it like any session started outside Atlas.
+    #[tokio::test]
+    async fn a_leftover_that_was_used_elsewhere_is_kept_and_handed_to_the_import() {
+        let (host, dir, _agent_id, fake) = host_with_deleting_agent("s-unrelated").await;
+        let history = host.history().unwrap();
+        let carried_on = acp::SessionId::new("s-carried-on-in-a-terminal");
+        history.store().record_session_opened(&carried_on);
+
+        let later = Utc::now() + chrono::Duration::minutes(10);
+        host.delete_unused_listed(ATLAS_AGENT_ID, &[(carried_on.clone(), Some(later))])
+            .await;
+        assert!(deletes(&fake).is_empty());
+        assert!(!host.known_or_atlas_owned(history).contains(&carried_on));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An agent that gives no "last updated" gives nothing to judge by: the
+    /// session is left alone, and stays Atlas's (not imported).
+    #[tokio::test]
+    async fn a_leftover_with_no_time_from_its_agent_is_left_alone() {
+        let (host, dir, _agent_id, fake) = host_with_deleting_agent("s-unrelated").await;
+        let history = host.history().unwrap();
+        let leftover = acp::SessionId::new("s-no-time");
+        history.store().record_session_opened(&leftover);
+
+        host.delete_unused_listed(ATLAS_AGENT_ID, &[(leftover.clone(), None)])
+            .await;
+        assert!(deletes(&fake).is_empty());
+        assert!(host.known_or_atlas_owned(history).contains(&leftover));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The review finding: opening a row binds the session, and binding used
     /// to count as "hosted", so the guard went away the moment the user could
     /// act on it. Bound with no Atlas turn is still a terminal's session.
     #[test]
-    fn a_bound_but_idle_session_with_a_fresh_write_is_live_elsewhere() {
+    fn a_bound_but_idle_session_with_a_fresh_write_is_not_atlas_own() {
         let now = Utc::now();
-        let written = Some(now - chrono::Duration::seconds(10));
+        let written = now - chrono::Duration::seconds(10);
         // Opened in Atlas, never prompted from it: no activity recorded.
-        assert!(live_elsewhere(
+        assert!(!explained_by_atlas(
             written,
-            Some(&AtlasActivity::default()),
-            now
+            Some(&AtlasActivity::default())
         ));
         // Prompted from Atlas long before the terminal's write.
         let idle = AtlasActivity {
@@ -6091,18 +6523,18 @@ mod tests {
             last_turn_end: Some(now - chrono::Duration::minutes(10)),
             ..Default::default()
         };
-        assert!(live_elsewhere(written, Some(&idle), now));
+        assert!(!explained_by_atlas(written, Some(&idle)));
     }
 
     #[test]
-    fn a_session_with_an_atlas_turn_in_flight_is_not_live_elsewhere() {
+    fn a_write_during_an_atlas_turn_is_atlas_own() {
         let now = Utc::now();
         let running = AtlasActivity {
             in_flight: 1,
             last_turn_end: None,
             ..Default::default()
         };
-        assert!(!live_elsewhere(Some(now), Some(&running), now));
+        assert!(explained_by_atlas(now, Some(&running)));
     }
 
     #[test]
@@ -6115,12 +6547,12 @@ mod tests {
             ..Default::default()
         };
         let trailing = ended + chrono::Duration::seconds(2);
-        assert!(!live_elsewhere(Some(trailing), Some(&done), now));
-        assert!(!live_elsewhere(Some(ended), Some(&done), now));
+        assert!(explained_by_atlas(trailing, Some(&done)));
+        assert!(explained_by_atlas(ended, Some(&done)));
     }
 
     #[test]
-    fn a_write_well_after_atlas_turn_ended_is_live_elsewhere() {
+    fn a_write_well_after_atlas_turn_ended_is_not_atlas_own() {
         let now = Utc::now();
         let ended = now - chrono::Duration::seconds(60);
         let done = AtlasActivity {
@@ -6129,7 +6561,7 @@ mod tests {
             ..Default::default()
         };
         let later = ended + chrono::Duration::seconds(30);
-        assert!(live_elsewhere(Some(later), Some(&done), now));
+        assert!(!explained_by_atlas(later, Some(&done)));
     }
 
     /// Rows recorded before the fix kept only the marker line. They read as
@@ -6154,6 +6586,30 @@ mod tests {
             thread_row(&row, &no_live()).title,
             "Origin dropdown cleanup"
         );
+    }
+}
+
+/// How long after Atlas opened a session the agent's own "last updated" may
+/// still be Atlas's doing: the mode, model and options a new session is put
+/// on are applied right after it opens, and an agent may count them. Later
+/// than this, something else wrote to it (`delete_unused_listed`). Erring
+/// long deletes a real conversation; erring short leaves an empty one listed.
+const UNUSED_SESSION_GRACE: chrono::Duration = chrono::Duration::seconds(60);
+
+/// Delete a session on its agent, if the agent advertised `session/delete`.
+/// Best effort: a refusal is logged, and the session stays known either way.
+async fn delete_on_agent(connection: &Arc<dyn AgentConnection>, session_id: &acp::SessionId) {
+    let Some(list) = connection.session_list() else {
+        tracing::debug!(session = %session_id, "not deleted: the agent lists no sessions");
+        return;
+    };
+    if !list.supports_delete() {
+        tracing::debug!(session = %session_id, "not deleted: the agent cannot delete sessions");
+        return;
+    }
+    match list.delete_session(session_id).await {
+        Ok(()) => tracing::info!(session = %session_id, "deleted an unused session on its agent"),
+        Err(e) => tracing::debug!(session = %session_id, "deleting an unused session: {e:#}"),
     }
 }
 

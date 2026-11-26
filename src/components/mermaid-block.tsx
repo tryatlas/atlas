@@ -1,5 +1,6 @@
 import { writeFileBase64 } from "@/features/editor/lib/editor-fs-api";
 import { save } from "@tauri-apps/plugin-dialog";
+import { toast } from "sonner";
 
 import { themeBase } from "@/features/theme/theme-values";
 import { copyText } from "@/lib/clipboard";
@@ -40,8 +41,8 @@ async function exportPng(svg: string): Promise<void> {
     if (!path) return;
     const base64 = await svgToPngBase64(svg);
     await writeFileBase64(path, base64);
-  } catch {
-    /* a cancelled dialog and a failed raster both leave the diagram intact */
+  } catch (error) {
+    toast.error("Could not export the diagram", { description: String(error) });
   }
 }
 
@@ -59,6 +60,9 @@ async function exportPng(svg: string): Promise<void> {
  * theme-subscription-allow: reads the background once, at the moment the user asks for the file; nothing is kept to go stale.
  */
 async function svgToPngBase64(svg: string): Promise<string> {
+  if (/<foreignObject\b/i.test(svg)) {
+    throw new Error("This diagram contains HTML that cannot be exported as PNG.");
+  }
   const viewBox = svg
     .match(/viewBox="([\d.\-\s]+)"/)?.[1]
     ?.trim()

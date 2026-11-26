@@ -38,8 +38,10 @@
 //! delta, and a snapshot carries the queue too, so the window's queued-message
 //! strip and any remote view are mirrors of this one list. The queue is
 //! bounded ([`QUEUE_MAX`]) and each item's text is cut to
-//! [`QUEUE_WIRE_TEXT_MAX`] on the wire — the full prompt stays here and is
-//! what the agent is sent.
+//! [`QUEUE_WIRE_TEXT_MAX`] on the delta, marked `truncated` — the full prompt
+//! stays here and is what the agent is sent, and a snapshot carries all of
+//! it, so a reader that must hand the prompt on (an edit, an agent switch, a
+//! restart onto a new session) never takes the head for the whole.
 //!
 //! # The seat
 //!
@@ -95,6 +97,8 @@ pub struct Prompt {
     /// the window already draws it off `session-prompt-injected`, and a
     /// stamped copy would draw it twice. It still reaches snapshots.
     pub from_atlas: bool,
+    /// Restart count belongs to this queued prompt, never the next user turn.
+    pub restart_continuations: u32,
 }
 
 impl Prompt {
@@ -205,7 +209,7 @@ impl From<atlas_agent_delta::PendingElicitation> for PendingElicitationWire {
 }
 
 /// One session's turn controller state (see the module docs).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct TurnControl {
     queue: VecDeque<QueuedItem>,
     /// The window's send gate is closed: nothing drains until it opens.
@@ -217,6 +221,31 @@ pub(super) struct TurnControl {
     /// `send_now` asked for the head to run next: the next drain goes ahead
     /// even if paused, once.
     force_next: bool,
+    /// The last turn failed (an error, a refusal, a token limit) with prompts
+    /// still parked: they were typed to follow a turn that went well, so they
+    /// wait for the user rather than running into the same wall (audit #77).
+    /// Kept apart from `paused`, which the window owns and overwrites. Lifted
+    /// by [`AgentHost::resume_queue`], a `send_now`, a turn that ends well,
+    /// or the queue emptying.
+    halted: bool,
+    /// Preparation may touch disk, but never on an IPC/runtime worker. It is
+    /// ordered within this session and remains cancellable before agent send.
+    preparation: Arc<tokio::sync::Semaphore>,
+    cancel: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Default for TurnControl {
+    fn default() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            paused: false,
+            running: None,
+            force_next: false,
+            halted: false,
+            preparation: Arc::new(tokio::sync::Semaphore::new(1)),
+            cancel: None,
+        }
+    }
 }
 
 impl TurnControl {
@@ -237,6 +266,9 @@ pub(in crate::commands::agent_host) struct Steering {
 
 impl SessionExtra for Steering {
     fn survives(&mut self, end: EndKind) -> bool {
+        if let Some(cancel) = &self.control.cancel {
+            cancel.send_replace(true);
+        }
         match end {
             // The session is over: the queue was typed for it and the seat
             // was a seat in it. Nothing is left to steer.
@@ -270,6 +302,12 @@ impl Steering {
             || self.control.running.is_some()
             || self.control.paused
             || self.control.force_next
+            || self.control.halted
+    }
+
+    /// Whether a failed turn halted the queue.
+    pub(in crate::commands::agent_host) fn queue_halted(&self) -> bool {
+        self.control.halted
     }
 
     pub(in crate::commands::agent_host) fn has_seat(&self) -> bool {
@@ -286,9 +324,10 @@ const RESERVED: u64 = u64::MAX;
 /// each prompt a disconnected phone keeps sending.
 pub const QUEUE_MAX: usize = 16;
 
-/// The most of a queued prompt's text that travels on `queue_changed` and in
-/// a snapshot. The whole prompt stays here and is what the agent gets; the
-/// chip shows the head of it.
+/// The most of a queued prompt's text that travels on `queue_changed`, which
+/// carries the whole queue on every change. The whole prompt stays here and is
+/// what the agent gets; the delta marks a cut item `truncated`, and a snapshot
+/// carries it whole.
 pub const QUEUE_WIRE_TEXT_MAX: usize = 2 * 1024;
 
 #[derive(Debug, Clone)]
@@ -299,11 +338,25 @@ struct QueuedItem {
 }
 
 impl QueuedItem {
+    /// As a `queue_changed` delta carries it: the head of a long text.
     fn wire(&self) -> QueuedPrompt {
+        let text = self.prompt.display_text();
+        let head = head_of(text, QUEUE_WIRE_TEXT_MAX);
         QueuedPrompt {
             id: self.id.clone(),
-            text: head_of(self.prompt.display_text(), QUEUE_WIRE_TEXT_MAX),
+            truncated: (head.len() < text.len()).then_some(true),
+            text: head,
             origin: self.origin.clone(),
+        }
+    }
+
+    /// As a snapshot carries it: the whole text.
+    fn whole(&self) -> QueuedPrompt {
+        QueuedPrompt {
+            id: self.id.clone(),
+            text: self.prompt.display_text().to_string(),
+            origin: self.origin.clone(),
+            truncated: None,
         }
     }
 }
@@ -384,6 +437,22 @@ pub struct SessionControls {
     pub modes: bool,
     pub models: bool,
     pub config: bool,
+}
+
+/// Whether a turn ended in a way the prompts queued behind it were not typed
+/// for: an error (rate limit, auth, a dead agent), or the agent refusing or
+/// running out of room. A cancel is not a failure — Stop discards the queue
+/// itself, and `send_now` cancels to run the head.
+fn turn_failed(outcome: &anyhow::Result<acp::StopReason>) -> bool {
+    match outcome {
+        Err(_) => true,
+        Ok(reason) => matches!(
+            reason,
+            acp::StopReason::Refusal
+                | acp::StopReason::MaxTokens
+                | acp::StopReason::MaxTurnRequests
+        ),
+    }
 }
 
 fn note_steer(verb: &str, session_id: &str, origin: &Origin) {
@@ -538,10 +607,13 @@ impl AgentHost {
             let Some(steering) = steering else {
                 return false;
             };
-            let queue = &mut steering.control.queue;
-            let before = queue.len();
-            queue.retain(|item| item.id != item_id);
-            queue.len() != before
+            let control = &mut steering.control;
+            let before = control.queue.len();
+            control.queue.retain(|item| item.id != item_id);
+            if control.queue.is_empty() {
+                control.halted = false;
+            }
+            control.queue.len() != before
         });
         if removed {
             self.announce_queue(&key.session_id);
@@ -574,6 +646,23 @@ impl AgentHost {
     /// or paused is simply nothing to do.
     pub fn drain_queue(self: &Arc<Self>, key: &SessionKey) -> Result<Option<u64>> {
         self.known_session(&key.session_id)?;
+        Ok(self
+            .maybe_drain(&key.session_id)
+            .map(|(_, turn_seq)| turn_seq))
+    }
+
+    /// Lift the halt a failed turn put on the queue (audit #77) and start the
+    /// head if the session is idle and the window's gate is open. The
+    /// window's "resume queue"; a no-op on a queue that is not halted.
+    pub fn resume_queue(self: &Arc<Self>, key: &SessionKey, origin: Origin) -> Result<Option<u64>> {
+        note_steer("resume_queue", &key.session_id, &origin);
+        self.seat(&key.session_id, &origin)?;
+        self.known_session(&key.session_id)?;
+        self.sessions.extra_mut(&key.session_id, |steering| {
+            if let Some(steering) = steering {
+                steering.control.halted = false;
+            }
+        });
         Ok(self
             .maybe_drain(&key.session_id)
             .map(|(_, turn_seq)| turn_seq))
@@ -620,18 +709,24 @@ impl AgentHost {
         }
     }
 
-    /// The session's queue, as the wire shows it.
+    /// The session's queue, as a snapshot carries it: every text whole.
     pub fn queue_of(&self, session_id: &str) -> Vec<QueuedPrompt> {
+        self.queue_as(session_id, QueuedItem::whole)
+    }
+
+    /// The session's queue, as `queue_changed` carries it: long texts cut.
+    fn queue_on_wire(&self, session_id: &str) -> Vec<QueuedPrompt> {
+        self.queue_as(session_id, QueuedItem::wire)
+    }
+
+    fn queue_as(
+        &self,
+        session_id: &str,
+        each: fn(&QueuedItem) -> QueuedPrompt,
+    ) -> Vec<QueuedPrompt> {
         self.sessions.extra_mut(session_id, |steering| {
             steering
-                .map(|steering| {
-                    steering
-                        .control
-                        .queue
-                        .iter()
-                        .map(QueuedItem::wire)
-                        .collect()
-                })
+                .map(|steering| steering.control.queue.iter().map(each).collect())
                 .unwrap_or_default()
         })
     }
@@ -651,9 +746,14 @@ impl AgentHost {
         note_steer("stop", &key.session_id, &origin);
         self.forget_wakes(&key.session_id);
         if let Some(history) = self.history() {
-            if let Some(thread_id) =
-                history.thread_for(&acp::SessionId::new(key.session_id.as_str()))
-            {
+            let session_id = acp::SessionId::new(key.session_id.as_str());
+            let thread_id = match self.plugin_id_for_agent(key.agent_id) {
+                Some(plugin_id) => {
+                    history.thread_for_agent(&plugin_id.as_str().into(), &session_id)
+                }
+                None => history.thread_for(&session_id),
+            };
+            if let Some(thread_id) = thread_id {
                 history.store().end_pull_request_watches(thread_id);
             }
         }
@@ -674,6 +774,11 @@ impl AgentHost {
     }
 
     fn cancel_turn(&self, session_id: &str) {
+        self.sessions.extra_mut(session_id, |steering| {
+            if let Some(cancel) = steering.and_then(|s| s.control.cancel.as_ref()) {
+                cancel.send_replace(true);
+            }
+        });
         self.manager.cancel(&acp::SessionId::new(session_id));
     }
 
@@ -684,6 +789,7 @@ impl AgentHost {
             };
             let control = &mut steering.control;
             control.force_next = false;
+            control.halted = false;
             let had = !control.queue.is_empty();
             control.queue.clear();
             had
@@ -734,7 +840,7 @@ impl AgentHost {
     }
 
     fn announce_queue(&self, session_id: &str) {
-        let queue = self.queue_of(session_id);
+        let queue = self.queue_on_wire(session_id);
         self.projector
             .note_queue_changed(&acp::SessionId::new(session_id), queue);
     }
@@ -753,7 +859,9 @@ impl AgentHost {
     fn maybe_drain(self: &Arc<Self>, session_id: &str) -> Option<(String, u64)> {
         let (item, at) = self.sessions.extra_mut(session_id, |steering| {
             let Steering { control, seat } = steering?;
-            if control.running.is_some() || (control.paused && !control.force_next) {
+            if control.running.is_some()
+                || ((control.paused || control.halted) && !control.force_next)
+            {
                 return None;
             }
             let at = control
@@ -761,6 +869,10 @@ impl AgentHost {
                 .iter()
                 .position(|item| seat.as_ref().is_none_or(|seat| seat.admits(&item.origin)))?;
             let item = control.queue.remove(at).expect("position is in range");
+            if control.force_next {
+                // The user picked this one to run: the queue is theirs again.
+                control.halted = false;
+            }
             control.force_next = false;
             control.running = Some(RESERVED);
             Some((item, at))
@@ -788,8 +900,9 @@ impl AgentHost {
     }
 
     /// A turn this host dispatched came back. If it is still the one the
-    /// controller is waiting on, the queue may move.
-    fn turn_returned(self: &Arc<Self>, session_id: &str, turn_seq: u64) {
+    /// controller is waiting on, the queue may move — unless the turn
+    /// `failed`, which halts a non-empty queue instead (audit #77).
+    fn turn_returned(self: &Arc<Self>, session_id: &str, turn_seq: u64, failed: bool) {
         let ours = self.sessions.extra_mut(session_id, |steering| {
             let Some(steering) = steering else {
                 return false;
@@ -798,7 +911,13 @@ impl AgentHost {
                 // Superseded by a newer dispatch: that one's return drains.
                 return false;
             }
-            steering.control.running = None;
+            let control = &mut steering.control;
+            control.running = None;
+            control.cancel = None;
+            control.halted = failed && control.has_queue();
+            if control.halted {
+                tracing::info!(target: "atlas::steering", session = session_id, "a failed turn halted the queue");
+            }
             true
         });
         if ours {
@@ -835,67 +954,129 @@ impl AgentHost {
             .next_turn_seq(session_id)
             .ok_or_else(HostError::unknown_session)?;
 
-        // The side effects, before the turn opens — capture binds the turn to
-        // its prompt at `note_prompt`, and a delta-only recorder would see a
-        // turn with no question (`user_message` is not what they record from).
-        if let Some(hooks) = self.prompt_hooks() {
-            hooks.prompt_sent(&PromptSent {
-                session_id,
-                cwd: &cwd,
-                plugin_id: &plugin_id,
-                model: model.as_deref(),
-                text: &prompt.text,
-                origin: &origin,
-                from_atlas: prompt.from_atlas,
-            });
-        }
-        // `interacted_at` is written by the hooks (`record_prompt`): a queued
-        // prompt counts when it is sent, not when it is typed (Zed's
-        // `update_interacted_at`), and a wake is not the user.
-
-        let content = prompt::with_pasted_texts(
-            prompt::with_resource_links(
-                prompt::compose(prompt.text, prompt.images),
-                prompt.resource_links,
-            ),
-            prompt.pastes,
-            embedded_context,
-        );
-        let acp_id = acp::SessionId::new(session_id);
-        // Every turn start, not only the bind: the user may have switched
-        // branches since the session opened, and the row should name the
-        // branch the latest work ran on. The model likewise.
-        self.refresh_branch(&acp_id, &cwd);
-        self.refresh_model(&acp_id);
-        // Before the turn opens, so the `status: running` that `begin_turn`
-        // emits already carries this turn's identity.
-        self.projector.set_turn_seq(&acp_id, turn_seq);
-        // On disk before it runs, so a launch after a quit or crash knows
-        // which turns to continue (`take_left_open_turns`).
-        let thread = self
-            .history()
-            .and_then(|history| history.thread_for(&acp_id));
-        if let Some(thread) = thread {
-            self.open_turns.begin(thread);
-        }
-        // Before the manager pushes the prompt onto the thread, so its entry
-        // is announced as this sender's `user_message`. Not for a prompt
-        // Atlas sent on its own (see `Prompt::from_atlas`).
-        if !content.is_empty() && !prompt.from_atlas {
-            self.projector
-                .stamp_user_message(&acp_id, origin, prompt.client_message_id);
-        }
-        // Before the agent can write a byte of this turn to its transcript, so
-        // the session watcher never mistakes that write for another process.
-        self.begin_atlas_turn(session_id);
-        self.sessions.with_extra(session_id, |steering| {
+        let (cancel_tx, mut cancelled) = tokio::sync::watch::channel(false);
+        let preparation = self.sessions.with_extra(session_id, |steering| {
+            if let Some(previous) = steering.control.cancel.replace(cancel_tx) {
+                previous.send_replace(true);
+            }
             steering.control.running = Some(turn_seq);
+            steering.control.preparation.clone()
         });
-
+        self.begin_atlas_turn(session_id);
         let this = self.clone();
         let session_key = session_id.to_owned();
+        // The session's own agent, for every history write below: two agents
+        // can share a session id (#86).
+        let history_agent: atlas_acp_thread::AgentId = plugin_id.as_str().into();
         tauri::async_runtime::spawn(async move {
-            let sent = this.manager.send(&acp_id, content).await;
+            let acp_id = acp::SessionId::new(session_key.clone());
+            let thread = this
+                .history()
+                .and_then(|history| history.thread_for_agent(&history_agent, &acp_id));
+            let sent = async {
+                let prepared = preparation.acquire().await?;
+                if this.sessions.info(&session_key).is_none() {
+                    return Ok(acp::StopReason::Cancelled);
+                }
+                if let Some(hooks) = this.prompt_hooks() {
+                    let key = session_key.clone();
+                    let cwd = cwd.clone();
+                    let prompt = prompt.clone();
+                    let origin = origin.clone();
+                    tokio::task::spawn_blocking(move || {
+                        hooks.prompt_sent(&PromptSent {
+                            session_id: &key,
+                            cwd: &cwd,
+                            plugin_id: &plugin_id,
+                            model: model.as_deref(),
+                            text: &prompt.text,
+                            origin: &origin,
+                            from_atlas: prompt.from_atlas,
+                        });
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("prompt preparation failed: {e}"))?;
+                }
+                let content = prompt::with_pasted_texts(
+                    prompt::with_resource_links(
+                        prompt::compose(prompt.text, prompt.images),
+                        prompt.resource_links,
+                    ),
+                    prompt.pastes,
+                    embedded_context,
+                );
+                this.refresh_branch(&history_agent, &acp_id, &cwd);
+                this.refresh_model(&history_agent, &acp_id);
+                this.projector.set_turn_seq(&acp_id, turn_seq);
+                if !content.is_empty() && !prompt.from_atlas {
+                    this.projector
+                        .stamp_user_message(&acp_id, origin, prompt.client_message_id);
+                }
+                // A Stop during preparation records a cancelled local turn,
+                // without starting the agent after Stop already returned.
+                let cancelled_before_send = || -> anyhow::Result<acp::StopReason> {
+                    if let Ok(handle) = this.thread(&session_key) {
+                        let mut thread = lock_thread(&handle);
+                        thread.push_user_prompt(None, content.iter().cloned());
+                        let turn = thread.begin_turn();
+                        thread.end_turn_unless_superseded(turn, acp::StopReason::Cancelled);
+                    }
+                    Ok(acp::StopReason::Cancelled)
+                };
+                if *cancelled.borrow() {
+                    return cancelled_before_send();
+                }
+                if let Some(thread) = thread {
+                    this.open_turns.begin(thread, prompt.restart_continuations);
+                }
+                // The thread this turn is sent on, held so the turn can still
+                // be cancelled once its session's record is gone: the
+                // registry's end forgets the manager's handle, and the id
+                // then names nothing to cancel (audit #85).
+                let sent_on = this.thread(&session_key).ok();
+                let send = this.manager.send(&acp_id, content.clone());
+                tokio::pin!(send);
+                let started = std::sync::atomic::AtomicBool::new(false);
+                let mut prepared = Some(prepared);
+                let result = {
+                    use std::future::Future;
+                    let polling = std::future::poll_fn(|cx| {
+                        started.store(true, std::sync::atomic::Ordering::Release);
+                        // The first poll synchronously opens the manager's turn
+                        // before yielding to its connection. Only then may a
+                        // newer preparation stamp another turn's metadata.
+                        let result = send.as_mut().poll(cx);
+                        prepared.take();
+                        result
+                    });
+                    tokio::pin!(polling);
+                    tokio::select! {
+                        biased;
+                        _ = cancelled.changed() => None,
+                        result = &mut polling => Some(result),
+                    }
+                };
+                match result {
+                    Some(result) => result,
+                    None if !started.load(std::sync::atomic::Ordering::Acquire) => {
+                        cancelled_before_send()
+                    }
+                    None => {
+                        if this.is_current_turn(&session_key, turn_seq) {
+                            this.manager.cancel(&acp_id);
+                        } else if this.sessions.info(&session_key).is_none() {
+                            // The session ended under the turn. A newer turn
+                            // would have a record; with none, this turn is
+                            // the thread's last and nothing else stops it.
+                            if let Some(thread) = &sent_on {
+                                lock_thread(thread).cancel();
+                            }
+                        }
+                        send.await
+                    }
+                }
+            }
+            .await;
             // Every way out of the turn ends it, a superseded one included:
             // each send counted itself in, so each counts itself out.
             this.end_atlas_turn(&session_key);
@@ -912,6 +1093,9 @@ impl AgentHost {
             }
             // A wake held for this turn goes out once the session is idle.
             this.drain_wakes_later(&session_key);
+            // A turn cut short by its session ending (the agent went) is not
+            // the turn failing: the rebind runs what was queued behind it.
+            let failed = turn_failed(&sent) && this.sessions.contains(&session_key);
             if let Err(e) = sent {
                 // A send that was superseded reports back late, and its failure
                 // belongs to a turn that is already over. Announcing it anyway
@@ -925,7 +1109,7 @@ impl AgentHost {
                     let class = classify_message(&message);
                     // A failure is a raised hand: a snoozed session wakes for it.
                     if let Some(history) = this.history() {
-                        history.note_failure(&acp_id, Utc::now());
+                        history.note_failure(&history_agent, &acp_id, Utc::now());
                     }
                     this.projector.note_turn_failed(
                         &acp_id,
@@ -940,7 +1124,7 @@ impl AgentHost {
                     );
                 }
             }
-            this.turn_returned(&session_key, turn_seq);
+            this.turn_returned(&session_key, turn_seq, failed);
         });
         Ok(turn_seq)
     }
@@ -962,7 +1146,7 @@ impl AgentHost {
         let key = self.projector.permission_key(&request_id).ok_or_else(|| {
             HostError::new("permission request is not pending", ErrorClass::Fatal)
         })?;
-        let handle = self.thread(session_id)?;
+        let handle = self.thread_in(key.agent_id, &key.session_id)?;
         match decision {
             PermissionDecision::Selected { option_id } => {
                 // The option's kind decides what the thread does with the tool
@@ -1010,7 +1194,7 @@ impl AgentHost {
         option_id: &str,
     ) -> Option<acp::PermissionOptionKind> {
         let key = self.projector.permission_key(&request_id)?;
-        let handle = self.thread(&key.session_id.to_string()).ok()?;
+        let handle = self.thread_in(key.agent_id, &key.session_id).ok()?;
         pending_option_kind(&handle, &key.tool_call_id, option_id)
     }
 
@@ -1071,7 +1255,7 @@ impl AgentHost {
             return Ok(());
         };
         self.seat(&key.session_id.to_string(), &origin)?;
-        let handle = self.thread(&key.session_id.to_string())?;
+        let handle = self.thread_in(key.agent_id, &key.session_id)?;
         let mut thread = lock_thread(&handle);
         match elicitation_response(action, content)? {
             Some(response) => thread.respond_to_elicitation(&key.entry_id, response),
@@ -1133,8 +1317,22 @@ impl AgentHost {
         // The thread has no event for this, so the host announces it — with
         // who picked it, so the window's pill and a remote viewer can say so.
         self.projector
-            .note_model_changed(&session_id, model_id, Some(origin));
-        self.refresh_model(&session_id);
+            .note_model_changed(&session_id, model_id, Some(origin.clone()));
+        // A model picked through a config option answers with the full option
+        // list, and the options that depend on the model (a reasoning level a
+        // new model offers differently) changed with it. The connection keeps
+        // that answer; forward it as `set_config_option` does, or those knobs
+        // stay stale until the agent happens to say otherwise (audit #38).
+        if let Some(options) = connection.session_config_options(&session_id) {
+            self.projector.note_config_options(
+                &session_id,
+                &options.config_options(),
+                Some(origin),
+            );
+        }
+        if let Some(plugin_id) = self.plugin_id_for_agent(key.agent_id) {
+            self.refresh_model(&plugin_id.as_str().into(), &session_id);
+        }
         Ok(())
     }
 
@@ -1234,10 +1432,26 @@ impl AgentHost {
     /// holds it (an RC session id, `"dev"`), so two holders release
     /// independently. Announced as `hold_changed` on the first hold.
     pub fn hold_session(&self, session_id: &str, holder: &str) -> Result<()> {
-        let first = self
-            .sessions
-            .hold(session_id, holder)
-            .ok_or_else(HostError::unknown_session)?;
+        self.hold_session_in(None, session_id, holder)
+    }
+
+    /// [`Self::hold_session`], for `agent_id`'s session when the caller knows
+    /// the agent: two agents can share a session id (#86), and by the bare id
+    /// such a session cannot be held.
+    pub fn hold_session_in(
+        &self,
+        agent_id: Option<AgentId>,
+        session_id: &str,
+        holder: &str,
+    ) -> Result<()> {
+        let held = match agent_id {
+            Some(id) => {
+                let agent = self.record_for(id)?.agent;
+                self.sessions.hold_of(&agent, session_id, holder)
+            }
+            None => self.sessions.hold(session_id, holder),
+        };
+        let first = held.ok_or_else(HostError::unknown_session)?;
         if first {
             tracing::info!(target: "atlas::steering", session = session_id, holder, "session held");
             self.projector
@@ -1252,10 +1466,44 @@ impl AgentHost {
     /// Releasing a hold that is not taken, or on a session already gone, is a
     /// no-op.
     pub async fn release_session(&self, session_id: &str, holder: &str) -> Result<()> {
-        let ended = match self.sessions.release(session_id, holder) {
+        self.release_session_in(None, session_id, holder).await
+    }
+
+    /// [`Self::release_session`], for `agent_id`'s session when the caller
+    /// knows the agent (#86).
+    pub async fn release_session_in(
+        &self,
+        agent_id: Option<AgentId>,
+        session_id: &str,
+        holder: &str,
+    ) -> Result<()> {
+        let scoped = match agent_id {
+            Some(id) => Some((id, self.record_for(id)?.agent)),
+            None => None,
+        };
+        // Taken before the release, which may end the session and forget
+        // the manager's handle with it (audit #85).
+        let (thread, released) = match &scoped {
+            Some((id, agent)) => (
+                self.thread_in(*id, &acp::SessionId::new(session_id)).ok(),
+                self.sessions.release_of(agent, session_id, holder),
+            ),
+            None => (
+                self.thread(session_id).ok(),
+                self.sessions.release(session_id, holder),
+            ),
+        };
+        let ended = match released {
             Released::NotHeld | Released::StillHeld => return Ok(()),
             Released::Last => None,
-            Released::LastAndEnded(ended) => Some(ended),
+            Released::LastAndEnded(ended) => {
+                // The window had already let it go: the session ends here,
+                // and a turn still running goes with it.
+                if let Some(thread) = &thread {
+                    lock_thread(thread).cancel();
+                }
+                Some(ended)
+            }
         };
         let window_gone = ended.is_some();
         tracing::info!(target: "atlas::steering", session = session_id, holder, window_gone, "session hold released");
@@ -1315,10 +1563,13 @@ mod tests {
         }
 
         fn last_queue(&self) -> Option<Vec<String>> {
+            self.last_queue_items()
+                .map(|queue| queue.into_iter().map(|q| q.text).collect())
+        }
+
+        fn last_queue_items(&self) -> Option<Vec<QueuedPrompt>> {
             self.deltas().into_iter().rev().find_map(|d| match d {
-                SessionDelta::QueueChanged { queue } => {
-                    Some(queue.into_iter().map(|q| q.text).collect())
-                }
+                SessionDelta::QueueChanged { queue } => Some(queue),
                 _ => None,
             })
         }
@@ -1326,6 +1577,28 @@ mod tests {
 
     #[derive(Default)]
     struct SeenPrompts(Mutex<Vec<(String, String, Origin)>>);
+
+    #[derive(Default)]
+    struct SlowPreparation {
+        entered: std::sync::atomic::AtomicBool,
+        timed_out: std::sync::atomic::AtomicBool,
+        release: (Mutex<bool>, std::sync::Condvar),
+    }
+
+    impl PromptHooks for SlowPreparation {
+        fn prompt_sent(&self, _: &PromptSent<'_>) {
+            self.entered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let guard = self.release.0.lock().unwrap();
+            let (_released, waited) = self
+                .release
+                .1
+                .wait_timeout_while(guard, Duration::from_secs(5), |released| !*released)
+                .unwrap();
+            self.timed_out
+                .store(waited.timed_out(), std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 
     impl PromptHooks for SeenPrompts {
         fn prompt_sent(&self, sent: &PromptSent<'_>) {
@@ -1407,6 +1680,44 @@ mod tests {
                 .extra_mut(&session_id, |s| s.is_some_and(|s| !s.turn_running()))
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn stopping_during_blocking_preparation_never_starts_the_agent() {
+        let f = fixture("s-stop-preparation").await;
+        let hooks = Arc::new(SlowPreparation::default());
+        f.host.set_prompt_hooks(hooks.clone());
+        f.host
+            .submit(
+                &f.key,
+                Prompt::text("do not run after Stop"),
+                Origin::Local,
+                SubmitPolicy::QueueIfBusy,
+            )
+            .unwrap();
+        until("preparation started", || {
+            hooks.entered.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await;
+        // The synchronous submit and the current-thread runtime both stay
+        // responsive while the hook is still waiting on blocking work.
+        assert!(!hooks.timed_out.load(std::sync::atomic::Ordering::SeqCst));
+        f.host.stop(&f.key, Origin::Local).unwrap();
+        *hooks.release.0.lock().unwrap() = true;
+        hooks.release.1.notify_all();
+        idle(&f).await;
+        assert!(
+            f.native.prompts().is_empty(),
+            "Stop must win before agent dispatch"
+        );
+        until("the cancelled turn reaches the delta sink", || {
+            f.recorder
+                .deltas()
+                .iter()
+                .any(|delta| matches!(delta, SessionDelta::TurnFinished { .. }))
+        })
+        .await;
+        let _ = std::fs::remove_dir_all(&f.dir);
     }
 
     /// The room's link dropping is not the driver losing the seat: while it
@@ -1612,8 +1923,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&f.dir);
     }
 
-    /// A long prompt travels whole to the agent and cut to the wire bound on
-    /// `queue_changed` and in the snapshot.
+    /// A long prompt travels whole to the agent and in the snapshot, and cut
+    /// to the wire bound (marked `truncated`) on `queue_changed`.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_queued_prompts_text_is_cut_on_the_wire_but_sent_whole() {
         let f = fixture("s-long").await;
@@ -1635,11 +1946,16 @@ mod tests {
         let on_wire = f.recorder.last_queue().unwrap().remove(0);
         assert!(on_wire.len() <= QUEUE_WIRE_TEXT_MAX, "{}", on_wire.len());
         assert!(long.starts_with(&on_wire));
+        // The delta says it is a head, and the snapshot — what an edit, an
+        // agent switch or a restart onto a new session reads — has it whole
+        // (audit #78).
         assert_eq!(
-            f.host.snapshot_meta(&f.key).unwrap().queue[0].text,
-            on_wire,
-            "the snapshot shows the same head"
+            f.recorder.last_queue_items().unwrap()[0].truncated,
+            Some(true)
         );
+        let snapshot = f.host.snapshot_meta(&f.key).unwrap().queue.remove(0);
+        assert_eq!(snapshot.text, long, "the snapshot carries all of it");
+        assert_eq!(snapshot.truncated, None);
 
         f.native.release_prompt();
         until("the long prompt ran", || f.native.prompts().len() == 2).await;
@@ -2107,5 +2423,200 @@ mod tests {
         };
         assert_eq!(f.host.snapshot(&f.key).unwrap().turn_seq, turn_seq);
         let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    // ---- a failed turn halts the queue (audit #77) ----------------------
+
+    /// Start turn one with a hand-delivered answer and park `two` behind it.
+    async fn queued_behind_a_turn(
+        session_id: &'static str,
+    ) -> (
+        Fixture,
+        tokio::sync::oneshot::Sender<anyhow::Result<acp::StopReason>>,
+    ) {
+        let f = fixture(session_id).await;
+        let answer = f.native.queue_prompt();
+        f.host
+            .submit(
+                &f.key,
+                Prompt::text("one"),
+                Origin::Local,
+                SubmitPolicy::Now,
+            )
+            .unwrap();
+        until("turn one runs", || f.native.prompts().len() == 1).await;
+        f.host
+            .enqueue(&f.key, Prompt::text("two"), Origin::Local)
+            .unwrap();
+        (f, answer)
+    }
+
+    fn halted(f: &Fixture) -> bool {
+        f.host
+            .sessions
+            .extra_mut(&f.key.session_id, |s| s.is_some_and(|s| s.queue_halted()))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_turn_halts_the_queue_until_it_is_resumed() {
+        let failures: [anyhow::Result<acp::StopReason>; 3] = [
+            Err(anyhow::anyhow!("rate limited")),
+            Ok(acp::StopReason::Refusal),
+            Ok(acp::StopReason::MaxTokens),
+        ];
+        for (n, failure) in failures.into_iter().enumerate() {
+            let (f, answer) = queued_behind_a_turn("s-fail-halts").await;
+            let what = format!("failure #{n}");
+            answer.send(failure).ok();
+            idle(&f).await;
+            assert!(halted(&f), "{what}: the queue was not halted");
+            // The window's drain edge on idle must not run it either.
+            assert_eq!(f.host.drain_queue(&f.key).unwrap(), None, "{what}");
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert_eq!(f.native.prompts().len(), 1, "{what}: the queue drained");
+            assert_eq!(f.recorder.last_queue(), Some(vec!["two".into()]), "{what}");
+
+            assert!(f
+                .host
+                .resume_queue(&f.key, Origin::Local)
+                .unwrap()
+                .is_some());
+            until("the resumed queue runs", || f.native.prompts().len() == 2).await;
+            assert_eq!(f.native.prompts()[1], "two");
+            assert!(!halted(&f));
+            f.native.release_prompt();
+            idle(&f).await;
+            let _ = std::fs::remove_dir_all(&f.dir);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_that_ends_well_still_drains_the_queue() {
+        let (f, answer) = queued_behind_a_turn("s-ok-drains").await;
+        answer.send(Ok(acp::StopReason::EndTurn)).ok();
+        until("two runs", || f.native.prompts().len() == 2).await;
+        assert!(!halted(&f));
+        f.native.release_prompt();
+        idle(&f).await;
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_now_runs_a_halted_queues_pick() {
+        let (f, answer) = queued_behind_a_turn("s-fail-send-now").await;
+        answer.send(Err(anyhow::anyhow!("rate limited"))).ok();
+        idle(&f).await;
+        let item = f.host.queue_of(&f.key.session_id)[0].id.clone();
+        f.host.send_now(&f.key, &item, Origin::Local).unwrap();
+        until("the pick runs", || f.native.prompts().len() == 2).await;
+        assert!(!halted(&f));
+        f.native.release_prompt();
+        idle(&f).await;
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    // ---- a model pick forwards the option list (audit #38) ---------------
+
+    /// An agent whose model is one of its config options: picking a model
+    /// answers with the whole list, where an option that depends on the model
+    /// changed too. The selector stores that answer, as the ACP connection
+    /// does, and the options read it back.
+    #[derive(Default)]
+    struct ModelAsOption(Mutex<Vec<acp::SessionConfigOption>>);
+
+    fn option(id: &str, current: &str) -> acp::SessionConfigOption {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": id,
+            "type": "select",
+            "currentValue": current,
+            "options": [
+                { "value": "a", "name": "A" },
+                { "value": "b", "name": "B" },
+            ],
+        }))
+        .expect("a select option")
+    }
+
+    struct Selector(Arc<ModelAsOption>);
+
+    impl atlas_acp_thread::AgentModelSelector for Selector {
+        fn list_models(
+            &self,
+        ) -> futures::future::BoxFuture<'static, anyhow::Result<atlas_acp_thread::AgentModelList>>
+        {
+            Box::pin(async { Ok(atlas_acp_thread::AgentModelList::Flat(Vec::new())) })
+        }
+
+        fn select_model(
+            &self,
+            model_id: AgentModelId,
+        ) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
+            *self.0 .0.lock().unwrap() =
+                vec![option("model", model_id.as_str()), option("effort", "b")];
+            Box::pin(async { Ok(()) })
+        }
+
+        fn selected_model(
+            &self,
+        ) -> futures::future::BoxFuture<'static, anyhow::Result<atlas_acp_thread::AgentModelInfo>>
+        {
+            Box::pin(async { Err(anyhow::anyhow!("not asked")) })
+        }
+    }
+
+    impl atlas_acp_thread::AgentSessionConfigOptions for ModelAsOption {
+        fn config_options(&self) -> Vec<acp::SessionConfigOption> {
+            self.0.lock().unwrap().clone()
+        }
+
+        fn set_config_option(
+            &self,
+            _config_id: acp::SessionConfigId,
+            _value: acp::SessionConfigOptionValue,
+        ) -> futures::future::BoxFuture<'static, anyhow::Result<Vec<acp::SessionConfigOption>>>
+        {
+            Box::pin(async { Err(anyhow::anyhow!("not asked")) })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_model_pick_forwards_the_option_list_it_was_answered_with() {
+        let options = Arc::new(ModelAsOption::default());
+        *options.0.lock().unwrap() = vec![option("model", "a"), option("effort", "a")];
+        let native = FakeConnection::builder()
+            .agent(ATLAS_AGENT_ID)
+            .session_id("s-model-options")
+            .model_selector(Arc::new(Selector(options.clone())))
+            .config_options(options.clone())
+            .handle();
+        let recorder = Arc::new(Recorder::default());
+        let (host, dir) =
+            fresh_host_with_native_and_sink(ScriptedServer::new(native), recorder.clone());
+        let agent_id = host.spawn(ATLAS_AGENT_ID).await.expect("spawn").agent_id;
+        let key = host
+            .new_session(agent_id, dir.clone(), Vec::new())
+            .await
+            .expect("a session opens")
+            .key;
+
+        host.set_model(&key, "b".into(), Origin::Local)
+            .await
+            .expect("the pick");
+
+        let announced = recorder.deltas().into_iter().rev().find_map(|d| match d {
+            SessionDelta::ConfigOptionsUpdated { config_options, .. } => Some(config_options),
+            _ => None,
+        });
+        let announced = announced.expect("the pick's option list never reached the window");
+        let effort = announced
+            .iter()
+            .find(|o| o["id"] == "effort")
+            .expect("the dependent option");
+        assert_eq!(
+            effort["currentValue"], "b",
+            "the dependent knob stayed stale"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

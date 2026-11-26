@@ -144,7 +144,15 @@ fn parse_time(text: &str) -> Option<i64> {
 }
 
 fn active_at(remark: &PrComment) -> &str {
-    remark.edited_at.as_deref().unwrap_or(&remark.created_at)
+    [
+        Some(remark.created_at.as_str()),
+        remark.edited_at.as_deref(),
+        remark.published_at.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .max_by_key(|at| parse_time(at).unwrap_or(i64::MIN))
+    .unwrap_or(&remark.created_at)
 }
 
 /// What `state` says that `watch` has not told yet. `remarks` is `None` when
@@ -715,7 +723,7 @@ async fn read_remarks(
     number: u64,
     activity: super::pull_requests::PrActivity,
 ) -> Option<Vec<PrComment>> {
-    if activity.comments_truncated && activity.review_threads_truncated {
+    if activity.review_threads_truncated {
         return None;
     }
     let mut remarks = activity.comments;
@@ -745,6 +753,7 @@ async fn read_remarks(
                         body: c.body,
                         created_at: c.created_at,
                         edited_at: c.edited_at,
+                        published_at: c.published_at,
                         url: c.url,
                         path: Some(thread.path.clone()),
                         review_state: None,
@@ -832,6 +841,7 @@ pub fn start(app: AppHandle, host: Arc<AgentHost>) {
             key,
             OutgoingPrompt::text(wake.text.clone()),
             PromptOrigin::Atlas,
+            wake.restart_continuations,
         )
     }));
 
@@ -1148,6 +1158,7 @@ fn send_wake(host: &Arc<AgentHost>, thread_id: ThreadId, wake: WakeMessage) {
     tauri::async_runtime::spawn(async move {
         let pending = PendingWake {
             source: WakeSource::PullRequestWatch,
+            restart_continuations: 0,
             thread_id,
             text: wake.text,
             summary: wake.summary,
@@ -1213,10 +1224,7 @@ pub async fn settle_finished(host: &Arc<AgentHost>, on_merge: bool) {
             .threads()
             .iter()
             .filter(|t| settles(t, on_merge))
-            .filter(|t| {
-                host.settle_thread(t.thread_id, &super::session_watcher::activity_in)
-                    .unwrap_or(false)
-            })
+            .filter(|t| host.settle_thread(t.thread_id).unwrap_or(false))
             .count()
     })
     .await
@@ -1353,6 +1361,7 @@ mod fake {
                         body: r.body,
                         created_at: r.created_at,
                         edited_at: r.edited_at,
+                        published_at: None,
                         url: None,
                         path: r.path,
                         review_state: None,

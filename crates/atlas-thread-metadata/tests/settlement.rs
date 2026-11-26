@@ -116,6 +116,7 @@ fn a_user_send_unsettles_but_agent_and_outside_activity_do_not() {
         title: Some("A title".into()),
         worktree_paths: WorktreePaths::from_folder_paths(row.folder_paths()),
         remote_connection: None,
+        activity: true,
     });
     assert!(store.thread(id).unwrap().is_settled(), "agent output");
 

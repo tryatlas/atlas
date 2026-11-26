@@ -165,6 +165,18 @@ export function appearanceForMode(mode: ThemeMode): "dark" | "light" {
  *  the settings store sets it before re-applying. */
 let interfaceContrast = 100;
 
+let previewLease: { theme: Theme; mode: ThemeMode } | null = null;
+
+/** Hold the visible theme while editing; ordinary applies still update the launch cache. */
+export function beginThemePreview(theme: Theme, mode: ThemeMode): () => void {
+  const lease = { theme, mode };
+  previewLease = lease;
+  applyTheme(theme, mode, {}, { preview: true });
+  return () => {
+    if (previewLease === lease) previewLease = null;
+  };
+}
+
 export function setInterfaceContrast(contrast: number): void {
   interfaceContrast = contrast;
 }
@@ -178,6 +190,10 @@ export function applyTheme(
   { preview = false }: { preview?: boolean } = {},
 ): ResolvedTheme {
   const resolved = resolveTheme(theme, appearanceForMode(mode), themeOverride, interfaceContrast);
+  if (!preview && previewLease) {
+    cacheLaunchTheme(launchCache(resolved));
+    return applyTheme(previewLease.theme, previewLease.mode, {}, { preview: true });
+  }
   activeTheme = resolved;
   if (typeof document === "undefined") return resolved;
 

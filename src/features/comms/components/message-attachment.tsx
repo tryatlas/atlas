@@ -1,6 +1,6 @@
 import { memo, useEffect, useState } from "react";
 import { Download, FileText, Link as LinkIcon } from "lucide-react";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { useLocalMedia } from "@/features/media/lib/use-local-media";
 import { HintGroup, HintItem, Icon, IconButton, Spinner } from "@tryatlas/design";
 import { openConversationMedia } from "../stores/lightbox-store";
 import { useCommsStore } from "../stores/comms-store";
@@ -62,10 +62,15 @@ export const MessageAttachment = memo(function MessageAttachment({
     };
   }, [attachment.id, attachment.filename, inline, path, failed]);
 
-  if (isAudio && !failed) {
+  const media = useLocalMedia(
+    inline ? path : null,
+    isAudio ? "audio" : isVideo ? "video" : "image",
+  );
+
+  if (isAudio && !failed && !media.error) {
     return (
       <AudioPlayer
-        src={path ? convertFileSrc(path) : null}
+        src={media.url}
         filename={attachment.filename}
         subtitle={formatBytes(attachment.bytes)}
         buffering={false}
@@ -74,11 +79,11 @@ export const MessageAttachment = memo(function MessageAttachment({
     );
   }
 
-  if (inline && !failed) {
+  if (inline && !failed && !media.error) {
     // Until the ratio is known, reserve a 16/10 box — close enough for most
     // screenshots that the correction is not a visible jump.
     const box = { aspectRatio: String(ratio ?? 16 / 10) };
-    if (!path) {
+    if (!media.url) {
       return (
         <div
           style={box}
@@ -91,7 +96,7 @@ export const MessageAttachment = memo(function MessageAttachment({
     if (isVideo) {
       return (
         <video
-          src={convertFileSrc(path)}
+          src={media.url}
           controls
           preload="metadata"
           style={box}
@@ -107,7 +112,7 @@ export const MessageAttachment = memo(function MessageAttachment({
         className="block w-full max-w-[520px] cursor-zoom-in overflow-hidden rounded-lg border border-border-subtle bg-card"
       >
         <img
-          src={convertFileSrc(path)}
+          src={media.url}
           alt={attachment.filename}
           draggable={false}
           onLoad={(e) => {
@@ -159,7 +164,7 @@ export const MessageAttachment = memo(function MessageAttachment({
         </span>
         <span className="block text-2xs tabular-nums text-disabled">
           {formatBytes(attachment.bytes)}
-          {failed && " · could not load"}
+          {(failed || media.error) && " · could not load"}
         </span>
       </span>
       <HintGroup>

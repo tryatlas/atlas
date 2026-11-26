@@ -19,6 +19,7 @@
 
 import type { DirectoryListing, ProjectEntry, ProjectEntryKind } from "./fs-api";
 import type { TreeSearchState } from "./tree-search";
+import { normalisePath } from "@/lib/file-links";
 
 /** One drawn row. Immutable and shared between flattens; see `rowsOf`. */
 export interface TreeRowData {
@@ -700,7 +701,7 @@ export class ProjectTreeModel {
     if (!this.listings.has("") && (!dirs || dirs.includes(""))) candidates.push("");
     const now: string[] = [];
     for (const dir of candidates) {
-      if (this.isVisibleDirectory(dir)) now.push(dir);
+      if (this.view.search || this.isVisibleDirectory(dir)) now.push(dir);
       else if (this.listings.has(dir)) this.stale.add(dir);
     }
     return this.load(now, { force: true });
@@ -772,9 +773,13 @@ export function refreshProjectTree(root: string, dirs?: readonly string[]): void
     return;
   }
   const rel: string[] = [];
+  const normalizedRoot = normalisePath(root);
+  if (!normalizedRoot) return;
   for (const dir of dirs) {
-    if (dir === root) rel.push("");
-    else if (dir.startsWith(`${root}/`)) rel.push(dir.slice(root.length + 1));
+    const normalizedDir = normalisePath(dir);
+    if (normalizedDir === normalizedRoot) rel.push("");
+    else if (normalizedDir?.startsWith(`${normalizedRoot}/`))
+      rel.push(normalizedDir.slice(normalizedRoot.length + 1));
   }
   if (rel.length > 0) void model.refresh(rel);
 }

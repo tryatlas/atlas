@@ -94,6 +94,9 @@ export function MembersModal({
   const [leaving, setLeaving] = useState(false);
   const leave = async () => {
     if (!org) return;
+    // The switch can succeed before the server refuses leaving. Close this
+    // confirmation before the active Organisation (and its label) can change.
+    setConfirmLeave(false);
     setLeaving(true);
     try {
       // `false`: the switch away was declined, and nothing was left.

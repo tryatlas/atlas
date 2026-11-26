@@ -6,6 +6,87 @@
 use atlas_comms::store::CommsStore;
 use atlas_comms::wire::{Conversation, ConversationKind, ReadState, Visibility};
 
+#[test]
+fn space_edits_survive_reopen_and_acknowledgement_is_identity_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("comms.db");
+    let store = CommsStore::open(&path).unwrap();
+    let id = store
+        .enqueue_space_update("a", "o", "c", "p", &[0, 1, 255])
+        .unwrap();
+    drop(store);
+    let store = CommsStore::open(&path).unwrap();
+    assert!(store.is_durable());
+    assert!(store
+        .load_space_updates("other", "o", "c", "p")
+        .unwrap()
+        .is_empty());
+    store
+        .acknowledge_space_updates("other", "o", "c", "p", &[id])
+        .unwrap();
+    let edits = store.load_space_updates("a", "o", "c", "p").unwrap();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].data, [0, 1, 255]);
+    store
+        .acknowledge_space_updates("a", "o", "c", "p", &[id])
+        .unwrap();
+    assert!(store
+        .load_space_updates("a", "o", "c", "p")
+        .unwrap()
+        .is_empty());
+    let next = store
+        .enqueue_space_update("a", "o", "c", "p", &[2])
+        .unwrap();
+    assert!(next > id);
+    let memory = CommsStore::open_in_memory().unwrap();
+    assert!(!memory.is_durable());
+    assert!(memory
+        .enqueue_space_update("a", "o", "c", "p", &[3])
+        .is_err());
+}
+
+#[test]
+fn a_recovery_snapshot_survives_acknowledgement_and_is_identity_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("comms.db");
+    let store = CommsStore::open(&path).unwrap();
+    let row = store
+        .enqueue_space_update("a", "o", "c", "p", &[4])
+        .unwrap();
+    store
+        .save_space_snapshot("a", "o", "c", "p", &[1, 2, 3, 4])
+        .unwrap();
+    store
+        .acknowledge_space_updates("a", "o", "c", "p", &[row])
+        .unwrap();
+    drop(store);
+    let store = CommsStore::open(&path).unwrap();
+    assert_eq!(
+        store.load_space_snapshot("a", "o", "c", "p").unwrap(),
+        Some(vec![1, 2, 3, 4])
+    );
+    for scope in [
+        ("other", "o", "c", "p"),
+        ("a", "other", "c", "p"),
+        ("a", "o", "other", "p"),
+        ("a", "o", "c", "other"),
+    ] {
+        assert!(store
+            .load_space_snapshot(scope.0, scope.1, scope.2, scope.3)
+            .unwrap()
+            .is_none());
+    }
+    store.save_space_snapshot("a", "o", "c", "p", &[9]).unwrap();
+    assert_eq!(
+        store.load_space_snapshot("a", "o", "c", "p").unwrap(),
+        Some(vec![9])
+    );
+    assert!(CommsStore::open_in_memory()
+        .unwrap()
+        .save_space_snapshot("a", "o", "c", "p", &[9])
+        .is_err());
+}
+
 fn conv(id: &str, name: &str) -> Conversation {
     Conversation {
         id: id.into(),

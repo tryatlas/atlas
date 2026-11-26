@@ -151,6 +151,7 @@ fn live(from: &ThreadMetadata, title: Option<&str>) -> LiveThreadUpdate {
         title: title.map(std::sync::Arc::from),
         worktree_paths: from.worktree_paths.clone(),
         remote_connection: None,
+        activity: true,
     }
 }
 
@@ -250,6 +251,7 @@ fn a_thread_with_no_project_is_kept_in_history_and_listed_under_none() {
         title: None,
         worktree_paths: WorktreePaths::default(),
         remote_connection: None,
+        activity: true,
     });
     store.flush().unwrap();
 
@@ -471,6 +473,7 @@ fn a_drafts_session_id_is_never_written_even_when_the_caller_offers_one() {
             "/tmp/atlas",
         )])),
         remote_connection: None,
+        activity: true,
     });
     store.flush().unwrap();
 

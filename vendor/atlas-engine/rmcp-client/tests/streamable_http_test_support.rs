@@ -337,8 +337,7 @@ impl Drop for ExecServerProcess {
 /// Starts a local exec-server and connects an initialized `ExecServerClient`.
 pub(crate) async fn spawn_exec_server() -> anyhow::Result<ExecServerProcess> {
     let atlas_agent_home = TempDir::new()?;
-    let mut child = Command::new(atlas_engine_utils_cargo_bin::cargo_bin("atlas-agent")?)
-        .args(["exec-server", "--listen", "ws://127.0.0.1:0"])
+    let mut child = Command::new(atlas_engine_utils_cargo_bin::cargo_bin("test_exec_server")?)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -361,7 +360,7 @@ pub(crate) async fn spawn_exec_server() -> anyhow::Result<ExecServerProcess> {
     })
 }
 
-/// Reads the websocket URL printed by `atlas_engine exec-server --listen`.
+/// Reads the websocket URL printed by the production executor's test entry point.
 async fn read_exec_server_listen_url(child: &mut Child) -> anyhow::Result<String> {
     let stdout = child
         .stdout

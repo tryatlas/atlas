@@ -70,7 +70,7 @@ export function CenterPanel() {
   // only the active one visible. Background projects keep the INERT expensive
   // subtrees mounted (editor/chat/knowledge/settings) so switching back is
   // instant, but drop the ones that keep working while hidden — terminals,
-  // browser embeds, Pixi graphs, PDFs — which were burning CPU/GPU in
+  // Pixi graphs, PDFs — which were burning CPU/GPU in
   // projects the user couldn't even see. A project with no view yet (never
   // visited this session) renders nothing until its first cold load.
   return (

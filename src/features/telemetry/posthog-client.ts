@@ -233,6 +233,12 @@ export function captureClientError(error: unknown, context: Record<string, unkno
 export function scrubMessage(text: string): string {
   return (
     text
+      // Native Windows errors and JS stacks carry drive paths and UNC shares,
+      // including spaces. Redact before the slash-only Unix matcher below.
+      .replace(/\b[A-Za-z]:[\\/][^\r\n"'<>|)]+|\\\\[^\\\s]+\\[^\r\n"'<>|)]+/g, (path) => {
+        const ext = /(\.[a-z0-9]{1,10})(?::\d+(?::\d+)?)?\s*$/i.exec(path)?.[1] ?? "";
+        return `<path${ext}>`;
+      })
       // Home directories, any user: `/Users/x/…` (mac), `/home/x/…` (linux).
       .replace(/\/(?:Users|home)\/[^/\s]+/g, "~")
       // Anything path-like that survives — keep the extension, drop the rest.

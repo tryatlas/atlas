@@ -355,9 +355,6 @@ pub(crate) fn promote(project_root: &Path, home: &Path, name: &str) -> Result<Sk
     }
     let dst = canonical_skill_dir(&skills_base(home), &safe)?;
     // Copy project canonical → global canonical (overwrite global copy).
-    if dst.exists() {
-        fs::remove_dir_all(&dst).map_err(|e| e.to_string())?;
-    }
     copy_dir_all(&src, &dst)?;
 
     let mut enabled_agents = Vec::new();
@@ -409,8 +406,10 @@ fn install_skill_from_dir(
 
     let safe = sanitize_name(skill_id)?;
     let dst = canonical_skill_dir(&skills_base(root), &safe)?;
-    if dst.exists() {
-        fs::remove_dir_all(&dst).map_err(|e| e.to_string())?;
+    if dst.symlink_metadata().is_ok() {
+        return Err(format!(
+            "skill '{safe}' is already installed; its local copy has been kept"
+        ));
     }
     copy_dir_all(&src_dir, &dst)?;
 

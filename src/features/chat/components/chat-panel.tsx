@@ -12,7 +12,12 @@ import { createPortal } from "react-dom";
 import { toast } from "sonner";
 import { clearAgentQuestion } from "@/features/notifications/lib/agent-notifier";
 import { useChatStore } from "../stores/chat-store";
-import { pinScope, resolvePinIndex, type ChatPin } from "../stores/chat-pins-store";
+import {
+  pinScope,
+  resolvePinIndex,
+  useChatPinsStore,
+  type ChatPin,
+} from "../stores/chat-pins-store";
 import { useDetailPanelStore } from "../stores/detail-panel-store";
 import { sessionScope } from "../lib/session-scope";
 import {
@@ -21,7 +26,6 @@ import {
 } from "@/features/session-context/stores/session-details-store";
 import { useSessionHeaderSlot } from "../stores/session-header-slot-store";
 import { useSessionSidePanel, useSessionSidePanelStore } from "../stores/session-side-panel-store";
-import { useSendHeldForTerminal } from "../stores/live-elsewhere-store";
 import { driverLabel } from "../lib/rc-api";
 import { useRcRemoteDriver } from "../stores/rc-store";
 import type { ImageAttachment } from "@/types/agents";
@@ -93,6 +97,7 @@ const ChatSearchPalette = lazy(() =>
 const Transcript = lazy(() => import("./transcript").then((m) => ({ default: m.Transcript })));
 import type { TranscriptHandle } from "./transcript";
 import { emitWindowEvent, useWindowEvent } from "@/lib/window-events";
+import { messageJump } from "../lib/jump-to-comment";
 // Diffs + tool output live here rather than inline in the thread — see the
 // module header for why that's a perf decision as much as a UX one.
 const DetailPanel = lazy(() => import("./detail-panel").then((m) => ({ default: m.DetailPanel })));
@@ -247,6 +252,19 @@ const ChatPanelContent = memo(function ChatPanelContent({ tabId }: ChatPanelProp
   // One scope for the whole panel — the header's pin dropdown and the
   // transcript's per-row pin buttons must address the same bucket.
   const pinScopeKey = pinScope(tabId, session?.acpSessionId);
+  // Pins outlive the ids they were placed with. A tab's first bind moves the
+  // pins placed before it to the session's scope, which a reopen reads; and
+  // whenever the thread's length changes (a load, a reopen, a rewind) the
+  // scope's pins are re-pointed at the messages showing, so a row keeps
+  // reading as pinned. Here, at the panel, so neither store calls the other.
+  const tabScopeKey = pinScope(tabId, undefined);
+  const messageCount = session?.messages.length ?? 0;
+  useEffect(() => {
+    const pins = useChatPinsStore.getState().actions;
+    if (pinScopeKey !== tabScopeKey) pins.adopt(tabScopeKey, pinScopeKey);
+    const messages = useChatStore.getState().sessions[tabId]?.messages;
+    if (messages?.length) pins.reconcile(pinScopeKey, messages);
+  }, [tabId, pinScopeKey, tabScopeKey, messageCount]);
 
   // A fresh chat starts on the native agent and starts immediately: the
   // default needs no probe, so there is no window in which the tab has to sit
@@ -271,10 +289,6 @@ const ChatPanelContent = memo(function ChatPanelContent({ tabId }: ChatPanelProp
   useChatPanelHotkeys(tabId, rootRef);
   useAcpPrewarm();
 
-  // A session another process is writing (ADR-0001 amendment, Rule 7) closes
-  // the drain gate like a pending resume does; "Send anyway" or the other
-  // process going quiet is its falling edge. The composer feeds the live set.
-  const heldElsewhere = useSendHeldForTerminal(session?.acpSessionId);
   // The no-AI-grant hold on the queue (`send-gate.ts`): what the composer
   // lock would be with no turn running.
   const noAiGrant = useNoAiGrant();
@@ -325,13 +339,16 @@ const ChatPanelContent = memo(function ChatPanelContent({ tabId }: ChatPanelProp
         toast.error("That message is no longer in this thread");
         return;
       }
-      emitWindowEvent("atlas:chat-jump", { index, tabId });
+      // With the pinned row's id: a pin on an answer that follows a thought or
+      // a tool call is not its turn's first message, and a jump by index
+      // alone found no turn starting there and went nowhere.
+      emitWindowEvent("atlas:chat-jump", messageJump(messages, index, tabId));
     },
     [tabId],
   );
   // The drain (`session-send.ts` decides what goes and what Rust's queue
   // holds), then the window events that send or stop from outside the composer.
-  useQueueDrain({ tabId, session, heldElsewhere, grantHold, bindControlRef });
+  useQueueDrain({ tabId, session, grantHold, bindControlRef });
   useChatPanelEvents(tabId, handleSendRef, handleStopRef);
 
   // No session yet. Normally a single frame (the effect above creates it on
@@ -438,10 +455,11 @@ const ChatPanelContent = memo(function ChatPanelContent({ tabId }: ChatPanelProp
           <SessionElicitation
             pending={pendingElicitation ?? null}
             remoteDriver={elicitationRemoteDriver}
-            onClose={() => {
-              if (!pendingElicitation) return;
-              clearAgentQuestion(tabId, pendingElicitation.requestId);
-              clearElicitation(tabId);
+            // By the id of the question answered: a late answer to a question
+            // already replaced must not close the one now showing.
+            onClose={(id) => {
+              clearAgentQuestion(tabId, id);
+              clearElicitation(tabId, id);
             }}
           />
           {/* Bottom fade lives in the transcript; the centered floating
@@ -497,7 +515,11 @@ const ChatPanelContent = memo(function ChatPanelContent({ tabId }: ChatPanelProp
             open={searchPaletteOpen}
             onOpenChange={setSearchPaletteOpen}
             messages={session.messages}
-            onJump={(idx) => emitWindowEvent("atlas:chat-jump", { index: idx, tabId })}
+            onJump={(idx) =>
+              // A reply mid-turn is not its turn's first message: the jump
+              // names its row, or it would go nowhere.
+              emitWindowEvent("atlas:chat-jump", messageJump(session.messages, idx, tabId))
+            }
           />
         </Suspense>
       )}

@@ -36,6 +36,7 @@ use hooks_common::EXTERNAL_AGENT_MIGRATED_HOOKS_SUBDIR;
 use hooks_common::SOURCE_EXTERNAL_AGENT_NAME;
 #[cfg(test)]
 use hooks_common::copy_hook_scripts;
+#[cfg(test)]
 pub(crate) use hooks_common::external_agent_config_dir;
 #[cfg(test)]
 use hooks_common::external_agent_project_dir_env_var;

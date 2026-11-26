@@ -26,9 +26,21 @@ uuid = { version = "1", features = ["v4"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# Already present in the workspace lock; kill-on-close process-tree ownership.
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
+
+[features]
+# `test_support::ScriptedAgent`, the scripted ACP agent process the
+# conformance suite runs. Turned on under `[dev-dependencies]` only, here and
+# in every consumer, so no shipping build compiles it.
+test-support = []
+
 [dev-dependencies]
 # The shared scripted `AgentConnection`; the feature is for tests only.
 atlas-acp-thread = { path = "../atlas-acp-thread", features = ["test-support"] }
+# This crate's own integration tests use the scripted agent too.
+atlas-agent-servers = { path = ".", features = ["test-support"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 
 # The workspace lint table is only real for members that opt in —

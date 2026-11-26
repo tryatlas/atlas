@@ -32,12 +32,8 @@ def _request(url: str) -> bytes:
     return github_request(url, "atlas-engine-skill-list")
 
 
-def _atlas_agent_home() -> str:
-    return os.environ.get("ATLAS_AGENT_HOME", os.path.expanduser("~/.atlas-agent"))
-
-
 def _installed_skills() -> set[str]:
-    root = os.path.join(_atlas_agent_home(), "skills")
+    root = os.path.expanduser("~/.agents/skills")
     if not os.path.isdir(root):
         return set()
     entries = set()

@@ -29,7 +29,6 @@ export const SURFACE_FOCUS_VARIABLES = [
   "knowledgeFocus",
   "pdfFocus",
   "canvasFocus",
-  "browserFocus",
   "diffFocus",
   "pullRequestFocus",
 ] as const;
@@ -57,7 +56,6 @@ export const WHEN_VARIABLE_DESCRIPTIONS: Readonly<Record<string, string>> = {
   knowledgeFocus: "Knowledge is the active tab",
   pdfFocus: "A PDF is the active tab",
   canvasFocus: "A canvas or space is the active tab",
-  browserFocus: "The browser is the active tab",
   diffFocus: "The review diff is the active tab",
   pullRequestFocus: "A pull request is the active tab",
   inputFocus: "You're typing in a text field",
