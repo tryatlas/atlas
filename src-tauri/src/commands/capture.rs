@@ -5603,9 +5603,15 @@ mod sync_worker_tests {
     #[test]
     fn a_projects_backlog_blocks_neither_recording_nor_another_projects_sync() {
         let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let a = cloud_project(a_dir.path(), "rw-a", 300);
-        let b = cloud_project(b_dir.path(), "rw-b", 1);
-        let (a_root, b_root) = (a_dir.path().to_path_buf(), b_dir.path().to_path_buf());
+        // The roots as the app holds them: the worker looks a Project's store
+        // up by its canonical path (`project_id_for`), and a temp dir is not
+        // one on macOS, where `/var` is a symlink to `/private/var`.
+        let (a_root, b_root) = (
+            PathBuf::from(project_id_for(a_dir.path())),
+            PathBuf::from(project_id_for(b_dir.path())),
+        );
+        let a = cloud_project(&a_root, "rw-a", 300);
+        let b = cloud_project(&b_root, "rw-b", 1);
         let stores: StoreRegistry = Arc::default();
         lock_ok(&stores).insert(a_root.clone(), a.clone());
         lock_ok(&stores).insert(b_root.clone(), b.clone());
