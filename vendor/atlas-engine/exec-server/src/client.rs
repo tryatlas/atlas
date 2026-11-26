@@ -1801,6 +1801,21 @@ mod tests {
             .expect("parent span should have trace context");
         let process_id = ProcessId::from("trace-process");
 
+        // The request span's callsite is shared with every other test that
+        // starts a process, and tracing caches one verdict per callsite for
+        // the whole process. A test thread with no subscriber that reaches it
+        // first caches "never"; the rebuild above corrects that, but only for
+        // callsites already on tracing's list, and a thread caught between
+        // deciding and listing is missed. The span then stays off, the request
+        // carries the parent's own span id, and the last assertion fails:
+        // about one run in six when the whole suite starts at once. A few
+        // spaced rebuilds outlast that window, which is two adjacent
+        // statements wide.
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            tracing::callsite::rebuild_interest_cache();
+        }
+
         let session = client
             .start_process(
                 ExecParams {

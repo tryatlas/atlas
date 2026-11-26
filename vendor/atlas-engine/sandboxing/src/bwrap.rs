@@ -57,6 +57,16 @@ fn should_warn_about_system_bwrap(permission_profile: &PermissionProfile) -> boo
 }
 
 fn system_bwrap_warning_for_path(system_bwrap_path: Option<&Path>) -> Option<String> {
+    system_bwrap_warning_for_path_within(system_bwrap_path, SYSTEM_BWRAP_PROBE_TIMEOUT)
+}
+
+/// The probe's patience is a parameter so a test can wait out a loaded
+/// machine: a probe that times out reports no warning, which reads there as a
+/// missed one.
+fn system_bwrap_warning_for_path_within(
+    system_bwrap_path: Option<&Path>,
+    probe_timeout: Duration,
+) -> Option<String> {
     if is_wsl1() {
         return Some(WSL1_BWRAP_WARNING.to_string());
     }
@@ -65,7 +75,7 @@ fn system_bwrap_warning_for_path(system_bwrap_path: Option<&Path>) -> Option<Str
         return Some(MISSING_BWRAP_WARNING.to_string());
     };
 
-    if !system_bwrap_has_user_namespace_access(system_bwrap_path, SYSTEM_BWRAP_PROBE_TIMEOUT) {
+    if !system_bwrap_has_user_namespace_access(system_bwrap_path, probe_timeout) {
         return Some(USER_NAMESPACE_WARNING.to_string());
     }
 
