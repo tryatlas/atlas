@@ -719,9 +719,9 @@ fn macos_git_binary_from_path(
 fn apple_developer_tools_available() -> bool {
     Command::new("/usr/bin/xcode-select")
         .arg("-p")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
 }
