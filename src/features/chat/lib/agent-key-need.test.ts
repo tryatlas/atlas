@@ -57,6 +57,7 @@ describe("detectKeyNeed", () => {
       ["STANDARDCOMPUTE_API_KEY missing", "standardcompute"],
       ["UBERLLM_API_KEY missing", "uberllm"],
       ["TRUSTEDROUTER_API_KEY missing", "trustedrouter"],
+      ["LLMTR_API_KEY missing", "llmtr"],
       ["needs XAI_API_KEY", "xai"],
       ["MISTRAL_API_KEY not set", "mistral"],
       ["GROQ_API_KEY required", "groq"],
