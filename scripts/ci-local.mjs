@@ -18,9 +18,11 @@
  * and the order they are read in. The default is this machine.
  *
  * The jobs and their commands are read out of `.github/workflows/ci.yml` at
- * run time, never copied: every `run:` step of every job, with the crate
- * matrix expanded from `.github/ci-crates.json` and its `if: matrix.<flag>`
- * conditions applied. Which jobs to run comes from the same planner CI's
+ * run time, never copied: every `run:` step of every job. CI groups the
+ * crates into a few jobs; here each crate is a job of its own, expanded from
+ * `.github/ci-crates.json` with its `if: matrix.<flag>` conditions applied,
+ * and scripts/ci-crates.mjs (the command CI's `crates` job runs) gets that
+ * one crate through CI_CRATES, as CI passes it a group. Which jobs to run comes from the same planner CI's
  * `changes` job uses (`scripts/ci-affected.mjs`), diffing the working tree
  * against the merge base with this branch's upstream. `frontend` always runs,
  * as in CI.
@@ -61,8 +63,8 @@
  *     that breaks or trips a lint. A Mac never compiles it, but it can
  *     type-check it, and for that it needs no Linux. For crates flagged `cross`
  *     in .github/ci-crates.json (their dependency tree builds no C), a Linux
- *     job run on a Mac gets each of its clippy steps again with `--target`
- *     for CI's Linux triple. Nothing links, so no Linux linker or sysroot is
+ *     job run on a Mac gets its clippy pass again with `--target` for CI's
+ *     Linux triple (CI_EXTRA_CLIPPY_TARGET, read by scripts/ci-crates.mjs). Nothing links, so no Linux linker or sysroot is
  *     needed; the standard library comes from rust-toolchain.toml's `targets`.
  *   - Code that only *runs* correctly on Linux: the engine's sandbox, which
  *     is bubblewrap, landlock and seccomp there and seatbelt on a Mac. The
@@ -199,6 +201,8 @@ function ciJobs() {
         name: entry ? entry.crate : (job.name ?? id),
         crate: entry?.crate,
         flags: entry ?? {},
+        // What CI's `crates` job hands scripts/ci-crates.mjs: here, one crate.
+        env: entry ? { CI_CRATES: entry.crate } : {},
         os,
         arch: /-arm\b/.test(runsOn) ? "arm64" : "x64",
         steps,
@@ -566,11 +570,12 @@ function stopJobContainer(id) {
  * so the step runs through it explicitly: it sets HOME, CARGO_HOME and
  * CARGO_TARGET_DIR and drops to the host user, as it does for `docker run`.
  */
-function execArgs(ctx, id, cwd, command) {
+function execArgs(ctx, id, cwd, command, vars = {}) {
   const tty = process.stdout.isTTY && process.stdin.isTTY;
   return [
     "exec",
     ...(tty ? ["-t"] : []),
+    ...Object.entries(vars).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
     "-w",
     path.posix.join(ctx.root, cwd),
     id,
@@ -589,24 +594,14 @@ function run(cmd, args, opts) {
 }
 
 /**
- * A Linux job run on another OS: after each clippy step, the same step for
- * CI's Linux target, for crates whose tree allows it (see the docblock).
+ * A Linux job run on another OS: its crate's clippy pass again for CI's Linux
+ * target, for crates whose tree allows it (see the docblock).
+ * scripts/ci-crates.mjs adds the pass when CI_EXTRA_CLIPPY_TARGET is set.
  */
 function withLinuxTargetClippy(job) {
   if (job.where !== "native" || job.os !== "linux" || HOST_OS === "linux") return;
   if (!job.flags.cross) return;
-  job.steps = job.steps.flatMap((step) => {
-    if (!/^cargo clippy\b/.test(step.run) || /--target\b/.test(step.run)) return [step];
-    const triple = linuxTriple(job);
-    return [
-      step,
-      {
-        name: `${step.name}, for ${triple}`,
-        run: step.run.replace(/^cargo clippy/, `cargo clippy --target ${triple}`),
-        cwd: step.cwd,
-      },
-    ];
-  });
+  job.env = { ...job.env, CI_EXTRA_CLIPPY_TARGET: linuxTriple(job) };
 }
 
 async function main(argv) {
@@ -660,7 +655,10 @@ async function main(argv) {
         skip: `  (skipped: CI runs it on ${j.os})`,
         native: "",
       }[j.where];
-      console.log(`\n${j.name}${where}`);
+      const vars = Object.entries(j.env)
+        .map(([k, v]) => `${k}=${v}`)
+        .join(" ");
+      console.log(`\n${j.name}${where}${vars ? `  [${vars}]` : ""}`);
       for (const s of j.steps) {
         const skip = skipReason(j, s) ? `  (skipped: ${skipReason(j, s)})` : "";
         console.log(`  [${s.cwd}] ${s.run.replace(/\s*\n\s*/g, "; ")}${skip}`);
@@ -800,10 +798,10 @@ async function runJob(job, ctx, env, out) {
     const command = ["bash", "-eo", "pipefail", "-c", step.run];
     const status =
       job.where === "container"
-        ? await run(DOCKER, execArgs(ctx, container, step.cwd, command), { stdio })
+        ? await run(DOCKER, execArgs(ctx, container, step.cwd, command, job.env), { stdio })
         : await run(command[0], command.slice(1), {
             cwd: path.join(REPO_ROOT, step.cwd),
-            env,
+            env: { ...env, ...job.env },
             stdio,
           });
     if (status !== 0) {

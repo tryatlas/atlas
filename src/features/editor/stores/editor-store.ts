@@ -47,7 +47,7 @@ interface EditorActions {
   actions: {
     openBuffer: (path: string, content: string, mtimeMs?: number) => void;
     setDirty: (path: string, dirty: boolean) => void;
-    markSaved: (path: string, content: string, mtimeMs?: number) => void;
+    markSaved: (path: string, content: string, mtimeMs?: number, dirty?: boolean) => void;
     /** Overwrite a buffer's content from disk (external change, buffer clean). */
     reloadBuffer: (path: string, content: string, mtimeMs: number) => void;
     /** Flag a dirty buffer whose file changed on disk (no content overwrite). */
@@ -94,12 +94,12 @@ export const useEditorStore = create<EditorState & EditorActions>()(
           // Clean means the document is the disk's text: nothing to carry.
           if (buf && !dirty) delete buf.draft;
         }),
-      markSaved: (path, content, mtimeMs) =>
+      markSaved: (path, content, mtimeMs, dirty = false) =>
         set((s) => {
           const buf = s.buffers[path];
           if (buf) {
             buf.originalContent = content;
-            buf.dirty = false;
+            buf.dirty = dirty;
             buf.externallyChanged = false;
             delete buf.draft;
             if (mtimeMs !== undefined) buf.diskMtimeMs = mtimeMs;

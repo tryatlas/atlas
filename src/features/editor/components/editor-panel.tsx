@@ -281,7 +281,15 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
     },
     onPendingChange: markClean,
     onConfirmed: (content) => {
-      markSaved(path, content, persistedMtime.current);
+      // The write may have finished after another edit. Record its baseline
+      // without letting disk reconciliation overwrite the newer document.
+      const current = viewRef.current?.getText();
+      markSaved(
+        path,
+        content,
+        persistedMtime.current,
+        current !== undefined && current !== content,
+      );
       logEvent({
         source: "editor",
         kind: "save",

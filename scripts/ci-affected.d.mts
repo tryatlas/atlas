@@ -19,6 +19,19 @@ export interface Package {
   dir: string;
   /** Names of the packages this one depends on by path (any kind). */
   deps: string[];
+  /** A `crates/*` package the root workspace excludes (own lockfile and target dir). */
+  excluded?: boolean;
+}
+
+export interface CrateGroup {
+  /** The job's name. */
+  group: string;
+  /** Crate names, checked by scripts/ci-crates.mjs in this order. */
+  crates: string[];
+  /** Whether the job installs bubblewrap. */
+  sandbox: boolean;
+  /** The directory rust-cache keys off: `.` or the excluded crate's own. */
+  workspace: string;
 }
 
 export interface Workspace {
@@ -63,6 +76,9 @@ export function plan(
   ctx: { workspace: Workspace; crates: CrateEntry[]; dialect: string[] },
   allReason?: string,
 ): Plan;
+export const CRATES_PER_GROUP: number;
+export function crateGroups(crates: CrateEntry[], workspace: Workspace): CrateGroup[];
+export function forDraft(p: Plan): Plan;
 export function readCrateMatrix(root?: string): CrateEntry[];
 export function resolveRange(
   env: Record<string, string | undefined>,

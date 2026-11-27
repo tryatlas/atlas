@@ -4,10 +4,12 @@ on:
   push:
     branches:
       - main
-      # `dev` takes every pull request (ADR-0030), so a push there runs the
-      # full suite on what was just integrated. It reads caches and writes
-      # none (see "Cache budget"): a pull request into `dev` restores from
-      # `main`, the default branch, which GitHub always offers.
+      # `dev` takes every pull request (ADR-0030). A push there is a merged
+      # pull request: it runs nothing when the pull request's own run passed
+      # on this exact tree, and the affected plan when dev moved during review
+      # (see `tested` and `resolveRange`). It reads caches and writes none (see
+      # "Cache budget"): a pull request into `dev` restores from `main`, the
+      # default branch, which GitHub always offers.
       - dev
       # Hotfix branches (release/0.5, …). Not for the check itself — work
       # lands here via PRs that were already checked — but so the branch owns a
@@ -18,6 +20,10 @@ on:
       # the app job versus ~2.
       - 'release/**'
   pull_request:
+    # The default three, plus `ready_for_review`: a draft runs the frontend
+    # only (see `forDraft` in scripts/ci-affected.mjs), so marking it ready
+    # must start the run that plans everything else.
+    types: [opened, synchronize, reopened, ready_for_review]
   # The Rust jobs run only for what a change affects (see the `changes` job),
   # so this weekly full run is the backstop: it catches anything the planner
   # misclassified, and it keeps main's rust-cache entries from being evicted
@@ -28,11 +34,15 @@ on:
   # Also a full run, on any branch: Actions → CI → Run workflow.
   workflow_dispatch:
 
-# A new push to the same branch makes the previous run's answer irrelevant.
-# Cancelling keeps queue times down when several PRs are in flight.
+# A new push to a pull request makes its running check irrelevant, so it is
+# cancelled. On a branch (dev, main, the release PR's manual runs) a running
+# run is never cancelled: a cancelled run writes no cache and proves nothing
+# (see `tested`), so a burst of merges used to throw away every run but the
+# last. Without cancel-in-progress, GitHub keeps the running run and, of the
+# runs waiting behind it, only the newest.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -112,9 +122,16 @@ jobs:
     # passed), and the back-merge PR into dev and its push. With `tested`
     # set, every planned job is skipped, `frontend` too, and `ci-ok` reports
     # success. A run counts as proof only if it covered everything it was
-    # shown: a manual or scheduled run (always full), or a push to main. Pull-request runs are never proof of a full run:
-    # their affected jobs and base can differ from the destination branch.
-    # In particular, every merge to dev still receives its full push plan.
+    # shown: a manual or scheduled run (always full), or a push to main.
+    #
+    # One narrower proof, for a push to dev only: a pull request's passing
+    # run on this exact tree. A merge commit's tree is the tree the pull
+    # request's last run tested whenever dev did not move while it was in
+    # review, about six merges in ten. Such a run planned the same diff a push
+    # would (base to merge), so it is the same check. `ci-ok` records it as an
+    # artifact named after the tree, and only for a non-draft pull request
+    # from this repository: a fork's run could be made to record any name.
+    # Pull-request runs never prove anything for main.
     name: plan
     runs-on: ubuntu-24.04-arm
     permissions:
@@ -123,11 +140,12 @@ jobs:
       actions: read
     outputs:
       tested: ${{ steps.tested.outputs.tested }}
+      tree: ${{ steps.tested.outputs.tree }}
       app: ${{ steps.plan.outputs.app }}
       engine-dialect: ${{ steps.plan.outputs.engine-dialect }}
       # Never empty: an unplanned run must still give the crates matrix an
       # empty list, not a blank `fromJSON` input.
-      crates: ${{ steps.plan.outputs.crates || '[]' }}
+      crate-groups: ${{ steps.plan.outputs.crate-groups || '[]' }}
       e2e: ${{ steps.plan.outputs.e2e }}
       cache-write: ${{ steps.cache.outputs.write }}
     steps:
@@ -143,6 +161,7 @@ jobs:
         run: |
           # HEAD is the commit under test: the pushed commit, or a PR's merge.
           tree="$(git rev-parse 'HEAD^{tree}')"
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
           proofs="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?status=success&per_page=100" \
             --jq '.workflow_runs[]
               | select(.event == "workflow_dispatch" or .event == "schedule"
@@ -159,6 +178,21 @@ jobs:
               exit 0
             fi
           done <<<"$proofs"
+          # A merged pull request whose own run passed on this tree (see above).
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_NAME" = dev ]; then
+            run="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=ci-passed-tree-$tree&per_page=100" \
+              --jq '[.artifacts[]
+                | select(.expired | not)
+                | select(.workflow_run.head_repository_id == (env.GITHUB_REPOSITORY_ID | tonumber))
+                ][0].workflow_run.id // empty' || true)"
+            if [ -n "$run" ]; then
+              url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run"
+              echo "This tree already passed on its pull request in $url; nothing to run."
+              echo "::notice title=CI skipped::This exact code already passed on its pull request in $url"
+              echo "tested=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
           echo "No earlier run tested this tree; planning as usual."
       - name: Plan
         id: plan
@@ -166,6 +200,7 @@ jobs:
         env:
           BEFORE: ${{ github.event.before }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
           RUSTUP_TOOLCHAIN: stable
         # Node and cargo come with the runner image; `cargo metadata
         # --no-deps` reads only the manifests, so no toolchain step is needed.
@@ -460,46 +495,50 @@ jobs:
           cargo test --locked -p atlas-engine-app-server --test all --
           suite::v2::turn_interrupt:: suite::v2::mcp_server_status::
   crates:
-    # Every crate gets its own job so a failure names the crate rather than the
-    # workspace. The list lives in `.github/ci-crates.json`, and the `changes`
-    # job passes on the entries this change affects. Adding a crate is a
-    # one-entry change there, and `tests/ci-coverage.test.ts` fails the build
-    # if a new crate is left out.
+    # Every crate in `.github/ci-crates.json` that the change affects, tested
+    # and linted by scripts/ci-crates.mjs, one crate at a time from its own
+    # directory with its own flags (that script has the rules: the clippy
+    # passes, `release-build`, the Windows-target pass for `cross` crates).
+    # Adding a crate is a one-entry change there, and
+    # `tests/ci-coverage.test.ts` fails the build if a new crate is left out.
     #
-    # Since #38 all of these except `atlas-kb-server` are members of the root
-    # workspace: `cargo test` inside a member directory still selects only that
-    # package, but the lockfile and target dir are the root's.
+    # Grouped, not one job per crate: a crate's tests take about half a
+    # minute and its job's setup (checkout, toolchain, two cache restores)
+    # took longer, 32 times over, while 32 jobs also overran the 20 a run may
+    # have going at once. `crateGroups` in scripts/ci-affected.mjs makes the
+    # groups: the sandbox crate and atlas-kb-server alone, the rest in groups
+    # of up to ten. A failure names its crate in the step's log and summary.
     #
-    # Entry flags:
+    # Entry flags (in .github/ci-crates.json):
     #
     # `clippy: true` marks the crates that are currently warning-clean under
     # `-D warnings`. The rest are not yet; flip the flag as each is cleaned up
     # rather than weakening the gate for the ones that already pass.
     #
     # `release-build: true` additionally builds the crate with its release
-    # profile (see the step).
+    # profile.
     #
-    # `sandbox: true` installs bubblewrap (see the step). `ci:local` runs
-    # these crates in its Linux container when asked (ATLAS_CI_LINUX=needed,
-    # or --linux), since only a Linux kernel can exercise the sandbox.
+    # `sandbox: true` gives the crate its own job, which installs bubblewrap
+    # (see the step). `ci:local` runs these crates in its Linux container when
+    # asked (ATLAS_CI_LINUX=needed, or --linux), since only a Linux kernel can
+    # exercise the sandbox.
     #
     # `cross: true` marks the crates whose dependency tree builds no C, so
-    # they can be clippy'd for another OS from any machine (see the Windows
-    # step). `ci:local` on a Mac clippies them for Linux too.
-
-    name: ${{ matrix.crate }}
+    # they can be clippy'd for another OS from any machine. `ci:local` on a Mac
+    # clippies them for Linux too.
+    name: ${{ matrix.group }}
     needs: changes
     # An empty matrix is an error, not a skip, so an empty plan skips here.
-    if: needs.changes.outputs.crates != '[]'
+    if: needs.changes.outputs.crate-groups != '[]'
     runs-on: ubuntu-24.04-arm
     env:
       RUSTC_WRAPPER: sccache # see the app job
       SCCACHE_GHA_RW_MODE: ${{ needs.changes.outputs.cache-write == 'true' && 'READ_WRITE' || 'READ_ONLY' }}
     strategy:
-      # Report every failing crate in one run instead of stopping at the first.
+      # Report every failing group in one run instead of stopping at the first.
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.changes.outputs.crates) }}
+        include: ${{ fromJSON(needs.changes.outputs.crate-groups) }}
     steps:
       - uses: actions/checkout@v5
       - name: Install the pinned Rust toolchain # see the app job
@@ -510,10 +549,10 @@ jobs:
       # profile and is built on demand at runtime) and so keeps its own cache.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ${{ matrix.crate == 'atlas-kb-server' && 'crates/atlas-kb-server' || '.' }}
+          workspaces: ${{ matrix.workspace }}
           save-if: ${{ needs.changes.outputs.cache-write == 'true' }}
       # Several suites build real git repositories in a tempdir, and `git
-      # commit` refuses to run without an identity. Set for every crate so
+      # commit` refuses to run without an identity. Set for every group so
       # adding such a test to another crate doesn't fail mysteriously.
       - name: Configure git identity for test repos
         run: |
@@ -533,9 +572,9 @@ jobs:
       # and the suite reports that an approved command never ran — three
       # translations away from "bwrap is not installed".
       #
-      # Flagged rather than installed for every crate because
+      # Flagged rather than installed for every group because
       # `tests/engine-quarantine.test.ts` keeps `atlas-native-agent` the only
-      # manifest allowed to name a `atlas-engine-*` crate, so no other job can reach
+      # manifest allowed to name a `atlas-engine-*` crate, so no other crate can reach
       # this sandbox. Flip the flag on any crate that later can.
       #
       # Installed is not enough on Ubuntu 24.04: AppArmor's
@@ -556,58 +595,13 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           bwrap --unshare-all --ro-bind / / true
-      - name: Test
-        working-directory: crates/${{ matrix.crate }}
-        run: cargo test --locked
-      # atlas-kb-server is never shipped as a binary: `knowledge_export`
-      # compiles it on the user's machine, with `cargo build --release` and the
-      # crate's own release profile (`panic = "abort"`, thin LTO, strip), which
-      # no other step here exercises. Three direct dependencies, so this costs
-      # well under a minute, and it is the build users actually run.
-      - name: Build (release profile, as knowledge_export does)
-        if: matrix.release-build
-        working-directory: crates/${{ matrix.crate }}
-        run: cargo build --locked --release
-      # Exactly one clippy pass per crate, never two. Every member crate gets
-      # at least the workspace lint table (`[lints] workspace = true`, #60),
-      # whose entries are denies of their own; `clippy: true` crates get
-      # `-D warnings` on top, which is a strict superset. It used to be both
-      # passes for those crates, and the plain one found nothing the strict
-      # one would not — while changing the clippy arguments invalidates every
-      # workspace member cargo lints, so for atlas-native-agent that was the
-      # whole ported engine linted twice. sccache cannot help here (clippy
-      # emits metadata only), so the only saving is not doing it twice.
-      #
-      # Two complementary `if`s rather than one step with an expression in
-      # `run`: tests/ci-coverage.test.ts checks the pair stays complementary,
-      # and a `run` line with no `${{ }}` in it stays runnable as-is by tools
-      # that replay these steps outside Actions.
-      - name: Clippy (-D warnings)
-        if: matrix.clippy
-        working-directory: crates/${{ matrix.crate }}
-        run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Clippy (workspace lint table)
-        if: ${{ !matrix.clippy }}
-        working-directory: crates/${{ matrix.crate }}
-        run: cargo clippy --locked --all-targets
-      # The crate's `cfg(windows)` arms, which no other step compiles: a
-      # Linux runner and a Mac both skip them, so a Windows-only break used to
-      # surface on a contributor's Windows machine (#324). `cross` marks the
-      # crates whose dependency tree builds no C for the target: clippy is
-      # metadata-only, nothing links, and the standard library for the target
-      # comes from rust-toolchain.toml's `targets`, so a Linux runner can check
-      # Windows with no Windows SDK. The other crates run a C compiler for the
-      # target in some build script (ring, zstd, bundled sqlite, aws-lc), which
-      # fails without that SDK; their Windows arms are checked as part of the
-      # app on a Windows runner (`app-windows`) instead.
-      #
-      # The workspace lint table only, as in `app-linux`: the question is
-      # whether it compiles and passes the denies on Windows, and a single
-      # argument set keeps this one extra pass rather than two.
-      - name: Clippy (Windows target)
-        if: matrix.cross
-        working-directory: crates/${{ matrix.crate }}
-        run: cargo clippy --locked --all-targets --target aarch64-pc-windows-msvc
+      # The crates go in through the environment, so the `run` line has no
+      # `${{ }}` in it and stays runnable as-is by tools that replay these
+      # steps outside Actions (`ci:local` passes one crate at a time).
+      - name: Test and lint each crate
+        env:
+          CI_CRATES: ${{ join(matrix.crates, ' ') }}
+        run: node scripts/ci-crates.mjs
 
   app-windows:
     # The app compiled for Windows, which neither the macOS `app` job nor
@@ -660,3 +654,26 @@ jobs:
           case " $RESULTS " in
             *" failure "*|*" cancelled "*) exit 1 ;;
           esac
+      # The proof a push to dev looks for (see the `changes` job): this tree
+      # passed on a pull request. Only after the check above passed, never for
+      # a draft (it ran the frontend only), and never for a fork, whose run
+      # could be edited to record any tree. A few bytes, kept for 30 days: a
+      # pull request merged later than that just runs again on dev.
+      - name: Record the tested tree
+        id: record
+        if: >-
+          github.event_name == 'pull_request' &&
+          !github.event.pull_request.draft &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          needs.changes.outputs.tree != ''
+        env:
+          TREE: ${{ needs.changes.outputs.tree }}
+        run: echo "$TREE" > tested-tree
+      - uses: actions/upload-artifact@v4
+        if: steps.record.outcome == 'success'
+        with:
+          name: ci-passed-tree-${{ needs.changes.outputs.tree }}
+          path: tested-tree
+          retention-days: 30
+          # A re-run of this job uploads the same name again.
+          overwrite: true

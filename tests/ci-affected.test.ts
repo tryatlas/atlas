@@ -3,12 +3,15 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import {
+  CRATES_PER_GROUP,
   EXTRA_INPUTS,
   GLOBAL_INPUTS,
   NON_RUST,
   REPO_ROOT,
   affectedPackages,
+  crateGroups,
   dialectPackages,
+  forDraft,
   loadWorkspace,
   matches,
   plan,
@@ -216,6 +219,10 @@ describe("the CI plan", () => {
     expect(p.crates.map((c) => c.crate)).toContain("atlas-kb-server");
   });
 
+  it("runs every crate when what the crates job runs for each one changes", () => {
+    expect(GLOBAL_INPUTS).toContain("scripts/ci-crates.mjs");
+  });
+
   it("runs everything for a global input or an unknown file", () => {
     for (const f of ["Cargo.lock", ".github/workflows/ci.yml", "some-new-config.toml"]) {
       const p = run([f]);
@@ -248,6 +255,68 @@ describe("the CI plan", () => {
   });
 });
 
+describe("the crates job's groups", () => {
+  const workspace = loadWorkspace();
+  const matrix = readCrateMatrix();
+  const groups = crateGroups(matrix, workspace);
+
+  it("checks every crate exactly once", () => {
+    const named = groups.flatMap((g) => g.crates).sort();
+    expect(named).toEqual(matrix.map((c) => c.crate).sort());
+  });
+
+  it("keeps a full run's group count well under the 20 jobs a run may have going", () => {
+    // Plus plan, frontend, e2e, the three app jobs, the engine dialect and ci-ok.
+    expect(groups.length + 8).toBeLessThanOrEqual(15);
+    for (const g of groups) expect(g.crates.length).toBeLessThanOrEqual(CRATES_PER_GROUP);
+  });
+
+  it("gives the sandbox crate a job of its own, the only one that installs bubblewrap", () => {
+    const sandboxed = matrix.filter((c) => c.sandbox).map((c) => c.crate);
+    expect(sandboxed.length).toBeGreaterThan(0);
+    for (const g of groups) {
+      expect({ group: g.group, sandbox: g.sandbox }).toEqual({
+        group: g.group,
+        sandbox: g.crates.some((c) => sandboxed.includes(c)),
+      });
+      if (g.sandbox) expect(g.crates).toHaveLength(1);
+    }
+  });
+
+  it("caches a crate the workspace excludes from its own directory, alone", () => {
+    const excluded = workspace.packages.filter((p) => p.excluded).map((p) => p.dir);
+    expect(excluded).toContain("crates/atlas-kb-server");
+    const kb = groups.find((g) => g.crates.includes("atlas-kb-server"))!;
+    expect(kb).toMatchObject({ crates: ["atlas-kb-server"], workspace: "crates/atlas-kb-server" });
+    for (const g of groups.filter((x) => x !== kb)) expect(g.workspace).toBe(".");
+  });
+
+  it("makes one plainly named group for a small change, and none for none", () => {
+    const two = matrix.filter((c) => ["atlas-git", "atlas-fs"].includes(c.crate));
+    expect(crateGroups(two, workspace)).toEqual([
+      { group: "crates", crates: ["atlas-fs", "atlas-git"], sandbox: false, workspace: "." },
+    ]);
+    expect(crateGroups([], workspace)).toEqual([]);
+  });
+});
+
+describe("a draft pull request", () => {
+  it("runs the frontend only, and says why", () => {
+    const full = plan(null, {
+      workspace: loadWorkspace(),
+      crates: readCrateMatrix(),
+      dialect: dialectPackages(ciYml),
+    });
+    const draft = forDraft(full);
+    expect(draft).toMatchObject({ app: false, engineDialect: false, crates: [], e2e: false });
+    expect(draft.reason).toContain("draft");
+  });
+
+  it("reruns when it is marked ready for review", () => {
+    expect(ciYml).toMatch(/^ {4}types: \[[^\]]*\bready_for_review\b[^\]]*\]$/m);
+  });
+});
+
 describe("the CI diff range", () => {
   const exists = () => true;
 
@@ -268,10 +337,23 @@ describe("the CI diff range", () => {
     expect(resolveRange(env, exists)).toEqual({ base: "a1", head: "b2" });
   });
 
+  it("diffs a push to dev (a merged pull request) against the previous head", () => {
+    // The `changes` job skips it outright when the pull request's own run
+    // passed on this tree; otherwise dev moved during review, and only what
+    // the merge changed needs checking.
+    const env = {
+      GITHUB_EVENT_NAME: "push",
+      GITHUB_REF_NAME: "dev",
+      BEFORE: "a1",
+      GITHUB_SHA: "b2",
+    };
+    expect(resolveRange(env, exists)).toEqual({ base: "a1", head: "b2" });
+  });
+
   it("runs everything when there is no trustworthy range", () => {
     const cases = [
       { GITHUB_EVENT_NAME: "push", GITHUB_REF_NAME: "main", BEFORE: "a1" },
-      { GITHUB_EVENT_NAME: "push", GITHUB_REF_NAME: "dev", BEFORE: "a1" },
+      { GITHUB_EVENT_NAME: "push", GITHUB_REF_NAME: "dev", BEFORE: "0".repeat(40) },
       { GITHUB_EVENT_NAME: "push", GITHUB_REF_NAME: "0.3.5", BEFORE: "0".repeat(40) },
       { GITHUB_EVENT_NAME: "schedule" },
       { GITHUB_EVENT_NAME: "workflow_dispatch" },
@@ -302,9 +384,9 @@ describe("the CI workflow follows the plan", () => {
       /^ {4}if: needs\.changes\.outputs\.engine-dialect == 'true'$/m,
     );
     expect(block("crates")).toMatch(
-      /^ {8}include: \$\{\{ fromJSON\(needs\.changes\.outputs\.crates\) \}\}$/m,
+      /^ {8}include: \$\{\{ fromJSON\(needs\.changes\.outputs\.crate-groups\) \}\}$/m,
     );
-    expect(block("crates")).toMatch(/^ {4}if: needs\.changes\.outputs\.crates != '\[\]'$/m);
+    expect(block("crates")).toMatch(/^ {4}if: needs\.changes\.outputs\.crate-groups != '\[\]'$/m);
     expect(block("e2e")).toMatch(/^ {4}if: needs\.changes\.outputs\.e2e == 'true'$/m);
   });
 

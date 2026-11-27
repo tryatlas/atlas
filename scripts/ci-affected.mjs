@@ -80,6 +80,8 @@ export const GLOBAL_INPUTS = [
   ".github/workflows/ci.yml",
   ".github/ci-crates.json",
   "scripts/ci-affected.mjs",
+  // What the `crates` job runs for each crate.
+  "scripts/ci-crates.mjs",
 ];
 
 /**
@@ -261,8 +263,9 @@ export const NON_RUST = [
 
 /**
  * The cargo packages CI can test: every root-workspace member, plus each
- * `crates/*` package the workspace excludes (atlas-kb-server). `dir` is
- * repo-relative, `deps` the names of the packages it depends on by path.
+ * `crates/*` package the workspace excludes (atlas-kb-server, marked
+ * `excluded`). `dir` is repo-relative, `deps` the names of the packages it
+ * depends on by path.
  */
 export function loadWorkspace(root = REPO_ROOT) {
   const meta = JSON.parse(
@@ -284,7 +287,7 @@ export function loadWorkspace(root = REPO_ROOT) {
     if (e.isDirectory() && !known.has(dir) && existsSync(path.join(root, dir, "Cargo.toml"))) {
       const manifest = readFileSync(path.join(root, dir, "Cargo.toml"), "utf8");
       const name = manifest.match(/^\[package\][^[]*?^name\s*=\s*"([^"]+)"/m)?.[1] ?? e.name;
-      packages.push({ name, dir, deps: [] });
+      packages.push({ name, dir, deps: [], excluded: true });
     }
   }
   return { packages };
@@ -369,6 +372,64 @@ export function plan(files, { workspace, crates, dialect }, allReason = "everyth
   };
 }
 
+/** Most crates one `crates` job checks; a full run makes three such groups. */
+export const CRATES_PER_GROUP = 10;
+
+/**
+ * The `crates` job's matrix: the planned crates, split into a few jobs.
+ *
+ * A crate flagged `sandbox` gets a job of its own: it is the slowest crate
+ * by far (it reaches the whole ported engine) and the only one that needs
+ * bubblewrap. So does a crate the root workspace excludes (atlas-kb-server),
+ * which has its own lockfile and target dir and so its own cache. The rest are
+ * dealt round-robin into as few groups as keep each at CRATES_PER_GROUP or
+ * under, so the groups finish at about the same time.
+ *
+ * Each group is `{ group, crates, sandbox, workspace }`: the job's name, the
+ * crate names `scripts/ci-crates.mjs` checks, whether to install bubblewrap,
+ * and the directory rust-cache keys off.
+ */
+export function crateGroups(crates, workspace) {
+  const excluded = new Set(
+    workspace.packages.filter((p) => p.excluded).map((p) => p.dir.replace(/^crates\//, "")),
+  );
+  const alone = crates.filter((c) => c.sandbox || excluded.has(c.crate));
+  const rest = crates.filter((c) => !alone.includes(c));
+  const count = Math.ceil(rest.length / CRATES_PER_GROUP);
+  const dealt = Array.from({ length: count }, () => []);
+  rest.forEach((c, i) => dealt[i % count].push(c.crate));
+  return [
+    ...alone.map((c) => ({
+      group: c.crate,
+      crates: [c.crate],
+      sandbox: Boolean(c.sandbox),
+      workspace: excluded.has(c.crate) ? `crates/${c.crate}` : ".",
+    })),
+    ...dealt.map((names, i) => ({
+      group: count === 1 ? "crates" : `crates (${i + 1} of ${count})`,
+      crates: names,
+      sandbox: false,
+      workspace: ".",
+    })),
+  ];
+}
+
+/**
+ * A draft pull request runs the frontend job only; marking it ready for
+ * review starts a run with the full plan. A draft cannot merge, so nothing it
+ * skips can land untested.
+ */
+export function forDraft(p) {
+  return {
+    ...p,
+    reason: `draft pull request (${p.reason}); marking it ready runs the planned jobs`,
+    app: false,
+    engineDialect: false,
+    crates: [],
+    e2e: false,
+  };
+}
+
 /** The CI crate matrix: `.github/ci-crates.json`. */
 export function readCrateMatrix(root = REPO_ROOT) {
   return JSON.parse(readFileSync(path.join(root, ".github", "ci-crates.json"), "utf8"));
@@ -389,11 +450,13 @@ export function resolveRange(env, commitExists) {
     return { base: env.PR_BASE, head: "HEAD" };
   }
   if (event === "push") {
-    // Every PR lands on dev and every promotion on main (ADR-0030), so a push to
-    // either gets the full suite, not a diff.
-    if (env.GITHUB_REF_NAME === "main" || env.GITHUB_REF_NAME === "dev") {
-      return { all: `push to ${env.GITHUB_REF_NAME}` };
-    }
+    // Promotions, hotfixes and releases land on main (ADR-0030), and a push
+    // there is what proves a tree for the releases that follow, so it gets
+    // the full suite. A push to dev is a merged pull request: when its exact
+    // tree already passed on the pull request the `changes` job skips the
+    // run outright, and otherwise (dev moved while it was in review) it is
+    // planned like any other push, from the previous head.
+    if (env.GITHUB_REF_NAME === "main") return { all: "push to main" };
     const before = env.BEFORE ?? "";
     if (!before || NULL_SHA.test(before)) return { all: "new branch, no previous head" };
     if (!commitExists(before)) return { all: "previous head is gone (force-push?)" };
@@ -419,7 +482,7 @@ export function changedFiles(base, head) {
 const firstParty = (names) =>
   names.filter((n) => !n.startsWith("atlas-engine-")).join(", ") || "none";
 
-function summarise(p, crates) {
+function summarise(p, crates, groups) {
   const jobs = [
     ["app (src-tauri)", p.app],
     ["app (src-tauri, Linux)", p.app],
@@ -449,6 +512,14 @@ function summarise(p, crates) {
         .join(", ") || "none"
     }`,
     "",
+    ...(groups.length
+      ? [
+          `Crate jobs: ${groups.length}`,
+          "",
+          ...groups.map((g) => `- ${g.group}: ${g.crates.join(", ")}`),
+          "",
+        ]
+      : []),
   ].join("\n");
 }
 
@@ -480,9 +551,11 @@ function main(argv) {
   );
   const workspace = loadWorkspace();
   const files = range.all ? null : changedFiles(range.base, range.head);
-  const result = plan(files, { workspace, crates, dialect }, range.all);
+  const planned = plan(files, { workspace, crates, dialect }, range.all);
+  const result = github && process.env.PR_DRAFT === "true" ? forDraft(planned) : planned;
 
-  const summary = summarise(result, crates);
+  const groups = crateGroups(result.crates, workspace);
+  const summary = summarise(result, crates, groups);
   process.stdout.write(`${summary}\n`);
   if (github) {
     appendFileSync(
@@ -490,7 +563,7 @@ function main(argv) {
       [
         `app=${result.app}`,
         `engine-dialect=${result.engineDialect}`,
-        `crates=${JSON.stringify(result.crates)}`,
+        `crate-groups=${JSON.stringify(groups)}`,
         `e2e=${result.e2e}`,
         "",
       ].join("\n"),
