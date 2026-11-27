@@ -109,6 +109,13 @@ const NEEDS: ProviderNeed[] = [
     phrases: ["trustedrouter api key"],
   },
   {
+    provider: "llmtr",
+    label: "LLMTR",
+    consoleHint: "llmtr.com",
+    envVars: ["LLMTR_API_KEY"],
+    phrases: ["llmtr api key"],
+  },
+  {
     provider: "xai",
     label: "xAI",
     consoleHint: "console.x.ai",

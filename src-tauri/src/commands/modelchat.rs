@@ -69,6 +69,7 @@ pub(super) fn provider_endpoint(provider: &str) -> Option<(ApiKind, &'static str
         "standardcompute" => (ApiKind::OpenAi, "https://api.stdcmpt.com/v1"),
         "uberllm" => (ApiKind::OpenAi, "https://api.uberllm.dev/v1"),
         "trustedrouter" => (ApiKind::OpenAi, "https://api.trustedrouter.com/v1"),
+        "llmtr" => (ApiKind::OpenAi, "https://llmtr.com/v1"),
         _ => return None,
     })
 }
@@ -462,6 +463,11 @@ fn fallback_models(provider: &str) -> Vec<&'static str> {
             "anthropic/claude-sonnet-4.6",
             "openai/gpt-5.5",
         ],
+        "llmtr" => vec![
+            "qwen/qwen3.8-flash",
+            "qwen/qwen3.8-max",
+            "mistral/devstral-medium-latest",
+        ],
         _ => vec![],
     }
 }
@@ -814,6 +820,26 @@ mod tests {
                 "deepseek/deepseek-v4-flash",
                 "anthropic/claude-sonnet-4.6",
                 "openai/gpt-5.5",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_llmtr_endpoint() {
+        let (kind, url) = provider_endpoint("llmtr").expect("llmtr endpoint must exist");
+        assert_eq!(kind, ApiKind::OpenAi);
+        assert_eq!(url, "https://llmtr.com/v1");
+    }
+
+    #[test]
+    fn test_llmtr_fallback_models() {
+        let models = fallback_models("llmtr");
+        assert_eq!(
+            models,
+            vec![
+                "qwen/qwen3.8-flash",
+                "qwen/qwen3.8-max",
+                "mistral/devstral-medium-latest",
             ]
         );
     }

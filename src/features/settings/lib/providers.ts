@@ -253,6 +253,14 @@ export const PROVIDERS: ProviderDef[] = [
     chat: true,
   },
   {
+    id: "llmtr",
+    name: "LLMTR",
+    env: "LLMTR_API_KEY",
+    category: "Gateway",
+    docsUrl: "https://llmtr.com/docs",
+    chat: true,
+  },
+  {
     id: "litellm",
     name: "LiteLLM Proxy",
     env: "LITELLM_API_KEY",
