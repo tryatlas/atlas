@@ -17,6 +17,33 @@ describe("findInText", () => {
     expect(findInText(text, "BETA", true)).toEqual([]);
   });
 
+  it("keeps ignoring case when another character expands under lowercasing", () => {
+    const text = "İstanbul NEEDLE\nneedle İ NEEDLE";
+    expect(findInText(text, "needle", false)).toEqual([
+      { line: 1, column: 10, endColumn: 16 },
+      { line: 2, column: 1, endColumn: 7 },
+      { line: 2, column: 10, endColumn: 16 },
+    ]);
+    expect(findInText(text, "needle", true)).toEqual([{ line: 2, column: 1, endColumn: 7 }]);
+    expect(findInText(text, "needle", false, 2)).toHaveLength(2);
+  });
+
+  it.each(["a.b", "[todo]", "a+b", "(todo)", "cost$", "a\\b"])(
+    "keeps %s literal in a file with a length-changing case fold",
+    (query) => {
+      expect(findInText(`İ ${query.toUpperCase()}`, query, false)).toEqual([
+        { line: 1, column: 3, endColumn: 3 + query.length },
+      ]);
+    },
+  );
+
+  it("uses the original span when the query itself expands under lowercasing", () => {
+    expect(findInText("İ İ", "İ", false)).toEqual([
+      { line: 1, column: 1, endColumn: 2 },
+      { line: 1, column: 3, endColumn: 4 },
+    ]);
+  });
+
   it("stops at the cap, and finds nothing for an empty or multi-line query", () => {
     expect(findInText("aaaa", "a", true, 2)).toHaveLength(2);
     expect(findInText(text, "", true)).toEqual([]);
