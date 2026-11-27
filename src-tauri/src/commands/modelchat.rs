@@ -69,6 +69,7 @@ pub(super) fn provider_endpoint(provider: &str) -> Option<(ApiKind, &'static str
         "standardcompute" => (ApiKind::OpenAi, "https://api.stdcmpt.com/v1"),
         "uberllm" => (ApiKind::OpenAi, "https://api.uberllm.dev/v1"),
         "trustedrouter" => (ApiKind::OpenAi, "https://api.trustedrouter.com/v1"),
+        "teamorouter" => (ApiKind::OpenAi, "https://api.teamorouter.com/v1"),
         _ => return None,
     })
 }
@@ -462,6 +463,7 @@ fn fallback_models(provider: &str) -> Vec<&'static str> {
             "anthropic/claude-sonnet-4.6",
             "openai/gpt-5.5",
         ],
+        "teamorouter" => vec!["claude-sonnet-5-5", "gpt-6.2-astra", "glm-5.3"],
         _ => vec![],
     }
 }
@@ -815,6 +817,23 @@ mod tests {
                 "anthropic/claude-sonnet-4.6",
                 "openai/gpt-5.5",
             ]
+        );
+    }
+
+    #[test]
+    fn test_teamorouter_endpoint() {
+        let (kind, url) =
+            provider_endpoint("teamorouter").expect("teamorouter endpoint must exist");
+        assert_eq!(kind, ApiKind::OpenAi);
+        assert_eq!(url, "https://api.teamorouter.com/v1");
+    }
+
+    #[test]
+    fn test_teamorouter_fallback_models() {
+        let models = fallback_models("teamorouter");
+        assert_eq!(
+            models,
+            vec!["claude-sonnet-5-5", "gpt-6.2-astra", "glm-5.3"]
         );
     }
 }

@@ -109,6 +109,13 @@ const NEEDS: ProviderNeed[] = [
     phrases: ["trustedrouter api key"],
   },
   {
+    provider: "teamorouter",
+    label: "TeamoRouter",
+    consoleHint: "teamorouter.com",
+    envVars: ["TEAMOROUTER_API_KEY"],
+    phrases: ["teamorouter api key"],
+  },
+  {
     provider: "xai",
     label: "xAI",
     consoleHint: "console.x.ai",

@@ -47,6 +47,7 @@ const PREFERRED: Record<string, string[]> = {
   standardcompute: ["StandardCompute", "deepseek/deepseek-v4.1-flash", "z-ai/glm-5.3"],
   uberllm: ["deepseek/deepseek-v4-flash", "anthropic/claude-sonnet-4.6", "openai/gpt-5.5"],
   trustedrouter: ["deepseek/deepseek-v4-flash", "anthropic/claude-sonnet-4.6", "openai/gpt-5.5"],
+  teamorouter: ["claude-sonnet-5-5", "gpt-6.2-astra", "glm-5.3"],
 };
 
 const MAX_MODELS = 18;
