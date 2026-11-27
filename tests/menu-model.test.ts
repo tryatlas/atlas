@@ -59,6 +59,26 @@ describe("menu model", () => {
     );
   });
 
+  /**
+   * On Linux a native menu is a GTK bar packed into the window above the
+   * webview, a second strip under Atlas's own titlebar. `hide_menu()` cannot
+   * keep it away: the window-state plugin `show()`s the window as it is
+   * built, tao queues that as a GTK `show_all()` that runs after `setup`'s
+   * hide, and the bar comes back. Every gate
+   * stays green; the bar only shows in the running Linux app. So Linux must
+   * never get the menu installed, and `hide_menu()` stays Windows-only.
+   */
+  it("installs no native menu on Linux", () => {
+    const rust = read("src-tauri/src/lib.rs");
+    const installs = [...rust.matchAll(/\.menu\(menu::build\)/g)];
+    expect(installs, "lib.rs installs the menu exactly once").toHaveLength(1);
+    expect(rust).toMatch(
+      /if cfg!\(target_os = "linux"\) \{\s*builder\s*\} else \{\s*builder\.menu\(menu::build\)\s*\}/,
+    );
+    const hide = rust.match(/#\[cfg\(([^\]]*)\)\]\s*let _ = window\.hide_menu\(\);/);
+    expect(hide?.[1], "hide_menu() is cfg-gated to Windows").toBe("windows");
+  });
+
   it("keeps Cmd+W a Close Tab item, never the window's", () => {
     expect(items.some((item) => item.type === "action" && item.id === "tabs.close")).toBe(true);
     expect(items.some((item) => item.type === "role" && item.role === "close")).toBe(false);

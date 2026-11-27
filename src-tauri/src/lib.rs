@@ -190,9 +190,21 @@ pub fn run() {
     // The app menu bar, built from `menu.json`; every custom item hands its
     // id to the renderer, which runs it. See `menu.rs`.
     //
-    // On Windows and Linux the native menu is hidden; the frontend draws its
-    // visible menu from the same model.
-    let builder = builder.menu(menu::build).on_menu_event(|app, event| {
+    // Off macOS the frontend draws the visible menu from the same model (the
+    // sidebar's menu button). Windows keeps a native menu, hidden in `setup`.
+    //
+    // Linux gets none at all. GTK packs it into the window as a visible bar,
+    // and hiding it does not last: the window-state plugin `show()`s the
+    // window as it is built, tao queues that as a GTK `show_all()`, and the
+    // queued call runs after `setup`'s hide and re-shows the bar. A hidden GTK menu's
+    // shortcuts don't fire either, so it bought nothing. `cfg!` rather than
+    // `#[cfg]` keeps `menu.rs` compiled and tested on Linux.
+    let builder = if cfg!(target_os = "linux") {
+        builder
+    } else {
+        builder.menu(menu::build)
+    };
+    let builder = builder.on_menu_event(|app, event| {
         let id = event.id().as_ref();
         if id == menu::QUIT_MENU_ID {
             commands::quit_guard::request_quit(app);
@@ -254,7 +266,9 @@ pub fn run() {
                 // tao leaves `trafficLightPosition` unapplied until the first
                 // resize; see the function.
                 commands::window::apply_traffic_light_inset(&window);
-                #[cfg(not(target_os = "macos"))]
+                // Only Windows installs a native menu to hide; see the
+                // menu wiring above for why Linux has none.
+                #[cfg(windows)]
                 let _ = window.hide_menu();
             }
             // The built-in browser is gone; delete the cookie and login

@@ -9,9 +9,10 @@ import { runMenuItem } from "./run-menu-item";
 const ACTION_IDS = menuActionIds();
 
 /**
- * The renderer half of the native macOS menu (`src-tauri/src/menu.rs`): run
+ * The renderer half of the native menu (`src-tauri/src/menu.rs`): run
  * whatever item was clicked, and keep every item's accelerator on the user's
- * current chord for it. A no-op off macOS, where the titlebar draws the menu.
+ * current chord for it. On Linux, which installs no native menu, the listener
+ * never fires and `menu_set_accelerators` is a no-op.
  */
 export function useNativeMenu(): void {
   useEffect(() => {
