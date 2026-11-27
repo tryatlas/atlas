@@ -1,4 +1,5 @@
-//! Native application menu, built from `src-tauri/menu.json`.
+//! Native application menu, built from `src-tauri/menu.json`. Installed on
+//! macOS, and hidden on Windows; Linux gets none (`lib.rs` says why).
 //!
 //! The menu model is shared: the frontend draws the same menus inside the
 //! Windows/Linux titlebar (`src/features/menu/`), so the two cannot list
