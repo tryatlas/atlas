@@ -274,9 +274,25 @@ mod probe_tests {
 
     /// A "shell" that takes `-lic <script>` like the real one and does what
     /// `body` says. The probe is what is under test, not zsh.
+    /// An executable script standing in for the login shell.
+    ///
+    /// `cp` writes the executable, not this process. Tests run on parallel
+    /// threads, and Linux refuses to exec a file any process holds open for
+    /// writing (ETXTBSY): had this thread written it, a sibling test forking
+    /// while the file was open would carry that descriptor into its child
+    /// until the child's own exec, and the probe's spawn would fail. That made
+    /// both probe tests flaky (2 runs in 60, as `a prompt shell answers` or a
+    /// missing pid file). The script `cp` copies from is never executed.
     fn fake_shell(dir: &std::path::Path, body: &str) -> String {
+        let source = dir.join("shell.txt");
         let path = dir.join("shell");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::write(&source, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let copied = std::process::Command::new("cp")
+            .arg(&source)
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(copied.success(), "cp wrote the fake shell");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path.to_string_lossy().into_owned()
     }
