@@ -11,15 +11,20 @@
 //   __atlasMock.actions.askLines()        open the box as ⌘↵ would on them
 //   __atlasMock.actions.openUnreadable()  a file that fails to load
 //   __atlasMock.actions.failSaves()       every save fails from now on (edit, ⌘S)
+//   __atlasMock.actions.holdNextSave()    pause the next save until releaseSave()
+//   __atlasMock.actions.externalEdit()    change the open file on disk and revalidate it
 
 import type { EditorView } from "@codemirror/view";
 import type { Scenario } from "../types";
 import { MOCK_PROJECT } from "../project";
 import { fsHandlers } from "../fixtures/files";
+import { emitWindowEvent } from "@/lib/window-events";
 
 const FILE = `${MOCK_PROJECT.path}/src/lib/api.ts`;
 
 let savesFail = false;
+let holdNextSave = false;
+let releaseSave: (() => void) | null = null;
 
 /** The open file tab's editor, found the way CodeMirror finds it. */
 async function fileView(): Promise<EditorView | null> {
@@ -43,6 +48,15 @@ export const askFiles: Scenario = {
   commands: {
     write_file_content: (args) => {
       if (savesFail) throw new Error(`EACCES: permission denied, open '${String(args.path)}'`);
+      if (holdNextSave) {
+        holdNextSave = false;
+        return new Promise((resolve) => {
+          releaseSave = () => {
+            releaseSave = null;
+            resolve(fsHandlers.write_file_content(args));
+          };
+        });
+      }
       return fsHandlers.write_file_content(args);
     },
   },
@@ -71,6 +85,18 @@ export const askFiles: Scenario = {
     },
     failSaves: () => {
       savesFail = true;
+    },
+    holdNextSave: () => {
+      holdNextSave = true;
+    },
+    releaseSave: () => {
+      releaseSave?.();
+    },
+    saveState: () => (releaseSave ? "pending" : "idle"),
+    savedText: () => fsHandlers.read_file_content({ path: FILE }),
+    externalEdit: async () => {
+      await fsHandlers.write_file_content({ path: FILE, content: "external edit" });
+      emitWindowEvent("atlas:window-active");
     },
   },
 };
