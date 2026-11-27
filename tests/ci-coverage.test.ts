@@ -3,13 +3,14 @@ import { readFileSync, readdirSync, existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readCrateMatrix } from "../scripts/ci-affected.mjs";
+import { WINDOWS_TARGET, crateSteps } from "../scripts/ci-crates.mjs";
 
 /**
  * Keeps `.github/workflows/ci.yml` bound to what is actually in the repo.
  *
- * Each crate is a standalone package, so CI names them one by one in a matrix
- * (`.github/ci-crates.json`, which the `changes` job filters into the
- * `crates` job's matrix). That list is hand-maintained, which means a PR
+ * Each crate is a standalone package, so CI names them one by one
+ * (`.github/ci-crates.json`, which the `changes` job filters and groups into
+ * the `crates` job's matrix, and scripts/ci-crates.mjs checks each). That list is hand-maintained, which means a PR
  * adding a crate gets a green check while its tests never run — the exact
  * failure that left 393 of this repo's tests (48%) unexecuted before this
  * suite existed. Nothing else notices, because a job that was never
@@ -20,7 +21,8 @@ import { readCrateMatrix } from "../scripts/ci-affected.mjs";
  * fail loudly instead of passing vacuously.
  *
  * The second half pins two shapes in the Rust jobs that fail slowly or
- * silently rather than loudly: the per-crate clippy pass (one, never two —
+ * silently rather than loudly: the per-crate clippy pass, which
+ * scripts/ci-crates.mjs builds (one, never two —
  * a second pass with different arguments re-lints the whole ported engine
  * for nothing) and the sccache wiring (a `RUSTC_WRAPPER` with no sccache on
  * PATH fails every cargo call; incremental compilation on makes every sccache
@@ -138,28 +140,63 @@ describe("CI's Rust jobs", () => {
     );
   });
 
-  it("runs exactly one clippy pass per matrix crate", () => {
-    // For the host OS; the cross-OS pass below is a different target.
-    const clippy = stepsOf(jobs.get("crates")!).filter(
-      (s) => s.run?.includes("cargo clippy") && !s.run.includes("--target"),
-    );
-    // Two steps with complementary conditions: `-D warnings` for the crates
-    // flagged `clippy: true`, the plain workspace-lint-table pass for the
-    // rest. An unconditional clippy step means flagged crates get two passes
-    // again, and a second argument set re-lints every workspace member.
-    expect(clippy.map((s) => s.if)).toEqual(["matrix.clippy", "${{ !matrix.clippy }}"]);
-    expect(clippy[0].run).toContain("-- -D warnings");
-    expect(clippy[1].run).not.toContain("-D warnings");
+  it("hands each planned group's crates to scripts/ci-crates.mjs", () => {
+    const steps = stepsOf(jobs.get("crates")!);
+    // The cargo commands live in the script, never in the job: a second
+    // copy here would drift from what ci:local runs.
+    expect(steps.filter((s) => s.run?.includes("cargo ")).map((s) => s.run)).toEqual([]);
+    const block = jobs.get("crates")!;
+    expect(block).toMatch(/^ {10}CI_CRATES: \$\{\{ join\(matrix\.crates, ' '\) \}\}$/m);
+    expect(steps.map((s) => s.run)).toContain("node scripts/ci-crates.mjs");
   });
 
-  it("clippies the crates flagged `cross` for Windows, once", () => {
-    const cross = stepsOf(jobs.get("crates")!).filter((s) => s.run?.includes("--target"));
-    expect(cross.map((s) => s.if)).toEqual(["matrix.cross"]);
-    expect(cross[0].run).toContain("cargo clippy");
-    expect(cross[0].run).toContain("--target aarch64-pc-windows-msvc");
+  it("runs exactly one clippy pass per crate for the host", () => {
+    // For the host OS; the cross-OS pass below is a different target. Two
+    // complementary argument sets: `-D warnings` for the crates flagged
+    // `clippy: true`, the plain workspace-lint-table pass for the rest. A
+    // second pass for a flagged crate re-lints every workspace member.
+    for (const entry of readCrateMatrix(REPO_ROOT)) {
+      const host = crateSteps(entry).filter(
+        (s) => s.args[0] === "clippy" && !s.args.includes("--target"),
+      );
+      expect({ crate: entry.crate, passes: host.length }).toEqual({
+        crate: entry.crate,
+        passes: 1,
+      });
+      expect({ crate: entry.crate, strict: host[0].args.includes("warnings") }).toEqual({
+        crate: entry.crate,
+        strict: Boolean(entry.clippy),
+      });
+    }
+  });
+
+  it("clippies the crates flagged `cross` for Windows, once, and no others", () => {
+    for (const entry of readCrateMatrix(REPO_ROOT)) {
+      const windows = crateSteps(entry).filter((s) => s.args.includes(WINDOWS_TARGET));
+      expect({ crate: entry.crate, passes: windows.length }).toEqual({
+        crate: entry.crate,
+        passes: entry.cross ? 1 : 0,
+      });
+    }
     // The flag means "no C in the tree", which only the probe that set it
     // could establish; this guards the flag's existence, not its accuracy.
     expect(readCrateMatrix(REPO_ROOT).some((c) => c.cross)).toBe(true);
+  });
+
+  it("tests every crate, and builds the release profile only where flagged", () => {
+    for (const entry of readCrateMatrix(REPO_ROOT)) {
+      const args = crateSteps(entry).map((s) => s.args.slice(0, 2).join(" "));
+      expect(args[0]).toBe("test --locked");
+      expect(args.includes("build --locked")).toBe(Boolean(entry["release-build"]));
+    }
+  });
+
+  it("adds ci:local's Linux-target pass only for `cross` crates", () => {
+    const extraTarget = "aarch64-unknown-linux-gnu";
+    for (const entry of readCrateMatrix(REPO_ROOT)) {
+      const linux = crateSteps(entry, { extraTarget }).filter((s) => s.args.includes(extraTarget));
+      expect(linux.length).toBe(entry.cross ? 1 : 0);
+    }
   });
 
   it("declares in rust-toolchain.toml every target CI and ci:local compile for", () => {
@@ -168,12 +205,13 @@ describe("CI's Rust jobs", () => {
       ...(/^targets\s*=\s*\[([^\]]*)\]/m.exec(toolchain)?.[1] ?? "").matchAll(/"([^"]+)"/g),
     ].map((m) => m[1]);
     const ciLocal = readFileSync(path.join(REPO_ROOT, "scripts", "ci-local.mjs"), "utf8");
-    const used = new Set(
-      [
+    const used = new Set([
+      ...[
         ...src.matchAll(/--target ([a-z0-9_-]+)/g),
         ...ciLocal.matchAll(/"(aarch64-unknown-linux-gnu)"/g),
       ].map((m) => m[1]),
-    );
+      WINDOWS_TARGET,
+    ]);
     expect(used.size).toBeGreaterThan(1);
     expect([...used].filter((t) => !declared.includes(t))).toEqual([]);
   });
