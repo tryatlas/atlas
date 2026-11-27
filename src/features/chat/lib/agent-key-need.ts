@@ -109,6 +109,13 @@ const NEEDS: ProviderNeed[] = [
     phrases: ["trustedrouter api key"],
   },
   {
+    provider: "aigrow",
+    label: "AIGROW",
+    consoleHint: "aigrow.gg/dashboard/api",
+    envVars: ["AIGROW_API_KEY"],
+    phrases: ["aigrow api key"],
+  },
+  {
     provider: "xai",
     label: "xAI",
     consoleHint: "console.x.ai",

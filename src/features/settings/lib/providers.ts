@@ -253,6 +253,15 @@ export const PROVIDERS: ProviderDef[] = [
     chat: true,
   },
   {
+    id: "aigrow",
+    name: "AIGROW",
+    env: "AIGROW_API_KEY",
+    category: "Gateway",
+    docsUrl: "https://aigrow.gg/ai-api/guide",
+    placeholder: "ag_...",
+    chat: true,
+  },
+  {
     id: "litellm",
     name: "LiteLLM Proxy",
     env: "LITELLM_API_KEY",

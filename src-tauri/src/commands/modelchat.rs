@@ -69,6 +69,7 @@ pub(super) fn provider_endpoint(provider: &str) -> Option<(ApiKind, &'static str
         "standardcompute" => (ApiKind::OpenAi, "https://api.stdcmpt.com/v1"),
         "uberllm" => (ApiKind::OpenAi, "https://api.uberllm.dev/v1"),
         "trustedrouter" => (ApiKind::OpenAi, "https://api.trustedrouter.com/v1"),
+        "aigrow" => (ApiKind::OpenAi, "https://aigrow.gg/v1"),
         _ => return None,
     })
 }
@@ -462,6 +463,7 @@ fn fallback_models(provider: &str) -> Vec<&'static str> {
             "anthropic/claude-sonnet-4.6",
             "openai/gpt-5.5",
         ],
+        "aigrow" => vec!["claude-haiku-5.5", "claude-sonnet-5.5", "gpt-6.2-sol"],
         _ => vec![],
     }
 }
@@ -815,6 +817,22 @@ mod tests {
                 "anthropic/claude-sonnet-4.6",
                 "openai/gpt-5.5",
             ]
+        );
+    }
+
+    #[test]
+    fn test_aigrow_endpoint() {
+        let (kind, url) = provider_endpoint("aigrow").expect("aigrow endpoint must exist");
+        assert_eq!(kind, ApiKind::OpenAi);
+        assert_eq!(url, "https://aigrow.gg/v1");
+    }
+
+    #[test]
+    fn test_aigrow_fallback_models() {
+        let models = fallback_models("aigrow");
+        assert_eq!(
+            models,
+            vec!["claude-haiku-5.5", "claude-sonnet-5.5", "gpt-6.2-sol"]
         );
     }
 }
